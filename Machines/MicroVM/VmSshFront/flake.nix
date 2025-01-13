@@ -114,7 +114,7 @@
 									settings =
 									{
 										PermitRootLogin = "no"; # SSH for extra users only
-										PasswordAuthentication = true; # Keys only
+										PasswordAuthentication = false; # Keys only
 										GatewayPorts = "clientspecified";   # This is required for binding reverse tunnels to real network interfaces (like, accepting connections which will be put into the tunnel), otherwise that's localhost only
 									};
 								};
