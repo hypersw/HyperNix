@@ -186,12 +186,8 @@
 								serviceConfig =
 								{
 									Type = "oneshot";
-									StandardOutput = "journal+console";
-									StandardError = "journal+console";
-									TTYPath = "/dev/ttyS0";
 									ExecStart = "/bin/sh -c " + "''" +
 										''
-										set -x
 										read up_raw idle < /proc/uptime
 										up_sec=''${up_raw%.*}
 										up_h=$((up_sec / 3600))
