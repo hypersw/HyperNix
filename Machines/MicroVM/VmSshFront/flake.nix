@@ -217,7 +217,7 @@
 										procs=$(ls -d /proc/[0-9]* 2>/dev/null | wc -l)
 										entropy=$(cat /proc/sys/kernel/random/entropy_avail 2>/dev/null)
 
-										logger -t heartbeat "up=''${up_h}h''${up_m}m mem=''${mem_pct}%(''${mem_used_mb}/''${mem_total_mb}MB) load=''${load1}/''${load5}/''${load15} ssh=''${ssh_count} banned=''${banned:-0} net=rx:''${rx:-?}MB/tx:''${tx:-?}MB procs=$procs entropy=$entropy"
+										echo "heartbeat: up=''${up_h}h''${up_m}m mem=''${mem_pct}%(''${mem_used_mb}/''${mem_total_mb}MB) load=''${load1}/''${load5}/''${load15} ssh=''${ssh_count} banned=''${banned:-0} net=rx:''${rx:-?}MB/tx:''${tx:-?}MB procs=$procs entropy=$entropy" > /dev/ttyS0
 									'' + "''";
 								};
 							};
