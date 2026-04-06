@@ -26,7 +26,7 @@
       forAllSystems = nixpkgs.lib.genAttrs [ "x86_64-linux" "aarch64-linux" ];
     in
     {
-      # Packages — assembled from subfolder flakes
+      # Packages — path-based naming: folder path with hyphens
       packages = forAllSystems (system:
         let
           cf3 = closefrom3.packages.${system} or {};
@@ -34,17 +34,17 @@
           vm = vm-ssh-front.packages.${system} or {};
         in
         {
-          closefrom3 = cf3.default or null;
-          ssh-askpass-credential-helper = askpass.default or null;
-          VmSshFront = vm.VmSshFront or null;
+          Util-CloseFrom3 = cf3.default or null;
+          Git-SshAskpassCredentialHelper = askpass.default or null;
+          Machines-MicroVM-VmSshFront = vm.VmSshFront or null;
         });
 
-      # NixOS modules
+      # NixOS modules — same naming convention
       nixosModules = {
-        ssh-askpass-credential-helper = ssh-askpass.nixosModules.default;
+        Git-SshAskpassCredentialHelper = ssh-askpass.nixosModules.default;
       };
 
-      # NixOS configurations (for machines)
+      # NixOS configurations
       nixosConfigurations = vm-ssh-front.nixosConfigurations or {};
     };
 }
