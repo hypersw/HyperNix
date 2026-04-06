@@ -99,6 +99,7 @@
 
             # Use programs.ssh.askPassword instead of setting SSH_ASKPASS directly —
             # NixOS's programs/ssh.nix owns that env var and conflicts otherwise
+            programs.ssh.enableAskPassword = true;
             programs.ssh.askPassword = "${pkg}/bin/ssh-askpass-credential-helper";
 
             # "prefer": try askpass first (hits cache silently), fall back to terminal.
