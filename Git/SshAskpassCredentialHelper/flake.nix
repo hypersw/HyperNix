@@ -4,7 +4,7 @@
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
     closefrom3 = {
-      url = "path:../../Util/CloseFrom3";
+      url = "github:hypersw/HyperNix?dir=Util/CloseFrom3";
       inputs.nixpkgs.follows = "nixpkgs";
     };
   };

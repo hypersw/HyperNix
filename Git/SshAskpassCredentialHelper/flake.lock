@@ -7,14 +7,20 @@
         ]
       },
       "locked": {
-        "path": "../../Util/CloseFrom3",
-        "type": "path"
+        "dir": "Util/CloseFrom3",
+        "lastModified": 1775477233,
+        "narHash": "sha256-ofFjTrztQ0J8YJFf76bA275qJIKdgPR2y1wYqQvo8Z4=",
+        "owner": "hypersw",
+        "repo": "HyperNix",
+        "rev": "73aa3cec21d1650ec9aff71304767d170f31665b",
+        "type": "github"
       },
       "original": {
-        "path": "../../Util/CloseFrom3",
-        "type": "path"
-      },
-      "parent": []
+        "dir": "Util/CloseFrom3",
+        "owner": "hypersw",
+        "repo": "HyperNix",
+        "type": "github"
+      }
     },
     "nixpkgs": {
       "locked": {
