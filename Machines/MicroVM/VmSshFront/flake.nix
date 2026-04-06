@@ -18,10 +18,10 @@
 
 			nixosConfigurations = 
 			{
-				"${VmNamePrefixed}" = nixpkgs.lib.nixosSystem 
+				"${VmNamePrefixed}" = nixpkgs.lib.nixosSystem
 				{
-					inherit system;
 					modules = [
+						{ nixpkgs.hostPlatform.system = system; }
 						microvm.nixosModules.microvm
 						# Import NixOS hardened profile for comprehensive security hardening
 						"${nixpkgs}/nixos/modules/profiles/hardened.nix"

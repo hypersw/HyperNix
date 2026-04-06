@@ -15,7 +15,7 @@
 
       mkScript = pkgs: { timeout, perTokenPin }:
         let
-          closefrom = closefrom3.packages.${pkgs.system}.default;
+          closefrom = closefrom3.packages.${pkgs.stdenv.hostPlatform.system}.default;
           zenity = pkgs.zenity;
         in
         pkgs.writeShellScriptBin "ssh-askpass-credential-helper" ''
