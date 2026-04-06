@@ -101,7 +101,9 @@
             # NixOS's programs/ssh.nix owns that env var and conflicts otherwise
             programs.ssh.askPassword = "${pkg}/bin/ssh-askpass-credential-helper";
 
-            # SSH_ASKPASS_REQUIRE is not managed by programs.ssh, set it separately
+            # "prefer": try askpass first (hits cache silently), fall back to terminal.
+            # Without this, SSH only uses askpass when there's no controlling terminal,
+            # bypassing the cache in interactive sessions.
             environment.sessionVariables.SSH_ASKPASS_REQUIRE = "prefer";
           });
         };
