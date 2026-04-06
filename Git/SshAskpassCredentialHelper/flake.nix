@@ -96,10 +96,13 @@
             inherit (cfg) timeout perTokenPin;
           }; in {
             environment.systemPackages = [ pkg ];
-            environment.sessionVariables = {
-              SSH_ASKPASS = "${pkg}/bin/ssh-askpass-credential-helper";
-              SSH_ASKPASS_REQUIRE = "prefer";
-            };
+
+            # Use programs.ssh.askPassword instead of setting SSH_ASKPASS directly —
+            # NixOS's programs/ssh.nix owns that env var and conflicts otherwise
+            programs.ssh.askPassword = "${pkg}/bin/ssh-askpass-credential-helper";
+
+            # SSH_ASKPASS_REQUIRE is not managed by programs.ssh, set it separately
+            environment.sessionVariables.SSH_ASKPASS_REQUIRE = "prefer";
           });
         };
     };
