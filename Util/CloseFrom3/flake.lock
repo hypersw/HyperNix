@@ -1,21 +1,5 @@
 {
   "nodes": {
-    "closefrom3": {
-      "inputs": {
-        "nixpkgs": [
-          "nixpkgs"
-        ]
-      },
-      "locked": {
-        "path": "../../Util/CloseFrom3",
-        "type": "path"
-      },
-      "original": {
-        "path": "../../Util/CloseFrom3",
-        "type": "path"
-      },
-      "parent": []
-    },
     "nixpkgs": {
       "locked": {
         "lastModified": 1775036866,
@@ -34,7 +18,6 @@
     },
     "root": {
       "inputs": {
-        "closefrom3": "closefrom3",
         "nixpkgs": "nixpkgs"
       }
     }
