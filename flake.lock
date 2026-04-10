@@ -16,6 +16,86 @@
       },
       "parent": []
     },
+    "daemon": {
+      "inputs": {
+        "nixpkgs": "nixpkgs_2"
+      },
+      "locked": {
+        "path": "../../../Modules/PrintersScanners/Daemon",
+        "type": "path"
+      },
+      "original": {
+        "path": "../../../Modules/PrintersScanners/Daemon",
+        "type": "path"
+      },
+      "parent": [
+        "print-scan-server"
+      ]
+    },
+    "epkowa": {
+      "inputs": {
+        "nixpkgs": [
+          "nixpkgs"
+        ]
+      },
+      "locked": {
+        "path": "./Modules/PrintersScanners/EpkowaScanner",
+        "type": "path"
+      },
+      "original": {
+        "path": "./Modules/PrintersScanners/EpkowaScanner",
+        "type": "path"
+      },
+      "parent": []
+    },
+    "epkowa_2": {
+      "inputs": {
+        "nixpkgs": "nixpkgs_3"
+      },
+      "locked": {
+        "path": "../../../Modules/PrintersScanners/EpkowaScanner",
+        "type": "path"
+      },
+      "original": {
+        "path": "../../../Modules/PrintersScanners/EpkowaScanner",
+        "type": "path"
+      },
+      "parent": [
+        "print-scan-server"
+      ]
+    },
+    "laserjet": {
+      "inputs": {
+        "nixpkgs": [
+          "nixpkgs"
+        ]
+      },
+      "locked": {
+        "path": "./Modules/PrintersScanners/LaserJetPrinter",
+        "type": "path"
+      },
+      "original": {
+        "path": "./Modules/PrintersScanners/LaserJetPrinter",
+        "type": "path"
+      },
+      "parent": []
+    },
+    "laserjet_2": {
+      "inputs": {
+        "nixpkgs": "nixpkgs_4"
+      },
+      "locked": {
+        "path": "../../../Modules/PrintersScanners/LaserJetPrinter",
+        "type": "path"
+      },
+      "original": {
+        "path": "../../../Modules/PrintersScanners/LaserJetPrinter",
+        "type": "path"
+      },
+      "parent": [
+        "print-scan-server"
+      ]
+    },
     "microvm": {
       "inputs": {
         "nixpkgs": [
@@ -38,6 +118,37 @@
         "type": "github"
       }
     },
+    "monitoring": {
+      "inputs": {
+        "nixpkgs": "nixpkgs_5"
+      },
+      "locked": {
+        "path": "../../../Modules/Monitoring/TelegramAlerts",
+        "type": "path"
+      },
+      "original": {
+        "path": "../../../Modules/Monitoring/TelegramAlerts",
+        "type": "path"
+      },
+      "parent": [
+        "print-scan-server"
+      ]
+    },
+    "nixos-hardware": {
+      "locked": {
+        "lastModified": 1775490113,
+        "narHash": "sha256-2ZBhDNZZwYkRmefK5XLOusCJHnoeKkoN95hoSGgMxWM=",
+        "owner": "NixOS",
+        "repo": "nixos-hardware",
+        "rev": "c775c2772ba56e906cbeb4e0b2db19079ef11ff7",
+        "type": "github"
+      },
+      "original": {
+        "owner": "NixOS",
+        "repo": "nixos-hardware",
+        "type": "github"
+      }
+    },
     "nixpkgs": {
       "locked": {
         "lastModified": 1775036866,
@@ -54,11 +165,151 @@
         "type": "github"
       }
     },
+    "nixpkgs_2": {
+      "locked": {
+        "lastModified": 1775423009,
+        "narHash": "sha256-vPKLpjhIVWdDrfiUM8atW6YkIggCEKdSAlJPzzhkQlw=",
+        "owner": "NixOS",
+        "repo": "nixpkgs",
+        "rev": "68d8aa3d661f0e6bd5862291b5bb263b2a6595c9",
+        "type": "github"
+      },
+      "original": {
+        "owner": "NixOS",
+        "ref": "nixos-unstable",
+        "repo": "nixpkgs",
+        "type": "github"
+      }
+    },
+    "nixpkgs_3": {
+      "locked": {
+        "lastModified": 1775423009,
+        "narHash": "sha256-vPKLpjhIVWdDrfiUM8atW6YkIggCEKdSAlJPzzhkQlw=",
+        "owner": "NixOS",
+        "repo": "nixpkgs",
+        "rev": "68d8aa3d661f0e6bd5862291b5bb263b2a6595c9",
+        "type": "github"
+      },
+      "original": {
+        "owner": "NixOS",
+        "ref": "nixos-unstable",
+        "repo": "nixpkgs",
+        "type": "github"
+      }
+    },
+    "nixpkgs_4": {
+      "locked": {
+        "lastModified": 1775423009,
+        "narHash": "sha256-vPKLpjhIVWdDrfiUM8atW6YkIggCEKdSAlJPzzhkQlw=",
+        "owner": "NixOS",
+        "repo": "nixpkgs",
+        "rev": "68d8aa3d661f0e6bd5862291b5bb263b2a6595c9",
+        "type": "github"
+      },
+      "original": {
+        "owner": "NixOS",
+        "ref": "nixos-unstable",
+        "repo": "nixpkgs",
+        "type": "github"
+      }
+    },
+    "nixpkgs_5": {
+      "locked": {
+        "lastModified": 1775423009,
+        "narHash": "sha256-vPKLpjhIVWdDrfiUM8atW6YkIggCEKdSAlJPzzhkQlw=",
+        "owner": "NixOS",
+        "repo": "nixpkgs",
+        "rev": "68d8aa3d661f0e6bd5862291b5bb263b2a6595c9",
+        "type": "github"
+      },
+      "original": {
+        "owner": "NixOS",
+        "ref": "nixos-unstable",
+        "repo": "nixpkgs",
+        "type": "github"
+      }
+    },
+    "nixpkgs_6": {
+      "locked": {
+        "lastModified": 1775423009,
+        "narHash": "sha256-vPKLpjhIVWdDrfiUM8atW6YkIggCEKdSAlJPzzhkQlw=",
+        "owner": "NixOS",
+        "repo": "nixpkgs",
+        "rev": "68d8aa3d661f0e6bd5862291b5bb263b2a6595c9",
+        "type": "github"
+      },
+      "original": {
+        "owner": "NixOS",
+        "ref": "nixos-unstable",
+        "repo": "nixpkgs",
+        "type": "github"
+      }
+    },
+    "print-scan-server": {
+      "inputs": {
+        "daemon": "daemon",
+        "epkowa": "epkowa_2",
+        "laserjet": "laserjet_2",
+        "monitoring": "monitoring",
+        "nixos-hardware": "nixos-hardware",
+        "nixpkgs": [
+          "nixpkgs"
+        ],
+        "telegram-bot": "telegram-bot"
+      },
+      "locked": {
+        "path": "./Machines/RPi4/PrintScanServer",
+        "type": "path"
+      },
+      "original": {
+        "path": "./Machines/RPi4/PrintScanServer",
+        "type": "path"
+      },
+      "parent": []
+    },
+    "printscan-daemon": {
+      "inputs": {
+        "nixpkgs": [
+          "nixpkgs"
+        ]
+      },
+      "locked": {
+        "path": "./Modules/PrintersScanners/Daemon",
+        "type": "path"
+      },
+      "original": {
+        "path": "./Modules/PrintersScanners/Daemon",
+        "type": "path"
+      },
+      "parent": []
+    },
+    "printscan-telegram": {
+      "inputs": {
+        "nixpkgs": [
+          "nixpkgs"
+        ]
+      },
+      "locked": {
+        "path": "./Modules/PrintersScanners/TelegramBot",
+        "type": "path"
+      },
+      "original": {
+        "path": "./Modules/PrintersScanners/TelegramBot",
+        "type": "path"
+      },
+      "parent": []
+    },
     "root": {
       "inputs": {
         "closefrom3": "closefrom3",
+        "epkowa": "epkowa",
+        "laserjet": "laserjet",
         "nixpkgs": "nixpkgs",
+        "print-scan-server": "print-scan-server",
+        "printscan-daemon": "printscan-daemon",
+        "printscan-telegram": "printscan-telegram",
         "ssh-askpass": "ssh-askpass",
+        "telegram-alerts": "telegram-alerts",
         "vm-ssh-front": "vm-ssh-front"
       }
     },
@@ -96,6 +347,38 @@
         "type": "path"
       },
       "parent": []
+    },
+    "telegram-alerts": {
+      "inputs": {
+        "nixpkgs": [
+          "nixpkgs"
+        ]
+      },
+      "locked": {
+        "path": "./Modules/Monitoring/TelegramAlerts",
+        "type": "path"
+      },
+      "original": {
+        "path": "./Modules/Monitoring/TelegramAlerts",
+        "type": "path"
+      },
+      "parent": []
+    },
+    "telegram-bot": {
+      "inputs": {
+        "nixpkgs": "nixpkgs_6"
+      },
+      "locked": {
+        "path": "../../../Modules/PrintersScanners/TelegramBot",
+        "type": "path"
+      },
+      "original": {
+        "path": "../../../Modules/PrintersScanners/TelegramBot",
+        "type": "path"
+      },
+      "parent": [
+        "print-scan-server"
+      ]
     },
     "vm-ssh-front": {
       "inputs": {
