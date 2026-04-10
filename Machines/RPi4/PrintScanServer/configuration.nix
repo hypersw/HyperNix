@@ -13,6 +13,19 @@
 
   hardware.enableRedistributableFirmware = true;
 
+  # Use the generic aarch64 kernel instead of the RPi-specific one.
+  # The nixos-hardware raspberry-pi-4 module selects linuxPackages_rpi4
+  # which uses a custom kernel (linux-rpi) that is NOT in cache.nixos.org.
+  # Every nixpkgs update would trigger a kernel recompile — 4-8 hours on
+  # the Pi, 1-2 hours under QEMU emulation on CI.
+  # The generic kernel is always cached and downloads in seconds.
+  # Trade-off: loses RPi-specific patches (GPU/display, camera, HAT overlays)
+  # which are irrelevant for a headless print/scan server.
+  #
+  # To restore RPi-specific kernel (requires own cachix or patience):
+  #   boot.kernelPackages = pkgs.linuxPackages_rpi4;
+  boot.kernelPackages = pkgs.linuxPackages;
+
   networking = {
     useDHCP = true;
     firewall = {
