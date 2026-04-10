@@ -259,49 +259,62 @@ No containers — the bot uses long-polling (outbound only, no inbound attack su
 all services need USB device access, and the RPi has limited RAM.
 
 ```
-┌─────────────────────────────────────────────────────────────┐
-│                     RPi4 Host (NixOS)                       │
-│                                                             │
-│  ┌──────────────┐   REST   ┌─────────────────────────────┐ │
-│  │ Telegram Bot  │◄───────►│                             │ │
-│  └──────────────┘          │    Print/Scan Daemon        │ │
-│  ┌──────────────┐   REST   │    (single binary)          │ │
-│  │ WhatsApp Bot  │◄───────►│                             │ │
-│  │ (later)       │          │  - Print jobs (→ lp/CUPS)  │ │
-│  └──────────────┘          │  - Scan jobs (→ scanimage)  │ │
-│  ┌──────────────┐   REST   │  - Scanner button poller    │ │
-│  │ Web UI        │◄───────►│  - Job queue / state        │ │
-│  │ (later)       │          │                             │ │
-│  └──────────────┘          └──────────┬──────────────────┘ │
-│                                       │                     │
-│  ┌───────────┐  ┌──────────┐    ┌────┴─────┐              │
-│  │ CUPS      │  │ AirSane  │    │ SANE     │              │
-│  │ (foo2zjs) │  │ (eSCL)   │    │ (epkowa) │              │
-│  └─────┬─────┘  └────┬─────┘    └────┬─────┘              │
-│        │USB           │SANE           │USB                  │
-│  ┌─────┴──────────────┴───────────────┴─────┐              │
-│  │              USB Hub / Ports              │              │
-│  │    HP P2015n          Epson V33           │              │
-│  └──────────────────────────────────────────┘              │
-│                                                             │
-│  ┌──────────────┐  ┌────────────────────────┐              │
-│  │ Monitoring    │  │ system.autoUpgrade     │              │
-│  │ Timer+OnFail  │  │ (daily, --refresh)     │              │
-│  └──────────────┘  └────────────────────────┘              │
-└─────────────────────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────────┐
+│                      RPi4 Host (NixOS)                       │
+│                                                              │
+│  ┌──────────────┐  unix   ┌──────────────────────────────┐  │
+│  │ Telegram Bot  │◄──────►│                              │  │
+│  │ (C#/.NET)     │ socket │    Print/Scan Daemon         │  │
+│  └──────────────┘         │    (C#/.NET, long-running)   │  │
+│  ┌──────────────┐  unix   │                              │  │
+│  │ WhatsApp Bot  │◄──────►│  - Print jobs (→ lp/CUPS)   │  │
+│  │ (Node.js)     │ socket │  - Scan jobs (→ scanimage)   │  │
+│  └──────────────┘         │  - Scanner button poller     │  │
+│  ┌──────────────┐  TCP    │  - Job queue / state         │  │
+│  │ Web UI        │◄──────►│                              │  │
+│  │ (later,       │ +token │  Listens on:                 │  │
+│  │  oauth2-proxy)│         │  - /run/printscan/api.sock  │  │
+│  └──────────────┘         │  - 127.0.0.1:PORT (web, +key)│  │
+│                            └──────────┬──────────────────┘  │
+│                                       │                      │
+│  ┌───────────┐  ┌──────────┐    ┌────┴─────┐               │
+│  │ CUPS      │  │ AirSane  │    │ SANE     │               │
+│  │ (foo2zjs) │  │ (eSCL)   │    │ (epkowa) │               │
+│  └─────┬─────┘  └────┬─────┘    └────┬─────┘               │
+│        │USB           │SANE           │USB                   │
+│  ┌─────┴──────────────┴───────────────┴─────┐               │
+│  │              USB Hub / Ports              │               │
+│  │    HP P2015n          Epson V33           │               │
+│  └──────────────────────────────────────────┘               │
+│                                                              │
+│  ┌──────────────┐  ┌────────────────────────┐               │
+│  │ Monitoring    │  │ system.autoUpgrade     │               │
+│  │ Timer+OnFail  │  │ (daily, --refresh)     │               │
+│  └──────────────┘  └────────────────────────┘               │
+└──────────────────────────────────────────────────────────────┘
 ```
 
 ### The Print/Scan Daemon
 
-Central service that owns all hardware interaction. Single binary (Rust or C#).
-Exposes a local REST API consumed by bots, web UI, or any future client.
+Central service that owns all hardware interaction. Long-running .NET process.
+Exposes a local API consumed by bots, web UI, or any future client.
+
+**Transport:**
+- **Primary**: Unix domain socket at `/run/printscan/api.sock` (mode 0660, group `printscan`).
+  Bots run as users in the `printscan` group. No tokens, no TLS — OS file permissions
+  control access. `SO_PEERCRED` available for caller identification if needed.
+  systemd socket activation with `SocketMode=0660` and `SocketGroup=printscan`.
+- **Secondary** (for web UI, later): TCP `127.0.0.1:PORT` with auto-generated API key
+  stored in a restricted config file. Web UI (SPA) served behind oauth2-proxy
+  (Google/Microsoft account gating) which forwards authenticated requests with
+  the API key. Same pattern as Syncthing.
 
 **Endpoints (draft):**
 - `POST /print` — accept file (PDF/image), options (page range, copies)
 - `POST /scan` — start scan with options (resolution, format), returns job ID
 - `GET /scan/{id}` — poll scan status, download result when done
 - `GET /status` — printer/scanner status (online, paper, errors)
-- `POST /button/subscribe` — register a callback for scanner button events
+- `POST /button/subscribe` — register for scanner button events (with callback)
 - `GET /jobs` — list recent print/scan jobs
 
 **Scanner button integration:** the daemon's button poller thread monitors the
@@ -322,14 +335,73 @@ No shared state between the daemon and AirSane/CUPS. A LAN user scanning via
 AirSane and a Telegram user scanning via the daemon compete for the SANE device
 lock — acceptable for a home setup with low concurrency.
 
-### Language Decision
+### Language Decisions
 
-**Recommendation: Rust** for the daemon. Smallest footprint on the RPi (2-8 MB RAM),
-best NixOS packaging story (crane), strongly-typed Telegram library (teloxide).
-Both bots and daemon could share a Rust workspace if desired.
+On 4-8 GB RPi4, memory differences between languages are negligible.
+Each component can use the best-fit stack since REST/socket boundaries decouple them.
 
-**Alternative: C#** if authoring speed outweighs footprint. SharpIpp for CUPS is
-a nice-to-have. ASP.NET Minimal APIs are lightweight enough for RPi4 with AOT.
+| Component | Language | Why |
+|---|---|---|
+| Print/Scan daemon | C# (.NET 8, JIT) | SharpIpp for CUPS, familiar, long-running (startup irrelevant), ASP.NET Minimal APIs for REST, platform-independent DLLs |
+| Telegram bot | C# (.NET 8, JIT) | Telegram.Bot is excellent (50M NuGet downloads), same ecosystem as daemon, separate process |
+| WhatsApp bot | Node.js | Baileys is JS-only, no choice |
+| Scanner button poller | Python (prototyping) → C# (production) | pyusb for reverse-engineering, then libusb P/Invoke or stays Python |
+| Web UI (later) | SPA (any) + oauth2-proxy | Behind Google/MSFT account gating |
+
+.NET JIT advantages over AOT/native for this use case:
+- Platform-independent DLLs — just need `dotnet-runtime` package
+- No cross-compilation toolchain hassle
+- Full reflection/dynamic loading works
+- Faster dev cycle
+- Long-running daemons — startup time irrelevant
+
+### WiFi Configuration
+
+**Per-device authentication** — not shared WPA-PSK.
+
+**Recommended: EAP-PEAP with Unifi built-in RADIUS** (simplest start):
+- Unifi supports WPA2/WPA3-Enterprise on WiFi SSIDs
+- Unifi has a built-in RADIUS server (Settings > Profiles > RADIUS) — supports
+  PEAP/MSCHAPv2 (username/password per device). Does NOT support EAP-TLS (certs).
+- Create a separate SSID (e.g., "IoT-Secure") with WPA2-Enterprise, keep existing
+  WPA-PSK SSID for human devices unchanged. Different VLANs if desired.
+- Revoke a device: delete its RADIUS user in Unifi
+- NixOS: `networking.wireless.networks."IoT-Secure".auth` with PEAP config,
+  password via sops-nix (not plaintext in Nix store)
+- Multiple SSIDs: Unifi supports 4-5 per radio, each independent security mode
+
+**Upgrade path: EAP-TLS with FreeRADIUS** (strongest, for later):
+- Private CA, client cert per device, revoke via CRL
+- Requires running FreeRADIUS (on this RPi or elsewhere)
+- NixOS `networking.wireless` supports EAP-TLS natively in wpa_supplicant
+
+**Alternative: PPSK via RADIUS** (unique PSK per device MAC):
+- Needs FreeRADIUS, returns per-MAC PSK in `Tunnel-Password`
+- Device side is just WPA2-PSK (simplest client config)
+- Unifi PPSK support via RADIUS not fully reliable on all firmware versions
+
+**Initial deployment**: Ethernet (no WiFi config needed). WiFi added later.
+
+### Local API Auth (Research Summary)
+
+**Unix socket** (chosen for bot→daemon):
+- OS file permissions are the access control — no tokens, no TLS needed
+- `SO_PEERCRED` gives caller UID/GID/PID — unforgeable, kernel-provided
+- Cannot be accidentally network-exposed (not TCP)
+- Industry standard: Docker, containerd, D-Bus, PulseAudio, systemd
+
+**TCP localhost** (for web UI later):
+- No OS-level access control on TCP ports — any local user can connect
+- Requires application-level auth (API key / bearer token)
+- Auto-generated key in restricted config file, same pattern as Syncthing
+- Web UI behind oauth2-proxy for Google/MSFT SSO before reaching the API
+
+**Industry patterns observed:**
+- Docker: Unix socket + file permissions, no auth on socket
+- CUPS: TCP + PAM basic auth for admin ops
+- Syncthing: TCP 127.0.0.1 + auto-generated API key in config.xml
+- Home Assistant: TCP + JWT bearer tokens + trusted-network bypass
+- Prometheus: TCP, no auth by default (network isolation assumed)
 
 ### SD Card Longevity
 
@@ -348,21 +420,23 @@ Could add bot UI for this later (print odd → prompt user to flip → print eve
 
 ### Build & Deploy
 
-1. **Initial**: cross-build SD image on x86_64 host via `boot.binfmt.emulatedSystems`
+1. **Initial**: Ethernet connection. Cross-build SD image on x86_64 host via
+   `boot.binfmt.emulatedSystems`. Flash to SD, boot RPi4.
 2. **Ongoing**: `system.autoUpgrade.flake = "github:hypersw/HyperNix#Machines-RPi4-PrintScanServer"`
    with `--refresh` daily. `OnFailure` → Telegram alert on upgrade failure
-3. **WiFi credentials**: baked into the initial image via sops-nix encrypted secret
+3. **WiFi**: added later, EAP-PEAP with Unifi built-in RADIUS, password via sops-nix
 4. **Public repo**: readonly GitHub access, no deploy key needed for `nix build`
 
 ### Implementation Order
 
-1. Machine flake (NixOS config, cross-build image, boot on RPi4, WiFi)
-2. Scanner button reverse-engineering (pyusb script on the dev host with scanner connected)
+1. Machine flake (NixOS config, cross-build image, boot on RPi4 via Ethernet)
+2. Scanner button reverse-engineering (pyusb script on dev host with scanner connected)
 3. LaserJetPrinter module (CUPS + foo2zjs, verify printing works)
 4. EpkowaScanner module (SANE + epkowa, verify scanning works)
-5. Print/Scan daemon (REST API, print/scan job handling, button poller)
-6. Telegram bot (long-polling, file receive → print, /scan command → scan)
+5. Print/Scan daemon (C#, Unix socket API, print/scan job handling, button poller)
+6. Telegram bot (C#, long-polling, file receive → print, /scan command → scan)
 7. AirSane (LAN scanning for iOS/macOS/Android)
 8. Monitoring module (OnFailure + health timer → Telegram)
-9. WhatsApp bot (Baileys, same REST API)
-10. Web UI (later, same REST API)
+9. WiFi configuration (EAP-PEAP, separate SSID)
+10. WhatsApp bot (Node.js/Baileys, same Unix socket API)
+11. Web UI (SPA + oauth2-proxy + TCP API with key)
