@@ -27,11 +27,12 @@ jobs:
 
       - name: Build SD card image
         run: |
-          # Build from the machine flake subdirectory — its path: inputs
-          # resolve relative to the git repo root (all files are checked out)
+          # Build from the repo root flake. --recreate-lock-file resolves
+          # all path: inputs fresh from the working tree (they can't be
+          # locked in advance since path: inputs are local-only).
           IMG_PATH=$(nix build \
-            'path:./Machines/RPi4/PrintScanServer#packages.x86_64-linux.sdImage' \
-            --no-link --print-out-paths \
+            '.#Machines-RPi4-PrintScanServer-sdImage' \
+            --no-link --print-out-paths --recreate-lock-file \
             --option system-features "big-parallel")
           echo "img_path=$IMG_PATH" >> "$GITHUB_ENV"
 
