@@ -184,3 +184,185 @@ be the killer feature that makes this unnecessary, but worth knowing the options
 - **SD card wear**: prefer USB SSD boot (EEPROM supports it). If SD card: mount /tmp as tmpfs,
   volatile journal, noatime, high-endurance card
 - `nix-community/nixos-hardware` has `raspberry-pi-4` module with hardware-specific settings
+
+### C# (.NET 8 AOT) vs Rust for the Daemon
+
+| Dimension | C# (.NET 8 AOT) | Rust |
+|---|---|---|
+| Binary size | 15-25 MB | 5-10 MB |
+| Idle RAM | 20-40 MB | 2-8 MB |
+| Startup | 10-50 ms | <5 ms |
+| Cross-compile aarch64 | Supported, needs cross toolchain | Easy, `cross` crate or manual |
+| Telegram library | Telegram.Bot (mature, 50M NuGet downloads) | teloxide (mature, strongly typed, async) |
+| SANE | Shell out to scanimage | Shell out to scanimage |
+| CUPS | SharpIpp (pure C# IPP) or shell out | ipp crate (less mature) or shell out |
+| NixOS packaging | Possible (`buildDotnetModule`), less common | Excellent (crane/buildRustPackage, best story) |
+| REST server | ASP.NET Minimal APIs (~15-25 MB) | axum (~2-4 MB stripped) |
+
+Both shell out to `scanimage` for SANE and `lp` for CUPS (or use IPP libraries).
+Rust wins on footprint and NixOS packaging. C# wins on familiarity and SharpIpp.
+
+### Scanner Button Detection (Epson V33)
+
+- V33 buttons use **vendor-specific bulk commands** (ESC/I protocol), NOT USB HID
+- No `/dev/input/` or `/dev/hidraw/` events — the host must **poll** the scanner
+- **scanbuttond** `backends/epson.c` is the best reference for the ESC/I button query
+  command format (sends `ESC !`, reads response byte with button state)
+- **scanbd** and **insaned** use SANE polling but epkowa doesn't expose buttons — won't work
+- Reverse-engineering approach:
+  1. `lsusb -v -d 04b8:0142` to enumerate interfaces/endpoints
+  2. `modprobe usbmon` + Wireshark on `usbmonN` to capture USB traffic
+  3. pyusb script to poll with suspected ESC/I commands while pressing buttons
+  4. Diff responses to map which bytes/bits correspond to which buttons
+- The scanner has 4 buttons — all should generate distinct response patterns
+- The polling daemon can be part of the main service daemon or a separate systemd unit
+
+### Monitoring (Non-Printer-Specific)
+
+- **systemd OnFailure=** template service + `curl` to Telegram API — zero overhead,
+  fires only on failure. Apply to critical services including `nixos-upgrade.service`
+- **Periodic health timer** (every 15 min): check for failed units, disk usage, RAM,
+  CPU temperature (`/sys/class/thermal/thermal_zone0/temp`), report to Telegram
+- **Boot confirmation**: oneshot service sends Telegram message on successful boot.
+  Optionally combine with healthchecks.io dead-man-switch for missed-boot detection
+- **Journal alerting**: `journalwatch` or custom `journalctl --since` in the timer
+- **monit** (~2 MB RAM) available if richer process monitoring needed beyond systemd
+- Token storage: `sops-nix` or `agenix` for the Telegram bot token (not plaintext in config)
+
+## Architecture (Revised)
+
+### Flake Structure in HyperNix
+
+```
+HyperNix/
+  Machines/RPi4/PrintScanServer/
+    flake.nix                — machine config, assembles modules, builds SD image
+    PLAN.md                  — this file
+  Modules/
+    PrintersScanners/
+      TelegramBot/
+        flake.nix            — Telegram bot, talks to the daemon REST API
+      WhatsAppBot/
+        flake.nix            — Baileys-based WhatsApp bot (later), same REST API
+      EpkowaScanner/
+        flake.nix            — SANE + epkowa + button poller + AirSane
+      LaserJetPrinter/
+        flake.nix            — CUPS + foo2zjs + Avahi advertising
+    Monitoring/
+      TelegramAlerts/
+        flake.nix            — OnFailure template, health timer, boot confirmation
+```
+
+### Service Architecture (on the RPi4, no containers)
+
+No containers — the bot uses long-polling (outbound only, no inbound attack surface),
+all services need USB device access, and the RPi has limited RAM.
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                     RPi4 Host (NixOS)                       │
+│                                                             │
+│  ┌──────────────┐   REST   ┌─────────────────────────────┐ │
+│  │ Telegram Bot  │◄───────►│                             │ │
+│  └──────────────┘          │    Print/Scan Daemon        │ │
+│  ┌──────────────┐   REST   │    (single binary)          │ │
+│  │ WhatsApp Bot  │◄───────►│                             │ │
+│  │ (later)       │          │  - Print jobs (→ lp/CUPS)  │ │
+│  └──────────────┘          │  - Scan jobs (→ scanimage)  │ │
+│  ┌──────────────┐   REST   │  - Scanner button poller    │ │
+│  │ Web UI        │◄───────►│  - Job queue / state        │ │
+│  │ (later)       │          │                             │ │
+│  └──────────────┘          └──────────┬──────────────────┘ │
+│                                       │                     │
+│  ┌───────────┐  ┌──────────┐    ┌────┴─────┐              │
+│  │ CUPS      │  │ AirSane  │    │ SANE     │              │
+│  │ (foo2zjs) │  │ (eSCL)   │    │ (epkowa) │              │
+│  └─────┬─────┘  └────┬─────┘    └────┬─────┘              │
+│        │USB           │SANE           │USB                  │
+│  ┌─────┴──────────────┴───────────────┴─────┐              │
+│  │              USB Hub / Ports              │              │
+│  │    HP P2015n          Epson V33           │              │
+│  └──────────────────────────────────────────┘              │
+│                                                             │
+│  ┌──────────────┐  ┌────────────────────────┐              │
+│  │ Monitoring    │  │ system.autoUpgrade     │              │
+│  │ Timer+OnFail  │  │ (daily, --refresh)     │              │
+│  └──────────────┘  └────────────────────────┘              │
+└─────────────────────────────────────────────────────────────┘
+```
+
+### The Print/Scan Daemon
+
+Central service that owns all hardware interaction. Single binary (Rust or C#).
+Exposes a local REST API consumed by bots, web UI, or any future client.
+
+**Endpoints (draft):**
+- `POST /print` — accept file (PDF/image), options (page range, copies)
+- `POST /scan` — start scan with options (resolution, format), returns job ID
+- `GET /scan/{id}` — poll scan status, download result when done
+- `GET /status` — printer/scanner status (online, paper, errors)
+- `POST /button/subscribe` — register a callback for scanner button events
+- `GET /jobs` — list recent print/scan jobs
+
+**Scanner button integration:** the daemon's button poller thread monitors the
+scanner via ESC/I bulk commands (every 500ms). On button press, it checks for
+active subscriptions (e.g., a Telegram user requested scan within 10 min) and
+auto-starts a scan with that user's last settings. Result is pushed to the
+subscriber via their bot.
+
+### Relationship with AirSane/CUPS
+
+AirSane and CUPS are **independent network services** — they talk directly to
+SANE/printer hardware. They don't go through the daemon. The daemon is a parallel
+client of the same hardware, coordinated by:
+- SANE device locking (only one client can use the scanner at a time)
+- CUPS queue (print jobs are serialized by CUPS regardless of source)
+
+No shared state between the daemon and AirSane/CUPS. A LAN user scanning via
+AirSane and a Telegram user scanning via the daemon compete for the SANE device
+lock — acceptable for a home setup with low concurrency.
+
+### Language Decision
+
+**Recommendation: Rust** for the daemon. Smallest footprint on the RPi (2-8 MB RAM),
+best NixOS packaging story (crane), strongly-typed Telegram library (teloxide).
+Both bots and daemon could share a Rust workspace if desired.
+
+**Alternative: C#** if authoring speed outweighs footprint. SharpIpp for CUPS is
+a nice-to-have. ASP.NET Minimal APIs are lightweight enough for RPi4 with AOT.
+
+### SD Card Longevity
+
+Using a camcorder-grade high-endurance SD card. Additional measures:
+- `boot.tmp.useTmpfs = true` — /tmp in RAM
+- `services.journald.extraConfig = "Storage=volatile"` — journal in RAM only
+- `fileSystems."/".options = [ "noatime" ]` — no access time writes
+- `nix.settings.auto-optimise-store = true` — dedup hard links in store
+- `nix-collect-garbage` on a weekly timer
+- Consider `f2fs` for root filesystem (flash-friendly, less tested with NixOS)
+
+### Duplex Printing
+
+Deferred. P2015n has no duplex unit. Manual even/odd via print-to-file for now.
+Could add bot UI for this later (print odd → prompt user to flip → print even).
+
+### Build & Deploy
+
+1. **Initial**: cross-build SD image on x86_64 host via `boot.binfmt.emulatedSystems`
+2. **Ongoing**: `system.autoUpgrade.flake = "github:hypersw/HyperNix#Machines-RPi4-PrintScanServer"`
+   with `--refresh` daily. `OnFailure` → Telegram alert on upgrade failure
+3. **WiFi credentials**: baked into the initial image via sops-nix encrypted secret
+4. **Public repo**: readonly GitHub access, no deploy key needed for `nix build`
+
+### Implementation Order
+
+1. Machine flake (NixOS config, cross-build image, boot on RPi4, WiFi)
+2. Scanner button reverse-engineering (pyusb script on the dev host with scanner connected)
+3. LaserJetPrinter module (CUPS + foo2zjs, verify printing works)
+4. EpkowaScanner module (SANE + epkowa, verify scanning works)
+5. Print/Scan daemon (REST API, print/scan job handling, button poller)
+6. Telegram bot (long-polling, file receive → print, /scan command → scan)
+7. AirSane (LAN scanning for iOS/macOS/Android)
+8. Monitoring module (OnFailure + health timer → Telegram)
+9. WhatsApp bot (Baileys, same REST API)
+10. Web UI (later, same REST API)
