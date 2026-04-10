@@ -41,8 +41,13 @@ jobs:
 
       - name: Prepare artifact
         run: |
-          # The image is already .img.zst from the NixOS builder
-          IMG_FILE=$(find "${{ env.img_path }}" -name "*.img.zst" | head -1)
+          # The store path is a directory containing the .img.zst file
+          IMG_FILE=$(find "${{ env.img_path }}" -name "*.img.zst" -type f | head -1)
+          if [ -z "$IMG_FILE" ]; then
+            echo "No .img.zst file found in ${{ env.img_path }}"
+            ls -laR "${{ env.img_path }}"
+            exit 1
+          fi
           IMG_NAME=$(basename "$IMG_FILE")
           cp "$IMG_FILE" "$IMG_NAME"
           echo "img_name=$IMG_NAME" >> "$GITHUB_ENV"
