@@ -185,9 +185,9 @@ be the killer feature that makes this unnecessary, but worth knowing the options
   volatile journal, noatime, high-endurance card
 - `nix-community/nixos-hardware` has `raspberry-pi-4` module with hardware-specific settings
 
-### C# (.NET 8 AOT) vs Rust for the Daemon
+### C# (.NET 10 AOT) vs Rust for the Daemon
 
-| Dimension | C# (.NET 8 AOT) | Rust |
+| Dimension | C# (.NET 10 AOT) | Rust |
 |---|---|---|
 | Binary size | 15-25 MB | 5-10 MB |
 | Idle RAM | 20-40 MB | 2-8 MB |
@@ -342,8 +342,8 @@ Each component can use the best-fit stack since REST/socket boundaries decouple 
 
 | Component | Language | Why |
 |---|---|---|
-| Print/Scan daemon | C# (.NET 8, JIT) | SharpIpp for CUPS, familiar, long-running (startup irrelevant), ASP.NET Minimal APIs for REST, platform-independent DLLs |
-| Telegram bot | C# (.NET 8, JIT) | Telegram.Bot is excellent (50M NuGet downloads), same ecosystem as daemon, separate process |
+| Print/Scan daemon | C# (.NET 10, JIT) | SharpIpp for CUPS, familiar, long-running (startup irrelevant), ASP.NET Minimal APIs for REST, platform-independent DLLs |
+| Telegram bot | C# (.NET 10, JIT) | Telegram.Bot is excellent (50M NuGet downloads), same ecosystem as daemon, separate process |
 | WhatsApp bot | Node.js | Baileys is JS-only, no choice |
 | Scanner button poller | Python (prototyping) → C# (production) | pyusb for reverse-engineering, then libusb P/Invoke or stays Python |
 | Web UI (later) | SPA (any) + oauth2-proxy | Behind Google/MSFT account gating |
