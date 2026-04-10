@@ -1,0 +1,59 @@
+name: Build RPi4 PrintScanServer SD Image
+
+on:
+  workflow_dispatch: # manual trigger only
+
+jobs:
+  build-sd-image:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: cachix/install-nix-action@v30
+        with:
+          extra_nix_config: |
+            extra-platforms = aarch64-linux
+            experimental-features = nix-command flakes
+
+      # Register QEMU as binfmt interpreter for aarch64 — lets nix
+      # transparently execute aarch64 binaries during the build.
+      # Most packages come from the binary cache; QEMU only runs
+      # for uncached packages.
+      - uses: docker/setup-qemu-action@v3
+        with:
+          platforms: arm64
+
+      - name: Build SD card image
+        run: |
+          nix build .#Machines-RPi4-PrintScanServer-sdImage \
+            --no-link --print-out-paths \
+            --option system-features "big-parallel" \
+            2>&1 | tee /tmp/build.log
+
+          # Extract the output path
+          IMG_PATH=$(tail -1 /tmp/build.log)
+          echo "img_path=$IMG_PATH" >> "$GITHUB_ENV"
+
+      - name: Compress and prepare artifact
+        run: |
+          # The image is already .img.zst from the NixOS builder
+          IMG_FILE=$(find ${{ env.img_path }} -name "*.img.zst" | head -1)
+          IMG_NAME=$(basename "$IMG_FILE")
+          cp "$IMG_FILE" "$IMG_NAME"
+          echo "img_name=$IMG_NAME" >> "$GITHUB_ENV"
+          ls -lh "$IMG_NAME"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sd-image
+          path: ${{ env.img_name }}
+          retention-days: 7
+
+      # On tagged releases, also upload to GitHub Releases
+      - name: Create release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ${{ env.img_name }}
