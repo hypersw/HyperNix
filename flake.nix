@@ -3,92 +3,121 @@
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
+    nixos-hardware.url = "github:NixOS/nixos-hardware";
 
-    # Utilities
-    closefrom3 = {
-      url = "path:./Util/CloseFrom3";
-      inputs.nixpkgs.follows = "nixpkgs";
-    };
-
-    # Git tools
-    ssh-askpass = {
-      url = "path:./Git/SshAskpassCredentialHelper";
-      inputs.nixpkgs.follows = "nixpkgs";
-      inputs.closefrom3.follows = "closefrom3";
-    };
-
-    # Machines
-    vm-ssh-front = {
-      url = "path:./Machines/MicroVM/VmSshFront";
-      inputs.nixpkgs.follows = "nixpkgs";
-    };
-    print-scan-server = {
-      url = "path:./Machines/RPi4/PrintScanServer";
-      inputs.nixpkgs.follows = "nixpkgs";
-    };
-
-    # Modules — PrintersScanners
-    laserjet = {
-      url = "path:./Modules/PrintersScanners/LaserJetPrinter";
-      inputs.nixpkgs.follows = "nixpkgs";
-    };
-    epkowa = {
-      url = "path:./Modules/PrintersScanners/EpkowaScanner";
-      inputs.nixpkgs.follows = "nixpkgs";
-    };
-    printscan-daemon = {
-      url = "path:./Modules/PrintersScanners/Daemon";
-      inputs.nixpkgs.follows = "nixpkgs";
-    };
-    printscan-telegram = {
-      url = "path:./Modules/PrintersScanners/TelegramBot";
-      inputs.nixpkgs.follows = "nixpkgs";
-    };
-
-    # Modules — Monitoring
-    telegram-alerts = {
-      url = "path:./Modules/Monitoring/TelegramAlerts";
-      inputs.nixpkgs.follows = "nixpkgs";
-    };
+    # External flake dependencies only — no path: sub-flakes.
+    # Internal modules/packages are plain nix files imported directly.
+    microvm.url = "github:astro/microvm.nix";
+    microvm.inputs.nixpkgs.follows = "nixpkgs";
   };
 
-  outputs = { self, nixpkgs
-            , closefrom3, ssh-askpass
-            , vm-ssh-front, print-scan-server
-            , laserjet, epkowa, printscan-daemon, printscan-telegram
-            , telegram-alerts }:
+  outputs = { self, nixpkgs, nixos-hardware, microvm }:
     let
       forAllSystems = nixpkgs.lib.genAttrs [ "x86_64-linux" "aarch64-linux" ];
-    in
-    {
-      # Packages — path-based naming: folder path with hyphens
-      packages = forAllSystems (system:
-        let
-          cf3 = closefrom3.packages.${system} or {};
-          askpass = ssh-askpass.packages.${system} or {};
-          vm = vm-ssh-front.packages.${system} or {};
-          pss = print-scan-server.packages.${system} or {};
-        in
-        {
-          Util-CloseFrom3 = cf3.default or null;
-          Git-SshAskpassCredentialHelper = askpass.default or null;
-          Machines-MicroVM-VmSshFront = vm.VmSshFront or null;
-          Machines-RPi4-PrintScanServer-sdImage = pss.sdImage or null;
-        });
 
-      # NixOS modules — same naming convention
-      nixosModules = {
-        Git-SshAskpassCredentialHelper = ssh-askpass.nixosModules.default;
-        Modules-PrintersScanners-LaserJetPrinter = laserjet.nixosModules.default;
-        Modules-PrintersScanners-EpkowaScanner = epkowa.nixosModules.default;
-        Modules-PrintersScanners-Daemon = printscan-daemon.nixosModules.default;
-        Modules-PrintersScanners-TelegramBot = printscan-telegram.nixosModules.default;
-        Modules-Monitoring-TelegramAlerts = telegram-alerts.nixosModules.default;
+      # Package builders — parameterized by pkgs
+      mkClosefrom3 = pkgs: pkgs.stdenv.mkDerivation {
+        pname = "closefrom3";
+        version = "1.0.0";
+        src = ./Util/CloseFrom3;
+        buildPhase = "$CC -O2 -Wall -o closefrom3 closefrom3.c";
+        installPhase = "mkdir -p $out/bin; cp closefrom3 $out/bin/";
+        meta.platforms = pkgs.lib.platforms.linux;
       };
 
-      # NixOS configurations
-      nixosConfigurations =
-        (vm-ssh-front.nixosConfigurations or {}) //
-        (print-scan-server.nixosConfigurations or {});
+      mkSshAskpass = pkgs: { timeout ? 3600, perTokenPin ? false }:
+        let closefrom = mkClosefrom3 pkgs;
+        in pkgs.writeShellScriptBin "ssh-askpass-credential-helper" ''
+          prompt="''${1:-}"
+
+          case "$prompt" in
+            "Enter PIN for '"*)
+              ${if perTokenPin then ''
+              cache_key="$prompt"
+              '' else ''
+              cache_key="pkcs11-pin"
+              ''}
+              ;;
+            *)
+              cache_key="$prompt"
+              ;;
+          esac
+
+          cached=$(printf 'protocol=pkcs11\nhost=%s\n' "$cache_key" \
+            | ${pkgs.git}/bin/git credential-cache get 2>/dev/null \
+            | ${pkgs.gnugrep}/bin/grep '^password=' | cut -d= -f2-)
+
+          if [ -n "$cached" ]; then
+            echo "$cached"
+            exit 0
+          fi
+
+          value=$(${pkgs.zenity}/bin/zenity --password --title="$prompt" 2>/dev/null) || exit 1
+          echo "$value"
+
+          printf 'protocol=pkcs11\nhost=%s\nusername=tpm\npassword=%s\n' "$cache_key" "$value" \
+            | ${closefrom}/bin/closefrom3 \
+              ${pkgs.git}/bin/git credential-cache --timeout=${toString timeout} store \
+              >/dev/null 2>/dev/null
+        '';
+
+      mkSpaceGitCredential = pkgs:
+        let
+          oauth2c-wrapped = pkgs.symlinkJoin {
+            name = "oauth2c-wrapped";
+            paths = [ pkgs.oauth2c ];
+            nativeBuildInputs = [ pkgs.makeWrapper ];
+            postBuild = ''
+              wrapProgram $out/bin/oauth2c \
+                --prefix PATH : ${pkgs.lib.makeBinPath [ pkgs.xdg-utils ]}
+            '';
+          };
+        in pkgs.writeShellApplication {
+          name = "space-git-credential";
+          excludeShellChecks = [ "SC1091" ];
+          runtimeInputs = [ oauth2c-wrapped pkgs.jq pkgs.curl pkgs.coreutils ];
+          text = builtins.readFile ./Git/SpaceGitCredential/space-git-credential.sh;
+        };
+    in
+    {
+      # ── Packages ──
+      packages = forAllSystems (system:
+        let pkgs = nixpkgs.legacyPackages.${system};
+        in {
+          Util-CloseFrom3 = mkClosefrom3 pkgs;
+          Git-SshAskpassCredentialHelper = mkSshAskpass pkgs {};
+          Git-SpaceGitCredential = mkSpaceGitCredential pkgs;
+          # Machine runner packages
+          Machines-MicroVM-VmSshFront =
+            self.nixosConfigurations.VmSshFront.config.microvm.declaredRunner or null;
+          Machines-RPi4-PrintScanServer-sdImage =
+            self.nixosConfigurations.PrintScanServer.config.system.build.sdImage or null;
+        });
+
+      # ── NixOS Modules ──
+      nixosModules = {
+        Git-SshAskpassCredentialHelper = import ./Modules/Git/SshAskpassCredentialHelper;
+        Modules-PrintersScanners-LaserJetPrinter = import ./Modules/PrintersScanners/LaserJetPrinter;
+        Modules-PrintersScanners-EpkowaScanner = import ./Modules/PrintersScanners/EpkowaScanner;
+        Modules-PrintersScanners-Daemon = import ./Modules/PrintersScanners/Daemon;
+        Modules-PrintersScanners-TelegramBot = import ./Modules/PrintersScanners/TelegramBot;
+        Modules-Monitoring-TelegramAlerts = import ./Modules/Monitoring/TelegramAlerts;
+      };
+
+      # ── NixOS Configurations ──
+      nixosConfigurations = {
+        VmSshFront = import ./Machines/MicroVM/VmSshFront/nixos.nix {
+          inherit nixpkgs microvm;
+        };
+
+        PrintScanServer = nixpkgs.lib.nixosSystem {
+          system = "aarch64-linux";
+          modules = [
+            nixos-hardware.nixosModules.raspberry-pi-4
+            "${nixpkgs}/nixos/modules/installer/sd-card/sd-image-aarch64.nix"
+            ./Machines/RPi4/PrintScanServer/configuration.nix
+          ];
+        };
+      };
     };
 }
