@@ -27,19 +27,18 @@ jobs:
 
       - name: Build SD card image
         run: |
-          nix build .#Machines-RPi4-PrintScanServer-sdImage \
+          # Build from the machine flake subdirectory — its path: inputs
+          # resolve relative to the git repo root (all files are checked out)
+          IMG_PATH=$(nix build \
+            'path:./Machines/RPi4/PrintScanServer#packages.x86_64-linux.sdImage' \
             --no-link --print-out-paths \
-            --option system-features "big-parallel" \
-            2>&1 | tee /tmp/build.log
-
-          # Extract the output path
-          IMG_PATH=$(tail -1 /tmp/build.log)
+            --option system-features "big-parallel")
           echo "img_path=$IMG_PATH" >> "$GITHUB_ENV"
 
-      - name: Compress and prepare artifact
+      - name: Prepare artifact
         run: |
           # The image is already .img.zst from the NixOS builder
-          IMG_FILE=$(find ${{ env.img_path }} -name "*.img.zst" | head -1)
+          IMG_FILE=$(find "${{ env.img_path }}" -name "*.img.zst" | head -1)
           IMG_NAME=$(basename "$IMG_FILE")
           cp "$IMG_FILE" "$IMG_NAME"
           echo "img_name=$IMG_NAME" >> "$GITHUB_ENV"
