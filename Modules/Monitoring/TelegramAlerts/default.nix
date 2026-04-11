@@ -2,11 +2,12 @@
 let
   cfg = config.services.telegram-alerts;
 
-  # Script to send a Telegram message — used by custom event services
+  # Script to send a Telegram message — reads token and chat ID from files at runtime
   sendTelegram = pkgs.writeShellScript "send-telegram" ''
-    CHAT_ID="$1"
+    CHAT_ID_FILE="$1"
     shift
     MESSAGE="$*"
+    CHAT_ID=$(cat "$CHAT_ID_FILE")
     TOKEN=$(cat ${cfg.tokenFile})
     ${pkgs.curl}/bin/curl -s -X POST \
       "https://api.telegram.org/bot$TOKEN/sendMessage" \
@@ -16,30 +17,48 @@ let
   '';
 
   sendAlert = pkgs.writeShellScript "send-alert" ''
-    ${sendTelegram} ${cfg.alertsChatId} "$@"
+    ${sendTelegram} ${cfg.alertsChatIdFile} "$@"
   '';
 
   sendLog = pkgs.writeShellScript "send-log" ''
-    ${sendTelegram} ${cfg.logChatId} "$@"
+    ${sendTelegram} ${cfg.logChatIdFile} "$@"
   '';
 
-  # Netdata health_alarm_notify.conf — routes by role to different chats
+  # Custom notification script for netdata — reads secrets from files at runtime.
+  # Netdata's built-in health_alarm_notify.conf can't read from files,
+  # so we use a custom script that netdata calls for all alarm transitions.
+  notifyScript = pkgs.writeShellScript "netdata-telegram-notify" ''
+    # Netdata passes alarm info via environment variables:
+    # $NETDATA_ALARM_STATUS (CRITICAL, WARNING, CLEAR)
+    # $NETDATA_ALARM_NAME, $NETDATA_ALARM_CHART, $NETDATA_ALARM_INFO
+    # $NETDATA_ALARM_ROLE
+
+    TOKEN=$(cat ${cfg.tokenFile} 2>/dev/null) || exit 0
+
+    # Route by role: "log" → low-priority, everything else → alerts
+    case "$NETDATA_ALARM_ROLE" in
+      log) CHAT_ID=$(cat ${cfg.logChatIdFile} 2>/dev/null) ;;
+      *)   CHAT_ID=$(cat ${cfg.alertsChatIdFile} 2>/dev/null) ;;
+    esac
+    [ -z "$CHAT_ID" ] && exit 0
+
+    HOST=$(hostname)
+    MSG="<b>$HOST [$NETDATA_ALARM_STATUS]</b> $NETDATA_ALARM_NAME%0A$NETDATA_ALARM_INFO%0AChart: $NETDATA_ALARM_CHART"
+
+    ${pkgs.curl}/bin/curl -s -X POST \
+      "https://api.telegram.org/bot$TOKEN/sendMessage" \
+      -d "chat_id=$CHAT_ID" \
+      -d "text=$MSG" \
+      -d "parse_mode=HTML" >/dev/null
+  '';
+
   notifyConf = pkgs.writeText "health_alarm_notify.conf" ''
-    # Telegram configuration
-    SEND_TELEGRAM="YES"
-    TELEGRAM_BOT_TOKEN_FILE="${cfg.tokenFile}"
+    # Use custom notification script — reads tokens/chat IDs from sops secrets at runtime
+    custom_sender="${notifyScript}"
 
-    # Default goes to alerts chat
-    DEFAULT_RECIPIENT_TELEGRAM="${cfg.alertsChatId}"
-
-    # Role-based routing:
-    # "alerts" role → high-priority chat (disk full, OOM, temp, service failure)
-    # "log" role → low-priority chat (warnings, informational)
-    role_recipients_telegram[sysadmin]="${cfg.alertsChatId}"
-    role_recipients_telegram[alerts]="${cfg.alertsChatId}"
-    role_recipients_telegram[log]="${cfg.logChatId}"
-
-    # Disable all other notification methods
+    # Disable all built-in methods — we handle everything in the custom script
+    SEND_CUSTOM="YES"
+    SEND_TELEGRAM="NO"
     SEND_EMAIL="NO"
     SEND_SLACK="NO"
     SEND_DISCORD="NO"
@@ -70,14 +89,14 @@ in
       description = "Path to file containing the Telegram bot API token";
     };
 
-    alertsChatId = lib.mkOption {
-      type = lib.types.str;
-      description = "Telegram chat ID for high-priority alerts (failures, critical thresholds)";
+    alertsChatIdFile = lib.mkOption {
+      type = lib.types.path;
+      description = "Path to file containing Telegram chat ID for high-priority alerts";
     };
 
-    logChatId = lib.mkOption {
-      type = lib.types.str;
-      description = "Telegram chat ID for low-priority events (boot, login, info)";
+    logChatIdFile = lib.mkOption {
+      type = lib.types.path;
+      description = "Path to file containing Telegram chat ID for low-priority events";
     };
 
     temperatureThreshold = lib.mkOption {

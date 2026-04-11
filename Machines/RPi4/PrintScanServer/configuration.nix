@@ -152,6 +152,8 @@ FLAKE
     defaultSopsFile = ./secrets/telegram.yaml;
     age.sshKeyPaths = [ "/etc/ssh/ssh_host_ed25519_key" ];
     secrets.telegram-token = {};
+    secrets.telegram-alerts-chat-id = {};
+    secrets.telegram-log-chat-id = {};
   };
 
   # ── Module enablement ──
@@ -163,8 +165,8 @@ FLAKE
   services.telegram-alerts = {
     enable = true;
     tokenFile = config.sops.secrets.telegram-token.path;
-    alertsChatId = "PLACEHOLDER";  # TODO: set after creating Telegram groups
-    logChatId = "PLACEHOLDER";     # TODO: set after creating Telegram groups
+    alertsChatIdFile = config.sops.secrets.telegram-alerts-chat-id.path;
+    logChatIdFile = config.sops.secrets.telegram-log-chat-id.path;
   };
 
   # Poll upstream flake for config changes every 5 min, rebuild if changed.
