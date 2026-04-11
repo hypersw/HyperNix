@@ -13,6 +13,18 @@
 
   hardware.enableRedistributableFirmware = true;
 
+  # Filesystems — RPi4 SD card layout (set by sd-image module on first flash,
+  # then referenced directly for subsequent nixos-rebuild).
+  # The sd-image module is only used for CI image builds, not runtime config.
+  fileSystems."/" = {
+    device = "/dev/disk/by-label/NIXOS_SD";
+    fsType = "ext4";
+  };
+  fileSystems."/boot/firmware" = {
+    device = "/dev/disk/by-label/FIRMWARE";
+    fsType = "vfat";
+  };
+
   # Use the generic aarch64 kernel instead of the RPi-specific one.
   # The nixos-hardware raspberry-pi-4 module selects linuxPackages_rpi4
   # which uses a custom kernel (linux-rpi) that is NOT in cache.nixos.org.

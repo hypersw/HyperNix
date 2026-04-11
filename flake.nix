@@ -91,7 +91,7 @@
           Machines-MicroVM-VmSshFront =
             self.nixosConfigurations.VmSshFront.config.microvm.declaredRunner or null;
           Machines-RPi4-PrintScanServer-sdImage =
-            self.nixosConfigurations.PrintScanServer.config.system.build.sdImage or null;
+            self.nixosConfigurations.PrintScanServer-sdImage.config.system.build.sdImage or null;
         });
 
       # ── NixOS Modules ──
@@ -110,7 +110,19 @@
           inherit nixpkgs microvm;
         };
 
+        # The running system config — used by nixos-rebuild on the Pi.
+        # Does NOT include the SD image/installer module (that's only for CI image builds).
         PrintScanServer = nixpkgs.lib.nixosSystem {
+          system = "aarch64-linux";
+          modules = [
+            nixos-hardware.nixosModules.raspberry-pi-4
+            ./Machines/RPi4/PrintScanServer/configuration.nix
+          ];
+        };
+
+        # SD image variant — includes the installer module for building flashable images.
+        # Only used by CI (GitHub Actions) and the sdImage package below.
+        PrintScanServer-sdImage = nixpkgs.lib.nixosSystem {
           system = "aarch64-linux";
           modules = [
             nixos-hardware.nixosModules.raspberry-pi-4
