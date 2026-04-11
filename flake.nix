@@ -102,6 +102,7 @@
         Modules-PrintersScanners-Daemon = import ./Modules/PrintersScanners/Daemon;
         Modules-PrintersScanners-TelegramBot = import ./Modules/PrintersScanners/TelegramBot;
         Modules-Monitoring-TelegramAlerts = import ./Modules/Monitoring/TelegramAlerts;
+        Modules-System-AutoRebuildOnPush = import ./Modules/System/AutoRebuildOnPush;
       };
 
       # ── NixOS Configurations ──

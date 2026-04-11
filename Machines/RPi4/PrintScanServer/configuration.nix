@@ -6,6 +6,7 @@
     ../../../Modules/PrintersScanners/Daemon
     ../../../Modules/PrintersScanners/TelegramBot
     ../../../Modules/Monitoring/TelegramAlerts
+    ../../../Modules/System/AutoRebuildOnPush
   ];
 
   networking.hostName = "printscan";
@@ -150,4 +151,9 @@ FLAKE
   services.printscan-daemon.enable = false;
   services.printscan-telegram-bot.enable = false;
   services.telegram-alerts.enable = false;
+
+  # Poll upstream flake for config changes every 5 min, rebuild if changed.
+  # Only updates the 'upstream' input (HyperNix), not nixpkgs —
+  # nixpkgs is updated by the monthly auto-upgrade service.
+  services.auto-rebuild-on-push.enable = true;
 }
