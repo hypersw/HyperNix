@@ -257,24 +257,25 @@ in
     #   ⚠️  netdata warning
     #   🔴 netdata critical
 
-    # Boot notification → log channel (only on real boot, not activation)
+    # Boot notification → log channel (only on real boot, not activation).
+    # Detects real boot by checking uptime < 5 minutes.
     systemd.services.boot-notify = {
       description = "Notify Telegram on successful boot";
       after = [ "multi-user.target" "network-online.target" ];
       wants = [ "network-online.target" ];
       wantedBy = [ "multi-user.target" ];
-      # ConditionPathExists prevents re-running on config switch —
-      # the file is created after first run and survives until reboot (tmpfs)
-      unitConfig.ConditionPathExists = "!/run/boot-notify-sent";
       serviceConfig = {
         Type = "oneshot";
         ExecStart = pkgs.writeShellScript "boot-notify" ''
+          UPTIME_S=$(${pkgs.coreutils}/bin/cat /proc/uptime | ${pkgs.coreutils}/bin/cut -d. -f1)
+          # Only notify on actual boot (uptime < 300s), not config switches
+          if [ "$UPTIME_S" -gt 300 ]; then
+            exit 0
+          fi
           HOST=$(${pkgs.hostname}/bin/hostname)
           KERNEL=$(${pkgs.coreutils}/bin/uname -r)
-          UPTIME_S=$(${pkgs.coreutils}/bin/cat /proc/uptime | ${pkgs.coreutils}/bin/cut -d. -f1)
           UPTIME=$(${formatUptime} "$UPTIME_S")
           ${sendLog} "🟢 <b>$HOST</b> booted%0AKernel: $KERNEL%0AUptime: $UPTIME"
-          ${pkgs.coreutils}/bin/touch /run/boot-notify-sent
         '';
       };
     };
@@ -285,7 +286,7 @@ in
       after = [ "multi-user.target" "network-online.target" ];
       wants = [ "network-online.target" ];
       wantedBy = [ "multi-user.target" ];
-      unitConfig.ConditionPathExists = "!/run/boot-notify-sent";
+      # no condition — script checks uptime internally
       serviceConfig = {
         Type = "oneshot";
         ExecStart = pkgs.writeShellScript "check-previous-boot" ''
@@ -332,7 +333,8 @@ in
     # Compares current system with the new one; only notifies if actually changed.
     system.activationScripts.notifyConfigChange = ''
       PREV=$(${pkgs.coreutils}/bin/readlink /run/current-system 2>/dev/null || echo "none")
-      NEW=$(${pkgs.coreutils}/bin/readlink $systemConfig 2>/dev/null || echo "unknown")
+      # $out is set by the NixOS activation environment to the new system path
+      NEW="''${out:-unknown}"
       if [ "$PREV" != "$NEW" ]; then
         HOST=$(${pkgs.hostname}/bin/hostname)
         PREV_NAME=$(${pkgs.coreutils}/bin/basename "$PREV" | ${pkgs.gnused}/bin/sed 's/^[^-]*-//')
@@ -341,7 +343,7 @@ in
       fi
     '';
 
-    # SSH login notifications
+    # SSH login notifications — uses journal cursor to avoid replays on service restart
     systemd.services.ssh-login-notify = {
       description = "Notify Telegram on SSH logins";
       after = [ "network-online.target" ];
@@ -351,9 +353,23 @@ in
         Type = "simple";
         Restart = "on-failure";
         RestartSec = "10s";
+        StateDirectory = "ssh-login-notify";
         ExecStart = pkgs.writeShellScript "ssh-login-notify" ''
           HOST=$(${pkgs.hostname}/bin/hostname)
-          ${pkgs.systemd}/bin/journalctl -f -u sshd --no-pager -q -o cat | while read -r line; do
+          CURSOR_FILE="/var/lib/ssh-login-notify/cursor"
+          CURSOR_ARG=""
+          if [ -f "$CURSOR_FILE" ]; then
+            CURSOR_ARG="--after-cursor=$(${pkgs.coreutils}/bin/cat "$CURSOR_FILE")"
+          fi
+          ${pkgs.systemd}/bin/journalctl -f -u sshd --no-pager -q -o cat \
+            --show-cursor $CURSOR_ARG | while read -r line; do
+            # Save cursor from cursor lines
+            case "$line" in
+              "-- cursor: "*)
+                echo "''${line#-- cursor: }" > "$CURSOR_FILE"
+                continue
+                ;;
+            esac
             case "$line" in
               *"Accepted"*)
                 ${sendLog} "🔑 <b>$HOST</b>: $line"
