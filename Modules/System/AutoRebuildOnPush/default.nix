@@ -18,21 +18,29 @@ let
       exit 1
     fi
 
-    # Extract the upstream URL from the flake metadata to resolve the remote ref
-    UPSTREAM_URL=$(${pkgs.nix}/bin/nix flake metadata "$FLAKE_DIR" --json 2>/dev/null \
-      | ${pkgs.jq}/bin/jq -r ".locks.nodes.\"$INPUT_NAME\".original.url // empty")
+    # Extract owner/repo/ref from the flake metadata.
+    # Handles both structured format (type+owner+repo) and url format (github:owner/repo).
+    ORIGINAL=$(${pkgs.nix}/bin/nix flake metadata "$FLAKE_DIR" --json 2>/dev/null \
+      | ${pkgs.jq}/bin/jq -c ".locks.nodes.\"$INPUT_NAME\".original")
 
-    if [ -z "$UPSTREAM_URL" ]; then
-      echo "$LOG_TAG: could not read upstream URL for input '$INPUT_NAME'" >&2
-      exit 1
+    UPSTREAM_TYPE=$(echo "$ORIGINAL" | ${pkgs.jq}/bin/jq -r '.type // empty')
+    if [ "$UPSTREAM_TYPE" = "github" ]; then
+      OWNER=$(echo "$ORIGINAL" | ${pkgs.jq}/bin/jq -r '.owner // empty')
+      REPO=$(echo "$ORIGINAL" | ${pkgs.jq}/bin/jq -r '.repo // empty')
+      BRANCH=$(echo "$ORIGINAL" | ${pkgs.jq}/bin/jq -r '.ref // "master"')
+      OWNER_REPO="$OWNER/$REPO"
+    else
+      # Fallback: try .url field (github:owner/repo format)
+      UPSTREAM_URL=$(echo "$ORIGINAL" | ${pkgs.jq}/bin/jq -r '.url // empty')
+      if [ -z "$UPSTREAM_URL" ]; then
+        echo "$LOG_TAG: unsupported upstream type '$UPSTREAM_TYPE' for input '$INPUT_NAME'" >&2
+        exit 1
+      fi
+      GITHUB_PART=$(echo "$UPSTREAM_URL" | sed 's|^github:||')
+      OWNER_REPO=$(echo "$GITHUB_PART" | cut -d/ -f1-2)
+      BRANCH=$(echo "$GITHUB_PART" | cut -d/ -f3-)
+      BRANCH="''${BRANCH:-master}"
     fi
-
-    # Resolve the GitHub owner/repo and branch from the URL
-    # Handles github:owner/repo and github:owner/repo/branch
-    GITHUB_PART=$(echo "$UPSTREAM_URL" | sed 's|^github:||')
-    OWNER_REPO=$(echo "$GITHUB_PART" | cut -d/ -f1-2)
-    BRANCH=$(echo "$GITHUB_PART" | cut -d/ -f3-)
-    BRANCH="''${BRANCH:-master}"
 
     LATEST_REV=$(${pkgs.git}/bin/git ls-remote "https://github.com/$OWNER_REPO" "refs/heads/$BRANCH" \
       | ${pkgs.coreutils}/bin/cut -f1)
