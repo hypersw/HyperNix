@@ -483,3 +483,4 @@ to the bot on push, the bot triggers rebuild. Zero polling, uses existing infra.
 10. WiFi configuration (EAP-PEAP, separate SSID)
 11. WhatsApp bot (Node.js/Baileys, same Unix socket API)
 12. Web UI (SPA + oauth2-proxy → Unix socket via oauth2-proxy upstream)
+# 2026-04-11T21:13:03+02:00
