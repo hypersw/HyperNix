@@ -42,13 +42,14 @@
     };
   };
 
-  users.users.admin = {
+  users.users.administrator = {
     isNormalUser = true;
     extraGroups = [ "wheel" "scanner" "lp" ];
     openssh.authorizedKeys.keys = [
-      # TODO: add your SSH public key here
+      "ecdsa-sha2-nistp256 AAAAE2VjZHNhLXNoYTItbmlzdHAyNTYAAAAIbmlzdHAyNTYAAABBBONDhHna93l9DyflhJWs5+OH5mGhTvz2k0o4YOjPIcHx+ie9BmU3+5821n4HsOHMb0pa14YRX5Z255RxYooc2/4= printscan-admin"
     ];
   };
+  users.users.root.hashedPassword = "!";  # no password, login disabled
   security.sudo.wheelNeedsPassword = false;
 
   nix = {
@@ -67,15 +68,30 @@
   system.autoUpgrade = {
     enable = true;
     flake = "github:hypersw/HyperNix#nixosConfigurations.PrintScanServer";
-    dates = "04:00";
-    randomizedDelaySec = "2h";
-    allowReboot = false;
+    dates = "*-*-01 02:00";  # first day of each month at 2 AM
+    randomizedDelaySec = "6h"; # spreads to 2-8 AM
+    allowReboot = true;      # unattended machine, reboot if kernel changed
   };
+
+  # Expand root partition to fill the SD card on first boot
+  boot.growPartition = true;
 
   # SD card longevity
   boot.tmp.useTmpfs = true;
   services.journald.extraConfig = "Storage=volatile";
   fileSystems."/".options = [ "noatime" ];
+
+  # Memory management: zram first, disk swap as OOM safety net
+  zramSwap = {
+    enable = true;
+    memoryPercent = 50;   # ~2 GB compressed swap in RAM
+    algorithm = "zstd";
+  };
+  swapDevices = [{
+    device = "/var/swapfile";
+    size = 2048;  # 2 GB on disk — last resort before OOM killer
+  }];
+  boot.kernel.sysctl."vm.swappiness" = 1;  # almost never touch disk swap
 
   environment.systemPackages = with pkgs; [
     htop
