@@ -230,19 +230,51 @@ in
 
     # ── Custom NixOS event sources (not covered by netdata) ──
 
-    # Boot notification → log channel
+    # Helper: format seconds into human-readable duration (like TimeSpan)
+    # 16428 → "4h 33m 48s"
+    formatUptime = pkgs.writeShellScript "format-uptime" ''
+      S=$1
+      D=$((S / 86400))
+      H=$(( (S % 86400) / 3600 ))
+      M=$(( (S % 3600) / 60 ))
+      SEC=$((S % 60))
+      if [ "$D" -gt 0 ]; then echo "''${D}d ''${H}h ''${M}m"
+      elif [ "$H" -gt 0 ]; then echo "''${H}h ''${M}m ''${SEC}s"
+      elif [ "$M" -gt 0 ]; then echo "''${M}m ''${SEC}s"
+      else echo "''${SEC}s"
+      fi
+    '';
+
+    # Emojis per event type:
+    #   🟢 boot
+    #   🔄 config switch
+    #   ✅ upgrade success
+    #   ❌ upgrade failure
+    #   🔑 SSH login
+    #   🚫 SSH failed login
+    #   🧹 GC
+    #   💥 previous boot panic
+    #   ⚠️  netdata warning
+    #   🔴 netdata critical
+
+    # Boot notification → log channel (only on real boot, not activation)
     systemd.services.boot-notify = {
       description = "Notify Telegram on successful boot";
       after = [ "multi-user.target" "network-online.target" ];
       wants = [ "network-online.target" ];
       wantedBy = [ "multi-user.target" ];
+      # ConditionPathExists prevents re-running on config switch —
+      # the file is created after first run and survives until reboot (tmpfs)
+      unitConfig.ConditionPathExists = "!/run/boot-notify-sent";
       serviceConfig = {
         Type = "oneshot";
         ExecStart = pkgs.writeShellScript "boot-notify" ''
           HOST=$(${pkgs.hostname}/bin/hostname)
           KERNEL=$(${pkgs.coreutils}/bin/uname -r)
-          UPTIME=$(${pkgs.coreutils}/bin/cat /proc/uptime | ${pkgs.coreutils}/bin/cut -d. -f1)
-          ${sendLog} "$HOST booted: $KERNEL (up ''${UPTIME}s)"
+          UPTIME_S=$(${pkgs.coreutils}/bin/cat /proc/uptime | ${pkgs.coreutils}/bin/cut -d. -f1)
+          UPTIME=$(${formatUptime} "$UPTIME_S")
+          ${sendLog} "🟢 <b>$HOST</b> booted%0AKernel: $KERNEL%0AUptime: $UPTIME"
+          ${pkgs.coreutils}/bin/touch /run/boot-notify-sent
         '';
       };
     };
@@ -253,21 +285,20 @@ in
       after = [ "multi-user.target" "network-online.target" ];
       wants = [ "network-online.target" ];
       wantedBy = [ "multi-user.target" ];
+      unitConfig.ConditionPathExists = "!/run/boot-notify-sent";
       serviceConfig = {
         Type = "oneshot";
         ExecStart = pkgs.writeShellScript "check-previous-boot" ''
           HOST=$(${pkgs.hostname}/bin/hostname)
-          # Check if previous boot had panics or critical errors
           PANICS=$(${pkgs.systemd}/bin/journalctl -b -1 -p 0..2 --no-pager -q 2>/dev/null | head -20)
           if [ -n "$PANICS" ]; then
-            ${sendAlert} "<b>$HOST: critical errors in previous boot</b>%0A<pre>$PANICS</pre>"
+            ${sendAlert} "💥 <b>$HOST</b>: critical errors in previous boot%0A<pre>$PANICS</pre>"
           fi
         '';
       };
     };
 
-    # NixOS upgrade failure → alert (keep OnFailure for the upgrade service specifically,
-    # since activation scripts don't run on failed builds)
+    # NixOS upgrade failure → alert
     systemd.services.nixos-upgrade = lib.mkIf config.system.autoUpgrade.enable {
       unitConfig.OnFailure = "upgrade-failure-notify.service";
       unitConfig.OnSuccess = "upgrade-success-notify.service";
@@ -279,7 +310,7 @@ in
         Type = "oneshot";
         ExecStart = pkgs.writeShellScript "upgrade-success-notify" ''
           HOST=$(${pkgs.hostname}/bin/hostname)
-          ${sendLog} "$HOST: auto-upgrade completed"
+          ${sendLog} "✅ <b>$HOST</b>: auto-upgrade completed"
         '';
       };
     };
@@ -291,7 +322,7 @@ in
         ExecStart = pkgs.writeShellScript "upgrade-failure-notify" ''
           HOST=$(${pkgs.hostname}/bin/hostname)
           LOG=$(${pkgs.systemd}/bin/journalctl -u nixos-upgrade --no-pager -n 15 -q 2>/dev/null)
-          ${sendAlert} "<b>$HOST: NixOS upgrade FAILED</b>%0A<pre>$LOG</pre>"
+          ${sendAlert} "❌ <b>$HOST</b>: NixOS upgrade FAILED%0A<pre>$LOG</pre>"
         '';
       };
     };
@@ -306,12 +337,11 @@ in
         HOST=$(${pkgs.hostname}/bin/hostname)
         PREV_NAME=$(${pkgs.coreutils}/bin/basename "$PREV" | ${pkgs.gnused}/bin/sed 's/^[^-]*-//')
         NEW_NAME=$(${pkgs.coreutils}/bin/basename "$NEW" | ${pkgs.gnused}/bin/sed 's/^[^-]*-//')
-        ${sendLog} "$HOST: config switched%0A<code>$PREV_NAME</code>%0A→ <code>$NEW_NAME</code>" &
+        ${sendLog} "🔄 <b>$HOST</b>: config switched%0A<code>$PREV_NAME</code>%0A→ <code>$NEW_NAME</code>" &
       fi
     '';
 
-    # SSH login notifications → log channel
-    # Watch auth journal for successful logins
+    # SSH login notifications
     systemd.services.ssh-login-notify = {
       description = "Notify Telegram on SSH logins";
       after = [ "network-online.target" ];
@@ -326,10 +356,10 @@ in
           ${pkgs.systemd}/bin/journalctl -f -u sshd --no-pager -q -o cat | while read -r line; do
             case "$line" in
               *"Accepted"*)
-                ${sendLog} "$HOST: $line"
+                ${sendLog} "🔑 <b>$HOST</b>: $line"
                 ;;
               *"Failed"*|*"Invalid user"*)
-                ${sendAlert} "<b>$HOST: $line</b>"
+                ${sendAlert} "🚫 <b>$HOST</b>: $line"
                 ;;
             esac
           done
@@ -350,7 +380,7 @@ in
           HOST=$(${pkgs.hostname}/bin/hostname)
           FREED=$(${pkgs.systemd}/bin/journalctl -u nix-gc --no-pager -n 5 -q 2>/dev/null | ${pkgs.gnugrep}/bin/grep -o '[0-9.]* [MG]iB' | tail -1)
           STORE_SIZE=$(${pkgs.coreutils}/bin/du -sh /nix/store 2>/dev/null | ${pkgs.coreutils}/bin/cut -f1)
-          ${sendLog} "$HOST: nix GC freed ''${FREED:-unknown}. Store: $STORE_SIZE"
+          ${sendLog} "🧹 <b>$HOST</b>: nix GC freed ''${FREED:-unknown}. Store: $STORE_SIZE"
         '';
       };
     };
