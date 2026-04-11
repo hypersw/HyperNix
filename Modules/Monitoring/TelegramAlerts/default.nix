@@ -333,8 +333,8 @@ in
     # Compares current system with the new one; only notifies if actually changed.
     system.activationScripts.notifyConfigChange = ''
       PREV=$(${pkgs.coreutils}/bin/readlink /run/current-system 2>/dev/null || echo "none")
-      # $out is set by the NixOS activation environment to the new system path
-      NEW="''${out:-unknown}"
+      # $systemConfig is set by the NixOS activate script to the new system path
+      NEW="''${systemConfig:-unknown}"
       if [ "$PREV" != "$NEW" ]; then
         HOST=$(${pkgs.hostname}/bin/hostname)
         PREV_NAME=$(${pkgs.coreutils}/bin/basename "$PREV" | ${pkgs.gnused}/bin/sed 's/^[^-]*-//')
@@ -356,20 +356,9 @@ in
         StateDirectory = "ssh-login-notify";
         ExecStart = pkgs.writeShellScript "ssh-login-notify" ''
           HOST=$(${pkgs.hostname}/bin/hostname)
-          CURSOR_FILE="/var/lib/ssh-login-notify/cursor"
-          CURSOR_ARG=""
-          if [ -f "$CURSOR_FILE" ]; then
-            CURSOR_ARG="--after-cursor=$(${pkgs.coreutils}/bin/cat "$CURSOR_FILE")"
-          fi
+          # Follow journal from NOW — avoids replaying old entries on service restart
           ${pkgs.systemd}/bin/journalctl -f -u sshd --no-pager -q -o cat \
-            --show-cursor $CURSOR_ARG | while read -r line; do
-            # Save cursor from cursor lines
-            case "$line" in
-              "-- cursor: "*)
-                echo "''${line#-- cursor: }" > "$CURSOR_FILE"
-                continue
-                ;;
-            esac
+            --since "now" | while read -r line; do
             case "$line" in
               *"Accepted"*)
                 ${sendLog} "🔑 <b>$HOST</b>: $line"
