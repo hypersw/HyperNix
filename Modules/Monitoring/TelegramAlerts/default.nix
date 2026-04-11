@@ -251,6 +251,18 @@ in
     # since activation scripts don't run on failed builds)
     systemd.services.nixos-upgrade = lib.mkIf config.system.autoUpgrade.enable {
       unitConfig.OnFailure = "upgrade-failure-notify.service";
+      unitConfig.OnSuccess = "upgrade-success-notify.service";
+    };
+
+    systemd.services.upgrade-success-notify = {
+      description = "Notify Telegram that upgrade service completed";
+      serviceConfig = {
+        Type = "oneshot";
+        ExecStart = pkgs.writeShellScript "upgrade-success-notify" ''
+          HOST=$(${pkgs.hostname}/bin/hostname)
+          ${sendLog} "$HOST: auto-upgrade completed"
+        '';
+      };
     };
 
     systemd.services.upgrade-failure-notify = {
