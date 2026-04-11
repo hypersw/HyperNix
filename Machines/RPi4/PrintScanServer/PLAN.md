@@ -405,38 +405,81 @@ Each component can use the best-fit stack since REST/socket boundaries decouple 
 
 ### SD Card Longevity
 
-Using a camcorder-grade high-endurance SD card. Additional measures:
+Using a camcorder-grade high-endurance SD card. Measures in the config:
 - `boot.tmp.useTmpfs = true` — /tmp in RAM
 - `services.journald.extraConfig = "Storage=volatile"` — journal in RAM only
 - `fileSystems."/".options = [ "noatime" ]` — no access time writes
 - `nix.settings.auto-optimise-store = true` — dedup hard links in store
-- `nix-collect-garbage` on a weekly timer
-- Consider `f2fs` for root filesystem (flash-friendly, less tested with NixOS)
+- `nix-collect-garbage` weekly (7-day retention)
+- `boot.growPartition = true` — auto-expand root on first boot
+
+### Memory Management
+
+- **zram swap** (50% of RAM, zstd compression) — ~2 GB compressed swap in RAM,
+  handles normal memory pressure without disk writes
+- **Disk swap** (2 GB `/var/swapfile`) — last resort before OOM killer, rarely touched
+- `vm.swappiness = 1` — almost never use disk swap
+
+### Kernel
+
+Generic aarch64 kernel (`pkgs.linuxPackages`) instead of RPi-specific (`linuxPackages_rpi4`).
+The RPi kernel is NOT in cache.nixos.org — every update would be a 4-8 hour compile.
+Generic kernel is always cached. Trade-off: no RPi-specific GPU/camera/HAT patches,
+irrelevant for a headless print/scan server.
 
 ### Duplex Printing
 
 Deferred. P2015n has no duplex unit. Manual even/odd via print-to-file for now.
 Could add bot UI for this later (print odd → prompt user to flip → print even).
 
+### User and Access
+
+- User `administrator` with wheel + scanner + lp groups, passwordless sudo
+- Root has no password, SSH root login disabled
+- SSH key-only authentication (ECDSA P-256, TPM-importable)
+
 ### Build & Deploy
 
-1. **Initial**: Ethernet connection. Cross-build SD image on x86_64 host via
-   `boot.binfmt.emulatedSystems`. Flash to SD, boot RPi4.
-2. **Ongoing**: `system.autoUpgrade.flake = "github:hypersw/HyperNix#Machines-RPi4-PrintScanServer"`
-   with `--refresh` daily. `OnFailure` → Telegram alert on upgrade failure
-3. **WiFi**: added later, EAP-PEAP with Unifi built-in RADIUS, password via sops-nix
-4. **Public repo**: readonly GitHub access, no deploy key needed for `nix build`
+1. **Initial**: SD image built by GitHub Actions (aarch64 via QEMU binfmt on x86_64
+   runners, ~20 min). Flash with `flash-sd.sh` script. Boot on Ethernet.
+2. **Self-update**: local `/etc/nixos/flake.nix` (generated on first boot) wraps
+   the upstream `github:hypersw/HyperNix#PrintScanServer` config. The local flake
+   owns the lock file and controls nixpkgs version.
+   - `system.autoUpgrade` runs monthly (1st of month, 2-8 AM), with `--refresh`
+   - `preStart` runs `nix flake update /etc/nixos` to pull fresh nixpkgs + upstream
+   - Reboot allowed (unattended machine)
+3. **Manual rebuild**: `sudo nixos-rebuild switch --flake /etc/nixos`
+   Or trigger the upgrade service: `sudo systemctl start nixos-upgrade.service`
+4. **WiFi**: added later, EAP-PEAP with Unifi built-in RADIUS, password via sops-nix
+5. **Public repo**: readonly GitHub access, no deploy key needed
+
+### TODO: Push-triggered rebuild
+
+Poll GitHub every 5-15 minutes for new upstream commits. If changed, update only
+the upstream input (not nixpkgs) and rebuild. This makes config pushes to
+HyperNix take effect on the machine within minutes, without a full nixpkgs update.
+
+Approach: systemd timer runs `git ls-remote` to compare upstream rev against
+the locked rev in `/etc/nixos/flake.lock`. If different:
+```bash
+nix flake update --update-input upstream /etc/nixos
+nixos-rebuild switch --flake /etc/nixos
+```
+
+Alternative: use Telegram as a push channel — a GitHub Action sends a message
+to the bot on push, the bot triggers rebuild. Zero polling, uses existing infra.
 
 ### Implementation Order
 
-1. Machine flake (NixOS config, cross-build image, boot on RPi4 via Ethernet)
+1. ~~Machine flake (NixOS config, SD image, boot on RPi4 via Ethernet)~~ DONE
 2. Scanner button reverse-engineering (pyusb script on dev host with scanner connected)
-3. LaserJetPrinter module (CUPS + foo2zjs, verify printing works)
-4. EpkowaScanner module (SANE + epkowa, verify scanning works)
+3. LaserJetPrinter module (CUPS + foo2zjs, verify printing works on RPi)
+4. EpkowaScanner module (SANE + epkowa, verify scanning works on RPi)
 5. Print/Scan daemon (C#, Unix socket API, print/scan job handling, button poller)
 6. Telegram bot (C#, long-polling, file receive → print, /scan command → scan)
 7. AirSane (LAN scanning for iOS/macOS/Android)
 8. Monitoring module (OnFailure + health timer → Telegram)
-9. WiFi configuration (EAP-PEAP, separate SSID)
-10. WhatsApp bot (Node.js/Baileys, same Unix socket API)
-11. Web UI (SPA + oauth2-proxy + TCP API with key)
+9. Push-triggered rebuild (polling or Telegram-based)
+10. WiFi configuration (EAP-PEAP, separate SSID)
+11. WhatsApp bot (Node.js/Baileys, same Unix socket API)
+12. Web UI (SPA + oauth2-proxy → Unix socket via oauth2-proxy upstream)
