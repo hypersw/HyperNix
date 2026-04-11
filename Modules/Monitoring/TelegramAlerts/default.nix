@@ -337,9 +337,12 @@ in
       NEW="''${systemConfig:-unknown}"
       if [ "$PREV" != "$NEW" ]; then
         HOST=$(${pkgs.hostname}/bin/hostname)
+        # Include short store hash (first 8 chars) to distinguish builds with same nixpkgs
+        PREV_HASH=$(${pkgs.coreutils}/bin/basename "$PREV" | ${pkgs.coreutils}/bin/cut -c1-8)
         PREV_NAME=$(${pkgs.coreutils}/bin/basename "$PREV" | ${pkgs.gnused}/bin/sed 's/^[^-]*-//')
+        NEW_HASH=$(${pkgs.coreutils}/bin/basename "$NEW" | ${pkgs.coreutils}/bin/cut -c1-8)
         NEW_NAME=$(${pkgs.coreutils}/bin/basename "$NEW" | ${pkgs.gnused}/bin/sed 's/^[^-]*-//')
-        ${sendLog} "🔄 <b>$HOST</b>: config switched%0A<code>$PREV_NAME</code>%0A→ <code>$NEW_NAME</code>" &
+        ${sendLog} "🔄 <b>$HOST</b>: config switched%0A<code>$PREV_HASH $PREV_NAME</code>%0A→ <code>$NEW_HASH $NEW_NAME</code>" &
       fi
     '';
 
