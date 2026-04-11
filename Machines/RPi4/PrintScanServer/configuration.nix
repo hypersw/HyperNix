@@ -46,7 +46,7 @@
     isNormalUser = true;
     extraGroups = [ "wheel" "scanner" "lp" ];
     openssh.authorizedKeys.keys = [
-      "ecdsa-sha2-nistp256 AAAAE2VjZHNhLXNoYTItbmlzdHAyNTYAAAAIbmlzdHAyNTYAAABBBONDhHna93l9DyflhJWs5+OH5mGhTvz2k0o4YOjPIcHx+ie9BmU3+5821n4HsOHMb0pa14YRX5Z255RxYooc2/4= printscan-admin"
+      "ecdsa-sha2-nistp256 AAAAE2VjZHNhLXNoYTItbmlzdHAyNTYAAAAIbmlzdHAyNTYAAABBBLESV1KGuOruuV5JdUr8wS8iQyIfEeYdJz2MC5zNCOjoTqzJpA3j5e3kdXbyFczRK25o5bFlThHzK2kmwmCE4zE= printscan-administrator"
     ];
   };
   users.users.root.hashedPassword = "!";  # no password, login disabled
