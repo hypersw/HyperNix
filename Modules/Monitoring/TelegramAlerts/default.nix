@@ -361,10 +361,15 @@ in
             --since "now" | while read -r line; do
             case "$line" in
               *"Accepted"*)
-                ${sendLog} "🔑 <b>$HOST</b>: $line"
+                # Parse: "Accepted publickey for USER from IP port PORT ..."
+                USER=$(echo "$line" | ${pkgs.gnused}/bin/sed -n 's/.*for \([^ ]*\) from.*/\1/p')
+                FROM=$(echo "$line" | ${pkgs.gnused}/bin/sed -n 's/.*from \([^ ]*\) port \([^ ]*\).*/\1:\2/p')
+                ${sendLog} "🔑 <b>$HOST</b>: incoming ssh user: <code>$USER</code> from: <code>$FROM</code>"
                 ;;
               *"Failed"*|*"Invalid user"*)
-                ${sendAlert} "🚫 <b>$HOST</b>: $line"
+                USER=$(echo "$line" | ${pkgs.gnused}/bin/sed -n 's/.*for \([^ ]*\) from.*/\1/p')
+                FROM=$(echo "$line" | ${pkgs.gnused}/bin/sed -n 's/.*from \([^ ]*\) port \([^ ]*\).*/\1:\2/p')
+                ${sendAlert} "🚫 <b>$HOST</b>: failed ssh user: <code>''${USER:-unknown}</code> from: <code>''${FROM:-unknown}</code>"
                 ;;
             esac
           done
