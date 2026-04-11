@@ -247,12 +247,10 @@ in
       };
     };
 
-    # NixOS upgrade success/failure notifications
-    systemd.services.nixos-upgrade = {
-      unitConfig.OnFailure = lib.mkIf config.system.autoUpgrade.enable
-        "upgrade-failure-notify.service";
-      unitConfig.OnSuccess = lib.mkIf config.system.autoUpgrade.enable
-        "upgrade-success-notify.service";
+    # NixOS upgrade failure → alert (keep OnFailure for the upgrade service specifically,
+    # since activation scripts don't run on failed builds)
+    systemd.services.nixos-upgrade = lib.mkIf config.system.autoUpgrade.enable {
+      unitConfig.OnFailure = "upgrade-failure-notify.service";
     };
 
     systemd.services.upgrade-failure-notify = {
@@ -267,17 +265,19 @@ in
       };
     };
 
-    systemd.services.upgrade-success-notify = {
-      description = "Notify Telegram on upgrade success";
-      serviceConfig = {
-        Type = "oneshot";
-        ExecStart = pkgs.writeShellScript "upgrade-success-notify" ''
-          HOST=$(${pkgs.hostname}/bin/hostname)
-          CURRENT=$(${pkgs.coreutils}/bin/readlink /run/current-system | ${pkgs.coreutils}/bin/sed 's|/nix/store/[^-]*-||')
-          ${sendLog} "$HOST: NixOS upgrade succeeded%0A$CURRENT"
-        '';
-      };
-    };
+    # System activation notification → fires on EVERY nixos-rebuild switch,
+    # regardless of how it was triggered (manual, auto-upgrade, auto-rebuild-on-push).
+    # Compares current system with the new one; only notifies if actually changed.
+    system.activationScripts.notifyConfigChange = ''
+      PREV=$(readlink /run/current-system 2>/dev/null || echo "none")
+      NEW=$(readlink $systemConfig 2>/dev/null || echo "unknown")
+      if [ "$PREV" != "$NEW" ]; then
+        HOST=$(hostname)
+        PREV_NAME=$(basename "$PREV" | sed 's/^[^-]*-//')
+        NEW_NAME=$(basename "$NEW" | sed 's/^[^-]*-//')
+        ${sendLog} "$HOST: config switched%0A<code>$PREV_NAME</code>%0A→ <code>$NEW_NAME</code>" &
+      fi
+    '';
 
     # SSH login notifications → log channel
     # Watch auth journal for successful logins
