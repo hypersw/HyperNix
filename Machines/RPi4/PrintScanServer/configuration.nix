@@ -117,7 +117,7 @@ FLAKE
   '';
 
   # Update flake inputs (nixpkgs, upstream) before each auto-upgrade
-  systemd.services.nixos-upgrade.preStart = "nix flake update /etc/nixos";
+  systemd.services.nixos-upgrade.preStart = "nix flake update --flake /etc/nixos";
 
   # Expand root partition to fill the SD card on first boot
   boot.growPartition = true;
