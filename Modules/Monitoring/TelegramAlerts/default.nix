@@ -24,6 +24,21 @@ let
     ${sendTelegram} ${cfg.logChatIdFile} "$@"
   '';
 
+  # Format seconds into human-readable duration (like TimeSpan)
+  # 16428 → "4h 33m 48s"
+  formatUptime = pkgs.writeShellScript "format-uptime" ''
+    S=$1
+    D=$((S / 86400))
+    H=$(( (S % 86400) / 3600 ))
+    M=$(( (S % 3600) / 60 ))
+    SEC=$((S % 60))
+    if [ "$D" -gt 0 ]; then echo "''${D}d ''${H}h ''${M}m"
+    elif [ "$H" -gt 0 ]; then echo "''${H}h ''${M}m ''${SEC}s"
+    elif [ "$M" -gt 0 ]; then echo "''${M}m ''${SEC}s"
+    else echo "''${SEC}s"
+    fi
+  '';
+
   # Custom notification script for netdata — reads secrets from files at runtime.
   # Netdata's built-in health_alarm_notify.conf can't read from files,
   # so we use a custom script that netdata calls for all alarm transitions.
@@ -229,21 +244,6 @@ in
     };
 
     # ── Custom NixOS event sources (not covered by netdata) ──
-
-    # Helper: format seconds into human-readable duration (like TimeSpan)
-    # 16428 → "4h 33m 48s"
-    formatUptime = pkgs.writeShellScript "format-uptime" ''
-      S=$1
-      D=$((S / 86400))
-      H=$(( (S % 86400) / 3600 ))
-      M=$(( (S % 3600) / 60 ))
-      SEC=$((S % 60))
-      if [ "$D" -gt 0 ]; then echo "''${D}d ''${H}h ''${M}m"
-      elif [ "$H" -gt 0 ]; then echo "''${H}h ''${M}m ''${SEC}s"
-      elif [ "$M" -gt 0 ]; then echo "''${M}m ''${SEC}s"
-      else echo "''${SEC}s"
-      fi
-    '';
 
     # Emojis per event type:
     #   🟢 boot
