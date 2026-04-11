@@ -110,14 +110,10 @@ in
         Type = "oneshot";
         ExecStart = checkScript;
 
-        # Network access needed for git ls-remote and nix flake update
-        # but restrict everything else
-        ProtectHome = true;
+        # Needs network (git ls-remote, nix flake update), /etc/nixos (lock file),
+        # /nix (store), and /root/.cache/nix (nix cache during flake update)
         PrivateTmp = true;
         NoNewPrivileges = true;
-
-        # Allow writes to /etc/nixos (flake.lock update) and nix store
-        ReadWritePaths = [ cfg.flakeDir "/nix" ];
       };
       path = [ pkgs.git ];
     };
