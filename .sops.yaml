@@ -1,0 +1,15 @@
+keys:
+  # Admin — can encrypt/decrypt all secrets
+  - &admin age1rs2lpa3lwwclafjjeku8tv2d84x6kys8lkthd206amctd74usatqq6nffp
+
+  # Machines — can decrypt their own secrets at activation time
+  # RPi4 PrintScanServer (derived from SSH host ed25519 key)
+  - &printscan age1pkty9mf7g48zu7ru4hsl3v2pg4r6slv7waeqmgfahxntap5qq38suw8rh4
+
+creation_rules:
+  # PrintScanServer secrets — admin + the machine itself
+  - path_regex: Machines/RPi4/PrintScanServer/secrets/.*
+    key_groups:
+      - age:
+          - *admin
+          - *printscan

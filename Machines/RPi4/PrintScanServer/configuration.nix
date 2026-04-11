@@ -145,12 +145,27 @@ FLAKE
     sane-backends
   ];
 
+  # ── Secrets (sops-nix) ──
+  # Decryption key derived from SSH host ed25519 key — no extra key management.
+  # Secrets are encrypted in the repo, decrypted to /run/secrets/ at activation.
+  sops = {
+    defaultSopsFile = ./secrets/telegram.yaml;
+    age.sshKeyPaths = [ "/etc/ssh/ssh_host_ed25519_key" ];
+    secrets.telegram-token = {};
+  };
+
   # ── Module enablement ──
   services.laserjet-printer.enable = true;
   services.epkowa-scanner.enable = true;
   services.printscan-daemon.enable = false;
   services.printscan-telegram-bot.enable = false;
-  services.telegram-alerts.enable = false;
+
+  services.telegram-alerts = {
+    enable = true;
+    tokenFile = config.sops.secrets.telegram-token.path;
+    alertsChatId = "PLACEHOLDER";  # TODO: set after creating Telegram groups
+    logChatId = "PLACEHOLDER";     # TODO: set after creating Telegram groups
+  };
 
   # Poll upstream flake for config changes every 5 min, rebuild if changed.
   # Only updates the 'upstream' input (HyperNix), not nixpkgs —

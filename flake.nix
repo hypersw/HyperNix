@@ -9,9 +9,12 @@
     # Internal modules/packages are plain nix files imported directly.
     microvm.url = "github:astro/microvm.nix";
     microvm.inputs.nixpkgs.follows = "nixpkgs";
+
+    sops-nix.url = "github:Mic92/sops-nix";
+    sops-nix.inputs.nixpkgs.follows = "nixpkgs";
   };
 
-  outputs = { self, nixpkgs, nixos-hardware, microvm }:
+  outputs = { self, nixpkgs, nixos-hardware, microvm, sops-nix }:
     let
       forAllSystems = nixpkgs.lib.genAttrs [ "x86_64-linux" "aarch64-linux" ];
 
@@ -117,6 +120,7 @@
           system = "aarch64-linux";
           modules = [
             nixos-hardware.nixosModules.raspberry-pi-4
+            sops-nix.nixosModules.sops
             ./Machines/RPi4/PrintScanServer/configuration.nix
           ];
         };
@@ -127,6 +131,7 @@
           system = "aarch64-linux";
           modules = [
             nixos-hardware.nixosModules.raspberry-pi-4
+            sops-nix.nixosModules.sops
             "${nixpkgs}/nixos/modules/installer/sd-card/sd-image-aarch64.nix"
             ./Machines/RPi4/PrintScanServer/configuration.nix
           ];
