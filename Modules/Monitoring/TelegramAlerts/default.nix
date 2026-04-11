@@ -300,12 +300,12 @@ in
     # regardless of how it was triggered (manual, auto-upgrade, auto-rebuild-on-push).
     # Compares current system with the new one; only notifies if actually changed.
     system.activationScripts.notifyConfigChange = ''
-      PREV=$(readlink /run/current-system 2>/dev/null || echo "none")
-      NEW=$(readlink $systemConfig 2>/dev/null || echo "unknown")
+      PREV=$(${pkgs.coreutils}/bin/readlink /run/current-system 2>/dev/null || echo "none")
+      NEW=$(${pkgs.coreutils}/bin/readlink $systemConfig 2>/dev/null || echo "unknown")
       if [ "$PREV" != "$NEW" ]; then
-        HOST=$(hostname)
-        PREV_NAME=$(basename "$PREV" | sed 's/^[^-]*-//')
-        NEW_NAME=$(basename "$NEW" | sed 's/^[^-]*-//')
+        HOST=$(${pkgs.hostname}/bin/hostname)
+        PREV_NAME=$(${pkgs.coreutils}/bin/basename "$PREV" | ${pkgs.gnused}/bin/sed 's/^[^-]*-//')
+        NEW_NAME=$(${pkgs.coreutils}/bin/basename "$NEW" | ${pkgs.gnused}/bin/sed 's/^[^-]*-//')
         ${sendLog} "$HOST: config switched%0A<code>$PREV_NAME</code>%0A→ <code>$NEW_NAME</code>" &
       fi
     '';
