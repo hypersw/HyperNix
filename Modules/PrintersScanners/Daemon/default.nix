@@ -62,8 +62,20 @@ in
         PrivateTmp = true;
         NoNewPrivileges = true;
 
-        # Socket created with group-writable permissions so bot can connect
-        UMask = "0117"; # files: 0660, dirs: 0770
+        UMask = "0007"; # socket: 0770 → group-accessible
+
+        # Fix socket ownership after Kestrel creates it.
+        # Kestrel creates the socket as the service user, but within ProtectSystem
+        # namespace the ownership may not propagate correctly to the host view.
+        ExecStartPost = pkgs.writeShellScript "fix-socket-perms" ''
+          # Wait for socket to exist
+          for i in $(seq 1 30); do
+            [ -S ${cfg.socketPath} ] && break
+            sleep 1
+          done
+          ${pkgs.coreutils}/bin/chgrp ${cfg.group} ${cfg.socketPath} 2>/dev/null || true
+          ${pkgs.coreutils}/bin/chmod 0770 ${cfg.socketPath} 2>/dev/null || true
+        '';
       };
     };
   };
