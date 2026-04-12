@@ -169,8 +169,7 @@ FLAKE
   services.printscan-telegram-bot = {
     enable = true;
     tokenFile = config.sops.secrets.printscan-bot-token.path;
-    # TODO: add allowed Telegram user IDs
-    # allowedUsers = [ 123456789 ];
+    allowedUsers = [ 93372553 ];
   };
 
   services.telegram-alerts = {

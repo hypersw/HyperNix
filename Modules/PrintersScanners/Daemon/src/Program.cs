@@ -3,18 +3,11 @@ using PrintScan.Shared;
 
 var builder = WebApplication.CreateBuilder(args);
 
-// Listen on Unix socket (path from env or default)
-var socketPath = Environment.GetEnvironmentVariable("PRINTSCAN_SOCKET")
-    ?? "/run/printscan/api.sock";
-
-// Delete stale socket file from previous run
-if (File.Exists(socketPath))
-    File.Delete(socketPath);
-
-builder.WebHost.ConfigureKestrel(options =>
-{
-    options.ListenUnixSocket(socketPath);
-});
+// Listen on Unix socket — path from env or default.
+// When socket-activated by systemd, the socket file already exists and is
+// managed by systemd. When running standalone, Kestrel creates it.
+// ASPNETCORE_URLS is set by the NixOS module to "http://unix:<path>".
+// No manual socket management needed — Kestrel handles both cases.
 
 builder.Services.AddSingleton<PrintService>();
 builder.Services.AddSingleton<ScanService>();
@@ -75,7 +68,7 @@ app.MapGet("/scan/{id}", (string id, ScanService scan) =>
 
 app.MapGet("/jobs", (ScanService scan) => Results.Ok(scan.GetRecentJobs()));
 
-app.Logger.LogInformation("PrintScan daemon listening on {Socket}", socketPath);
+app.Logger.LogInformation("PrintScan daemon listening on {Urls}", Environment.GetEnvironmentVariable("ASPNETCORE_URLS") ?? "default");
 app.Run();
 
 // ── Print Service (shells out to lp) ──

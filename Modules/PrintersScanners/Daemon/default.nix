@@ -24,43 +24,38 @@ in
   config = lib.mkIf cfg.enable {
     users.groups.${cfg.group} = {};
 
-    systemd.sockets.printscan-daemon = {
-      description = "Print/Scan Daemon Socket";
-      wantedBy = [ "sockets.target" ];
-      socketConfig = {
-        ListenStream = cfg.socketPath;
-        SocketMode = "0660";
-        SocketGroup = cfg.group;
-        DirectoryMode = "0755";
-        RuntimeDirectory = "printscan";
-      };
-    };
-
     systemd.services.printscan-daemon = {
       description = "Print/Scan Daemon";
-      after = [ "cups.service" ];
+      after = [ "cups.service" "network.target" ];
       wants = [ "cups.service" ];
+      wantedBy = [ "multi-user.target" ];
 
       environment = {
         PRINTSCAN_SOCKET = cfg.socketPath;
-        # ASP.NET needs this to not try HTTPS
         ASPNETCORE_URLS = "http://unix:${cfg.socketPath}";
       };
 
       serviceConfig = {
-        Type = "notify";
+        Type = "simple";
         ExecStart = "${daemonPackage}/bin/PrintScan.Daemon";
         Restart = "on-failure";
         RestartSec = "5s";
 
+        # RuntimeDirectory creates /run/printscan/ writable by the service user
+        RuntimeDirectory = "printscan";
+        RuntimeDirectoryMode = "0755";
+
         DynamicUser = true;
         SupplementaryGroups = [ cfg.group "lp" "scanner" ];
 
-        # Hardening
+        # Hardening — strict but allow writing to /run/printscan/
         ProtectSystem = "strict";
         ProtectHome = true;
         PrivateTmp = true;
         NoNewPrivileges = true;
+
+        # Socket created with group-writable permissions so bot can connect
+        UMask = "0117"; # files: 0660, dirs: 0770
       };
     };
   };

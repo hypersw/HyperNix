@@ -29,8 +29,8 @@ in
 
     systemd.services.printscan-telegram-bot = {
       description = "Print/Scan Telegram Bot";
-      after = [ "printscan-daemon.socket" "network-online.target" ];
-      wants = [ "printscan-daemon.socket" "network-online.target" ];
+      after = [ "printscan-daemon.service" "network-online.target" ];
+      wants = [ "printscan-daemon.service" "network-online.target" ];
       wantedBy = [ "multi-user.target" ];
 
       # Token provided via systemd LoadCredential → $CREDENTIALS_DIRECTORY/telegram-token
