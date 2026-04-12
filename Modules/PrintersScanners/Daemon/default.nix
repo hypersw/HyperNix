@@ -52,8 +52,10 @@ in
 
       environment = {
         PRINTSCAN_SOCKET = cfg.socketPath;
-        # Fallback for standalone/dev use; systemd socket takes priority
-        ASPNETCORE_URLS = "http://unix:${cfg.socketPath}";
+        # Don't set ASPNETCORE_URLS — Kestrel picks up the socket fd from
+        # systemd via LISTEN_FDS (UseSystemd()). Setting ASPNETCORE_URLS
+        # would make Kestrel try to bind a second socket, failing with
+        # "address already in use".
       };
 
       serviceConfig = {
