@@ -170,7 +170,7 @@ FLAKE
     enable = true;
     tokenFile = config.sops.secrets.printscan-bot-token.path;
     allowedUsers = [
-      { id = 93372553; name = "hypersw"; }
+      { id = 1398173959; name = "hypersw"; }
       { id = 2074641026; name = "ol"; }
       { id = 6935307009; name = "alice"; }
     ];
