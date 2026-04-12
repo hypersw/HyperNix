@@ -169,7 +169,9 @@ FLAKE
   services.printscan-telegram-bot = {
     enable = true;
     tokenFile = config.sops.secrets.printscan-bot-token.path;
-    allowedUsers = [ 93372553 ];
+    allowedUsers = [
+      { id = 93372553; name = "baltic"; }
+    ];
   };
 
   services.telegram-alerts = {

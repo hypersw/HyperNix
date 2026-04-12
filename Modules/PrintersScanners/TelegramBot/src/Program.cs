@@ -17,9 +17,12 @@ if (string.IsNullOrEmpty(tokenFile) || !File.Exists(tokenFile))
     throw new Exception($"Bot token file not found (PRINTSCAN_BOT_TOKEN_FILE or CREDENTIALS_DIRECTORY/telegram-token). Tried: {tokenFile}");
 var socketPath = Environment.GetEnvironmentVariable("PRINTSCAN_SOCKET")
     ?? "/run/printscan/api.sock";
-var allowedUsersStr = Environment.GetEnvironmentVariable("PRINTSCAN_ALLOWED_USERS") ?? "";
-var allowedUsers = allowedUsersStr.Split(',', StringSplitOptions.RemoveEmptyEntries)
-    .Select(long.Parse).ToHashSet();
+
+// Parse allowed users from JSON: [{"id":123,"name":"alice"}, ...]
+var allowedUsersJson = Environment.GetEnvironmentVariable("PRINTSCAN_ALLOWED_USERS") ?? "[]";
+var allowedUsersList = System.Text.Json.JsonSerializer.Deserialize<List<AllowedUser>>(allowedUsersJson,
+    new System.Text.Json.JsonSerializerOptions { PropertyNameCaseInsensitive = true }) ?? [];
+var allowedUsers = allowedUsersList.ToDictionary(u => u.Id, u => u.Name);
 
 var token = (await System.IO.File.ReadAllTextAsync(tokenFile)).Trim();
 var bot = new TelegramBotClient(token);
@@ -38,7 +41,8 @@ var daemonClient = new HttpClient(new SocketsHttpHandler
     BaseAddress = new Uri("http://localhost") // hostname is ignored for Unix sockets
 };
 
-Console.WriteLine($"PrintScan Telegram bot starting (allowed users: {allowedUsersStr})");
+Console.WriteLine($"PrintScan Telegram bot starting (allowed users: {string.Join(", ", allowedUsers.Select(u => $"{u.Value}({u.Key})"))})");
+
 
 using var cts = new CancellationTokenSource();
 Console.CancelKeyPress += (_, e) => { e.Cancel = true; cts.Cancel(); };
@@ -85,11 +89,14 @@ async Task HandleMessage(Message message, CancellationToken ct)
     var chatId = message.Chat.Id;
 
     // Access control
-    if (allowedUsers.Count > 0 && !allowedUsers.Contains(userId))
+    if (allowedUsers.Count > 0 && !allowedUsers.ContainsKey(userId))
     {
+        Console.Error.WriteLine($"Unauthorized access attempt from user {userId} ({message.From?.Username ?? "unknown"})");
         await bot.SendMessage(chatId, "⛔ Not authorized", cancellationToken: ct);
         return;
     }
+    if (allowedUsers.Count > 0)
+        Console.WriteLine($"Request from {allowedUsers[userId]} ({userId}): {message.Text ?? message.Document?.FileName ?? "media"}");
 
     // File received → print
     if (message.Document is { } doc)
@@ -215,8 +222,9 @@ async Task HandleCallback(CallbackQuery callback, CancellationToken ct)
     var chatId = callback.Message!.Chat.Id;
     var userId = callback.From.Id;
 
-    if (allowedUsers.Count > 0 && !allowedUsers.Contains(userId))
+    if (allowedUsers.Count > 0 && !allowedUsers.ContainsKey(userId))
     {
+        Console.Error.WriteLine($"Unauthorized callback from user {userId}");
         await bot.AnswerCallbackQuery(callback.Id, "Not authorized", cancellationToken: ct);
         return;
     }
@@ -318,3 +326,5 @@ async Task ShowStatus(long chatId, CancellationToken ct)
         await bot.SendMessage(chatId, $"❌ Cannot reach daemon: {ex.Message}", cancellationToken: ct);
     }
 }
+
+record AllowedUser(long Id, string Name);

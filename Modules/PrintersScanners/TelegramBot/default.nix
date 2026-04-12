@@ -15,9 +15,14 @@ in
     };
 
     allowedUsers = lib.mkOption {
-      type = lib.types.listOf lib.types.int;
+      type = lib.types.listOf (lib.types.submodule {
+        options = {
+          id = lib.mkOption { type = lib.types.int; description = "Telegram user ID"; };
+          name = lib.mkOption { type = lib.types.str; description = "Display name (for logging and accounting)"; };
+        };
+      });
       default = [];
-      description = "Telegram user IDs allowed to use the bot (whitelist)";
+      description = "Telegram users allowed to use the bot";
     };
   };
 
@@ -36,7 +41,7 @@ in
       # Token provided via systemd LoadCredential → $CREDENTIALS_DIRECTORY/telegram-token
       environment = {
         PRINTSCAN_SOCKET = daemonCfg.socketPath;
-        PRINTSCAN_ALLOWED_USERS = lib.concatMapStringsSep "," toString cfg.allowedUsers;
+        PRINTSCAN_ALLOWED_USERS = builtins.toJSON (map (u: { inherit (u) id name; }) cfg.allowedUsers);
       };
 
       serviceConfig = {
