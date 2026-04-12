@@ -311,6 +311,12 @@ in
         web = {
           "mode" = "none"; # no dashboard, alerts only
         };
+        # Disable plugins that don't apply (RPi has no IPMI, IPsec, etc.)
+        "plugin:freeipmi" = { enabled = "no"; };
+        "plugin:perf" = { enabled = "no"; };
+        "plugin:ioping" = { enabled = "no"; };
+        "plugin:charts.d" = { enabled = "no"; }; # libreswan, opensips
+        "plugin:logs-management" = { enabled = "no"; };
       };
       configDir = {
         "health_alarm_notify.conf" = notifyConf;
@@ -323,26 +329,10 @@ in
                 - '*.service'
         '';
 
-        # Disk space — override thresholds, send to alerts role
-        "health.d/disk_custom.conf" = pkgs.writeText "disk_custom.conf" ''
-          alarm: disk_space_warn
-              on: disk.space
-          lookup: max -1s foreach *
-           units: %
-           every: 60s
-            warn: $this > ${toString cfg.diskWarning}
-              to: log
-            info: disk space above ${toString cfg.diskWarning}%
-
-          alarm: disk_space_crit
-              on: disk.space
-          lookup: max -1s foreach *
-           units: %
-           every: 60s
-            crit: $this > ${toString cfg.diskCritical}
-              to: alerts
-            info: disk space above ${toString cfg.diskCritical}%
-        '';
+        # Disk space — use netdata's built-in disk_space_usage alarm,
+        # just disable our broken custom one. Built-in defaults are
+        # warn at 80%, crit at 90% which matches our config.
+        # To customize further, override the built-in alarm template.
 
         # CPU temperature — RPi thermal zone
         "health.d/temperature_custom.conf" = pkgs.writeText "temperature_custom.conf" ''
@@ -377,11 +367,12 @@ in
             info: a systemd service entered failed state
         '';
 
-        # RAM usage
+        # RAM usage — use calc with system.ram dimensions.
+        # system.ram has dimensions: used, free, cached, buffers
         "health.d/ram_custom.conf" = pkgs.writeText "ram_custom.conf" ''
           alarm: ram_usage_warn
               on: system.ram
-          lookup: average -1m percentage-of-absolute-row
+            calc: $used * 100 / ($used + $free + $cached + $buffers)
            units: %
            every: 30s
             warn: $this > 85
@@ -390,7 +381,7 @@ in
 
           alarm: ram_usage_crit
               on: system.ram
-          lookup: average -1m percentage-of-absolute-row
+            calc: $used * 100 / ($used + $free + $cached + $buffers)
            units: %
            every: 30s
             crit: $this > 95
