@@ -85,11 +85,18 @@
     {
       # ── Packages ──
       packages = forAllSystems (system:
-        let pkgs = nixpkgs.legacyPackages.${system};
+        let
+          pkgs = nixpkgs.legacyPackages.${system};
+          printScanShared = import ./Modules/PrintersScanners/Shared/package.nix { inherit pkgs; };
+          printScanDaemon = import ./Modules/PrintersScanners/Daemon/package.nix { inherit pkgs; sharedPackage = printScanShared; };
+          printScanBot = import ./Modules/PrintersScanners/TelegramBot/package.nix { inherit pkgs; sharedPackage = printScanShared; };
         in {
           Util-CloseFrom3 = mkClosefrom3 pkgs;
           Git-SshAskpassCredentialHelper = mkSshAskpass pkgs {};
           Git-SpaceGitCredential = mkSpaceGitCredential pkgs;
+          Modules-PrintersScanners-Shared = printScanShared;
+          Modules-PrintersScanners-Daemon = printScanDaemon;
+          Modules-PrintersScanners-TelegramBot = printScanBot;
           # Machine runner packages
           Machines-MicroVM-VmSshFront =
             self.nixosConfigurations.VmSshFront.config.microvm.declaredRunner or null;

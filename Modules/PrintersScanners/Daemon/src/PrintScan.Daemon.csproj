@@ -7,12 +7,15 @@
   </PropertyGroup>
 
   <ItemGroup>
-    <PackageReference Include="Microsoft.AspNetCore.OpenApi" Version="10.0.5" />
     <PackageReference Include="SharpIpp" Version="0.10.0" />
   </ItemGroup>
 
   <ItemGroup>
-    <ProjectReference Include="..\PrintScan.Shared\PrintScan.Shared.csproj" />
+    <!-- Shared DLL path injected by nix at build time. For local dev, set
+         PRINTSCAN_SHARED_DLL environment variable or use the solution file. -->
+    <Reference Include="PrintScan.Shared">
+      <HintPath>$(PRINTSCAN_SHARED_DLL)/PrintScan.Shared.dll</HintPath>
+    </Reference>
   </ItemGroup>
 
 </Project>

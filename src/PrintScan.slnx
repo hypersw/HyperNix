@@ -1,5 +1,0 @@
-<Solution>
-  <Project Path="PrintScan.Daemon/PrintScan.Daemon.csproj" />
-  <Project Path="PrintScan.Shared/PrintScan.Shared.csproj" />
-  <Project Path="PrintScan.TelegramBot/PrintScan.TelegramBot.csproj" />
-</Solution>

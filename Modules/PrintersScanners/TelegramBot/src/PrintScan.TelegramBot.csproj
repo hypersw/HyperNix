@@ -1,0 +1,21 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net10.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Telegram.Bot" Version="22.9.6" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- Shared DLL path injected by nix at build time -->
+    <Reference Include="PrintScan.Shared">
+      <HintPath>$(PRINTSCAN_SHARED_DLL)/PrintScan.Shared.dll</HintPath>
+    </Reference>
+  </ItemGroup>
+
+</Project>
