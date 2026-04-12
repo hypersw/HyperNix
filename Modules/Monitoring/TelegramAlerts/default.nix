@@ -24,6 +24,136 @@ let
     ${sendTelegram} ${cfg.logChatIdFile} "$@"
   '';
 
+  # Query GitHub API for commit details (owner/repo, rev) → "short_hash date subject"
+  # Returns empty on failure. 10s timeout.
+  ghCommitInfo = pkgs.writeShellScript "gh-commit-info" ''
+    OWNER_REPO="$1"
+    REV="$2"
+    [ -z "$REV" ] || [ "$REV" = "dirty" ] && exit 0
+    RESP=$(${pkgs.curl}/bin/curl -sf --max-time 10 \
+      "https://api.github.com/repos/$OWNER_REPO/commits/$REV" 2>/dev/null) || exit 0
+    SHORT=$(echo "$REV" | ${pkgs.coreutils}/bin/cut -c1-7)
+    DATE=$(echo "$RESP" | ${pkgs.jq}/bin/jq -r '.commit.committer.date // empty' | ${pkgs.coreutils}/bin/cut -c1-16)
+    MSG=$(echo "$RESP" | ${pkgs.jq}/bin/jq -r '.commit.message // empty' | ${pkgs.coreutils}/bin/head -1 | ${pkgs.coreutils}/bin/cut -c1-60)
+    [ -n "$DATE" ] && echo "$SHORT $DATE $MSG"
+  '';
+
+  # Send switch notification: immediate basic message, then edit with enriched git info.
+  # Entirely fault-tolerant — failures at any stage don't block activation or lose the message.
+  enrichedSwitchNotify = pkgs.writeShellScript "enriched-switch-notify" ''
+    LOG_TAG="config-switch-notify"
+    PREV="$1"
+    NEW="$2"
+    HOST=$(${pkgs.hostname}/bin/hostname)
+
+    PREV_STORE=$(${pkgs.coreutils}/bin/basename "$PREV" | ${pkgs.coreutils}/bin/cut -c1-8)
+    NEW_STORE=$(${pkgs.coreutils}/bin/basename "$NEW" | ${pkgs.coreutils}/bin/cut -c1-8)
+
+    # Read build-revision metadata — may not exist in older system generations
+    REV_FILE="etc/monitoring/build-revisions"
+    if ! PREV_INFO=$(${pkgs.coreutils}/bin/cat "$PREV/$REV_FILE" 2>/dev/null); then
+      echo "$LOG_TAG: WARNING: previous system has no $REV_FILE" >&2
+      PREV_INFO='{}'
+    fi
+    if ! NEW_INFO=$(${pkgs.coreutils}/bin/cat "$NEW/$REV_FILE" 2>/dev/null); then
+      echo "$LOG_TAG: WARNING: new system has no $REV_FILE" >&2
+      NEW_INFO='{}'
+    fi
+
+    PREV_CFG_REV=$(echo "$PREV_INFO" | ${pkgs.jq}/bin/jq -r '.configRev // empty')
+    NEW_CFG_REV=$(echo "$NEW_INFO" | ${pkgs.jq}/bin/jq -r '.configRev // empty')
+    PREV_NIXPKGS_REV=$(echo "$PREV_INFO" | ${pkgs.jq}/bin/jq -r '.nixpkgsRev // empty')
+    NEW_NIXPKGS_REV=$(echo "$NEW_INFO" | ${pkgs.jq}/bin/jq -r '.nixpkgsRev // empty')
+    CFG_REPO=$(echo "$NEW_INFO" | ${pkgs.jq}/bin/jq -r '.configRepo // empty')
+
+    # Read secrets — error if missing (module is enabled, secrets must exist)
+    if ! CHAT_ID=$(${pkgs.coreutils}/bin/cat ${cfg.logChatIdFile} 2>/dev/null) || [ -z "$CHAT_ID" ]; then
+      echo "$LOG_TAG: ERROR: cannot read chat ID from ${cfg.logChatIdFile}" >&2
+      exit 1
+    fi
+    if ! TOKEN=$(${pkgs.coreutils}/bin/cat ${cfg.tokenFile} 2>/dev/null) || [ -z "$TOKEN" ]; then
+      echo "$LOG_TAG: ERROR: cannot read token from ${cfg.tokenFile}" >&2
+      exit 1
+    fi
+
+    PREV_CFG_SHORT="''${PREV_CFG_REV:+$(echo "$PREV_CFG_REV" | ${pkgs.coreutils}/bin/cut -c1-7)}"
+    NEW_CFG_SHORT="''${NEW_CFG_REV:+$(echo "$NEW_CFG_REV" | ${pkgs.coreutils}/bin/cut -c1-7)}"
+    PREV_LABEL="''${PREV_CFG_SHORT:-n/a} $PREV_STORE"
+    NEW_LABEL="''${NEW_CFG_SHORT:-n/a} $NEW_STORE"
+    BASIC_MSG="🔄 <b>$HOST</b>: config switched%0A<code>$PREV_LABEL</code>%0A→ <code>$NEW_LABEL</code>%0A%0ALoading commit details..."
+
+    # Send and capture message_id for later editing
+    if ! SEND_RESP=$(${pkgs.curl}/bin/curl -sf -X POST \
+      "https://api.telegram.org/bot$TOKEN/sendMessage" \
+      -d "chat_id=$CHAT_ID" \
+      -d "text=$BASIC_MSG" \
+      -d "parse_mode=HTML" 2>/dev/null); then
+      echo "$LOG_TAG: ERROR: failed to send Telegram message" >&2
+      exit 1
+    fi
+    MSG_ID=$(echo "$SEND_RESP" | ${pkgs.jq}/bin/jq -r '.result.message_id // empty')
+    if [ -z "$MSG_ID" ]; then
+      echo "$LOG_TAG: ERROR: Telegram API returned no message_id" >&2
+      exit 1
+    fi
+
+    # Enrich with GitHub commit details (10s timeout per call, warn on failure)
+    CFG_INFO=""
+    if [ -n "$NEW_CFG_REV" ] && [ "$NEW_CFG_REV" != "dirty" ] && [ -n "$CFG_REPO" ]; then
+      if ! CFG_INFO=$(${ghCommitInfo} "$CFG_REPO" "$NEW_CFG_REV"); then
+        echo "$LOG_TAG: WARNING: failed to fetch config commit info for $NEW_CFG_REV" >&2
+        CFG_INFO=""
+      fi
+    fi
+
+    NIXPKGS_INFO=""
+    if [ -n "$NEW_NIXPKGS_REV" ]; then
+      if ! NIXPKGS_INFO=$(${ghCommitInfo} "NixOS/nixpkgs" "$NEW_NIXPKGS_REV"); then
+        echo "$LOG_TAG: WARNING: failed to fetch nixpkgs commit info for $NEW_NIXPKGS_REV" >&2
+        NIXPKGS_INFO=""
+      fi
+    fi
+
+    # Determine nixpkgs change status
+    if [ -z "$PREV_NIXPKGS_REV" ] || [ -z "$NEW_NIXPKGS_REV" ]; then
+      NIXPKGS_CHANGED="n/a"
+    elif [ "$PREV_NIXPKGS_REV" = "$NEW_NIXPKGS_REV" ]; then
+      NIXPKGS_CHANGED="unchanged"
+    else
+      NIXPKGS_CHANGED="updated"
+    fi
+
+    # Build enriched message — always show all fields, use n/a for missing
+    RICH_MSG="🔄 <b>$HOST</b>: config switched%0A<code>$PREV_LABEL</code> → <code>$NEW_LABEL</code>"
+
+    if [ -n "$CFG_INFO" ]; then
+      RICH_MSG="$RICH_MSG%0A%0A⚙️ Config: <code>$CFG_INFO</code>"
+    elif [ -n "$NEW_CFG_SHORT" ]; then
+      RICH_MSG="$RICH_MSG%0A%0A⚙️ Config: <code>$NEW_CFG_SHORT</code> (details unavailable)"
+    else
+      RICH_MSG="$RICH_MSG%0A%0A⚙️ Config: n/a"
+    fi
+
+    if [ -n "$NIXPKGS_INFO" ]; then
+      RICH_MSG="$RICH_MSG%0A📦 Nixpkgs ($NIXPKGS_CHANGED): <code>$NIXPKGS_INFO</code>"
+    elif [ -n "$NEW_NIXPKGS_REV" ]; then
+      NIXPKGS_SHORT=$(echo "$NEW_NIXPKGS_REV" | ${pkgs.coreutils}/bin/cut -c1-7)
+      RICH_MSG="$RICH_MSG%0A📦 Nixpkgs ($NIXPKGS_CHANGED): <code>$NIXPKGS_SHORT</code>"
+    else
+      RICH_MSG="$RICH_MSG%0A📦 Nixpkgs: n/a"
+    fi
+
+    # Edit the original message with enriched content
+    if ! ${pkgs.curl}/bin/curl -sf -X POST \
+      "https://api.telegram.org/bot$TOKEN/editMessageText" \
+      -d "chat_id=$CHAT_ID" \
+      -d "message_id=$MSG_ID" \
+      -d "text=$RICH_MSG" \
+      -d "parse_mode=HTML" >/dev/null 2>&1; then
+      echo "$LOG_TAG: WARNING: failed to edit message with enriched content" >&2
+    fi
+  '';
+
   # Format seconds into human-readable duration (like TimeSpan)
   # 16428 → "4h 33m 48s"
   formatUptime = pkgs.writeShellScript "format-uptime" ''
@@ -126,6 +256,26 @@ in
       description = "CPU temperature critical threshold (Celsius)";
     };
 
+    # Build-time revision info — set from the flake where revisions are available.
+    # The module embeds these into a monitoring-specific file at build time.
+    configRevision = lib.mkOption {
+      type = lib.types.str;
+      default = "unknown";
+      description = "Git revision of the system configuration flake";
+    };
+
+    nixpkgsRevision = lib.mkOption {
+      type = lib.types.str;
+      default = "unknown";
+      description = "Git revision of the nixpkgs input";
+    };
+
+    configRepoOwner = lib.mkOption {
+      type = lib.types.str;
+      default = "hypersw/HyperNix";
+      description = "GitHub owner/repo for the config flake (for commit info queries)";
+    };
+
     diskWarning = lib.mkOption {
       type = lib.types.int;
       default = 80;
@@ -140,6 +290,13 @@ in
   };
 
   config = lib.mkIf cfg.enable {
+
+    # ── Build-time revision info (monitoring-internal, not for other modules) ──
+    environment.etc."monitoring/build-revisions".text = builtins.toJSON {
+      configRev = cfg.configRevision;
+      nixpkgsRev = cfg.nixpkgsRevision;
+      configRepo = cfg.configRepoOwner;
+    };
 
     # ── Netdata: system metrics + built-in alarms + Telegram delivery ──
 
@@ -328,21 +485,15 @@ in
       };
     };
 
-    # System activation notification → fires on EVERY nixos-rebuild switch,
-    # regardless of how it was triggered (manual, auto-upgrade, auto-rebuild-on-push).
-    # Compares current system with the new one; only notifies if actually changed.
+    # System activation notification → fires on EVERY nixos-rebuild switch.
+    # Sends an immediate notification with store hashes, then enriches in background
+    # with git commit details from GitHub API (fault-tolerant, 10s timeout).
     system.activationScripts.notifyConfigChange = ''
       PREV=$(${pkgs.coreutils}/bin/readlink /run/current-system 2>/dev/null || echo "none")
-      # $systemConfig is set by the NixOS activate script to the new system path
       NEW="''${systemConfig:-unknown}"
       if [ "$PREV" != "$NEW" ]; then
-        HOST=$(${pkgs.hostname}/bin/hostname)
-        # Include short store hash (first 8 chars) to distinguish builds with same nixpkgs
-        PREV_HASH=$(${pkgs.coreutils}/bin/basename "$PREV" | ${pkgs.coreutils}/bin/cut -c1-8)
-        PREV_NAME=$(${pkgs.coreutils}/bin/basename "$PREV" | ${pkgs.gnused}/bin/sed 's/^[^-]*-//')
-        NEW_HASH=$(${pkgs.coreutils}/bin/basename "$NEW" | ${pkgs.coreutils}/bin/cut -c1-8)
-        NEW_NAME=$(${pkgs.coreutils}/bin/basename "$NEW" | ${pkgs.gnused}/bin/sed 's/^[^-]*-//')
-        ${sendLog} "🔄 <b>$HOST</b>: config switched%0A<code>$PREV_HASH $PREV_NAME</code>%0A→ <code>$NEW_HASH $NEW_NAME</code>" &
+        # Run the enriched notification entirely in background — must not block activation
+        ${enrichedSwitchNotify} "$PREV" "$NEW" &
       fi
     '';
 

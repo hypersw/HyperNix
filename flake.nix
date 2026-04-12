@@ -121,6 +121,11 @@
           modules = [
             nixos-hardware.nixosModules.raspberry-pi-4
             sops-nix.nixosModules.sops
+            {
+              system.configurationRevision = self.rev or self.dirtyRev or "dirty";
+              services.telegram-alerts.configRevision = self.rev or self.dirtyRev or "dirty";
+              services.telegram-alerts.nixpkgsRevision = nixpkgs.rev;
+            }
             ./Machines/RPi4/PrintScanServer/configuration.nix
           ];
         };

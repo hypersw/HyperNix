@@ -167,6 +167,8 @@ FLAKE
     tokenFile = config.sops.secrets.telegram-token.path;
     alertsChatIdFile = config.sops.secrets.telegram-alerts-chat-id.path;
     logChatIdFile = config.sops.secrets.telegram-log-chat-id.path;
+    # Revision info is passed from the flake (see flake.nix specialArgs or module overlay)
+    # These are set by the flake where self.rev and nixpkgs.rev are available.
   };
 
   # Poll upstream flake for config changes every 5 min, rebuild if changed.
