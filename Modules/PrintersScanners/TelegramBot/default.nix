@@ -27,6 +27,12 @@ in
   };
 
   config = lib.mkIf cfg.enable {
+    users.users.printscan-bot = {
+      isSystemUser = true;
+      group = daemonCfg.group;
+      description = "PrintScan Telegram bot service user";
+    };
+
     assertions = [{
       assertion = daemonCfg.enable;
       message = "services.printscan-telegram-bot requires services.printscan-daemon to be enabled";
@@ -53,8 +59,8 @@ in
         # systemd credential — decrypted file available at $CREDENTIALS_DIRECTORY/telegram-token
         LoadCredential = "telegram-token:${cfg.tokenFile}";
 
-        DynamicUser = true;
-        SupplementaryGroups = [ daemonCfg.group ];
+        User = "printscan-bot";
+        Group = daemonCfg.group;  # access to daemon's socket
 
         # Hardening
         ProtectSystem = "strict";

@@ -23,6 +23,11 @@ in
 
   config = lib.mkIf cfg.enable {
     users.groups.${cfg.group} = {};
+    users.users.printscan-daemon = {
+      isSystemUser = true;
+      group = cfg.group;
+      description = "PrintScan daemon service user";
+    };
 
     systemd.services.printscan-daemon = {
       description = "Print/Scan Daemon";
@@ -47,8 +52,8 @@ in
         RuntimeDirectoryMode = "0775";
         RuntimeDirectoryPreserve = true;
 
-        DynamicUser = true;
-        Group = cfg.group; # socket inherits this group → bot can connect
+        User = "printscan-daemon";
+        Group = cfg.group;  # socket inherits this group → bot can connect
         SupplementaryGroups = [ "lp" "scanner" ];
 
         # Hardening — strict but allow writing to /run/printscan/
