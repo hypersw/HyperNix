@@ -81,14 +81,26 @@ let
     PREV_LABEL="''${PREV_CFG_SHORT:-n/a} $PREV_STORE"
     NEW_LABEL="''${NEW_CFG_SHORT:-n/a} $NEW_STORE"
     BASIC_MSG="🔄 <b>$HOST</b>: config switched%0A<code>$PREV_LABEL</code>%0A→ <code>$NEW_LABEL</code>%0A%0ALoading commit details..."
+    echo "$LOG_TAG: sending notification (chat=$CHAT_ID, msg length=''${#BASIC_MSG})" >&2
 
-    # Send and capture message_id for later editing
-    if ! SEND_RESP=$(${pkgs.curl}/bin/curl -sf -X POST \
-      "https://api.telegram.org/bot$TOKEN/sendMessage" \
-      -d "chat_id=$CHAT_ID" \
-      -d "text=$BASIC_MSG" \
-      -d "parse_mode=HTML" 2>/dev/null); then
-      echo "$LOG_TAG: ERROR: failed to send Telegram message" >&2
+    # Send with retry (3 attempts, 5s delay) — network may not be ready right after switch
+    SEND_RESP=""
+    for attempt in 1 2 3; do
+      SEND_RESP=$(${pkgs.curl}/bin/curl -s --max-time 15 -X POST \
+        "https://api.telegram.org/bot''${TOKEN}/sendMessage" \
+        -d "chat_id=$CHAT_ID" \
+        -d "text=$BASIC_MSG" \
+        -d "parse_mode=HTML" 2>&1)
+      CURL_RC=$?
+      if [ $CURL_RC -eq 0 ] && echo "$SEND_RESP" | ${pkgs.gnugrep}/bin/grep -q '"ok":true'; then
+        echo "$LOG_TAG: sent successfully (attempt $attempt)" >&2
+        break
+      fi
+      echo "$LOG_TAG: send attempt $attempt failed (curl rc=$CURL_RC, resp=$SEND_RESP)" >&2
+      [ "$attempt" -lt 3 ] && ${pkgs.coreutils}/bin/sleep 5
+    done
+    if ! echo "$SEND_RESP" | ${pkgs.gnugrep}/bin/grep -q '"ok":true'; then
+      echo "$LOG_TAG: ERROR: all send attempts failed" >&2
       exit 1
     fi
     MSG_ID=$(echo "$SEND_RESP" | ${pkgs.jq}/bin/jq -r '.result.message_id // empty')

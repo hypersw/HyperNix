@@ -41,12 +41,15 @@ in
         Restart = "on-failure";
         RestartSec = "5s";
 
-        # RuntimeDirectory creates /run/printscan/ writable by the service user
+        # RuntimeDirectory creates /run/printscan/ writable by the service user.
+        # Group set to printscan so the bot (in printscan group) can access the socket.
         RuntimeDirectory = "printscan";
-        RuntimeDirectoryMode = "0755";
+        RuntimeDirectoryMode = "0775";
+        RuntimeDirectoryPreserve = true;
 
         DynamicUser = true;
-        SupplementaryGroups = [ cfg.group "lp" "scanner" ];
+        Group = cfg.group; # socket inherits this group → bot can connect
+        SupplementaryGroups = [ "lp" "scanner" ];
 
         # Hardening — strict but allow writing to /run/printscan/
         ProtectSystem = "strict";
