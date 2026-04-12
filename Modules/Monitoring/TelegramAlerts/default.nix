@@ -485,17 +485,32 @@ in
       };
     };
 
-    # System activation notification → fires on EVERY nixos-rebuild switch.
-    # Sends an immediate notification with store hashes, then enriches in background
-    # with git commit details from GitHub API (fault-tolerant, 10s timeout).
-    system.activationScripts.notifyConfigChange = ''
-      PREV=$(${pkgs.coreutils}/bin/readlink /run/current-system 2>/dev/null || echo "none")
-      NEW="''${systemConfig:-unknown}"
-      if [ "$PREV" != "$NEW" ]; then
-        # Run the enriched notification entirely in background — must not block activation
-        ${enrichedSwitchNotify} "$PREV" "$NEW" &
-      fi
+    # System switch notification — runs as a oneshot service after every activation.
+    # Uses activation script to record previous system path (before /run/current-system
+    # is updated), then a systemd service sends the notification (after sops secrets
+    # are available).
+    system.activationScripts.recordPreviousSystem = ''
+      ${pkgs.coreutils}/bin/readlink /run/current-system > /run/previous-system-path 2>/dev/null || echo "none" > /run/previous-system-path
     '';
+
+    systemd.services.config-switch-notify = {
+      description = "Notify Telegram on config switch";
+      after = [ "multi-user.target" "network-online.target" ];
+      wants = [ "network-online.target" ];
+      wantedBy = [ "multi-user.target" ];
+      # Only runs once per activation — ExecStart checks if system actually changed
+      serviceConfig = {
+        Type = "oneshot";
+        RemainAfterExit = true;
+        ExecStart = pkgs.writeShellScript "config-switch-notify-check" ''
+          PREV=$(${pkgs.coreutils}/bin/cat /run/previous-system-path 2>/dev/null || echo "none")
+          NEW=$(${pkgs.coreutils}/bin/readlink /run/current-system 2>/dev/null || echo "unknown")
+          if [ "$PREV" != "$NEW" ] && [ "$PREV" != "none" ]; then
+            ${enrichedSwitchNotify} "$PREV" "$NEW"
+          fi
+        '';
+      };
+    };
 
     # SSH login notifications — uses journal cursor to avoid replays on service restart
     systemd.services.ssh-login-notify = {
