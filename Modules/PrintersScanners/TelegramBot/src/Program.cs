@@ -5,9 +5,16 @@ using Telegram.Bot.Types;
 using Telegram.Bot.Types.Enums;
 using Telegram.Bot.Types.ReplyMarkups;
 
-// Configuration from environment
-var tokenFile = Environment.GetEnvironmentVariable("PRINTSCAN_BOT_TOKEN_FILE")
-    ?? throw new Exception("PRINTSCAN_BOT_TOKEN_FILE not set");
+// Configuration from environment.
+// Token file: prefer PRINTSCAN_BOT_TOKEN_FILE, fallback to systemd credentials directory.
+var tokenFile = Environment.GetEnvironmentVariable("PRINTSCAN_BOT_TOKEN_FILE");
+if (string.IsNullOrEmpty(tokenFile))
+{
+    var credDir = Environment.GetEnvironmentVariable("CREDENTIALS_DIRECTORY");
+    tokenFile = credDir is not null ? Path.Combine(credDir, "telegram-token") : null;
+}
+if (string.IsNullOrEmpty(tokenFile) || !File.Exists(tokenFile))
+    throw new Exception($"Bot token file not found (PRINTSCAN_BOT_TOKEN_FILE or CREDENTIALS_DIRECTORY/telegram-token). Tried: {tokenFile}");
 var socketPath = Environment.GetEnvironmentVariable("PRINTSCAN_SOCKET")
     ?? "/run/printscan/api.sock";
 var allowedUsersStr = Environment.GetEnvironmentVariable("PRINTSCAN_ALLOWED_USERS") ?? "";

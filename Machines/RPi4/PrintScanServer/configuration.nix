@@ -164,8 +164,14 @@ FLAKE
   # ── Module enablement ──
   services.laserjet-printer.enable = true;
   services.epkowa-scanner.enable = true;
-  services.printscan-daemon.enable = false;
-  services.printscan-telegram-bot.enable = false;
+  services.printscan-daemon.enable = true;
+
+  services.printscan-telegram-bot = {
+    enable = true;
+    tokenFile = config.sops.secrets.printscan-bot-token.path;
+    # TODO: add allowed Telegram user IDs
+    # allowedUsers = [ 123456789 ];
+  };
 
   services.telegram-alerts = {
     enable = true;

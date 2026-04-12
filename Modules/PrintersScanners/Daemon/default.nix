@@ -1,6 +1,8 @@
 { config, lib, pkgs, ... }:
 let
   cfg = config.services.printscan-daemon;
+  sharedPackage = import ../Shared/package.nix { inherit pkgs; };
+  daemonPackage = import ./package.nix { inherit pkgs sharedPackage; };
 in
 {
   options.services.printscan-daemon = {
@@ -38,13 +40,23 @@ in
       description = "Print/Scan Daemon";
       after = [ "cups.service" ];
       wants = [ "cups.service" ];
+
+      environment = {
+        PRINTSCAN_SOCKET = cfg.socketPath;
+        # ASP.NET needs this to not try HTTPS
+        ASPNETCORE_URLS = "http://unix:${cfg.socketPath}";
+      };
+
       serviceConfig = {
         Type = "notify";
-        ExecStart = "${pkgs.coreutils}/bin/sleep infinity"; # placeholder
+        ExecStart = "${daemonPackage}/bin/PrintScan.Daemon";
         Restart = "on-failure";
         RestartSec = "5s";
+
         DynamicUser = true;
         SupplementaryGroups = [ cfg.group "lp" "scanner" ];
+
+        # Hardening
         ProtectSystem = "strict";
         ProtectHome = true;
         PrivateTmp = true;

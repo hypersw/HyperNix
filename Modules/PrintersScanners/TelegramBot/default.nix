@@ -2,6 +2,8 @@
 let
   cfg = config.services.printscan-telegram-bot;
   daemonCfg = config.services.printscan-daemon;
+  sharedPackage = import ../Shared/package.nix { inherit pkgs; };
+  botPackage = import ./package.nix { inherit pkgs sharedPackage; };
 in
 {
   options.services.printscan-telegram-bot = {
@@ -30,22 +32,30 @@ in
       after = [ "printscan-daemon.socket" "network-online.target" ];
       wants = [ "printscan-daemon.socket" "network-online.target" ];
       wantedBy = [ "multi-user.target" ];
+
+      # Token provided via systemd LoadCredential → $CREDENTIALS_DIRECTORY/telegram-token
+      environment = {
+        PRINTSCAN_SOCKET = daemonCfg.socketPath;
+        PRINTSCAN_ALLOWED_USERS = lib.concatMapStringsSep "," toString cfg.allowedUsers;
+      };
+
       serviceConfig = {
         Type = "simple";
-        ExecStart = "${pkgs.coreutils}/bin/sleep infinity"; # placeholder
+        ExecStart = "${botPackage}/bin/PrintScan.TelegramBot";
         Restart = "on-failure";
         RestartSec = "10s";
+
+        # systemd credential — decrypted file available at $CREDENTIALS_DIRECTORY/telegram-token
         LoadCredential = "telegram-token:${cfg.tokenFile}";
+
         DynamicUser = true;
         SupplementaryGroups = [ daemonCfg.group ];
+
+        # Hardening
         ProtectSystem = "strict";
         ProtectHome = true;
         PrivateTmp = true;
         NoNewPrivileges = true;
-      };
-      environment = {
-        PRINTSCAN_SOCKET = daemonCfg.socketPath;
-        PRINTSCAN_ALLOWED_USERS = lib.concatMapStringsSep "," toString cfg.allowedUsers;
       };
     };
   };
