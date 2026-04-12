@@ -480,12 +480,12 @@ in
     # Uses activation script to record previous system path (before /run/current-system
     # is updated), then a systemd service sends the notification (after sops secrets
     # are available).
+    # Record the current system path BEFORE the switch updates /run/current-system.
+    # config-switch-notify reads this to compare old vs new.
+    # Same pattern as boot-notify: Type=oneshot without RemainAfterExit goes inactive
+    # after each run, so wantedBy=multi-user.target re-triggers it on every switch.
     system.activationScripts.recordPreviousSystem = ''
       ${pkgs.coreutils}/bin/readlink /run/current-system > /run/previous-system-path 2>/dev/null || echo "none" > /run/previous-system-path
-      # Mark the notify service for restart so it re-runs after this activation.
-      # The service checks if the system actually changed before notifying.
-      ${pkgs.systemd}/bin/systemctl reset-failed config-switch-notify.service 2>/dev/null || true
-      ${pkgs.systemd}/bin/systemctl stop config-switch-notify.service 2>/dev/null || true
     '';
 
     systemd.services.config-switch-notify = {
