@@ -482,6 +482,10 @@ in
     # are available).
     system.activationScripts.recordPreviousSystem = ''
       ${pkgs.coreutils}/bin/readlink /run/current-system > /run/previous-system-path 2>/dev/null || echo "none" > /run/previous-system-path
+      # Mark the notify service for restart so it re-runs after this activation.
+      # The service checks if the system actually changed before notifying.
+      ${pkgs.systemd}/bin/systemctl reset-failed config-switch-notify.service 2>/dev/null || true
+      ${pkgs.systemd}/bin/systemctl stop config-switch-notify.service 2>/dev/null || true
     '';
 
     systemd.services.config-switch-notify = {
@@ -489,10 +493,10 @@ in
       after = [ "multi-user.target" "network-online.target" ];
       wants = [ "network-online.target" ];
       wantedBy = [ "multi-user.target" ];
-      # Only runs once per activation — ExecStart checks if system actually changed
+      # Stopped by activation script, then re-triggered by wantedBy on each switch.
+      # ExecStart checks if system actually changed before notifying.
       serviceConfig = {
         Type = "oneshot";
-        RemainAfterExit = true;
         ExecStart = pkgs.writeShellScript "config-switch-notify-check" ''
           PREV=$(${pkgs.coreutils}/bin/cat /run/previous-system-path 2>/dev/null || echo "none")
           NEW=$(${pkgs.coreutils}/bin/readlink /run/current-system 2>/dev/null || echo "unknown")
