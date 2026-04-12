@@ -149,11 +149,16 @@ FLAKE
   # Decryption key derived from SSH host ed25519 key — no extra key management.
   # Secrets are encrypted in the repo, decrypted to /run/secrets/ at activation.
   sops = {
-    defaultSopsFile = ./secrets/telegram.yaml;
+    defaultSopsFile = ./secrets/secrets.yaml;
     age.sshKeyPaths = [ "/etc/ssh/ssh_host_ed25519_key" ];
-    secrets.telegram-token = {};
+
+    # Monitoring bot
+    secrets.telegram-monitoring-bot-token = {};
     secrets.telegram-alerts-chat-id = {};
     secrets.telegram-log-chat-id = {};
+
+    # Print/scan bot
+    secrets.printscan-bot-token = {};
   };
 
   # ── Module enablement ──
@@ -164,7 +169,7 @@ FLAKE
 
   services.telegram-alerts = {
     enable = true;
-    tokenFile = config.sops.secrets.telegram-token.path;
+    tokenFile = config.sops.secrets.telegram-monitoring-bot-token.path;
     alertsChatIdFile = config.sops.secrets.telegram-alerts-chat-id.path;
     logChatIdFile = config.sops.secrets.telegram-log-chat-id.path;
     # Revision info is passed from the flake (see flake.nix specialArgs or module overlay)

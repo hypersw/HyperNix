@@ -1,0 +1,313 @@
+using System.Net.Http.Headers;
+using System.Net.Sockets;
+using Telegram.Bot;
+using Telegram.Bot.Types;
+using Telegram.Bot.Types.Enums;
+using Telegram.Bot.Types.ReplyMarkups;
+
+// Configuration from environment
+var tokenFile = Environment.GetEnvironmentVariable("PRINTSCAN_BOT_TOKEN_FILE")
+    ?? throw new Exception("PRINTSCAN_BOT_TOKEN_FILE not set");
+var socketPath = Environment.GetEnvironmentVariable("PRINTSCAN_SOCKET")
+    ?? "/run/printscan/api.sock";
+var allowedUsersStr = Environment.GetEnvironmentVariable("PRINTSCAN_ALLOWED_USERS") ?? "";
+var allowedUsers = allowedUsersStr.Split(',', StringSplitOptions.RemoveEmptyEntries)
+    .Select(long.Parse).ToHashSet();
+
+var token = (await System.IO.File.ReadAllTextAsync(tokenFile)).Trim();
+var bot = new TelegramBotClient(token);
+
+// HTTP client that talks to daemon via Unix socket
+var daemonClient = new HttpClient(new SocketsHttpHandler
+{
+    ConnectCallback = async (context, ct) =>
+    {
+        var socket = new Socket(AddressFamily.Unix, SocketType.Stream, ProtocolType.Unspecified);
+        await socket.ConnectAsync(new UnixDomainSocketEndPoint(socketPath), ct);
+        return new NetworkStream(socket, ownsSocket: true);
+    }
+})
+{
+    BaseAddress = new Uri("http://localhost") // hostname is ignored for Unix sockets
+};
+
+Console.WriteLine($"PrintScan Telegram bot starting (allowed users: {allowedUsersStr})");
+
+using var cts = new CancellationTokenSource();
+Console.CancelKeyPress += (_, e) => { e.Cancel = true; cts.Cancel(); };
+
+// Long-polling loop
+var offset = 0;
+while (!cts.IsCancellationRequested)
+{
+    try
+    {
+        var updates = await bot.GetUpdates(offset, timeout: 30, cancellationToken: cts.Token);
+        foreach (var update in updates)
+        {
+            offset = update.Id + 1;
+            _ = Task.Run(() => HandleUpdate(update, cts.Token));
+        }
+    }
+    catch (OperationCanceledException) { break; }
+    catch (Exception ex)
+    {
+        Console.Error.WriteLine($"Polling error: {ex.Message}");
+        await Task.Delay(5000, cts.Token);
+    }
+}
+
+async Task HandleUpdate(Update update, CancellationToken ct)
+{
+    try
+    {
+        if (update.Message is { } message)
+            await HandleMessage(message, ct);
+        else if (update.CallbackQuery is { } callback)
+            await HandleCallback(callback, ct);
+    }
+    catch (Exception ex)
+    {
+        Console.Error.WriteLine($"Error handling update {update.Id}: {ex.Message}");
+    }
+}
+
+async Task HandleMessage(Message message, CancellationToken ct)
+{
+    var userId = message.From?.Id ?? 0;
+    var chatId = message.Chat.Id;
+
+    // Access control
+    if (allowedUsers.Count > 0 && !allowedUsers.Contains(userId))
+    {
+        await bot.SendMessage(chatId, "⛔ Not authorized", cancellationToken: ct);
+        return;
+    }
+
+    // File received → print
+    if (message.Document is { } doc)
+    {
+        await HandlePrintDocument(chatId, doc, ct);
+        return;
+    }
+
+    // Photo received → print
+    if (message.Photo is { Length: > 0 } photos)
+    {
+        await HandlePrintPhoto(chatId, photos.Last(), ct);
+        return;
+    }
+
+    // Commands
+    var text = message.Text?.Trim() ?? "";
+    switch (text.Split(' ', '@')[0].ToLower())
+    {
+        case "/scan":
+            await ShowScanOptions(chatId, ct);
+            break;
+        case "/status":
+            await ShowStatus(chatId, ct);
+            break;
+        case "/help":
+        case "/start":
+            await bot.SendMessage(chatId, """
+                🖨️ <b>PrintScan Bot</b>
+
+                Send a <b>PDF</b> or <b>image</b> to print it.
+
+                Commands:
+                /scan — start a scan
+                /status — printer & scanner status
+                /help — this message
+                """, parseMode: ParseMode.Html, cancellationToken: ct);
+            break;
+        default:
+            await bot.SendMessage(chatId, "Send a file to print, or /scan to scan.", cancellationToken: ct);
+            break;
+    }
+}
+
+async Task HandlePrintDocument(long chatId, Document doc, CancellationToken ct)
+{
+    var status = await bot.SendMessage(chatId, $"🖨️ Printing <code>{doc.FileName}</code>...",
+        parseMode: ParseMode.Html, cancellationToken: ct);
+
+    try
+    {
+        using var ms = new MemoryStream();
+        await bot.GetInfoAndDownloadFile(doc.FileId, ms, ct);
+        ms.Position = 0;
+
+        using var content = new MultipartFormDataContent();
+        var fileContent = new StreamContent(ms);
+        fileContent.Headers.ContentType = new MediaTypeHeaderValue("application/octet-stream");
+        content.Add(fileContent, "file", doc.FileName ?? "document");
+
+        var response = await daemonClient.PostAsync("/print", content, ct);
+        if (response.IsSuccessStatusCode)
+            await bot.EditMessageText(chatId, status.Id, $"✅ Printed <code>{doc.FileName}</code>",
+                parseMode: ParseMode.Html, cancellationToken: ct);
+        else
+            await bot.EditMessageText(chatId, status.Id, $"❌ Print failed: {response.StatusCode}",
+                cancellationToken: ct);
+    }
+    catch (Exception ex)
+    {
+        await bot.EditMessageText(chatId, status.Id, $"❌ Print error: {ex.Message}",
+            cancellationToken: ct);
+    }
+}
+
+async Task HandlePrintPhoto(long chatId, PhotoSize photo, CancellationToken ct)
+{
+    var status = await bot.SendMessage(chatId, "🖨️ Printing photo...", cancellationToken: ct);
+
+    try
+    {
+        using var ms = new MemoryStream();
+        await bot.GetInfoAndDownloadFile(photo.FileId, ms, ct);
+        ms.Position = 0;
+
+        using var content = new MultipartFormDataContent();
+        var fileContent = new StreamContent(ms);
+        fileContent.Headers.ContentType = new MediaTypeHeaderValue("image/jpeg");
+        content.Add(fileContent, "file", "photo.jpg");
+
+        var response = await daemonClient.PostAsync("/print", content, ct);
+        if (response.IsSuccessStatusCode)
+            await bot.EditMessageText(chatId, status.Id, "✅ Photo printed", cancellationToken: ct);
+        else
+            await bot.EditMessageText(chatId, status.Id, $"❌ Print failed: {response.StatusCode}",
+                cancellationToken: ct);
+    }
+    catch (Exception ex)
+    {
+        await bot.EditMessageText(chatId, status.Id, $"❌ Print error: {ex.Message}",
+            cancellationToken: ct);
+    }
+}
+
+async Task ShowScanOptions(long chatId, CancellationToken ct)
+{
+    var keyboard = new InlineKeyboardMarkup()
+        .AddButton("📷 200 dpi (fast)", "scan:200:jpeg:90")
+        .AddNewRow()
+        .AddButton("📷 300 dpi", "scan:300:jpeg:90")
+        .AddNewRow()
+        .AddButton("📷 600 dpi (quality)", "scan:600:jpeg:95")
+        .AddNewRow()
+        .AddButton("🖼️ PNG 300 dpi (lossless)", "scan:300:png:0")
+        .AddNewRow()
+        .AddButton("🖼️ TIFF 600 dpi (archive)", "scan:600:tiff:0");
+
+    await bot.SendMessage(chatId, "Choose scan settings:", replyMarkup: keyboard, cancellationToken: ct);
+}
+
+async Task HandleCallback(CallbackQuery callback, CancellationToken ct)
+{
+    var chatId = callback.Message!.Chat.Id;
+    var userId = callback.From.Id;
+
+    if (allowedUsers.Count > 0 && !allowedUsers.Contains(userId))
+    {
+        await bot.AnswerCallbackQuery(callback.Id, "Not authorized", cancellationToken: ct);
+        return;
+    }
+
+    var data = callback.Data ?? "";
+    if (data.StartsWith("scan:"))
+    {
+        var parts = data.Split(':');
+        if (parts.Length >= 4)
+        {
+            var dpi = parts[1];
+            var format = parts[2];
+            var quality = parts[3];
+
+            await bot.AnswerCallbackQuery(callback.Id, "Scanning...", cancellationToken: ct);
+            await bot.EditMessageText(chatId, callback.Message.Id,
+                $"📷 Scanning at {dpi} dpi ({format})...", cancellationToken: ct);
+
+            try
+            {
+                // Start scan
+                using var scanContent = new FormUrlEncodedContent(new Dictionary<string, string>
+                {
+                    ["dpi"] = dpi,
+                    ["format"] = format,
+                    ["quality"] = quality,
+                });
+                var scanResp = await daemonClient.PostAsync("/scan", scanContent, ct);
+                var scanJson = await scanResp.Content.ReadAsStringAsync(ct);
+                var jobId = System.Text.Json.JsonDocument.Parse(scanJson)
+                    .RootElement.GetProperty("id").GetString();
+
+                // Poll for completion
+                for (var i = 0; i < 120; i++) // up to 2 minutes
+                {
+                    await Task.Delay(1000, ct);
+                    var jobResp = await daemonClient.GetAsync($"/scan/{jobId}", ct);
+
+                    if (jobResp.Content.Headers.ContentType?.MediaType?.StartsWith("image/") == true)
+                    {
+                        // Scan complete — download and send to user
+                        var imageStream = await jobResp.Content.ReadAsStreamAsync(ct);
+                        var fileName = $"scan-{jobId}.{format}";
+
+                        await bot.SendDocument(chatId, new InputFileStream(imageStream, fileName),
+                            caption: $"✅ Scanned at {dpi} dpi", cancellationToken: ct);
+
+                        await bot.DeleteMessage(chatId, callback.Message.Id, ct);
+                        return;
+                    }
+
+                    var status = System.Text.Json.JsonDocument.Parse(
+                        await jobResp.Content.ReadAsStringAsync(ct));
+                    var jobStatus = status.RootElement.GetProperty("status").GetString();
+
+                    if (jobStatus == "Failed")
+                    {
+                        var error = status.RootElement.GetProperty("error").GetString();
+                        await bot.EditMessageText(chatId, callback.Message.Id,
+                            $"❌ Scan failed: {error}", cancellationToken: ct);
+                        return;
+                    }
+                }
+
+                await bot.EditMessageText(chatId, callback.Message.Id,
+                    "❌ Scan timed out", cancellationToken: ct);
+            }
+            catch (Exception ex)
+            {
+                await bot.EditMessageText(chatId, callback.Message.Id,
+                    $"❌ Scan error: {ex.Message}", cancellationToken: ct);
+            }
+        }
+    }
+}
+
+async Task ShowStatus(long chatId, CancellationToken ct)
+{
+    try
+    {
+        var resp = await daemonClient.GetAsync("/status", ct);
+        var json = await resp.Content.ReadAsStringAsync(ct);
+        var status = System.Text.Json.JsonDocument.Parse(json);
+        var printer = status.RootElement.GetProperty("printer");
+        var scanner = status.RootElement.GetProperty("scanner");
+
+        var printerOnline = printer.GetProperty("online").GetBoolean();
+        var scannerOnline = scanner.GetProperty("online").GetBoolean();
+
+        await bot.SendMessage(chatId, $"""
+            📊 <b>Status</b>
+
+            🖨️ Printer: {(printerOnline ? "✅ online" : "❌ offline")}
+            📷 Scanner: {(scannerOnline ? "✅ online" : "❌ offline")}
+            """, parseMode: ParseMode.Html, cancellationToken: ct);
+    }
+    catch (Exception ex)
+    {
+        await bot.SendMessage(chatId, $"❌ Cannot reach daemon: {ex.Message}", cancellationToken: ct);
+    }
+}

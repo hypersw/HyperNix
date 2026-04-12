@@ -8,7 +8,7 @@ keys:
 
 creation_rules:
   # PrintScanServer secrets — admin + the machine itself
-  - path_regex: Machines/RPi4/PrintScanServer/secrets/.*
+  - path_regex: Machines/RPi4/PrintScanServer/secrets/secrets\.yaml$
     key_groups:
       - age:
           - *admin
