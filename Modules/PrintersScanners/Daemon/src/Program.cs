@@ -4,12 +4,20 @@ using PrintScan.Shared;
 
 var builder = WebApplication.CreateBuilder(args);
 
-// systemd integration: accept socket-activated fds, notify ready, journal logging
+// systemd integration: sd_notify(READY=1), journal logging
 builder.Host.UseSystemd();
 
-// Kestrel picks up the socket from systemd (LISTEN_FDS) automatically
-// when UseSystemd() is active and a socket unit passes the fd.
-// Fallback: ASPNETCORE_URLS env var for standalone/dev use.
+// Use systemd socket activation if LISTEN_FDS is set (socket unit passes the fd).
+// Otherwise fall back to ASPNETCORE_URLS or default (standalone/dev use).
+var listenFds = Environment.GetEnvironmentVariable("LISTEN_FDS");
+if (listenFds is not null && int.TryParse(listenFds, out var fdCount) && fdCount > 0)
+{
+    // fd 3 is the first passed socket (systemd convention: SD_LISTEN_FDS_START = 3)
+    builder.WebHost.ConfigureKestrel(options =>
+    {
+        options.ListenHandle((ulong)(3));
+    });
+}
 
 builder.Services.AddSingleton<PrintService>();
 builder.Services.AddSingleton<ScanService>();
