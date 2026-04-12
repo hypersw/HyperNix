@@ -1,13 +1,15 @@
 using System.Diagnostics;
+using Microsoft.Extensions.Hosting.Systemd;
 using PrintScan.Shared;
 
 var builder = WebApplication.CreateBuilder(args);
 
-// Listen on Unix socket — path from env or default.
-// When socket-activated by systemd, the socket file already exists and is
-// managed by systemd. When running standalone, Kestrel creates it.
-// ASPNETCORE_URLS is set by the NixOS module to "http://unix:<path>".
-// No manual socket management needed — Kestrel handles both cases.
+// systemd integration: accept socket-activated fds, notify ready, journal logging
+builder.Host.UseSystemd();
+
+// Kestrel picks up the socket from systemd (LISTEN_FDS) automatically
+// when UseSystemd() is active and a socket unit passes the fd.
+// Fallback: ASPNETCORE_URLS env var for standalone/dev use.
 
 builder.Services.AddSingleton<PrintService>();
 builder.Services.AddSingleton<ScanService>();

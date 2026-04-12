@@ -29,53 +29,49 @@ in
       description = "PrintScan daemon service user";
     };
 
+    # Socket unit — systemd creates the socket with correct ownership/permissions
+    # declaratively, then passes the fd to the daemon via socket activation.
+    systemd.sockets.printscan-daemon = {
+      description = "Print/Scan Daemon Socket";
+      wantedBy = [ "sockets.target" ];
+      socketConfig = {
+        ListenStream = cfg.socketPath;
+        SocketMode = "0660";
+        SocketUser = "printscan-daemon";
+        SocketGroup = cfg.group;
+        RuntimeDirectory = "printscan";
+        RuntimeDirectoryMode = "0755";
+      };
+    };
+
     systemd.services.printscan-daemon = {
       description = "Print/Scan Daemon";
-      after = [ "cups.service" "network.target" ];
+      after = [ "cups.service" ];
       wants = [ "cups.service" ];
-      wantedBy = [ "multi-user.target" ];
+      # No wantedBy — socket activation starts the service on first connection
 
       environment = {
         PRINTSCAN_SOCKET = cfg.socketPath;
+        # Fallback for standalone/dev use; systemd socket takes priority
         ASPNETCORE_URLS = "http://unix:${cfg.socketPath}";
       };
 
       serviceConfig = {
-        Type = "simple";
+        # notify: UseSystemd() sends sd_notify(READY=1) when the app is ready
+        Type = "notify";
         ExecStart = "${daemonPackage}/bin/PrintScan.Daemon";
         Restart = "on-failure";
         RestartSec = "5s";
 
-        # RuntimeDirectory creates /run/printscan/ writable by the service user.
-        # Group set to printscan so the bot (in printscan group) can access the socket.
-        RuntimeDirectory = "printscan";
-        RuntimeDirectoryMode = "0775";
-        RuntimeDirectoryPreserve = true;
-
         User = "printscan-daemon";
-        Group = cfg.group;  # socket inherits this group → bot can connect
+        Group = cfg.group;
         SupplementaryGroups = [ "lp" "scanner" ];
 
-        # Hardening — strict but allow writing to /run/printscan/
+        # Hardening
         ProtectSystem = "strict";
         ProtectHome = true;
         PrivateTmp = true;
         NoNewPrivileges = true;
-
-        UMask = "0007"; # socket: 0770 → group-accessible
-
-        # Fix socket ownership after Kestrel creates it.
-        # Kestrel creates the socket as the service user, but within ProtectSystem
-        # namespace the ownership may not propagate correctly to the host view.
-        ExecStartPost = pkgs.writeShellScript "fix-socket-perms" ''
-          # Wait for socket to exist
-          for i in $(seq 1 30); do
-            [ -S ${cfg.socketPath} ] && break
-            sleep 1
-          done
-          ${pkgs.coreutils}/bin/chgrp ${cfg.group} ${cfg.socketPath} 2>/dev/null || true
-          ${pkgs.coreutils}/bin/chmod 0770 ${cfg.socketPath} 2>/dev/null || true
-        '';
       };
     };
   };

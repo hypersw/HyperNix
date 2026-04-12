@@ -1,5 +1,10 @@
 [
   {
+    "pname": "Microsoft.Extensions.Hosting.Systemd",
+    "version": "10.0.5",
+    "hash": "sha256-lIqyqE9xR9lVE2LmKBwo/u6X7VdicpvoVnhahsHvUbc="
+  },
+  {
     "pname": "SharpIpp",
     "version": "0.10.0",
     "hash": "sha256-UatEoMVfTZGdiG9MvIE8WxVPUQe+DN4ngo+LLQuhmYc="
