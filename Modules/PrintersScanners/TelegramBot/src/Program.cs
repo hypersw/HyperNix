@@ -51,15 +51,8 @@ await bot.SetMyCommands([
     new BotCommand { Command = "status", Description = "📊 Printer & scanner status" },
     new BotCommand { Command = "help", Description = "❓ How to use this bot" },
 ]);
-await bot.SetMyDescription("""
-    🖨️ Home print & scan server.
-
-    📄 Send a PDF or image to print it
-    📷 /scan — scan a document
-    📊 /status — check device status
-    ❓ /help — usage info
-    """);
-await bot.SetMyShortDescription("🖨️ Print & scan from Telegram");
+await bot.SetMyDescription("Press Start to sign in.");
+await bot.SetMyShortDescription("Private print & scan service");
 Console.WriteLine("Bot commands and description registered");
 
 // Persistent reply keyboard — always visible, phone-friendly
