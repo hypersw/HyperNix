@@ -44,12 +44,23 @@ var daemonClient = new HttpClient(new SocketsHttpHandler
 Console.WriteLine($"PrintScan Telegram bot starting (allowed users: {string.Join(", ", allowedUsers.Select(u => $"{u.Value}({u.Key})"))})");
 
 // Register bot commands (visible in Telegram's menu)
+// Register commands, description, and short description on every startup.
+// These are idempotent — Telegram silently ignores if unchanged.
 await bot.SetMyCommands([
     new BotCommand { Command = "scan", Description = "📷 Scan a document" },
     new BotCommand { Command = "status", Description = "📊 Printer & scanner status" },
     new BotCommand { Command = "help", Description = "❓ How to use this bot" },
 ]);
-Console.WriteLine("Bot commands registered");
+await bot.SetMyDescription("""
+    🖨️ Home print & scan server.
+
+    📄 Send a PDF or image to print it
+    📷 /scan — scan a document
+    📊 /status — check device status
+    ❓ /help — usage info
+    """);
+await bot.SetMyShortDescription("🖨️ Print & scan from Telegram");
+Console.WriteLine("Bot commands and description registered");
 
 // Persistent reply keyboard — always visible, phone-friendly
 var mainKeyboard = new ReplyKeyboardMarkup(
@@ -148,8 +159,11 @@ async Task HandleMessage(Message message, CancellationToken ct)
             await bot.SendMessage(chatId, """
                 🖨️ <b>PrintScan Bot</b>
 
-                Send a <b>PDF</b> or <b>image</b> to print it.
-                Use the buttons below or type commands.
+                📄 Send a <b>PDF</b> or <b>image</b> to print it
+                📷 /scan — scan a document
+                📊 /status — check printer &amp; scanner
+
+                Use the buttons below 👇
                 """, parseMode: ParseMode.Html, replyMarkup: mainKeyboard, cancellationToken: ct);
             break;
         default:
