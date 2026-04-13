@@ -335,13 +335,18 @@ async Task ShowStatus(long chatId, CancellationToken ct)
         await bot.SendMessage(chatId, $"""
             📊 <b>Status</b>
 
-            🖨️ Printer: {(printerOnline ? "✅ online" : "❌ offline")}
-            📷 Scanner: {(scannerOnline ? "✅ online" : "❌ offline")}
+            🖨️ Printer: {(printerOnline ? "✅ online" : "⚠️ offline")}
+            📷 Scanner: {(scannerOnline ? "✅ online" : "⚠️ offline")}
             """, parseMode: ParseMode.Html, cancellationToken: ct);
     }
-    catch (Exception ex)
+    catch (Exception)
     {
-        await bot.SendMessage(chatId, $"❌ Cannot reach daemon: {ex.Message}", cancellationToken: ct);
+        await bot.SendMessage(chatId, """
+            📊 <b>Status</b>
+
+            🖨️ Printer: 🔌 unreachable
+            📷 Scanner: 🔌 unreachable
+            """, parseMode: ParseMode.Html, cancellationToken: ct);
     }
 }
 
