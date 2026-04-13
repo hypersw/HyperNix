@@ -1,5 +1,6 @@
 using System.Diagnostics;
 using Microsoft.Extensions.Hosting.Systemd;
+using PrintScan.Daemon;
 using PrintScan.Shared;
 
 var builder = WebApplication.CreateBuilder(args);
@@ -88,7 +89,7 @@ public class PrintService(ILogger<PrintService> logger)
     {
         try
         {
-            var result = RunCommand("lpstat", "-p");
+            var result = RunCommand(ToolPaths.LpStat, "-p");
             var online = result.ExitCode == 0 && !result.Output.Contains("disabled");
             return new PrinterStatus(online, result.Output.Trim());
         }
@@ -112,7 +113,7 @@ public class PrintService(ILogger<PrintService> logger)
             if (!string.IsNullOrEmpty(request.PageRange))
                 args.AddRange(["-o", $"page-ranges={request.PageRange}"]);
 
-            var result = RunCommand("lp", string.Join(" ", args));
+            var result = RunCommand(ToolPaths.Lp, string.Join(" ", args));
             if (result.ExitCode != 0)
             {
                 logger.LogError("lp failed: {Error}", result.Error);
@@ -154,7 +155,7 @@ public class ScanService(ILogger<ScanService> logger)
     {
         try
         {
-            var result = RunCommand("scanimage", "-L");
+            var result = RunCommand(ToolPaths.ScanImage, "-L");
             var online = result.ExitCode == 0 && result.Output.Contains("epkowa");
             return new ScannerStatus(online, result.Output.Trim());
         }
@@ -193,7 +194,7 @@ public class ScanService(ILogger<ScanService> logger)
                 var args = $"--resolution {request.Dpi} --format {formatArg} --output-file {outputPath}";
 
                 logger.LogInformation("Starting scan: {Args}", args);
-                var result = await RunCommandAsync("scanimage", args);
+                var result = await RunCommandAsync(ToolPaths.ScanImage, args);
 
                 if (result.ExitCode != 0)
                 {

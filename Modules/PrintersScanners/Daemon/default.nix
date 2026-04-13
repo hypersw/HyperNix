@@ -50,11 +50,8 @@ in
       wants = [ "cups.service" ];
       # No wantedBy — socket activation starts the service on first connection
 
-      # Commands the daemon shells out to
-      path = [
-        pkgs.cups       # lpstat, lp
-        pkgs.sane-backends  # scanimage
-      ];
+      # Tool paths are baked into the DLL at build time (ToolPaths.g.cs)
+      # — no PATH needed, no env vars for tool locations.
 
       environment = {
         PRINTSCAN_SOCKET = cfg.socketPath;
