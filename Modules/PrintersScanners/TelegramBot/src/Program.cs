@@ -132,19 +132,19 @@ async Task HandleMessage(Message message, CancellationToken ct)
 
     // Commands — match both /commands and keyboard button text
     var text = message.Text?.Trim() ?? "";
-    var cmd = text.Split(' ', '@')[0].ToLower();
-    switch (cmd)
+    var textLower = text.ToLower();
+    var slashCmd = text.Split(' ', '@')[0].ToLower(); // for /commands with @botname
+    switch (textLower)
     {
-        case "/scan":
         case "📷 scan":
+        case var _ when slashCmd == "/scan":
             await ShowScanOptions(chatId, ct);
             break;
-        case "/status":
         case "📊 status":
+        case var _ when slashCmd == "/status":
             await ShowStatus(chatId, ct);
             break;
-        case "/help":
-        case "/start":
+        case var _ when slashCmd is "/help" or "/start":
             await bot.SendMessage(chatId, """
                 🖨️ <b>PrintScan Bot</b>
 
