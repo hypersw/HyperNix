@@ -50,6 +50,12 @@ in
       wants = [ "cups.service" ];
       # No wantedBy — socket activation starts the service on first connection
 
+      # Commands the daemon shells out to
+      path = [
+        pkgs.cups       # lpstat, lp
+        pkgs.sane-backends  # scanimage
+      ];
+
       environment = {
         PRINTSCAN_SOCKET = cfg.socketPath;
         # Don't set ASPNETCORE_URLS — Kestrel picks up the socket fd from
