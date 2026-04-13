@@ -43,6 +43,24 @@ var daemonClient = new HttpClient(new SocketsHttpHandler
 
 Console.WriteLine($"PrintScan Telegram bot starting (allowed users: {string.Join(", ", allowedUsers.Select(u => $"{u.Value}({u.Key})"))})");
 
+// Register bot commands (visible in Telegram's menu)
+await bot.SetMyCommands([
+    new BotCommand { Command = "scan", Description = "📷 Scan a document" },
+    new BotCommand { Command = "status", Description = "📊 Printer & scanner status" },
+    new BotCommand { Command = "help", Description = "❓ How to use this bot" },
+]);
+Console.WriteLine("Bot commands registered");
+
+// Persistent reply keyboard — always visible, phone-friendly
+var mainKeyboard = new ReplyKeyboardMarkup(
+    new[]
+    {
+        new KeyboardButton[] { "📷 Scan", "📊 Status" },
+    })
+{
+    ResizeKeyboard = true, // compact size
+    IsPersistent = true,   // always visible
+};
 
 using var cts = new CancellationTokenSource();
 Console.CancelKeyPress += (_, e) => { e.Cancel = true; cts.Cancel(); };
@@ -112,14 +130,17 @@ async Task HandleMessage(Message message, CancellationToken ct)
         return;
     }
 
-    // Commands
+    // Commands — match both /commands and keyboard button text
     var text = message.Text?.Trim() ?? "";
-    switch (text.Split(' ', '@')[0].ToLower())
+    var cmd = text.Split(' ', '@')[0].ToLower();
+    switch (cmd)
     {
         case "/scan":
+        case "📷 scan":
             await ShowScanOptions(chatId, ct);
             break;
         case "/status":
+        case "📊 status":
             await ShowStatus(chatId, ct);
             break;
         case "/help":
@@ -128,15 +149,12 @@ async Task HandleMessage(Message message, CancellationToken ct)
                 🖨️ <b>PrintScan Bot</b>
 
                 Send a <b>PDF</b> or <b>image</b> to print it.
-
-                Commands:
-                /scan — start a scan
-                /status — printer & scanner status
-                /help — this message
-                """, parseMode: ParseMode.Html, cancellationToken: ct);
+                Use the buttons below or type commands.
+                """, parseMode: ParseMode.Html, replyMarkup: mainKeyboard, cancellationToken: ct);
             break;
         default:
-            await bot.SendMessage(chatId, "Send a file to print, or /scan to scan.", cancellationToken: ct);
+            await bot.SendMessage(chatId, "Send a file to print, or tap 📷 Scan below.",
+                replyMarkup: mainKeyboard, cancellationToken: ct);
             break;
     }
 }
