@@ -101,6 +101,29 @@ async Task HandleUpdate(Update update, CancellationToken ct)
 {
     try
     {
+        // Centralized auth — extract user ID from any update type
+        var userId = update.Message?.From?.Id
+            ?? update.CallbackQuery?.From?.Id
+            ?? 0;
+
+        if (userId == 0)
+            return; // no identifiable user (channel post, etc.) — silently ignore
+
+        if (allowedUsers.Count > 0 && !allowedUsers.ContainsKey(userId))
+        {
+            // Silent ignore for unauthorized users — don't confirm bot is active.
+            // Log once per user to avoid spam in journal.
+            Console.Error.WriteLine($"Unauthorized: {userId} ({update.Message?.From?.Username ?? update.CallbackQuery?.From?.Username ?? "?"})");
+            return;
+        }
+
+        if (allowedUsers.Count > 0)
+        {
+            var name = allowedUsers[userId];
+            var action = update.Message?.Text ?? update.Message?.Document?.FileName ?? update.CallbackQuery?.Data ?? "?";
+            Console.WriteLine($"{name} ({userId}): {action}");
+        }
+
         if (update.Message is { } message)
             await HandleMessage(message, ct);
         else if (update.CallbackQuery is { } callback)
@@ -114,18 +137,7 @@ async Task HandleUpdate(Update update, CancellationToken ct)
 
 async Task HandleMessage(Message message, CancellationToken ct)
 {
-    var userId = message.From?.Id ?? 0;
     var chatId = message.Chat.Id;
-
-    // Access control
-    if (allowedUsers.Count > 0 && !allowedUsers.ContainsKey(userId))
-    {
-        Console.Error.WriteLine($"Unauthorized access attempt from user {userId} ({message.From?.Username ?? "unknown"})");
-        await bot.SendMessage(chatId, "⛔ Not authorized", cancellationToken: ct);
-        return;
-    }
-    if (allowedUsers.Count > 0)
-        Console.WriteLine($"Request from {allowedUsers[userId]} ({userId}): {message.Text ?? message.Document?.FileName ?? "media"}");
 
     // File received → print
     if (message.Document is { } doc)
@@ -252,14 +264,7 @@ async Task ShowScanOptions(long chatId, CancellationToken ct)
 async Task HandleCallback(CallbackQuery callback, CancellationToken ct)
 {
     var chatId = callback.Message!.Chat.Id;
-    var userId = callback.From.Id;
-
-    if (allowedUsers.Count > 0 && !allowedUsers.ContainsKey(userId))
-    {
-        Console.Error.WriteLine($"Unauthorized callback from user {userId}");
-        await bot.AnswerCallbackQuery(callback.Id, "Not authorized", cancellationToken: ct);
-        return;
-    }
+    // Auth already checked in HandleUpdate
 
     var data = callback.Data ?? "";
     if (data.StartsWith("scan:"))
