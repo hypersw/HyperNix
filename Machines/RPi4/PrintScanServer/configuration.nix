@@ -45,6 +45,7 @@
     firewall = {
       enable = true;
       allowedTCPPorts = [ 22 ];
+      allowedUDPPorts = [ 5353 ];  # mDNS (Avahi)
     };
 
     # WiFi client — connect to IoT PPSK network
