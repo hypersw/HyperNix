@@ -32,14 +32,25 @@ let
     EOF
   '';
 
-  # Wrapper that invokes the x86_64 scanimage. Kernel's binfmt_misc handler
-  # transparently runs it via qemu-x86_64. SANE env vars point at x86_64 libs
-  # and configs so the whole dlopen chain (libsane-epkowa → interpreter) uses
-  # the emulated-arch binaries.
+  # Wrapper that invokes the x86_64 scanimage via box64 (not binfmt).
+  #
+  # Why box64 directly: qemu-user (the default binfmt handler) can't handle
+  # libusb's async USBDEVFS ioctls — scans fail with EPROTO. box64's libusb
+  # path works. But box64's dynarec is unstable on NixOS; BOX64_DYNAREC=0
+  # (interpreter mode) is needed for any non-trivial app.
+  #
+  # Why not make box64 the binfmt handler: box64 isn't robust enough for
+  # arbitrary build-time x86_64 invocations (nix builds of pinned pkgsX86
+  # will call sh/bash/gcc, which box64 fumbles). Keep qemu-user as the
+  # global binfmt handler (for build time) and invoke box64 explicitly
+  # only for our runtime scanner path.
   scanimageX86 = pkgs.writeShellScriptBin "scanimage-x86" ''
+    export BOX64_NOBANNER=1
+    export BOX64_DYNAREC=0
+    export BOX64_ALLOWMISSINGLIBS=1
     export SANE_CONFIG_DIR=${saneConfX86}/etc/sane.d
     export LD_LIBRARY_PATH=${saneLibsX86}/lib/sane:${saneLibsX86}/lib
-    exec ${pkgsX86.sane-backends}/bin/scanimage "$@"
+    exec ${pkgs.box64}/bin/box64 ${pkgsX86.sane-backends}/bin/scanimage "$@"
   '';
 in
 {
