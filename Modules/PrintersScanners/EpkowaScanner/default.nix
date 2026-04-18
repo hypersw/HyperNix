@@ -25,7 +25,14 @@ in
     '';
 
     environment.etc."sane-config-epkowa/dll.conf".text = "epkowa";
-    environment.etc."sane-config-epkowa/epkowa.conf".text = "usb";
+    # Without the specific USB-ID line, epkowa detects the scanner as
+    # "Epson (unknown model)" and sane_open fails with EINVAL. The ID line
+    # maps 04b8:0142 to the Perfection V33 model so the interpreter plugin
+    # loads correctly.
+    environment.etc."sane-config-epkowa/epkowa.conf".text = lib.strings.concatLines [
+      "usb"
+      ''usb 0x04b8 0x0142 "Perfection V33" "Epson Perfection V33/V330"''
+    ];
     environment.variables.SANE_CONFIG_DIR = lib.mkForce "/etc/sane-config-epkowa";
 
     services.saned.enable = true;
