@@ -440,6 +440,29 @@ in
       };
     };
 
+    # Shutdown notification → log channel.
+    # Runs on graceful shutdown/reboot via ExecStop (ExecStart is a no-op).
+    # Must complete while network is still up — ordered before network-online.target
+    # so shutdown sequence stops us before tearing down networking.
+    systemd.services.shutdown-notify = {
+      description = "Notify Telegram on graceful shutdown";
+      wantedBy = [ "multi-user.target" ];
+      before = [ "network-online.target" ];
+      after = [ "network-online.target" ];
+      wants = [ "network-online.target" ];
+      serviceConfig = {
+        Type = "oneshot";
+        RemainAfterExit = true;
+        ExecStart = "${pkgs.coreutils}/bin/true";
+        ExecStop = pkgs.writeShellScript "shutdown-notify" ''
+          HOST=$(${pkgs.hostname}/bin/hostname)
+          UPTIME_S=$(${pkgs.coreutils}/bin/cat /proc/uptime | ${pkgs.coreutils}/bin/cut -d. -f1)
+          UPTIME=$(${formatUptime} "$UPTIME_S")
+          ${sendLog} "🔴 <b>$HOST</b> shutting down%0AUptime: $UPTIME"
+        '';
+      };
+    };
+
     # Previous boot panic check → alerts channel
     systemd.services.check-previous-boot = {
       description = "Check previous boot for kernel panics or critical errors";
