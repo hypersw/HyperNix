@@ -215,7 +215,7 @@ FLAKE
   services.laserjet-printer.enable = true;
   services.epkowa-scanner = {
     enable = true;
-    useX86Backends = false;  # two-stage bootstrap: binfmt first, then flip to true
+    useX86Backends = true;  # scanimage-x86 via qemu-user binfmt (epkowa interpreter is x86_64-only)
   };
   services.printscan-daemon.enable = true;
 
