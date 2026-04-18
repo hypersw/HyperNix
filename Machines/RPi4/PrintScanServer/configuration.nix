@@ -206,9 +206,17 @@ FLAKE
     };
   };
 
+  # Enable x86_64 binary emulation via qemu-user binfmt.
+  # Needed because Epson's esci-interpreter scanner plugin is x86_64-only
+  # and has no aarch64 build. See services.epkowa-scanner.useX86Backends.
+  boot.binfmt.emulatedSystems = [ "x86_64-linux" ];
+
   # ── Module enablement ──
   services.laserjet-printer.enable = true;
-  services.epkowa-scanner.enable = true;
+  services.epkowa-scanner = {
+    enable = true;
+    useX86Backends = true;  # test scanimage-x86 under qemu-user
+  };
   services.printscan-daemon.enable = true;
 
   services.printscan-telegram-bot = {
