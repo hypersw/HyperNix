@@ -50,6 +50,9 @@
     wireless = {
       enable = true;
       secretsFile = config.sops.templates."wpa-secrets".path;
+      # Disable Wi-Fi Direct (P2P) — RPi4's BCM43455 doesn't support the
+      # required DFS/wide channels, causing constant brcmf_set_channel errors.
+      extraConfig = "p2p_disabled=1";
       networks."HyperAir.IotPsk" = {
         pskRaw = "ext:psk_iot";  # pskRaw outputs unquoted — required for ext: refs
         hidden = true;  # SSID not broadcast — probe actively
