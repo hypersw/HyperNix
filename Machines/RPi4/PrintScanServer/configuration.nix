@@ -97,7 +97,6 @@
       options = "--delete-older-than 7d";
     };
   };
-  # Needed for unifi-related packages in container builds.
   nixpkgs.config.allowUnfree = true;
 
   system.autoUpgrade = {
