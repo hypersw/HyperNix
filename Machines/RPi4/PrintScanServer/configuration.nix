@@ -176,8 +176,12 @@ FLAKE
     # WiFi
     secrets.wifi-iot-psk = {};
 
-    # wpa_supplicant secrets file — maps sops secret to ext: reference
-    templates."wpa-secrets".content = "psk_iot=${config.sops.placeholder."wifi-iot-psk"}";
+    # wpa_supplicant secrets file — maps sops secret to ext: reference.
+    # wpa_supplicant runs sandboxed as its own user, needs read access.
+    templates."wpa-secrets" = {
+      content = "psk_iot=${config.sops.placeholder."wifi-iot-psk"}";
+      owner = "wpa_supplicant";
+    };
   };
 
   # ── Module enablement ──
