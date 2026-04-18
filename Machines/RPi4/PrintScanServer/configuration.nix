@@ -45,6 +45,19 @@
       enable = true;
       allowedTCPPorts = [ 22 ];
     };
+
+    # WiFi client — connect to IoT PPSK network
+    wireless = {
+      enable = true;
+      secretsFile = config.sops.templates."wpa-secrets".path;
+      networks."HyperAir.IotPsk".psk = "ext:psk_iot";
+    };
+  };
+
+  # Ensure wpa_supplicant starts after sops decrypts secrets
+  systemd.services.wpa_supplicant = {
+    after = [ "sops-nix.service" ];
+    wants = [ "sops-nix.service" ];
   };
 
   services.openssh = {
@@ -159,6 +172,12 @@ FLAKE
 
     # Print/scan bot
     secrets.printscan-bot-token = {};
+
+    # WiFi
+    secrets.wifi-iot-psk = {};
+
+    # wpa_supplicant secrets file — maps sops secret to ext: reference
+    templates."wpa-secrets".content = "psk_iot=${config.sops.placeholder."wifi-iot-psk"}";
   };
 
   # ── Module enablement ──
