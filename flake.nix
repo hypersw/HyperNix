@@ -5,6 +5,13 @@
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
     nixos-hardware.url = "github:NixOS/nixos-hardware";
 
+    # Older nixpkgs pinned for x86_64 cross-arch builds.
+    # Needed for box64-under-binfmt (epkowa scanner on aarch64): box64's
+    # libc/libudev wrappers were written for glibc ~2.35 and don't export
+    # newer syscall wrappers (fsmount, pidfd_spawn, mount_setattr, …).
+    # glibc in nixos-22.11 is 2.35, pre-dating all symbols box64 chokes on.
+    nixpkgs-old-x86.url = "github:NixOS/nixpkgs/nixos-22.11";
+
     # External flake dependencies only — no path: sub-flakes.
     # Internal modules/packages are plain nix files imported directly.
     microvm.url = "github:astro/microvm.nix";
@@ -14,7 +21,7 @@
     sops-nix.inputs.nixpkgs.follows = "nixpkgs";
   };
 
-  outputs = { self, nixpkgs, nixos-hardware, microvm, sops-nix }:
+  outputs = { self, nixpkgs, nixpkgs-old-x86, nixos-hardware, microvm, sops-nix }:
     let
       forAllSystems = nixpkgs.lib.genAttrs [ "x86_64-linux" "aarch64-linux" ];
 
@@ -125,6 +132,7 @@
         # Does NOT include the SD image/installer module (that's only for CI image builds).
         PrintScanServer = nixpkgs.lib.nixosSystem {
           system = "aarch64-linux";
+          specialArgs = { inherit nixpkgs-old-x86; };
           modules = [
             nixos-hardware.nixosModules.raspberry-pi-4
             sops-nix.nixosModules.sops
@@ -141,6 +149,7 @@
         # Only used by CI (GitHub Actions) and the sdImage package below.
         PrintScanServer-sdImage = nixpkgs.lib.nixosSystem {
           system = "aarch64-linux";
+          specialArgs = { inherit nixpkgs-old-x86; };
           modules = [
             nixos-hardware.nixosModules.raspberry-pi-4
             sops-nix.nixosModules.sops

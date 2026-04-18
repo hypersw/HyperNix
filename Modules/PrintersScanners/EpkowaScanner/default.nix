@@ -1,11 +1,19 @@
-{ config, lib, pkgs, ... }:
+{ config, lib, pkgs, nixpkgs-old-x86 ? null, ... }:
 let
   cfg = config.services.epkowa-scanner;
 
   # x86_64 SANE stack for aarch64 hosts — Epson's esci-interpreter plugin is
   # x86_64-only, so we run scanimage (and the whole SANE stack) under
-  # qemu-user binfmt. See useX86Backends option below for rationale.
-  pkgsX86 = import pkgs.path { system = "x86_64-linux"; config.allowUnfree = true; };
+  # binfmt (box64). See useX86Backends option below for rationale.
+  #
+  # Pinned to an older nixpkgs (passed via specialArgs) so the resulting
+  # x86_64 libraries reference only glibc symbols that box64's wrapper table
+  # knows about. Without this pin, modern libudev.so would reference fsmount,
+  # pidfd_spawn, mount_setattr, etc. that aren't in box64's wrapper.
+  pkgsX86 =
+    if nixpkgs-old-x86 != null
+    then import nixpkgs-old-x86 { system = "x86_64-linux"; config.allowUnfree = true; }
+    else import pkgs.path { system = "x86_64-linux"; config.allowUnfree = true; };
 
   # Combined x86_64 SANE lib dir — mirrors what hardware.sane does natively:
   # symlink libsane-epkowa.so and its interpreter plugin where scanimage finds them.
