@@ -455,6 +455,12 @@ in
         RemainAfterExit = true;
         ExecStart = "${pkgs.coreutils}/bin/true";
         ExecStop = pkgs.writeShellScript "shutdown-notify" ''
+          # Only notify on actual system shutdown/reboot, not unit restart
+          # (ExecStop fires on any stop, including systemctl restart shutdown-notify)
+          STATE=$(${pkgs.systemd}/bin/systemctl is-system-running 2>/dev/null || true)
+          if [ "$STATE" != "stopping" ]; then
+            exit 0
+          fi
           HOST=$(${pkgs.hostname}/bin/hostname)
           UPTIME_S=$(${pkgs.coreutils}/bin/cat /proc/uptime | ${pkgs.coreutils}/bin/cut -d. -f1)
           UPTIME=$(${formatUptime} "$UPTIME_S")
