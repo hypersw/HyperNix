@@ -50,7 +50,10 @@
     wireless = {
       enable = true;
       secretsFile = config.sops.templates."wpa-secrets".path;
-      networks."HyperAir.IotPsk".psk = "ext:psk_iot";
+      networks."HyperAir.IotPsk" = {
+        psk = "ext:psk_iot";
+        hidden = true;  # SSID not broadcast — probe actively
+      };
     };
   };
 
