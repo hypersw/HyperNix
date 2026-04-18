@@ -442,12 +442,12 @@ in
 
     # Shutdown notification → log channel.
     # Runs on graceful shutdown/reboot via ExecStop (ExecStart is a no-op).
-    # Must complete while network is still up — ordered before network-online.target
-    # so shutdown sequence stops us before tearing down networking.
+    # Must complete while network is still up. systemd stops units in reverse
+    # dependency order, so After=network-online.target means network is up
+    # when we start AND still up when we stop (network-online waits for us).
     systemd.services.shutdown-notify = {
       description = "Notify Telegram on graceful shutdown";
       wantedBy = [ "multi-user.target" ];
-      before = [ "network-online.target" ];
       after = [ "network-online.target" ];
       wants = [ "network-online.target" ];
       serviceConfig = {
