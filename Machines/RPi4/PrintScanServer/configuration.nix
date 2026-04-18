@@ -12,6 +12,7 @@
   networking.hostName = "printscan";
   system.stateVersion = "25.05";
 
+  # Required for RPi4 WiFi (brcmfmac) and Bluetooth firmware blobs.
   hardware.enableRedistributableFirmware = true;
 
   # Filesystems — RPi4 SD card layout (set by sd-image module on first flash,
@@ -76,18 +77,19 @@
 
   users.users.administrator = {
     isNormalUser = true;
-    extraGroups = [ "wheel" "scanner" "lp" ];
+    extraGroups = [ "wheel" "scanner" "lp" ];  # scanner+lp for SANE/CUPS access
     openssh.authorizedKeys.keys = [
       "ecdsa-sha2-nistp256 AAAAE2VjZHNhLXNoYTItbmlzdHAyNTYAAAAIbmlzdHAyNTYAAABBBLESV1KGuOruuV5JdUr8wS8iQyIfEeYdJz2MC5zNCOjoTqzJpA3j5e3kdXbyFczRK25o5bFlThHzK2kmwmCE4zE= printscan-administrator"
     ];
   };
-  users.users.root.hashedPassword = "!";  # no password, login disabled
+  users.users.root.hashedPassword = "!";  # disable root login entirely
+  # Headless device — no interactive console for password entry.
   security.sudo.wheelNeedsPassword = false;
 
   nix = {
     settings = {
       experimental-features = [ "nix-command" "flakes" ];
-      auto-optimise-store = true;
+      auto-optimise-store = true;  # hardlink identical store paths — saves SD card space
     };
     gc = {
       automatic = true;
@@ -95,6 +97,7 @@
       options = "--delete-older-than 7d";
     };
   };
+  # Needed for unifi-related packages in container builds.
   nixpkgs.config.allowUnfree = true;
 
   system.autoUpgrade = {
@@ -135,16 +138,18 @@ FLAKE
     fi
   '';
 
-  # Update flake inputs (nixpkgs, upstream) before each auto-upgrade
+  # Update flake inputs (nixpkgs, upstream) before each auto-upgrade.
+  # Without this, auto-upgrade would rebuild from the stale lock file
+  # and never pick up new nixpkgs or upstream changes.
   systemd.services.nixos-upgrade.preStart = "nix flake update --flake /etc/nixos";
 
   # Expand root partition to fill the SD card on first boot
   boot.growPartition = true;
 
-  # SD card longevity
-  boot.tmp.useTmpfs = true;
-  services.journald.extraConfig = "Storage=volatile";
-  fileSystems."/".options = [ "noatime" ];
+  # SD card longevity — minimize writes to extend flash lifetime.
+  boot.tmp.useTmpfs = true;                          # /tmp in RAM, not on disk
+  services.journald.extraConfig = "Storage=volatile"; # journal in RAM, lost on reboot
+  fileSystems."/".options = [ "noatime" ];            # skip access-time writes
 
   # Memory management: zram first, disk swap as OOM safety net
   zramSwap = {
