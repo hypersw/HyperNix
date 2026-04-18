@@ -206,10 +206,17 @@ FLAKE
     };
   };
 
-  # Enable x86_64 binary emulation via qemu-user binfmt.
+  # Enable x86_64 binary emulation via binfmt.
   # Needed because Epson's esci-interpreter scanner plugin is x86_64-only
   # and has no aarch64 build. See services.epkowa-scanner.useX86Backends.
+  #
+  # Default emulator is qemu-user, but its USBDEVFS ioctl translation is
+  # incomplete — async URB submit/reap (libusb-1.x bulk transfers) fails
+  # with EPROTO. Override with FEX-Emu, which is aarch64-specific and has
+  # better syscall coverage for real-world apps.
   boot.binfmt.emulatedSystems = [ "x86_64-linux" ];
+  boot.binfmt.registrations."x86_64-linux".interpreter =
+    lib.mkForce "${pkgs.fex}/bin/FEXInterpreter";
 
   # ── Module enablement ──
   services.laserjet-printer.enable = true;
