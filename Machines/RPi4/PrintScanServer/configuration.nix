@@ -212,11 +212,12 @@ FLAKE
   #
   # Default emulator is qemu-user, but its USBDEVFS ioctl translation is
   # incomplete — async URB submit/reap (libusb-1.x bulk transfers) fails
-  # with EPROTO. Override with FEX-Emu, which is aarch64-specific and has
-  # better syscall coverage for real-world apps.
+  # with EPROTO. FEX-Emu requires ARMv8.2+ and SIGILLs on RPi4's Cortex-A72.
+  # Box64 is designed for older ARM SBCs including RPi4 and handles real-world
+  # x86_64 apps including USB better than qemu-user.
   boot.binfmt.emulatedSystems = [ "x86_64-linux" ];
   boot.binfmt.registrations."x86_64-linux".interpreter =
-    lib.mkForce "${pkgs.fex}/bin/FEXInterpreter";
+    lib.mkForce "${pkgs.box64}/bin/box64";
 
   # ── Module enablement ──
   services.laserjet-printer.enable = true;
