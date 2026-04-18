@@ -67,6 +67,17 @@
     wants = [ "sops-nix.service" ];
   };
 
+  # Advertise hostname on the LAN via mDNS (multicast DNS).
+  # Lets clients reach this machine as printscan.local without DNS config.
+  services.avahi = {
+    enable = true;
+    nssmdns4 = true;  # resolve .local names on this machine too
+    publish = {
+      enable = true;
+      addresses = true;
+    };
+  };
+
   services.openssh = {
     enable = true;
     settings = {
