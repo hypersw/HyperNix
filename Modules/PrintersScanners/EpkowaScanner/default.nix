@@ -33,12 +33,19 @@ let
   # plugin libdirs into one LD_LIBRARY_PATH entry and point the x86_64 ld.so
   # at it before exec'ing the stub. Inherited fds (fd 3) survive this kind
   # of bash exec chain.
+  #
+  # The interpreter .so is linked against libstdc++.so.6 and libgcc_s.so.1
+  # (C++ runtime — the proprietary blob is compiled from C++). Those aren't
+  # the interpreter's problem to find, they're ld.so's — add the x86_64 gcc
+  # cc.lib/lib path so the linker resolves the transitive deps.
   esciPluginLibs = lib.concatMapStringsSep ":"
     (p: "${p}/lib/esci")
     (lib.attrValues (lib.filterAttrs (_: lib.isDerivation) pkgsX86.epkowa.plugins));
 
+  ccRuntimeX86 = "${pkgsX86.stdenv.cc.cc.lib}/lib";
+
   stubWrapper = pkgs.writeShellScriptBin "epkowa-stub-x64" ''
-    export LD_LIBRARY_PATH=${esciPluginLibs}''${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}
+    export LD_LIBRARY_PATH=${esciPluginLibs}:${ccRuntimeX86}''${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}
     exec ${stubBinary}/bin/epkowa-stub-x64 "$@"
   '';
 
