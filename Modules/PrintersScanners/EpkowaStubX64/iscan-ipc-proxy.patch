@@ -97,7 +97,7 @@
 new file mode 100644
 --- /dev/null
 +++ backend/epkowa_ipc.c
-@@ -0,0 +1,591 @@
+@@ -0,0 +1,592 @@
 +/* epkowa_ipc.c — proxy side of the stub/proxy split.
 + *
 + * On architectures that can't load the proprietary esci-interpreter plugin
@@ -123,11 +123,12 @@ new file mode 100644
 +#include <errno.h>
 +#include <fcntl.h>
 +#include <signal.h>
-+#include <stdbool.h>
 +#include <stdint.h>
 +#include <stdio.h>
 +#include <stdlib.h>
 +#include <string.h>
++/* No <stdbool.h> — "defines.h" (via epkowa_ipc.h) supplies iscan's own
++ * bool typedef. See comment in epkowa_ipc.h. */
 +#include <sys/socket.h>
 +#include <sys/stat.h>
 +#include <sys/types.h>
@@ -692,7 +693,7 @@ new file mode 100644
 new file mode 100644
 --- /dev/null
 +++ backend/epkowa_ipc.h
-@@ -0,0 +1,47 @@
+@@ -0,0 +1,51 @@
 +/* epkowa_ipc.h — proxy-side IPC interface (see epkowa_ipc.c).
 + *
 + * These functions mirror the signatures expected by epkowa_ip.c's
@@ -703,10 +704,14 @@ new file mode 100644
 +#ifndef epkowa_ipc_h_included
 +#define epkowa_ipc_h_included
 +
-+#include <stdbool.h>
 +#include <stdint.h>
 +#include <stddef.h>
 +
++/* "defines.h" provides iscan's own `typedef enum { false, true } bool`.
++ * Using <stdbool.h>'s _Bool here would make these declarations
++ * type-incompatible with the `interpreter_type` fn-pointer slots that
++ * epkowa_ip.c assigns them to. */
++#include "defines.h"
 +#include "epkowa_ip_api.h"
 +
 +#ifdef __cplusplus
