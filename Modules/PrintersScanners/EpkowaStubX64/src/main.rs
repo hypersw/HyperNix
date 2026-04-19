@@ -157,6 +157,7 @@ fn write_frame(s: &mut UnixStream, op: u8, payload: &[u8]) -> std::io::Result<()
 // safe regardless of what the plugin does with its input buffers.
 
 unsafe extern "C" fn cb_usb_read(buffer: *mut libc::c_void, length: libc::size_t) -> libc::ssize_t {
+    eprintln!("[stub]   cb_usb_read({} bytes)", length);
     let mut s = cb_sock();
     if write_frame(&mut s, OP_CB_USB_READ, &(length as u32).to_le_bytes()).is_err() {
         return -1;
@@ -176,6 +177,7 @@ unsafe extern "C" fn cb_usb_read(buffer: *mut libc::c_void, length: libc::size_t
 }
 
 unsafe extern "C" fn cb_usb_write(buffer: *mut libc::c_void, length: libc::size_t) -> libc::ssize_t {
+    eprintln!("[stub]   cb_usb_write({} bytes)", length);
     let mut s = cb_sock();
     let data = std::slice::from_raw_parts(buffer as *const u8, length);
     let mut payload = Vec::with_capacity(4 + data.len());
@@ -489,20 +491,38 @@ fn serve(mut sock: UnixStream) -> std::io::Result<()> {
         let plen = read_u32(&mut sock)? as usize;
         let payload = read_exact(&mut sock, plen)?;
 
-        match op {
-            OP_OPEN_LIBRARY => handle_open_library(&mut sock, &payload)?,
-            OP_INT_INIT_WITH_CTRL => handle_int_init(&mut sock, &payload)?,
-            OP_INT_FINI => handle_int_fini(&mut sock)?,
-            OP_INT_READ => handle_int_read(&mut sock, &payload)?,
-            OP_INT_WRITE => handle_int_write(&mut sock, &payload)?,
-            OP_INT_POWER_SAVING_MODE => handle_power_saving(&mut sock)?,
-            OP_FUNCTION_S_0 => handle_function_s_0(&mut sock, &payload)?,
-            OP_FUNCTION_S_1 => handle_function_s_1(&mut sock, &payload)?,
+        // Per-op log to stderr — catches which call was in flight when the
+        // loaded proprietary .so aborts the process (e.g. glibc double-free
+        // detection). `eprintln!` flushes, so the final line before a crash
+        // survives to the caller's stderr.
+        let op_name = match op {
+            OP_OPEN_LIBRARY => "OPEN_LIBRARY",
+            OP_INT_INIT_WITH_CTRL => "INT_INIT[_WITH_CTRL]",
+            OP_INT_FINI => "INT_FINI",
+            OP_INT_READ => "INT_READ",
+            OP_INT_WRITE => "INT_WRITE",
+            OP_INT_POWER_SAVING_MODE => "INT_POWER_SAVING_MODE",
+            OP_FUNCTION_S_0 => "FUNCTION_S_0",
+            OP_FUNCTION_S_1 => "FUNCTION_S_1",
+            _ => "?",
+        };
+        eprintln!("[stub] -> {} ({} bytes)", op_name, plen);
+        let r = match op {
+            OP_OPEN_LIBRARY => handle_open_library(&mut sock, &payload),
+            OP_INT_INIT_WITH_CTRL => handle_int_init(&mut sock, &payload),
+            OP_INT_FINI => handle_int_fini(&mut sock),
+            OP_INT_READ => handle_int_read(&mut sock, &payload),
+            OP_INT_WRITE => handle_int_write(&mut sock, &payload),
+            OP_INT_POWER_SAVING_MODE => handle_power_saving(&mut sock),
+            OP_FUNCTION_S_0 => handle_function_s_0(&mut sock, &payload),
+            OP_FUNCTION_S_1 => handle_function_s_1(&mut sock, &payload),
             other => {
                 eprintln!("[stub] unknown op 0x{:02x}", other);
                 return Ok(());
             }
-        }
+        };
+        eprintln!("[stub] <- {} done", op_name);
+        r?;
     }
 }
 
