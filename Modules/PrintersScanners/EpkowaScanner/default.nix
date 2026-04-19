@@ -1,4 +1,4 @@
-{ config, lib, pkgs, nixpkgs-old-x86 ? null, ... }:
+{ config, lib, pkgs, ... }:
 let
   cfg = config.services.epkowa-scanner;
 
@@ -16,15 +16,11 @@ let
   # over an inherited Unix socket; USB callbacks are forwarded back over the
   # same socket to the aarch64 side. See PROTOCOL.md in EpkowaStubX64/.
   #
-  # Pinned old nixpkgs for the x86_64 side: the interpreter plugin and its
-  # loader were built against a specific libc era. Modern nixpkgs x86_64
-  # binaries work fine for computational code, but pinning keeps the
-  # surface stable.
+  # x86_64 side uses the same nixpkgs as the host — the stub only does pure
+  # CPU work (ESC/I byte munging) under qemu-user, which handles arbitrary
+  # glibc syscalls fine. No USB ioctl drama since USB stays aarch64-native.
 
-  pkgsX86 =
-    if nixpkgs-old-x86 != null
-    then import nixpkgs-old-x86 { system = "x86_64-linux"; config.allowUnfree = true; }
-    else import pkgs.path       { system = "x86_64-linux"; config.allowUnfree = true; };
+  pkgsX86 = import pkgs.path { system = "x86_64-linux"; config.allowUnfree = true; };
 
   # Rust stub, cross-compiled to x86_64 (rustPlatform uses native cross-
   # compilation — no qemu at build time). Loads the proprietary plugin
