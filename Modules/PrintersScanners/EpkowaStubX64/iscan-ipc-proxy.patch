@@ -1,0 +1,790 @@
+diff --git a/backend/Makefile.am b/backend/Makefile.am
+index 4a36339..0a885fd 100644
+--- a/backend/Makefile.am
++++ b/backend/Makefile.am
+@@ -97,6 +97,8 @@ libepkowa_la_SOURCES = \
+ 	epkowa_ip.c \
+ 	epkowa_ip.h \
+ 	epkowa_ip_api.h \
++	epkowa_ipc.c \
++	epkowa_ipc.h \
+ 	channel.c \
+ 	channel.h \
+ 	channel-net.c \
+diff --git a/backend/epkowa_ip.c b/backend/epkowa_ip.c
+index 763a34a..8751594 100644
+--- a/backend/epkowa_ip.c
++++ b/backend/epkowa_ip.c
+@@ -62,6 +62,15 @@
+ 
+ #include "sane/sanei_usb.h"
+ 
++#ifdef USE_IPC_PROXY
++#include "epkowa_ipc.h"
++/* Non-NULL sentinel we stash in interpreter->_module when the "library"
++ * was loaded via the IPC proxy. Dereferencing is never done; we only
++ * compare for NULL-ness. */
++static int _ipc_module_sentinel;
++#define IPC_MODULE_SENTINEL ((void *)&_ipc_module_sentinel)
++#endif
++
+ #define TICK_INTERVAL	60	/* seconds */
+ #define TICK_TIME_OUT	15	/* intervals */
+ 
+@@ -190,7 +199,16 @@ _dtor (device_type *device)
+   alarm (0);
+ #endif
+ 
+-  lt_dlclose (device->interpreter->_module);
++#ifdef USE_IPC_PROXY
++  if (device->interpreter->_module == IPC_MODULE_SENTINEL)
++  {
++    ipc_unload_interpreter ();
++  }
++  else
++#endif
++  {
++    lt_dlclose (device->interpreter->_module);
++  }
+   device->interpreter->_module = 0;
+ 
+   delete (device->interpreter);
+@@ -435,6 +453,37 @@ _load (const char *name, device_type *device)
+   void *handle = NULL;
+   struct interpreter_type *di = device->interpreter;
+ 
++#ifdef USE_IPC_PROXY
++  /* Load the interpreter via an out-of-process stub (different-arch
++   * plugins) and fill the function-pointer slots with IPC wrappers. */
++  {
++    bool has_ctrl = false;
++    if (!ipc_load_interpreter (name, &has_ctrl))
++    {
++      err_fatal ("ipc_load_interpreter failed for %s", name);
++      return NULL;
++    }
++    if (has_ctrl)
++    {
++      di->_init_with_ctrl = ipc_int_init_with_ctrl;
++      di->_init = NULL;
++    }
++    else
++    {
++      di->_init_with_ctrl = NULL;
++      di->_init = ipc_int_init;
++    }
++    di->_fini  = ipc_int_fini;
++    di->_read  = ipc_int_read;
++    di->_write = ipc_int_write;
++    di->_power = ipc_int_power_saving_mode;
++    di->_s_0   = ipc_function_s_0;
++    di->_s_1   = ipc_function_s_1;
++    handle = IPC_MODULE_SENTINEL;
++    goto installed;
++  }
++#endif
++
+   /* FIXME: should set the search path to a list of directories based
+      on the regular load path with the PACKAGE attached to each of the
+      individual directories.  Should _not_ look in the regular load
+@@ -491,6 +540,10 @@ _load (const char *name, device_type *device)
+       return NULL;
+     }
+ 
++#ifdef USE_IPC_PROXY
++installed:
++#endif
++
+   /* FIXME: if we are still here, we should set up the alarm stuff
+      here because _load is really a sort of ctor.  Note that open
+      should disarm the alarm and close should re-arm it.  Our dtor
+diff --git a/backend/epkowa_ipc.c b/backend/epkowa_ipc.c
+new file mode 100644
+index 0000000..38b7df8
+--- /dev/null
++++ b/backend/epkowa_ipc.c
+@@ -0,0 +1,591 @@
++/* epkowa_ipc.c — proxy side of the stub/proxy split.
++ *
++ * On architectures that can't load the proprietary esci-interpreter plugin
++ * directly (e.g. aarch64 hosts with only x86_64 plugin binaries available),
++ * spawn a per-scan helper process that loads the plugin and serves API calls
++ * over a Unix socket. USB stays on this (aarch64) side — the stub forwards
++ * USB callbacks back to us.
++ *
++ * Compiled only when --enable-ipc-proxy is passed to configure (defines
++ * USE_IPC_PROXY). Otherwise epkowa_ip.c's _load() uses lt_dlopenext as
++ * before and this file is inert.
++ *
++ * See HyperNix/Modules/PrintersScanners/EpkowaStubX64/PROTOCOL.md for the
++ * wire format.
++ */
++
++#ifdef HAVE_CONFIG_H
++#include <config.h>
++#endif
++
++#ifdef USE_IPC_PROXY
++
++#include <errno.h>
++#include <fcntl.h>
++#include <signal.h>
++#include <stdbool.h>
++#include <stdint.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <sys/socket.h>
++#include <sys/stat.h>
++#include <sys/types.h>
++#include <sys/wait.h>
++#include <unistd.h>
++
++#include "epkowa_ip_api.h"
++#include "epkowa_ipc.h"
++#include "message.h"       /* err_fatal, err_minor, log_info */
++
++
++/* ─── Op codes (mirror of Rust constants in stub/src/main.rs) ──────── */
++
++#define OP_INT_INIT_WITH_CTRL       0x01
++#define OP_INT_FINI                 0x02
++#define OP_INT_READ                 0x03
++#define OP_INT_WRITE                0x04
++#define OP_INT_POWER_SAVING_MODE    0x05
++#define OP_FUNCTION_S_0             0x06
++#define OP_FUNCTION_S_1             0x07
++#define OP_OPEN_LIBRARY             0x08
++
++#define OP_INT_INIT_RESP            0x81
++#define OP_INT_FINI_RESP            0x82
++#define OP_INT_READ_RESP            0x83
++#define OP_INT_WRITE_RESP           0x84
++#define OP_INT_POWER_SAVING_MODE_RESP 0x85
++#define OP_FUNCTION_S_0_RESP        0x86
++#define OP_FUNCTION_S_1_RESP        0x87
++#define OP_OPEN_LIBRARY_RESP        0x88
++
++#define OP_CB_USB_READ              0xC1
++#define OP_CB_USB_WRITE             0xC2
++#define OP_CB_USB_CTRL              0xC3
++
++#define OP_CB_USB_READ_RESP         0xD1
++#define OP_CB_USB_WRITE_RESP        0xD2
++#define OP_CB_USB_CTRL_RESP         0xD3
++
++
++/* ─── State ─────────────────────────────────────────────────────────── */
++
++/* One stub process per loaded interpreter. We follow iscan's existing
++ * pattern of "one interpreter at a time" (g_epson is also a file-scoped
++ * global). */
++static int  g_sock = -1;
++static pid_t g_stub_pid = -1;
++
++/* Registered USB callbacks, captured at int_init/int_init_with_ctrl time and
++ * invoked when the stub sends a CB_* request back to us. */
++static io_callback    *g_cb_read  = NULL;
++static io_callback    *g_cb_write = NULL;
++static ctrl_callback  *g_cb_ctrl  = NULL;
++
++
++/* ─── Wire helpers ──────────────────────────────────────────────────── */
++
++static int write_all(int fd, const void *buf, size_t n)
++{
++  const char *p = buf;
++  while (n) {
++    ssize_t w = write(fd, p, n);
++    if (w < 0) { if (errno == EINTR) continue; return -1; }
++    if (w == 0) return -1;
++    p += w; n -= w;
++  }
++  return 0;
++}
++
++static int read_all(int fd, void *buf, size_t n)
++{
++  char *p = buf;
++  while (n) {
++    ssize_t r = read(fd, p, n);
++    if (r < 0) { if (errno == EINTR) continue; return -1; }
++    if (r == 0) return -1;  /* EOF before we got all bytes */
++    p += r; n -= r;
++  }
++  return 0;
++}
++
++static int read_u8(int fd, uint8_t *out)
++{
++  return read_all(fd, out, 1);
++}
++
++static int read_u32(int fd, uint32_t *out)
++{
++  return read_all(fd, out, 4);
++}
++
++static int read_i64(int fd, int64_t *out)
++{
++  return read_all(fd, out, 8);
++}
++
++static int write_frame(int fd, uint8_t op, const void *payload, uint32_t len)
++{
++  if (write_all(fd, &op, 1) < 0) return -1;
++  if (write_all(fd, &len, 4) < 0) return -1;
++  if (len && write_all(fd, payload, len) < 0) return -1;
++  return 0;
++}
++
++
++/* ─── Callback dispatcher ────────────────────────────────────────────
++ *
++ * When we send a request to the stub, the stub may send CB_* requests
++ * back (for USB reads/writes/control) before producing the final response.
++ * Loop reading incoming messages, serving callbacks in-line, until we
++ * see the response matching `expected_op`.
++ */
++
++static int handle_cb_usb_read(void)
++{
++  uint32_t length;
++  if (read_u32(g_sock, &length) < 0) return -1;
++
++  void *buf = malloc(length ? length : 1);
++  if (!buf) return -1;
++  ssize_t ret = g_cb_read ? g_cb_read(buf, length) : 0;
++  size_t data_len = (ret > 0) ? (size_t)ret : 0;
++
++  /* Response: i64 ret, u32 data_len, bytes */
++  size_t payload_len = 8 + 4 + data_len;
++  uint8_t *payload = malloc(payload_len);
++  if (!payload) { free(buf); return -1; }
++  int64_t ret64 = (int64_t)ret;
++  memcpy(payload,     &ret64,    8);
++  uint32_t dlen32 = (uint32_t)data_len;
++  memcpy(payload + 8, &dlen32,   4);
++  if (data_len) memcpy(payload + 12, buf, data_len);
++
++  int rc = write_frame(g_sock, OP_CB_USB_READ_RESP, payload, payload_len);
++  free(payload);
++  free(buf);
++  return rc;
++}
++
++static int handle_cb_usb_write(uint32_t plen)
++{
++  if (plen < 4) return -1;
++  uint32_t dlen;
++  if (read_u32(g_sock, &dlen) < 0) return -1;
++  if (plen != 4 + dlen) return -1;
++
++  void *buf = malloc(dlen ? dlen : 1);
++  if (!buf) return -1;
++  if (dlen && read_all(g_sock, buf, dlen) < 0) { free(buf); return -1; }
++
++  ssize_t ret = g_cb_write ? g_cb_write(buf, dlen) : 0;
++  free(buf);
++
++  int64_t ret64 = (int64_t)ret;
++  return write_frame(g_sock, OP_CB_USB_WRITE_RESP, &ret64, 8);
++}
++
++static int handle_cb_usb_ctrl(uint32_t plen)
++{
++  /* Layout: u32 req_type, u32 request, u32 value, u32 index, u32 size,
++   *         u32 data_len, bytes[data_len]. */
++  if (plen < 24) return -1;
++  uint32_t request_type, request, value, index, size, data_len;
++  if (read_u32(g_sock, &request_type) < 0) return -1;
++  if (read_u32(g_sock, &request)      < 0) return -1;
++  if (read_u32(g_sock, &value)        < 0) return -1;
++  if (read_u32(g_sock, &index)        < 0) return -1;
++  if (read_u32(g_sock, &size)         < 0) return -1;
++  if (read_u32(g_sock, &data_len)     < 0) return -1;
++  if (plen != 24 + data_len) return -1;
++
++  /* For an IN transfer, we allocate `size` bytes and pass to the callback
++   * to be filled. For OUT, we read the data from the socket. */
++  int is_in = (request_type & 0x80) != 0;
++  size_t buf_len = is_in ? size : data_len;
++  uint8_t *buf = malloc(buf_len ? buf_len : 1);
++  if (!buf) return -1;
++  if (!is_in && data_len) {
++    if (read_all(g_sock, buf, data_len) < 0) { free(buf); return -1; }
++  }
++
++  ssize_t ret = g_cb_ctrl
++    ? g_cb_ctrl(request_type, request, value, index, size, buf)
++    : 0;
++
++  uint32_t resp_data_len = (is_in && ret > 0) ? (uint32_t)ret : 0;
++  size_t resp_len = 8 + 4 + resp_data_len;
++  uint8_t *resp = malloc(resp_len);
++  if (!resp) { free(buf); return -1; }
++  int64_t ret64 = (int64_t)ret;
++  memcpy(resp,     &ret64,         8);
++  memcpy(resp + 8, &resp_data_len, 4);
++  if (resp_data_len) memcpy(resp + 12, buf, resp_data_len);
++
++  int rc = write_frame(g_sock, OP_CB_USB_CTRL_RESP, resp, resp_len);
++  free(resp);
++  free(buf);
++  return rc;
++}
++
++/* Wait for a response with op == `expected`, servicing callbacks in-line. */
++static int await_response(uint8_t expected, uint8_t *out_op, uint32_t *out_plen)
++{
++  for (;;) {
++    uint8_t  op;
++    uint32_t plen;
++    if (read_u8(g_sock, &op)   < 0) return -1;
++    if (read_u32(g_sock, &plen) < 0) return -1;
++
++    switch (op) {
++      case OP_CB_USB_READ:
++        /* plen is the length of *our* payload (u32 length). We don't use
++         * it directly — handle_cb_usb_read reads its own fields. */
++        (void)plen;
++        if (handle_cb_usb_read() < 0) return -1;
++        continue;
++      case OP_CB_USB_WRITE:
++        if (handle_cb_usb_write(plen) < 0) return -1;
++        continue;
++      case OP_CB_USB_CTRL:
++        if (handle_cb_usb_ctrl(plen) < 0) return -1;
++        continue;
++      default:
++        if (op != expected) {
++          err_fatal("ipc: unexpected op 0x%02x (expected 0x%02x)", op, expected);
++          return -1;
++        }
++        *out_op   = op;
++        *out_plen = plen;
++        return 0;
++    }
++  }
++}
++
++
++/* ─── Stub lifecycle ────────────────────────────────────────────────── */
++
++static int spawn_stub(void)
++{
++  int sv[2];
++  if (socketpair(AF_UNIX, SOCK_STREAM, 0, sv) < 0) {
++    err_fatal("ipc: socketpair: %s", strerror(errno));
++    return -1;
++  }
++
++  const char *stub_path = getenv("EPKOWA_IPC_STUB");
++  if (!stub_path) stub_path = IPC_STUB_PATH;  /* defined at configure time */
++
++  pid_t pid = fork();
++  if (pid < 0) {
++    err_fatal("ipc: fork: %s", strerror(errno));
++    close(sv[0]); close(sv[1]);
++    return -1;
++  }
++  if (pid == 0) {
++    /* Child: arrange stub end on fd 3, close everything else we don't
++     * need, then exec the stub. */
++    if (dup2(sv[1], 3) < 0) _exit(127);
++    /* Close parent end + the original stub-end fd. fd 3 is what we want. */
++    if (sv[0] != 3) close(sv[0]);
++    if (sv[1] != 3) close(sv[1]);
++    /* Best-effort close of any stray open fds (SANE frontends may have
++     * others open). Keep 0/1/2/3. */
++    long maxfd = sysconf(_SC_OPEN_MAX);
++    if (maxfd <= 0) maxfd = 1024;
++    for (int fd = 4; fd < maxfd; ++fd) close(fd);
++
++    char *argv[] = { (char *)stub_path, NULL };
++    execv(stub_path, argv);
++    _exit(127);
++  }
++
++  close(sv[1]);
++  g_sock = sv[0];
++  g_stub_pid = pid;
++  return 0;
++}
++
++static void shutdown_stub(void)
++{
++  if (g_sock >= 0) { close(g_sock); g_sock = -1; }
++  if (g_stub_pid > 0) {
++    /* The stub should exit on its own when the socket closes, but reap
++     * it either way to avoid zombies. Give it a brief chance to exit
++     * gracefully before SIGKILL. */
++    for (int i = 0; i < 20; ++i) {
++      int status;
++      pid_t r = waitpid(g_stub_pid, &status, WNOHANG);
++      if (r == g_stub_pid || r < 0) { g_stub_pid = -1; return; }
++      usleep(50 * 1000);
++    }
++    kill(g_stub_pid, SIGKILL);
++    waitpid(g_stub_pid, NULL, 0);
++    g_stub_pid = -1;
++  }
++}
++
++
++/* ─── Public entry point (replaces lt_dlopenext in epkowa_ip.c) ──── */
++
++bool ipc_load_interpreter(const char *library_name, bool *has_ctrl)
++{
++  if (g_sock >= 0) {
++    /* We're already loaded — either this is a re-entrant call (bug) or
++     * the previous interpreter wasn't cleanly torn down. Reset. */
++    shutdown_stub();
++  }
++  if (spawn_stub() < 0) return false;
++
++  /* Send OPEN_LIBRARY: u16 name_len, bytes */
++  size_t nlen = strlen(library_name);
++  if (nlen > UINT16_MAX) { shutdown_stub(); return false; }
++  size_t payload_len = 2 + nlen;
++  uint8_t *payload = malloc(payload_len);
++  if (!payload) { shutdown_stub(); return false; }
++  uint16_t n16 = (uint16_t)nlen;
++  memcpy(payload,     &n16,         2);
++  memcpy(payload + 2, library_name, nlen);
++  int rc = write_frame(g_sock, OP_OPEN_LIBRARY, payload, payload_len);
++  free(payload);
++  if (rc < 0) { shutdown_stub(); return false; }
++
++  uint8_t op; uint32_t plen;
++  if (await_response(OP_OPEN_LIBRARY_RESP, &op, &plen) < 0 || plen < 2) {
++    shutdown_stub();
++    return false;
++  }
++  uint8_t resp[2];
++  if (read_all(g_sock, resp, 2) < 0) { shutdown_stub(); return false; }
++  if (resp[0] != 1) { shutdown_stub(); return false; }
++  if (has_ctrl) *has_ctrl = (resp[1] != 0);
++  return true;
++}
++
++void ipc_unload_interpreter(void)
++{
++  shutdown_stub();
++  g_cb_read = NULL;
++  g_cb_write = NULL;
++  g_cb_ctrl = NULL;
++}
++
++
++/* ─── Wrapper functions (IPC versions of int_*, function_s_*) ───── */
++
++static bool ipc_common_init(int fd, io_callback *r, io_callback *w,
++                            ctrl_callback *c, bool use_ctrl)
++{
++  g_cb_read = r;
++  g_cb_write = w;
++  g_cb_ctrl = c;
++
++  uint8_t payload[5];
++  memcpy(payload, &fd, 4);
++  payload[4] = use_ctrl ? 1 : 0;
++  if (write_frame(g_sock, OP_INT_INIT_WITH_CTRL, payload, 5) < 0) return false;
++
++  uint8_t op; uint32_t plen;
++  if (await_response(OP_INT_INIT_RESP, &op, &plen) < 0 || plen < 1) return false;
++  uint8_t ok;
++  if (read_all(g_sock, &ok, 1) < 0) return false;
++  return ok != 0;
++}
++
++bool ipc_int_init(int fd, io_callback *read_cb, io_callback *write_cb)
++{
++  return ipc_common_init(fd, read_cb, write_cb, NULL, false);
++}
++
++bool ipc_int_init_with_ctrl(int fd, io_callback *read_cb, io_callback *write_cb,
++                            ctrl_callback *ctrl_cb)
++{
++  return ipc_common_init(fd, read_cb, write_cb, ctrl_cb, true);
++}
++
++void ipc_int_fini(void)
++{
++  if (g_sock < 0) return;
++  (void)write_frame(g_sock, OP_INT_FINI, NULL, 0);
++  uint8_t op; uint32_t plen;
++  (void)await_response(OP_INT_FINI_RESP, &op, &plen);
++}
++
++int ipc_int_read(void *buffer, size_t length)
++{
++  if (g_sock < 0) return -1;
++  uint32_t len32 = (uint32_t)length;
++  if (write_frame(g_sock, OP_INT_READ, &len32, 4) < 0) return -1;
++
++  uint8_t op; uint32_t plen;
++  if (await_response(OP_INT_READ_RESP, &op, &plen) < 0) return -1;
++  if (plen < 8) return -1;
++  int32_t ret;
++  uint32_t dlen;
++  if (read_all(g_sock, &ret,  4) < 0) return -1;
++  if (read_all(g_sock, &dlen, 4) < 0) return -1;
++  if (plen != 8 + dlen) return -1;
++  if (dlen) {
++    size_t take = (dlen <= length) ? dlen : length;
++    if (read_all(g_sock, buffer, take) < 0) return -1;
++    if (dlen > take) {
++      /* Drain extra, shouldn't happen in practice but be safe. */
++      uint8_t scratch[4096];
++      size_t remaining = dlen - take;
++      while (remaining) {
++        size_t chunk = remaining > sizeof(scratch) ? sizeof(scratch) : remaining;
++        if (read_all(g_sock, scratch, chunk) < 0) return -1;
++        remaining -= chunk;
++      }
++    }
++  }
++  return ret;
++}
++
++int ipc_int_write(void *buffer, size_t length)
++{
++  if (g_sock < 0) return -1;
++  uint32_t dlen = (uint32_t)length;
++  size_t payload_len = 4 + dlen;
++  uint8_t *payload = malloc(payload_len);
++  if (!payload) return -1;
++  memcpy(payload, &dlen, 4);
++  if (dlen) memcpy(payload + 4, buffer, dlen);
++  int rc = write_frame(g_sock, OP_INT_WRITE, payload, payload_len);
++  free(payload);
++  if (rc < 0) return -1;
++
++  uint8_t op; uint32_t plen;
++  if (await_response(OP_INT_WRITE_RESP, &op, &plen) < 0) return -1;
++  if (plen < 4) return -1;
++  int32_t ret;
++  if (read_all(g_sock, &ret, 4) < 0) return -1;
++  return ret;
++}
++
++void ipc_int_power_saving_mode(void)
++{
++  if (g_sock < 0) return;
++  (void)write_frame(g_sock, OP_INT_POWER_SAVING_MODE, NULL, 0);
++  uint8_t op; uint32_t plen;
++  (void)await_response(OP_INT_POWER_SAVING_MODE_RESP, &op, &plen);
++}
++
++int ipc_function_s_0(unsigned int offset, unsigned int width,
++                     unsigned int resolution, unsigned int opt_resolution,
++                     double *table)
++{
++  if (g_sock < 0) return 0;
++  /* table length is `width` doubles per _ftor1. Encode that explicitly. */
++  uint32_t tlen = (uint32_t)width;
++  size_t payload_len = 5 * 4 + (size_t)tlen * 8;
++  uint8_t *payload = malloc(payload_len);
++  if (!payload) return 0;
++  memcpy(payload,      &offset,         4);
++  memcpy(payload + 4,  &width,          4);
++  memcpy(payload + 8,  &resolution,     4);
++  memcpy(payload + 12, &opt_resolution, 4);
++  memcpy(payload + 16, &tlen,           4);
++  if (tlen) memcpy(payload + 20, table, (size_t)tlen * 8);
++  int rc = write_frame(g_sock, OP_FUNCTION_S_0, payload, payload_len);
++  free(payload);
++  if (rc < 0) return 0;
++
++  uint8_t op; uint32_t plen;
++  if (await_response(OP_FUNCTION_S_0_RESP, &op, &plen) < 0) return 0;
++  if (plen < 8) return 0;
++  int32_t ret;
++  uint32_t resp_tlen;
++  if (read_all(g_sock, &ret,       4) < 0) return 0;
++  if (read_all(g_sock, &resp_tlen, 4) < 0) return 0;
++  if (plen != 8 + (uint32_t)resp_tlen * 8) return 0;
++  if (resp_tlen) {
++    size_t take = resp_tlen > tlen ? tlen : resp_tlen;
++    if (read_all(g_sock, table, (size_t)take * 8) < 0) return 0;
++    if (resp_tlen > take) {
++      /* Defensive drain; shouldn't happen if stub obeys the protocol. */
++      uint8_t scratch[4096];
++      size_t remaining = ((size_t)resp_tlen - take) * 8;
++      while (remaining) {
++        size_t chunk = remaining > sizeof(scratch) ? sizeof(scratch) : remaining;
++        if (read_all(g_sock, scratch, chunk) < 0) return 0;
++        remaining -= chunk;
++      }
++    }
++  }
++  return ret;
++}
++
++void ipc_function_s_1(uint8_t *in_buf, uint8_t *out_buf,
++                      unsigned int width, bool color, double *table)
++{
++  if (g_sock < 0) return;
++  /* Actual byte lengths of in/out buffers aren't passed as arguments by
++   * the interpreter API — the caller (_ftor0) knows them as bytes_per_line
++   * but only passes `pixels_per_line` as `width`. We need byte lengths.
++   *
++   * The convention is: buffer length is `width * bytes_per_pixel`. For the
++   * supported V33 depth-8 formats: grayscale = width*1, RGB = width*3.
++   * (Depth-1 never reaches here per _ftor0's guard.) */
++  unsigned int bytes_per_pixel = color ? 3 : 1;
++  uint32_t buflen = (uint32_t)(width * bytes_per_pixel);
++  uint32_t tlen = (uint32_t)width;
++
++  size_t payload_len = 4 + 1 + 4 + (size_t)tlen * 8 + 4 + (size_t)buflen;
++  uint8_t *payload = malloc(payload_len);
++  if (!payload) return;
++  size_t off = 0;
++  memcpy(payload + off, &width, 4); off += 4;
++  payload[off++] = color ? 1 : 0;
++  memcpy(payload + off, &tlen, 4); off += 4;
++  if (tlen) { memcpy(payload + off, table, (size_t)tlen * 8); off += (size_t)tlen * 8; }
++  memcpy(payload + off, &buflen, 4); off += 4;
++  if (buflen) { memcpy(payload + off, in_buf, buflen); off += buflen; }
++  int rc = write_frame(g_sock, OP_FUNCTION_S_1, payload, payload_len);
++  free(payload);
++  if (rc < 0) return;
++
++  uint8_t op; uint32_t plen;
++  if (await_response(OP_FUNCTION_S_1_RESP, &op, &plen) < 0) return;
++  /* Response: u32 out_len, bytes, u32 tlen, doubles */
++  if (plen < 8) return;
++  uint32_t out_len;
++  if (read_all(g_sock, &out_len, 4) < 0) return;
++  if (out_len) {
++    size_t take = out_len > buflen ? buflen : out_len;
++    if (read_all(g_sock, out_buf, take) < 0) return;
++    if (out_len > take) {
++      uint8_t scratch[4096];
++      size_t remaining = (size_t)out_len - take;
++      while (remaining) {
++        size_t chunk = remaining > sizeof(scratch) ? sizeof(scratch) : remaining;
++        if (read_all(g_sock, scratch, chunk) < 0) return;
++        remaining -= chunk;
++      }
++    }
++  }
++  uint32_t resp_tlen;
++  if (read_all(g_sock, &resp_tlen, 4) < 0) return;
++  if (resp_tlen) {
++    size_t take = resp_tlen > tlen ? tlen : resp_tlen;
++    if (read_all(g_sock, table, take * 8) < 0) return;
++    if (resp_tlen > take) {
++      uint8_t scratch[4096];
++      size_t remaining = ((size_t)resp_tlen - take) * 8;
++      while (remaining) {
++        size_t chunk = remaining > sizeof(scratch) ? sizeof(scratch) : remaining;
++        if (read_all(g_sock, scratch, chunk) < 0) return;
++        remaining -= chunk;
++      }
++    }
++  }
++}
++
++#else  /* !USE_IPC_PROXY */
++
++/* Keep the object compilable with an empty TU when disabled, so the
++ * Makefile can unconditionally list epkowa_ipc.c without an autoconf
++ * conditional on every source list. */
++typedef int keep_iso_c_happy;
++
++#endif  /* USE_IPC_PROXY */
+diff --git a/backend/epkowa_ipc.h b/backend/epkowa_ipc.h
+new file mode 100644
+index 0000000..0974eb3
+--- /dev/null
++++ b/backend/epkowa_ipc.h
+@@ -0,0 +1,47 @@
++/* epkowa_ipc.h — proxy-side IPC interface (see epkowa_ipc.c).
++ *
++ * These functions mirror the signatures expected by epkowa_ip.c's
++ * `interpreter_type` function-pointer slots, so _load() can fill the
++ * slots with &ipc_int_init (etc.) when --enable-ipc-proxy is on.
++ */
++
++#ifndef epkowa_ipc_h_included
++#define epkowa_ipc_h_included
++
++#include <stdbool.h>
++#include <stdint.h>
++#include <stddef.h>
++
++#include "epkowa_ip_api.h"
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++/* Lifecycle: spawn a stub process and load the given interpreter library
++ * inside it. Sets *has_ctrl to whether the plugin exports
++ * int_init_with_ctrl (vs. only int_init). Call ipc_unload_interpreter()
++ * to tear down. */
++bool ipc_load_interpreter(const char *library_name, bool *has_ctrl);
++void ipc_unload_interpreter(void);
++
++/* IPC-backed versions of the interpreter API. Installed into
++ * interpreter_type by epkowa_ip.c:_load() when USE_IPC_PROXY. */
++bool ipc_int_init           (int fd, io_callback *read_cb, io_callback *write_cb);
++bool ipc_int_init_with_ctrl (int fd, io_callback *read_cb, io_callback *write_cb,
++                             ctrl_callback *ctrl_cb);
++void ipc_int_fini           (void);
++int  ipc_int_read           (void *buffer, size_t length);
++int  ipc_int_write          (void *buffer, size_t length);
++void ipc_int_power_saving_mode (void);
++int  ipc_function_s_0       (unsigned int offset, unsigned int width,
++                             unsigned int resolution, unsigned int opt_resolution,
++                             double *table);
++void ipc_function_s_1       (uint8_t *in_buf, uint8_t *out_buf,
++                             unsigned int width, bool color, double *table);
++
++#ifdef __cplusplus
++} /* extern "C" */
++#endif
++
++#endif /* !epkowa_ipc_h_included */
+diff --git a/configure.ac b/configure.ac
+index 3459e62..8dab895 100644
+--- a/configure.ac
++++ b/configure.ac
+@@ -315,6 +315,35 @@ AC_MSG_RESULT([$enable_timing])
+ AM_CONDITIONAL(ENABLE_TIMING, test x$enable_timing = xyes)
+ 
+ 
++dnl  Use an out-of-process "stub" to run the proprietary esci-interpreter
++dnl  plugins when they can't be loaded natively (e.g. x86_64 plugins on an
++dnl  aarch64 host). When enabled, epkowa_ip.c's _load() forwards calls over
++dnl  a Unix socket to a per-scan helper process which does the dlopen.
++dnl
++dnl  --with-ipc-stub=PATH sets the compile-time default path to the helper
++dnl  executable. Overridable at run time via the EPKOWA_IPC_STUB env var.
++
++AC_MSG_CHECKING(whether to use the IPC proxy for interpreter plugins)
++AC_ARG_ENABLE(ipc-proxy,
++	      AC_HELP_STRING([--enable-ipc-proxy],
++			     [forward esci-interpreter calls to an out-of-process stub]),
++	      ,
++	      [enable_ipc_proxy=no])
++AC_MSG_RESULT([$enable_ipc_proxy])
++if test x$enable_ipc_proxy = xyes; then
++  AC_DEFINE([USE_IPC_PROXY], 1,
++	    [Define to 1 to use an out-of-process stub for esci-interpreter plugins.])
++  AC_ARG_WITH(ipc-stub,
++	      AC_HELP_STRING([--with-ipc-stub=PATH],
++			     [default path to the stub helper executable]),
++	      [ipc_stub_path=$withval],
++	      [ipc_stub_path=/usr/libexec/epkowa-stub-x64])
++  AC_DEFINE_UNQUOTED([IPC_STUB_PATH], ["$ipc_stub_path"],
++		     [Default path to the interpreter stub executable.])
++fi
++AM_CONDITIONAL(ENABLE_IPC_PROXY, test x$enable_ipc_proxy = xyes)
++
++
+ dnl  Facilitate builds on architectures other than i386 and friends.
+ 
+ AC_SUBST(ISCAN_HOST_CPU,[$host_cpu])

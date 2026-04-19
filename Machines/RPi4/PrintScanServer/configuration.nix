@@ -206,21 +206,17 @@ FLAKE
     };
   };
 
-  # Enable x86_64 binary emulation via qemu-user binfmt — used for build-time
-  # x86_64 invocations (nix builds pulling pinned pkgsX86).
-  #
-  # Runtime scanner path uses box64 directly (not binfmt), see EpkowaScanner
-  # module: qemu-user's USBDEVFS ioctl coverage is incomplete (libusb bulk
-  # transfers fail with EPROTO), but box64's isn't stable enough to be the
-  # global binfmt handler.
+  # Enable x86_64 binary emulation via qemu-user binfmt.
+  # The EpkowaScanner module's proxy/stub approach spawns a short-lived
+  # x86_64 helper per scan (see EpkowaStubX64/PROTOCOL.md). qemu-user runs
+  # the helper transparently. USB stays aarch64-native in our code — the
+  # helper does pure CPU work (ESC/I byte munging), which qemu-user handles
+  # fine. This also lets nix build x86_64 dependencies under emulation.
   boot.binfmt.emulatedSystems = [ "x86_64-linux" ];
 
   # ── Module enablement ──
   services.laserjet-printer.enable = true;
-  services.epkowa-scanner = {
-    enable = true;
-    useX86Backends = true;  # scanimage-x86 via qemu-user binfmt (epkowa interpreter is x86_64-only)
-  };
+  services.epkowa-scanner.enable = true;
   services.printscan-daemon.enable = true;
 
   services.printscan-telegram-bot = {
