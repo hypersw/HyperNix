@@ -32,11 +32,17 @@ let
   stubBinary = pkgs.pkgsCross.gnu64.callPackage ../EpkowaStubX64/package.nix {};
 
   # The stub binary alone can't find the x86_64 interpreter .so files — they
-  # live in pkgsX86.epkowa's esci bundle dir. Wrap the stub in a shell script
-  # that points the x86_64 ld.so at the right directories before exec.
-  # Inherited fds (fd 3) survive this kind of bash exec chain.
+  # live in per-scanner bundle derivations (pkgsX86.epkowa.plugins.*, each
+  # installing its libesci-interpreter-*.so to /lib/esci/). Colon-join all
+  # plugin libdirs into one LD_LIBRARY_PATH entry and point the x86_64 ld.so
+  # at it before exec'ing the stub. Inherited fds (fd 3) survive this kind
+  # of bash exec chain.
+  esciPluginLibs = lib.concatMapStringsSep ":"
+    (p: "${p}/lib/esci")
+    (lib.attrValues (lib.filterAttrs (_: lib.isDerivation) pkgsX86.epkowa.plugins));
+
   stubWrapper = pkgs.writeShellScriptBin "epkowa-stub-x64" ''
-    export LD_LIBRARY_PATH=${pkgsX86.epkowa}/lib/esci:${pkgsX86.epkowa}/lib''${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}
+    export LD_LIBRARY_PATH=${esciPluginLibs}''${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}
     exec ${stubBinary}/bin/epkowa-stub-x64 "$@"
   '';
 
