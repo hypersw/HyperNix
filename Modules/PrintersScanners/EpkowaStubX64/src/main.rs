@@ -251,11 +251,39 @@ fn handle_open_library(sock: &mut UnixStream, payload: &[u8]) -> std::io::Result
         Err(_) => return write_frame(sock, OP_OPEN_LIBRARY_RESP, &[0, 0]),
     };
 
-    let lib = match unsafe { Library::new(name) } {
-        Ok(l) => l,
-        Err(e) => {
-            eprintln!("[stub] dlopen {:?} failed: {}", name, e);
-            return write_frame(sock, OP_OPEN_LIBRARY_RESP, &[0, 0]);
+    // Mirror libtool's lt_dlopenext behaviour: if the caller passed a bare
+    // library name (like "libesci-interpreter-perfection-v330"), try a few
+    // common suffixes before giving up.
+    let candidates: Vec<String> = if name.ends_with(".so")
+        || name.contains(".so.")
+        || name.ends_with(".la")
+    {
+        vec![name.to_string()]
+    } else {
+        vec![
+            format!("{name}.so"),
+            format!("{name}.so.0"),
+            format!("{name}.la"),
+            name.to_string(),
+        ]
+    };
+    let lib = {
+        let mut loaded: Option<Library> = None;
+        let mut last_err: Option<String> = None;
+        for cand in &candidates {
+            match unsafe { Library::new(cand) } {
+                Ok(l) => { loaded = Some(l); break; }
+                Err(e) => last_err = Some(format!("{cand}: {e}")),
+            }
+        }
+        match loaded {
+            Some(l) => l,
+            None => {
+                eprintln!("[stub] dlopen of {:?} failed (tried {}): {}",
+                    name, candidates.join(", "),
+                    last_err.unwrap_or_else(|| "(no attempts)".into()));
+                return write_frame(sock, OP_OPEN_LIBRARY_RESP, &[0, 0]);
+            }
         }
     };
 
