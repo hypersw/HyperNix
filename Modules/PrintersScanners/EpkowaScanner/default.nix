@@ -44,10 +44,33 @@ let
   # will call sh/bash/gcc, which box64 fumbles). Keep qemu-user as the
   # global binfmt handler (for build time) and invoke box64 explicitly
   # only for our runtime scanner path.
+  # Assemble a directory of aarch64-native libraries that box64 wraps.
+  # Box64's wrapper layer calls out to native-arch implementations of common
+  # libs (libudev, libusb, libpng, libz, libxml2, libatomic) instead of
+  # emulating them, for performance. It looks them up at system paths that
+  # NixOS doesn't populate, so we stage them into a single dir and point
+  # BOX64_LD_LIBRARY_PATH at it. Symlinks also cover the extra soname aliases
+  # box64 checks for (e.g. libudev.so.0 for libudev-proper).
+  box64NativeLibs = pkgs.runCommandLocal "box64-native-libs" {} ''
+    mkdir -p $out/lib
+    ln -sf ${pkgs.libpng}/lib/libpng16.so.16 $out/lib/libpng16.so.16
+    ln -sf ${pkgs.libpng}/lib/libpng16.so.16 $out/lib/libpng16.so
+    ln -sf ${pkgs.zlib}/lib/libz.so.1 $out/lib/libz.so.1
+    ln -sf ${pkgs.zlib}/lib/libz.so.1 $out/lib/libz.so
+    ln -sf ${pkgs.libusb1}/lib/libusb-1.0.so.0 $out/lib/libusb-1.0.so.0
+    ln -sf ${pkgs.libusb1}/lib/libusb-1.0.so.0 $out/lib/libusb-1.0.so
+    ln -sf ${pkgs.libxml2.out}/lib/libxml2.so.2 $out/lib/libxml2.so.2
+    ln -sf ${pkgs.libxml2.out}/lib/libxml2.so.2 $out/lib/libxml2.so
+    ln -sf ${pkgs.systemdLibs}/lib/libudev.so.1 $out/lib/libudev.so.1
+    ln -sf ${pkgs.systemdLibs}/lib/libudev.so.1 $out/lib/libudev.so.0
+    ln -sf ${pkgs.stdenv.cc.cc.lib}/lib/libatomic.so.1 $out/lib/libatomic.so.1
+  '';
+
   scanimageX86 = pkgs.writeShellScriptBin "scanimage-x86" ''
     export BOX64_NOBANNER=1
     export BOX64_DYNAREC=0
     export BOX64_ALLOWMISSINGLIBS=1
+    export BOX64_LD_LIBRARY_PATH=${box64NativeLibs}/lib
     export SANE_CONFIG_DIR=${saneConfX86}/etc/sane.d
     export LD_LIBRARY_PATH=${saneLibsX86}/lib/sane:${saneLibsX86}/lib
     exec ${pkgs.box64}/bin/box64 ${pkgsX86.sane-backends}/bin/scanimage "$@"
