@@ -159,8 +159,13 @@ FLAKE
 
   # SD card longevity — minimize writes to extend flash lifetime.
   boot.tmp.useTmpfs = true;                          # /tmp in RAM, not on disk
-  services.journald.extraConfig = "Storage=volatile"; # journal in RAM, lost on reboot
   fileSystems."/".options = [ "noatime" ];            # skip access-time writes
+  # Journal in RAM (volatile) saves writes but loses history across reboots.
+  # On a settled Pi where everything just works, that's the right trade-off.
+  # While the system is still being iterated on, we need logs from previous
+  # boots to diagnose stalls/crashes — so keep the journal persistent for
+  # now. Flip back to volatile once the config stabilises.
+  #   services.journald.extraConfig = "Storage=volatile";
 
   # Memory management: zram first, disk swap as OOM safety net
   zramSwap = {
