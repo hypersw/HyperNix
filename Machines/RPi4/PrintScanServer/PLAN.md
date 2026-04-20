@@ -314,13 +314,40 @@ ways. If we see flakiness, this is the first thing to re-examine.
 - **scanbuttond** `backends/epson.c` is the best reference for the ESC/I button query
   command format (sends `ESC !`, reads response byte with button state)
 - **scanbd** and **insaned** use SANE polling but epkowa doesn't expose buttons — won't work
-- Reverse-engineering approach:
-  1. `lsusb -v -d 04b8:0142` to enumerate interfaces/endpoints
-  2. `modprobe usbmon` + Wireshark on `usbmonN` to capture USB traffic
-  3. pyusb script to poll with suspected ESC/I commands while pressing buttons
-  4. Diff responses to map which bytes/bits correspond to which buttons
-- The scanner has 4 buttons — all should generate distinct response patterns
-- The polling daemon can be part of the main service daemon or a separate systemd unit
+- The scanner has 4 buttons (Scan / Copy / PDF / Send) — all should generate distinct
+  response patterns. We only care about the Scan button for now.
+
+**Reverse-engineering status (pending hardware):** scaffold code and probe script are in
+place; actual protocol bits need a short session with the scanner attached.
+
+Probe script: `Modules/PrintersScanners/EpkowaScanner/probe-button.py` (pyusb).
+Prompts the operator to press each button in turn and diffs the 4-byte `ESC !`
+replies against a baseline. Run it as:
+
+```
+# on the Pi, with the scanner attached and no scanimage running
+nix-shell -p python3 python3Packages.pyusb --run 'python3 probe-button.py'
+```
+
+Scaffold: `Modules/PrintersScanners/Daemon/src/ButtonPoller.cs` — `BackgroundService`
+hosted in the daemon, subscribes to `ScannerMonitor.IsOnline()` and
+`SessionService.Current.InFlightScan`, polls on a 1s tick when idle, emits
+`SessionEventType.ScannerButton` on rising edges. The `DoUsbPollAsync` method is
+currently a no-op TODO — once the probe tells us the byte/bit, we fill it in.
+
+**Test path without hardware:** `POST /debug/button` on the daemon calls
+`ButtonPoller.SimulatePress()` which emits the event immediately. Lets us exercise
+the whole bot-side reaction (session → auto-scan) end-to-end via a shell poke.
+
+Integration once hardware protocol is known:
+  1. Pick a libusb binding — leaning toward a small Rust sidecar the daemon
+     exec's, since we already have Rust infra for the IPC stub and keeping the
+     C# daemon free of native deps is nice.
+  2. Coordinate with SANE's USB claim: only poll when the active session's
+     `InFlightScan` is false. Even then, SANE may briefly hold the device on
+     scan edges — retry on `USBDEVFS_CLAIMINTERFACE EBUSY`.
+  3. Debounce rising-edge transitions (one emit per physical press, not per
+     100ms of held-down state).
 
 ### Monitoring (Non-Printer-Specific)
 
@@ -684,29 +711,25 @@ GitHub webhook setup would need a public endpoint we don't have.)
 3. ~~Push-triggered rebuild (auto-rebuild-on-push service polling GitHub)~~ DONE
 4. ~~Monitoring module (OnFailure + Telegram alerts + boot confirmation)~~ DONE
 5. ~~LaserJetPrinter module (CUPS + foo2zjs)~~ DONE (printing untested end-to-end)
-6. **Daemon redesign — session model + streaming pipeline + SSE events.** Refactor
-   existing `PrintScan.Daemon` to session-based API, in-memory
-   `RecyclableMemoryStream` scan pipeline, SSE `/events` stream, persistent
-   session store under `/var/lib/printscan/sessions.json`. No hardware required,
-   all testable with `scanimage --test` or a mock.
-7. **Bot redesign — status-message UX + materialized staging + takeover flow.**
-   Refactor `PrintScan.TelegramBot` to consume daemon SSE, stage scans under
-   `/var/lib/printscan-bot/…`, edit status message on events, handle
-   `session.terminated` gracefully. Still no hardware; mock the daemon in unit
-   tests or run daemon with a fake scanner.
-8. **Graceful-shutdown plumbing on both services**: SIGTERM handler that drains
-   in-flight ops, `TimeoutStopSec=20min` in the unit files.
-9. **Scanner button reverse-engineering** (now that the driver works, pyusb
-   script on the Pi with the scanner attached; map button bytes). Integrate
-   as a daemon poller thread emitting `scanner.button` events.
-10. **AirSane** (LAN scanning for iOS/macOS/Android) — independent of the bot path.
-11. **Scanner power-off-via-USB** — capture Windows Epson app idle sequence
+6. ~~**Daemon redesign** — session model + streaming pipeline + SSE events.~~ DONE
+7. ~~**Bot redesign** — status-message UX + materialized staging + takeover flow.~~ DONE
+8. ~~**Graceful-shutdown plumbing** on both services — SIGTERM drain,
+   `TimeoutStopSec=20min`.~~ DONE
+9. **Scanner button — probe + integration.** Scaffold is committed
+   (`ButtonPoller.cs` in the daemon, `probe-button.py` under EpkowaScanner/).
+   When the rig is up: run the probe, fill in `DoUsbPollAsync` with the
+   decoded ESC/I bits, pick a libusb binding (Rust sidecar preferred).
+10. **End-to-end dry-run** on hardware with the `POST /debug/button` path
+    exercising the session → bot-reactive-scan flow before the real button
+    poll is wired, to isolate surprises.
+11. **AirSane** (LAN scanning for iOS/macOS/Android) — independent of the bot path.
+12. **Scanner power-off-via-USB** — capture Windows Epson app idle sequence
     with Wireshark + `usbmon`, replay on session close.
-12. **Zigbee relay** to power-cycle scanner + RPi on session open. Hardware
+13. **Zigbee relay** to power-cycle scanner + RPi on session open. Hardware
     not yet available — parked, not in any phase.
-13. **WiFi** (EAP-PEAP, separate SSID, sops-nix for creds).
-14. **WhatsApp bot** (Node.js/Baileys, same daemon API).
-15. **Web UI** (SPA + oauth2-proxy → daemon API).
+14. **WiFi** (EAP-PEAP, separate SSID, sops-nix for creds).
+15. **WhatsApp bot** (Node.js/Baileys, same daemon API).
+16. **Web UI** (SPA + oauth2-proxy → daemon API).
 
-Current focus: **6 → 7 → 8**, all implementable without hardware access, then
-boot the rig for end-to-end validation on 9.
+Current focus when the rig comes back up: **9 → 10**, everything before is
+complete and building clean.

@@ -30,6 +30,8 @@ builder.Services.AddSingleton<ShutdownGate>();
 builder.Services.AddHostedService(sp => sp.GetRequiredService<ShutdownGate>());
 builder.Services.AddSingleton<ScannerMonitor>();
 builder.Services.AddHostedService(sp => sp.GetRequiredService<ScannerMonitor>());
+builder.Services.AddSingleton<ButtonPoller>();
+builder.Services.AddHostedService(sp => sp.GetRequiredService<ButtonPoller>());
 
 var app = builder.Build();
 
@@ -117,6 +119,16 @@ app.MapGet("/sessions/{id}/image/{seq:int}",
     img.Data.Position = 0;
     await img.Data.CopyToAsync(response.Body, ct);
     return Results.Empty;
+});
+
+// ── Debug / test hooks ──────────────────────────────────────────────────────
+
+// Simulate a scanner button press — used for end-to-end testing of the
+// session → bot-reactive-scan path without physical hardware access.
+app.MapPost("/debug/button", (ButtonPoller poller) =>
+{
+    poller.SimulatePress();
+    return Results.NoContent();
 });
 
 // ── Server-Sent Events ──────────────────────────────────────────────────────
