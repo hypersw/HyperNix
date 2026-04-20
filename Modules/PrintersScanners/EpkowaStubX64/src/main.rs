@@ -60,6 +60,16 @@ const IPC_FD: RawFd = 3;
 const CANARY_SIZE: usize = 64;
 const CANARY_BYTE: u8 = 0xA5;
 
+/// Hex dump of a byte slice, capped at `cap` bytes of hex, with a "..."
+/// suffix if truncated. Pair with a length field in the caller's log
+/// line so capped dumps stay unambiguous.
+fn hex_short(data: &[u8], cap: usize) -> String {
+    let n = data.len().min(cap);
+    let hex: Vec<String> = data[..n].iter().map(|b| format!("{:02x}", b)).collect();
+    let suffix = if data.len() > cap { " ..." } else { "" };
+    format!("{}{}", hex.join(" "), suffix)
+}
+
 fn check_canary(op: &str, buf: &[u8], requested: usize) {
     let tail = &buf[requested..];
     if let Some(off) = tail.iter().position(|&b| b != CANARY_BYTE) {
@@ -404,6 +414,10 @@ fn handle_int_read(sock: &mut UnixStream, payload: &[u8]) -> std::io::Result<()>
     });
     check_canary("int_read", &buf, length);
     let got = if ret > 0 { ret as usize } else { 0 };
+    eprintln!(
+        "[stub]    int_read len={} ret={} got={}: {}",
+        length, ret, got, hex_short(&buf[..got], 48)
+    );
     let mut resp = Vec::with_capacity(4 + 4 + got);
     resp.extend_from_slice(&ret.to_le_bytes());
     resp.extend_from_slice(&(got as u32).to_le_bytes());
@@ -429,10 +443,18 @@ fn handle_int_write(sock: &mut UnixStream, payload: &[u8]) -> std::io::Result<()
     let mut data = Vec::with_capacity(dlen + CANARY_SIZE);
     data.extend_from_slice(&payload[4..4 + dlen]);
     data.resize(dlen + CANARY_SIZE, CANARY_BYTE);
+    eprintln!(
+        "[stub]    int_write in  len={}: {}",
+        dlen, hex_short(&data[..dlen], 48)
+    );
     let ret = with_plugin(-1, |p| unsafe {
         (p.write)(data.as_mut_ptr() as *mut libc::c_void, dlen)
     });
     check_canary("int_write", &data, dlen);
+    eprintln!(
+        "[stub]    int_write out len={} ret={}: {}",
+        dlen, ret, hex_short(&data[..dlen], 48)
+    );
     write_frame(sock, OP_INT_WRITE_RESP, &ret.to_le_bytes())
 }
 

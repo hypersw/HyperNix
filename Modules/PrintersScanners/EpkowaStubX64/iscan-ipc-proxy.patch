@@ -124,7 +124,7 @@
 new file mode 100644
 --- /dev/null
 +++ backend/epkowa_ipc.c
-@@ -0,0 +1,604 @@
+@@ -0,0 +1,626 @@
 +/* epkowa_ipc.c — proxy side of the stub/proxy split.
 + *
 + * On architectures that can't load the proprietary esci-interpreter plugin
@@ -165,6 +165,24 @@ new file mode 100644
 +#include "epkowa_ip_api.h"
 +#include "epkowa_ipc.h"
 +#include "message.h"       /* err_fatal, err_minor, log_info */
++
++
++/* Dump up to `IPC_HEX_CAP` bytes of a buffer as hex, prefixed by a label
++ * and the total length. Capped so firmware uploads and scan-line data
++ * don't bury the log. Marker "..." if truncated. Printed unconditionally
++ * on stderr — grep [ipc] to isolate. */
++#define IPC_HEX_CAP 48
++static void log_hex(const char *label, const void *buf, size_t len)
++{
++  enum { CAP = IPC_HEX_CAP };
++  const unsigned char *p = buf;
++  size_t show = len < CAP ? len : CAP;
++  fprintf(stderr, "[ipc] %s %zub:", label, len);
++  for (size_t i = 0; i < show; ++i) fprintf(stderr, " %02x", p[i]);
++  if (len > CAP) fprintf(stderr, " ...");
++  fputc('\n', stderr);
++  fflush(stderr);
++}
 +
 +
 +/* ─── Op codes (mirror of Rust constants in stub/src/main.rs) ──────── */
@@ -278,6 +296,7 @@ new file mode 100644
 +  if (!buf) return -1;
 +  ssize_t ret = g_cb_read ? g_cb_read(buf, length) : 0;
 +  size_t data_len = (ret > 0) ? (size_t)ret : 0;
++  log_hex("cb_usb_read <- USB", buf, data_len);
 +
 +  /* Response: i64 ret, u32 data_len, bytes */
 +  size_t payload_len = 8 + 4 + data_len;
@@ -305,6 +324,7 @@ new file mode 100644
 +  void *buf = malloc(dlen ? dlen : 1);
 +  if (!buf) return -1;
 +  if (dlen && read_all(g_sock, buf, dlen) < 0) { free(buf); return -1; }
++  log_hex("cb_usb_write -> USB", buf, dlen);
 +
 +  ssize_t ret = g_cb_write ? g_cb_write(buf, dlen) : 0;
 +  free(buf);
@@ -337,9 +357,11 @@ new file mode 100644
 +    if (read_all(g_sock, buf, data_len) < 0) { free(buf); return -1; }
 +  }
 +
++  if (!is_in && data_len) log_hex("cb_usb_ctrl -> USB", buf, data_len);
 +  ssize_t ret = g_cb_ctrl
 +    ? g_cb_ctrl(request_type, request, value, index, size, buf)
 +    : 0;
++  if (is_in && ret > 0) log_hex("cb_usb_ctrl <- USB", buf, (size_t)ret);
 +
 +  uint32_t resp_data_len = (is_in && ret > 0) ? (uint32_t)ret : 0;
 +  size_t resp_len = 8 + 4 + resp_data_len;
