@@ -54,6 +54,23 @@ const OP_CB_USB_CTRL_RESP: u8 = 0xD3;
 /// stdin/stdout/stderr.
 const IPC_FD: RawFd = 3;
 
+/// Tail-guard bytes we pad every plugin-exposed read/write buffer with so
+/// a plugin overrun shows up as a canary-fill change rather than random
+/// heap corruption detected minutes later.
+const CANARY_SIZE: usize = 64;
+const CANARY_BYTE: u8 = 0xA5;
+
+fn check_canary(op: &str, buf: &[u8], requested: usize) {
+    let tail = &buf[requested..];
+    if let Some(off) = tail.iter().position(|&b| b != CANARY_BYTE) {
+        let end = (off + 16).min(tail.len());
+        eprintln!(
+            "[stub] CANARY CORRUPT in {}: requested={}, first-bad-offset=+{}, tail[{}..{}]={:02x?}",
+            op, requested, off, off, end, &tail[off..end]
+        );
+    }
+}
+
 // ──────────────────────────────────────────────────────────────────────────
 // Interpreter ABI (from epkowa_ip_api.h — matches the proprietary .so)
 
@@ -376,10 +393,16 @@ fn handle_int_read(sock: &mut UnixStream, payload: &[u8]) -> std::io::Result<()>
         return write_frame(sock, OP_INT_READ_RESP, &resp);
     }
     let length = u32::from_le_bytes([payload[0], payload[1], payload[2], payload[3]]) as usize;
-    let mut buf = vec![0u8; length];
+    // Overallocate with a 0xA5 canary tail so we can detect the plugin
+    // writing past the `length` byte window it was asked to fill. Cheap
+    // in-band overrun check: if the canary tail changes after the call,
+    // the plugin went past the end of our buffer.
+    let mut buf = vec![CANARY_BYTE; length + CANARY_SIZE];
+    buf[..length].fill(0);
     let ret = with_plugin(-1, |p| unsafe {
         (p.read)(buf.as_mut_ptr() as *mut libc::c_void, length)
     });
+    check_canary("int_read", &buf, length);
     let got = if ret > 0 { ret as usize } else { 0 };
     let mut resp = Vec::with_capacity(4 + 4 + got);
     resp.extend_from_slice(&ret.to_le_bytes());
@@ -399,10 +422,17 @@ fn handle_int_write(sock: &mut UnixStream, payload: &[u8]) -> std::io::Result<()
     // Copy into an owned Vec — the plugin may call into its own USB callbacks
     // (which use cb_sock), so we don't want to hold a slice into our payload
     // buffer any longer than necessary.
-    let mut data = payload[4..4 + dlen].to_vec();
+    // Canary tail: in_buf is nominally read-only for int_write, but some
+    // ESC/I interpreters munge the command bytes in place (encryption /
+    // checksumming), and a stray store past `dlen` would corrupt our
+    // heap silently. Detect it cheaply.
+    let mut data = Vec::with_capacity(dlen + CANARY_SIZE);
+    data.extend_from_slice(&payload[4..4 + dlen]);
+    data.resize(dlen + CANARY_SIZE, CANARY_BYTE);
     let ret = with_plugin(-1, |p| unsafe {
         (p.write)(data.as_mut_ptr() as *mut libc::c_void, dlen)
     });
+    check_canary("int_write", &data, dlen);
     write_frame(sock, OP_INT_WRITE_RESP, &ret.to_le_bytes())
 }
 
