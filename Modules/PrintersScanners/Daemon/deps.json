@@ -5,6 +5,11 @@
     "hash": "sha256-lIqyqE9xR9lVE2LmKBwo/u6X7VdicpvoVnhahsHvUbc="
   },
   {
+    "pname": "Microsoft.IO.RecyclableMemoryStream",
+    "version": "3.0.1",
+    "hash": "sha256-unFg/5EcU/XKJbob4GtQC43Ydgi5VjeBGs7hfhj4EYo="
+  },
+  {
     "pname": "SharpIpp",
     "version": "0.10.0",
     "hash": "sha256-UatEoMVfTZGdiG9MvIE8WxVPUQe+DN4ngo+LLQuhmYc="

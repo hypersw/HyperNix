@@ -72,6 +72,17 @@ in
         Group = cfg.group;
         SupplementaryGroups = [ "lp" "scanner" ];
 
+        # Session store — systemd creates /var/lib/printscan owned by our
+        # user, exports STATE_DIRECTORY into the environment.
+        StateDirectory = "printscan";
+        StateDirectoryMode = "0750";
+
+        # Give in-flight scan + TG upload plenty of time to finish on
+        # SIGTERM. Hard cap still enforced.
+        TimeoutStopSec = "20min";
+        KillSignal = "SIGTERM";
+        SendSIGHUP = false;
+
         # Hardening
         ProtectSystem = "strict";
         ProtectHome = true;

@@ -59,6 +59,20 @@ in
         # systemd credential — decrypted file available at $CREDENTIALS_DIRECTORY/telegram-token
         LoadCredential = "telegram-token:${cfg.tokenFile}";
 
+        # Staging dir for scans mid-upload. On tmpfs (/run) so no SD wear;
+        # survives bot-process restarts, cleared on reboot.
+        RuntimeDirectory = "printscan-bot";
+        RuntimeDirectoryMode = "0700";
+        # Keep the staging dir across restarts — systemd would otherwise
+        # delete it on service stop. RuntimeDirectoryPreserve=yes keeps it
+        # until the host reboots.
+        RuntimeDirectoryPreserve = "yes";
+
+        # Allow graceful drain of in-flight TG uploads on SIGTERM.
+        TimeoutStopSec = "20min";
+        KillSignal = "SIGTERM";
+        SendSIGHUP = false;
+
         User = "printscan-bot";
         Group = daemonCfg.group;  # access to daemon's socket
 

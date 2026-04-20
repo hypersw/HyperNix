@@ -1,258 +1,168 @@
-using System.Diagnostics;
+using Microsoft.AspNetCore.Http.Features;
 using Microsoft.Extensions.Hosting.Systemd;
 using PrintScan.Daemon;
 using PrintScan.Shared;
 
 var builder = WebApplication.CreateBuilder(args);
 
-// systemd integration: sd_notify(READY=1), journal logging
 builder.Host.UseSystemd();
 
-// Use systemd socket activation if LISTEN_FDS is set (socket unit passes the fd).
-// Otherwise fall back to ASPNETCORE_URLS or default (standalone/dev use).
+// Systemd socket activation — pick up fd 3 if LISTEN_FDS is set.
 var listenFds = Environment.GetEnvironmentVariable("LISTEN_FDS");
 if (listenFds is not null && int.TryParse(listenFds, out var fdCount) && fdCount > 0)
 {
-    // fd 3 is the first passed socket (systemd convention: SD_LISTEN_FDS_START = 3)
-    builder.WebHost.ConfigureKestrel(options =>
-    {
-        options.ListenHandle((ulong)(3));
-    });
+    builder.WebHost.ConfigureKestrel(options => options.ListenHandle(3));
 }
 
+// systemd sets STATE_DIRECTORY when StateDirectory= is configured.
+// Fall back to /var/lib/printscan when running outside systemd.
+var stateDir = Environment.GetEnvironmentVariable("STATE_DIRECTORY")?.Split(':')[0]
+    ?? "/var/lib/printscan";
+
+builder.Services.AddSingleton(new SessionStore(stateDir));
+builder.Services.AddSingleton<EventBroker>();
+builder.Services.AddSingleton<ScanPipeline>();
 builder.Services.AddSingleton<PrintService>();
-builder.Services.AddSingleton<ScanService>();
+builder.Services.AddSingleton<SessionService>();
+
+// ShutdownGate and ScannerMonitor need to be both injectable and hosted.
+builder.Services.AddSingleton<ShutdownGate>();
+builder.Services.AddHostedService(sp => sp.GetRequiredService<ShutdownGate>());
+builder.Services.AddSingleton<ScannerMonitor>();
+builder.Services.AddHostedService(sp => sp.GetRequiredService<ScannerMonitor>());
 
 var app = builder.Build();
 
-// ── Status ──
-app.MapGet("/status", (PrintService print, ScanService scan) =>
-    Results.Ok(new DeviceStatus(print.GetStatus(), scan.GetStatus())));
+// ── Status ──────────────────────────────────────────────────────────────────
 
-// ── Print ──
-app.MapPost("/print", async (HttpRequest request, PrintService print) =>
+app.MapGet("/status", (PrintService print, ScannerMonitor mon) =>
+    Results.Ok(new DeviceStatus(
+        print.GetStatus(),
+        new ScannerStatus(mon.IsOnline()))));
+
+// ── Print (unchanged shape) ─────────────────────────────────────────────────
+
+app.MapPost("/print", async (HttpRequest request, PrintService print, ShutdownGate gate, CancellationToken ct) =>
 {
-    var form = await request.ReadFormAsync();
+    var form = await request.ReadFormAsync(ct);
     var file = form.Files.FirstOrDefault();
-    if (file is null)
-        return Results.BadRequest("No file provided");
+    if (file is null) return Results.BadRequest("No file provided");
 
     var pageRange = form["pageRange"].FirstOrDefault();
     var copies = int.TryParse(form["copies"].FirstOrDefault(), out var c) ? c : 1;
-
     using var ms = new MemoryStream();
-    await file.CopyToAsync(ms);
+    await file.CopyToAsync(ms, ct);
 
-    var req = new PrintRequest(file.FileName, ms.ToArray(), pageRange, copies);
-    var result = await print.PrintAsync(req);
-    return result ? Results.Ok("Printed") : Results.StatusCode(500);
+    using var _ = gate.Begin("print");
+    var ok = await print.PrintAsync(
+        new PrintRequest(file.FileName, ms.ToArray(), pageRange, copies), ct);
+    return ok ? Results.Ok("Printed") : Results.StatusCode(500);
 });
 
-// ── Scan ──
-app.MapPost("/scan", async (ScanService scan, HttpRequest request) =>
-{
-    var form = await request.ReadFormAsync();
-    var dpi = int.TryParse(form["dpi"].FirstOrDefault(), out var d) ? d : 200;
-    var formatStr = form["format"].FirstOrDefault() ?? "jpeg";
-    var format = Enum.TryParse<ScanFormat>(formatStr, ignoreCase: true, out var f) ? f : ScanFormat.Jpeg;
-    var quality = int.TryParse(form["quality"].FirstOrDefault(), out var q) ? q : 90;
+// ── Sessions ────────────────────────────────────────────────────────────────
 
-    var job = await scan.StartScanAsync(new ScanRequest(dpi, format, quality));
-    return Results.Ok(job);
-});
-
-app.MapGet("/scan/{id}", (string id, ScanService scan) =>
+app.MapPost("/sessions", (HttpRequest req, OpenSessionRequest body, SessionService svc) =>
 {
-    var job = scan.GetJob(id);
-    if (job is null)
-        return Results.NotFound();
-    if (job.Status == ScanJobStatus.Done && job.ResultPath is not null)
+    var takeover = string.Equals(req.Query["takeover"].ToString(), "true",
+        StringComparison.OrdinalIgnoreCase);
+    var (outcome, session, existing) = svc.TryOpen(body, takeover);
+    return outcome switch
     {
-        var stream = File.OpenRead(job.ResultPath);
-        var contentType = job.ResultPath.EndsWith(".png") ? "image/png"
-            : job.ResultPath.EndsWith(".tiff") ? "image/tiff"
-            : "image/jpeg";
-        return Results.Stream(stream, contentType, Path.GetFileName(job.ResultPath));
-    }
-    return Results.Ok(job);
+        SessionService.OpenOutcome.Opened => Results.Created($"/sessions/{session!.Id}", session),
+        SessionService.OpenOutcome.Conflict => Results.Conflict(
+            new SessionConflict(existing!,
+                $"Session already active for {existing!.OwnerDisplayName}; retry with ?takeover=true to reclaim.")),
+        _ => Results.StatusCode(500)
+    };
 });
 
-app.MapGet("/jobs", (ScanService scan) => Results.Ok(scan.GetRecentJobs()));
+app.MapGet("/sessions/{id}", (string id, SessionService svc) =>
+{
+    var cur = svc.Current;
+    if (cur is null || cur.Id != id) return Results.NotFound();
+    return Results.Ok(cur);
+});
 
-app.Logger.LogInformation("PrintScan daemon listening on {Urls}", Environment.GetEnvironmentVariable("ASPNETCORE_URLS") ?? "default");
+app.MapDelete("/sessions/{id}", (string id, SessionService svc) =>
+{
+    var ok = svc.Close(id, SessionTerminationReason.Closed);
+    return ok ? Results.NoContent() : Results.NotFound();
+});
+
+app.MapPost("/sessions/{id}/scan", async (string id, SessionService svc, CancellationToken ct) =>
+{
+    try
+    {
+        var seq = await svc.RequestScanAsync(id, ct);
+        return Results.Accepted($"/sessions/{id}/image/{seq}", new { sessionId = id, seq });
+    }
+    catch (InvalidOperationException ex)
+    {
+        return Results.BadRequest(ex.Message);
+    }
+    catch (Exception ex)
+    {
+        return Results.Problem(ex.Message, statusCode: 500);
+    }
+});
+
+app.MapGet("/sessions/{id}/image/{seq:int}",
+    async (string id, int seq, SessionService svc, HttpResponse response, CancellationToken ct) =>
+{
+    var img = svc.GetImage(id, seq);
+    if (img is null) return Results.NotFound();
+    response.ContentType = img.ContentType;
+    response.Headers.ContentDisposition =
+        $"attachment; filename=\"{img.FileName}\"";
+    img.Data.Position = 0;
+    await img.Data.CopyToAsync(response.Body, ct);
+    return Results.Empty;
+});
+
+// ── Server-Sent Events ──────────────────────────────────────────────────────
+
+app.MapGet("/events", async (HttpContext ctx, EventBroker broker, SessionService svc, CancellationToken ct) =>
+{
+    ctx.Response.Headers.CacheControl = "no-cache";
+    ctx.Response.Headers.ContentType = "text/event-stream";
+    ctx.Features.Get<IHttpResponseBodyFeature>()?.DisableBuffering();
+
+    var reader = broker.Subscribe(out var token);
+
+    // Prime a freshly-connected subscriber with the current session (if any),
+    // so it can rebuild state without extra GETs.
+    var current = svc.Current;
+    if (current is not null)
+    {
+        var primer = new SessionEvent(SessionEventType.SessionOpened,
+            Session: current, SessionId: current.Id);
+        await ctx.Response.WriteAsync(EventBroker.FormatSse(primer), ct);
+        await ctx.Response.Body.FlushAsync(ct);
+    }
+
+    try
+    {
+        await foreach (var ev in reader.ReadAllAsync(ct))
+        {
+            await ctx.Response.WriteAsync(EventBroker.FormatSse(ev), ct);
+            await ctx.Response.Body.FlushAsync(ct);
+        }
+    }
+    catch (OperationCanceledException) { /* client disconnected */ }
+    finally
+    {
+        broker.Unsubscribe(token);
+    }
+});
+
+app.Logger.LogInformation("PrintScan daemon starting (state={StateDir})", stateDir);
+
+// Clean up session expiry timer on shutdown.
+var lifetime = app.Services.GetRequiredService<IHostApplicationLifetime>();
+lifetime.ApplicationStopping.Register(() =>
+{
+    var svc = app.Services.GetRequiredService<SessionService>();
+    svc.DisposeAsync().AsTask().GetAwaiter().GetResult();
+});
+
 app.Run();
-
-// ── Print Service (shells out to lp) ──
-public class PrintService(ILogger<PrintService> logger)
-{
-    public PrinterStatus GetStatus()
-    {
-        try
-        {
-            var result = RunCommand(ToolPaths.LpStat, "-p");
-            var online = result.ExitCode == 0 && !result.Output.Contains("disabled");
-            return new PrinterStatus(online, result.Output.Trim());
-        }
-        catch (Exception ex)
-        {
-            logger.LogError(ex, "Failed to get printer status");
-            return new PrinterStatus(false, ex.Message);
-        }
-    }
-
-    public async Task<bool> PrintAsync(PrintRequest request)
-    {
-        var tempFile = Path.Combine(Path.GetTempPath(), $"printscan-{Guid.NewGuid()}{Path.GetExtension(request.FileName)}");
-        try
-        {
-            await File.WriteAllBytesAsync(tempFile, request.FileData);
-
-            var args = new List<string> { tempFile };
-            if (request.Copies > 1)
-                args.AddRange(["-n", request.Copies.ToString()]);
-            if (!string.IsNullOrEmpty(request.PageRange))
-                args.AddRange(["-o", $"page-ranges={request.PageRange}"]);
-
-            var result = RunCommand(ToolPaths.Lp, string.Join(" ", args));
-            if (result.ExitCode != 0)
-            {
-                logger.LogError("lp failed: {Error}", result.Error);
-                return false;
-            }
-
-            logger.LogInformation("Printed {File} ({Copies} copies, pages: {Pages})",
-                request.FileName, request.Copies, request.PageRange ?? "all");
-            return true;
-        }
-        finally
-        {
-            File.Delete(tempFile);
-        }
-    }
-
-    private static CommandResult RunCommand(string command, string args)
-    {
-        using var process = Process.Start(new ProcessStartInfo(command, args)
-        {
-            RedirectStandardOutput = true,
-            RedirectStandardError = true,
-            UseShellExecute = false,
-        })!;
-        var output = process.StandardOutput.ReadToEnd();
-        var error = process.StandardError.ReadToEnd();
-        process.WaitForExit();
-        return new CommandResult(process.ExitCode, output, error);
-    }
-}
-
-// ── Scan Service (shells out to scanimage) ──
-public class ScanService(ILogger<ScanService> logger)
-{
-    private readonly Dictionary<string, ScanJob> _jobs = new();
-    private readonly Lock _lock = new();
-
-    public ScannerStatus GetStatus()
-    {
-        try
-        {
-            var result = RunCommand(ToolPaths.ScanImage, "-L");
-            var online = result.ExitCode == 0 && result.Output.Contains("epkowa");
-            return new ScannerStatus(online, result.Output.Trim());
-        }
-        catch (Exception ex)
-        {
-            logger.LogError(ex, "Failed to get scanner status");
-            return new ScannerStatus(false, ex.Message);
-        }
-    }
-
-    public async Task<ScanJob> StartScanAsync(ScanRequest request)
-    {
-        var id = Guid.NewGuid().ToString("N")[..8];
-        var ext = request.Format switch
-        {
-            ScanFormat.Png => ".png",
-            ScanFormat.Tiff => ".tiff",
-            _ => ".jpg",
-        };
-        var outputPath = Path.Combine(Path.GetTempPath(), $"scan-{id}{ext}");
-
-        var job = new ScanJob(id, ScanJobStatus.Scanning);
-        lock (_lock) { _jobs[id] = job; }
-
-        _ = Task.Run(async () =>
-        {
-            try
-            {
-                var formatArg = request.Format switch
-                {
-                    ScanFormat.Png => "png",
-                    ScanFormat.Tiff => "tiff",
-                    _ => "jpeg",
-                };
-
-                var args = $"--resolution {request.Dpi} --format {formatArg} --output-file {outputPath}";
-
-                logger.LogInformation("Starting scan: {Args}", args);
-                var result = await RunCommandAsync(ToolPaths.ScanImage, args);
-
-                if (result.ExitCode != 0)
-                {
-                    logger.LogError("scanimage failed: {Error}", result.Error);
-                    lock (_lock) { _jobs[id] = job with { Status = ScanJobStatus.Failed, Error = result.Error }; }
-                    return;
-                }
-
-                logger.LogInformation("Scan complete: {Path}", outputPath);
-                lock (_lock) { _jobs[id] = job with { Status = ScanJobStatus.Done, ResultPath = outputPath }; }
-            }
-            catch (Exception ex)
-            {
-                logger.LogError(ex, "Scan failed");
-                lock (_lock) { _jobs[id] = job with { Status = ScanJobStatus.Failed, Error = ex.Message }; }
-            }
-        });
-
-        return job;
-    }
-
-    public ScanJob? GetJob(string id)
-    {
-        lock (_lock) { return _jobs.GetValueOrDefault(id); }
-    }
-
-    public IReadOnlyList<ScanJob> GetRecentJobs()
-    {
-        lock (_lock) { return _jobs.Values.OrderByDescending(j => j.Id).Take(20).ToList(); }
-    }
-
-    private static CommandResult RunCommand(string command, string args)
-    {
-        using var process = Process.Start(new ProcessStartInfo(command, args)
-        {
-            RedirectStandardOutput = true,
-            RedirectStandardError = true,
-            UseShellExecute = false,
-        })!;
-        var output = process.StandardOutput.ReadToEnd();
-        var error = process.StandardError.ReadToEnd();
-        process.WaitForExit();
-        return new CommandResult(process.ExitCode, output, error);
-    }
-
-    private static async Task<CommandResult> RunCommandAsync(string command, string args)
-    {
-        using var process = Process.Start(new ProcessStartInfo(command, args)
-        {
-            RedirectStandardOutput = true,
-            RedirectStandardError = true,
-            UseShellExecute = false,
-        })!;
-        var output = await process.StandardOutput.ReadToEndAsync();
-        var error = await process.StandardError.ReadToEndAsync();
-        await process.WaitForExitAsync();
-        return new CommandResult(process.ExitCode, output, error);
-    }
-}
-
-public record CommandResult(int ExitCode, string Output, string Error);

@@ -1,12 +1,18 @@
 using System.Net.Http.Headers;
-using System.Net.Sockets;
+using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Logging;
+using PrintScan.Shared;
+using PrintScan.TelegramBot;
 using Telegram.Bot;
 using Telegram.Bot.Types;
 using Telegram.Bot.Types.Enums;
 using Telegram.Bot.Types.ReplyMarkups;
 
-// Configuration from environment.
-// Token file: prefer PRINTSCAN_BOT_TOKEN_FILE, fallback to systemd credentials directory.
+// ── Config ──────────────────────────────────────────────────────────────────
+
+var socketPath = Environment.GetEnvironmentVariable("PRINTSCAN_SOCKET") ?? "/run/printscan/api.sock";
+
+// Token: prefer PRINTSCAN_BOT_TOKEN_FILE, fallback to systemd credential dir.
 var tokenFile = Environment.GetEnvironmentVariable("PRINTSCAN_BOT_TOKEN_FILE");
 if (string.IsNullOrEmpty(tokenFile))
 {
@@ -14,352 +20,590 @@ if (string.IsNullOrEmpty(tokenFile))
     tokenFile = credDir is not null ? Path.Combine(credDir, "telegram-token") : null;
 }
 if (string.IsNullOrEmpty(tokenFile) || !File.Exists(tokenFile))
-    throw new Exception($"Bot token file not found (PRINTSCAN_BOT_TOKEN_FILE or CREDENTIALS_DIRECTORY/telegram-token). Tried: {tokenFile}");
-var socketPath = Environment.GetEnvironmentVariable("PRINTSCAN_SOCKET")
-    ?? "/run/printscan/api.sock";
+    throw new Exception($"Bot token file not found (tried {tokenFile})");
 
-// Parse allowed users from JSON: [{"id":123,"name":"alice"}, ...]
+// systemd sets RUNTIME_DIRECTORY when RuntimeDirectory= is configured.
+var runtimeDir = Environment.GetEnvironmentVariable("RUNTIME_DIRECTORY")?.Split(':')[0]
+    ?? "/run/printscan-bot";
+
 var allowedUsersJson = Environment.GetEnvironmentVariable("PRINTSCAN_ALLOWED_USERS") ?? "[]";
-var allowedUsersList = System.Text.Json.JsonSerializer.Deserialize<List<AllowedUser>>(allowedUsersJson,
-    new System.Text.Json.JsonSerializerOptions { PropertyNameCaseInsensitive = true }) ?? [];
-var allowedUsers = allowedUsersList.ToDictionary(u => u.Id, u => u.Name);
+var allowedUsers = (System.Text.Json.JsonSerializer.Deserialize<List<AllowedUser>>(
+    allowedUsersJson,
+    new System.Text.Json.JsonSerializerOptions { PropertyNameCaseInsensitive = true }) ?? [])
+    .ToDictionary(u => u.Id, u => u.Name);
 
-var token = (await System.IO.File.ReadAllTextAsync(tokenFile)).Trim();
+// ── Infra ───────────────────────────────────────────────────────────────────
+
+using var loggerFactory = LoggerFactory.Create(b => b.AddSimpleConsole(o =>
+{
+    o.SingleLine = true;
+    o.TimestampFormat = "HH:mm:ss.fff ";
+}));
+var log = loggerFactory.CreateLogger("bot");
+
+var token = (await File.ReadAllTextAsync(tokenFile)).Trim();
 var bot = new TelegramBotClient(token);
+using var daemon = new DaemonClient(socketPath, loggerFactory.CreateLogger<DaemonClient>());
+var staging = new Staging(runtimeDir, loggerFactory.CreateLogger<Staging>());
 
-// HTTP client that talks to daemon via Unix socket
-var daemonClient = new HttpClient(new SocketsHttpHandler
-{
-    ConnectCallback = async (context, ct) =>
-    {
-        var socket = new Socket(AddressFamily.Unix, SocketType.Stream, ProtocolType.Unspecified);
-        await socket.ConnectAsync(new UnixDomainSocketEndPoint(socketPath), ct);
-        return new NetworkStream(socket, ownsSocket: true);
-    }
-})
-{
-    BaseAddress = new Uri("http://localhost") // hostname is ignored for Unix sockets
-};
+// in-memory bot-side session state, keyed by daemon's session id
+var sessions = new Dictionary<string, BotSession>();
+var sessionsLock = new Lock();
 
-Console.WriteLine($"PrintScan Telegram bot starting (allowed users: {string.Join(", ", allowedUsers.Select(u => $"{u.Value}({u.Key})"))})");
+// gate: refuse to exit while an upload is in flight
+var inFlight = 0;
+var inFlightDrained = new SemaphoreSlim(1, 1);
 
-// Register bot commands (visible in Telegram's menu)
-// Register commands, description, and short description on every startup.
-// These are idempotent — Telegram silently ignores if unchanged.
+// ── Bot commands ────────────────────────────────────────────────────────────
+
 await bot.SetMyCommands([
-    new BotCommand { Command = "scan", Description = "📷 Scan a document" },
-    new BotCommand { Command = "status", Description = "📊 Printer & scanner status" },
-    new BotCommand { Command = "help", Description = "❓ How to use this bot" },
+    new() { Command = "scan", Description = "📷 Start a scan session" },
+    new() { Command = "status", Description = "📊 Printer & scanner status" },
+    new() { Command = "help",   Description = "❓ How to use this bot" },
 ]);
-await bot.SetMyDescription("Press Start to sign in.");
-await bot.SetMyShortDescription("Private print & scan service");
-Console.WriteLine("Bot commands and description registered");
-
-// Persistent reply keyboard — always visible, phone-friendly
 var mainKeyboard = new ReplyKeyboardMarkup(
-    new[]
-    {
-        new KeyboardButton[] { "📷 Scan", "📊 Status" },
-    })
-{
-    ResizeKeyboard = true, // compact size
-    IsPersistent = true,   // always visible
-};
+    new[] { new KeyboardButton[] { "📷 Scan", "📊 Status" } })
+{ ResizeKeyboard = true, IsPersistent = true };
+
+log.LogInformation("bot starting, allowed users: {Users}, socket: {Sock}, staging: {Stg}",
+    string.Join(", ", allowedUsers.Select(u => $"{u.Value}({u.Key})")),
+    socketPath, runtimeDir);
+
+// ── Cancellation / shutdown ─────────────────────────────────────────────────
 
 using var cts = new CancellationTokenSource();
 Console.CancelKeyPress += (_, e) => { e.Cancel = true; cts.Cancel(); };
+AppDomain.CurrentDomain.ProcessExit += (_, _) => cts.Cancel();
 
-// Long-polling loop
-var offset = 0;
-while (!cts.IsCancellationRequested)
+// ── Background loops ────────────────────────────────────────────────────────
+
+var sseLoop = Task.Run(() => RunSseLoopAsync(cts.Token));
+var retryLoop = Task.Run(() => SweepStagingAsync(cts.Token));
+var pollOffset = 0;
+
+try
 {
-    try
+    while (!cts.IsCancellationRequested)
     {
-        var updates = await bot.GetUpdates(offset, timeout: 30, cancellationToken: cts.Token);
-        foreach (var update in updates)
+        try
         {
-            offset = update.Id + 1;
-            _ = Task.Run(() => HandleUpdate(update, cts.Token));
+            var updates = await bot.GetUpdates(pollOffset, timeout: 30, cancellationToken: cts.Token);
+            foreach (var u in updates)
+            {
+                pollOffset = u.Id + 1;
+                _ = Task.Run(() => HandleUpdateAsync(u, cts.Token));
+            }
+        }
+        catch (OperationCanceledException) { break; }
+        catch (Exception ex)
+        {
+            log.LogError(ex, "poll error");
+            try { await Task.Delay(5000, cts.Token); } catch { break; }
         }
     }
-    catch (OperationCanceledException) { break; }
-    catch (Exception ex)
-    {
-        Console.Error.WriteLine($"Polling error: {ex.Message}");
-        await Task.Delay(5000, cts.Token);
-    }
+}
+finally
+{
+    log.LogInformation("draining in-flight uploads before exit");
+    await inFlightDrained.WaitAsync();
+    inFlightDrained.Release();
+    try { await sseLoop; } catch { }
+    try { await retryLoop; } catch { }
+    log.LogInformation("clean exit");
 }
 
-async Task HandleUpdate(Update update, CancellationToken ct)
+// ────────────────────────────────────────────────────────────────────────────
+// Update routing
+// ────────────────────────────────────────────────────────────────────────────
+
+async Task HandleUpdateAsync(Update update, CancellationToken ct)
 {
     try
     {
-        // Centralized auth — extract user ID from any update type
-        var userId = update.Message?.From?.Id
-            ?? update.CallbackQuery?.From?.Id
-            ?? 0;
-
-        if (userId == 0)
-            return; // no identifiable user (channel post, etc.) — silently ignore
-
+        var userId = update.Message?.From?.Id ?? update.CallbackQuery?.From?.Id ?? 0;
+        if (userId == 0) return;
         if (allowedUsers.Count > 0 && !allowedUsers.ContainsKey(userId))
         {
-            // Silent ignore for unauthorized users — don't confirm bot is active.
-            // Log once per user to avoid spam in journal.
-            Console.Error.WriteLine($"Unauthorized: {userId} ({update.Message?.From?.Username ?? update.CallbackQuery?.From?.Username ?? "?"})");
+            log.LogWarning("unauthorized user {Id}", userId);
             return;
         }
-
-        if (allowedUsers.Count > 0)
-        {
-            var name = allowedUsers[userId];
-            var action = update.Message?.Text ?? update.Message?.Document?.FileName ?? update.CallbackQuery?.Data ?? "?";
-            Console.WriteLine($"{name} ({userId}): {action}");
-        }
-
-        if (update.Message is { } message)
-            await HandleMessage(message, ct);
-        else if (update.CallbackQuery is { } callback)
-            await HandleCallback(callback, ct);
+        var name = allowedUsers.Count > 0 ? allowedUsers[userId] : "user";
+        if (update.Message is { } msg)
+            await HandleMessageAsync(name, msg, ct);
+        else if (update.CallbackQuery is { } cb)
+            await HandleCallbackAsync(name, cb, ct);
     }
     catch (Exception ex)
     {
-        Console.Error.WriteLine($"Error handling update {update.Id}: {ex.Message}");
+        log.LogError(ex, "update {Id} failed", update.Id);
     }
 }
 
-async Task HandleMessage(Message message, CancellationToken ct)
+async Task HandleMessageAsync(string userName, Message msg, CancellationToken ct)
 {
-    var chatId = message.Chat.Id;
+    if (msg.Document is { } doc) { await HandlePrintDocumentAsync(msg.Chat.Id, doc, ct); return; }
+    if (msg.Photo is { Length: > 0 } ph) { await HandlePrintPhotoAsync(msg.Chat.Id, ph.Last(), ct); return; }
 
-    // File received → print
-    if (message.Document is { } doc)
+    var text = (msg.Text ?? "").Trim();
+    var slash = text.Split(' ', '@')[0].ToLower();
+    if (text.Equals("📷 Scan", StringComparison.OrdinalIgnoreCase) || slash == "/scan")
+        await StartScanFlowAsync(msg.Chat.Id, userName, ct);
+    else if (text.Equals("📊 Status", StringComparison.OrdinalIgnoreCase) || slash == "/status")
+        await ShowStatusAsync(msg.Chat.Id, ct);
+    else if (slash is "/help" or "/start")
+        await bot.SendMessage(msg.Chat.Id, """
+            🖨️ <b>PrintScan Bot</b>
+
+            📄 Send a PDF or image to print it
+            📷 /scan — start a scan session
+            📊 /status — printer & scanner
+            """, parseMode: ParseMode.Html, replyMarkup: mainKeyboard, cancellationToken: ct);
+    else
+        await bot.SendMessage(msg.Chat.Id, "Send a file to print, or tap 📷 Scan.",
+            replyMarkup: mainKeyboard, cancellationToken: ct);
+}
+
+async Task HandleCallbackAsync(string userName, CallbackQuery cb, CancellationToken ct)
+{
+    var chatId = cb.Message!.Chat.Id;
+    var msgId = cb.Message.Id;
+    var data = cb.Data ?? "";
+    await bot.AnswerCallbackQuery(cb.Id, cancellationToken: ct);
+
+    if (data.StartsWith("open:"))
     {
-        await HandlePrintDocument(chatId, doc, ct);
-        return;
+        // format chosen → show DPI menu
+        var fmt = data["open:".Length..];
+        await bot.EditMessageText(chatId, msgId,
+            $"📷 Format: <b>{fmt.ToUpperInvariant()}</b>. Choose resolution:",
+            parseMode: ParseMode.Html,
+            replyMarkup: ScanMenu.RenderDpi(fmt), cancellationToken: ct);
     }
-
-    // Photo received → print
-    if (message.Photo is { Length: > 0 } photos)
+    else if (data.StartsWith("dpi:"))
     {
-        await HandlePrintPhoto(chatId, photos.Last(), ct);
-        return;
+        // format + dpi chosen → try to open daemon session
+        var parts = data.Split(':');
+        if (parts.Length != 3) return;
+        var fmt = Enum.TryParse<ScanFormat>(parts[1], ignoreCase: true, out var f) ? f : ScanFormat.Jpeg;
+        var dpi = int.TryParse(parts[2], out var d) ? d : ScanMenu.DefaultDpi;
+        await TryOpenSessionAsync(chatId, msgId, userName, new ScanParams(dpi, fmt), takeover: false, ct);
     }
-
-    // Commands — match both /commands and keyboard button text
-    var text = message.Text?.Trim() ?? "";
-    var textLower = text.ToLower();
-    var slashCmd = text.Split(' ', '@')[0].ToLower(); // for /commands with @botname
-    switch (textLower)
+    else if (data.StartsWith("confirm_takeover:"))
     {
-        case "📷 scan":
-        case var _ when slashCmd == "/scan":
-            await ShowScanOptions(chatId, ct);
-            break;
-        case "📊 status":
-        case var _ when slashCmd == "/status":
-            await ShowStatus(chatId, ct);
-            break;
-        case var _ when slashCmd is "/help" or "/start":
-            await bot.SendMessage(chatId, """
-                🖨️ <b>PrintScan Bot</b>
-
-                📄 Send a <b>PDF</b> or <b>image</b> to print it
-                📷 /scan — scan a document
-                📊 /status — check printer &amp; scanner
-
-                Use the buttons below 👇
-                """, parseMode: ParseMode.Html, replyMarkup: mainKeyboard, cancellationToken: ct);
-            break;
-        default:
-            await bot.SendMessage(chatId, "Send a file to print, or tap 📷 Scan below.",
-                replyMarkup: mainKeyboard, cancellationToken: ct);
-            break;
+        var parts = data.Split(':');
+        if (parts.Length != 4) return;
+        var fmt = Enum.TryParse<ScanFormat>(parts[1], ignoreCase: true, out var f) ? f : ScanFormat.Jpeg;
+        var dpi = int.TryParse(parts[2], out var d) ? d : ScanMenu.DefaultDpi;
+        var answer = parts[3];
+        if (answer == "yes")
+            await TryOpenSessionAsync(chatId, msgId, userName, new ScanParams(dpi, fmt), takeover: true, ct);
+        else
+            await bot.EditMessageText(chatId, msgId, "Cancelled.", cancellationToken: ct);
+    }
+    else if (data.StartsWith("scan:"))
+    {
+        var sid = data["scan:".Length..];
+        try
+        {
+            await daemon.RequestScanAsync(sid, ct);
+        }
+        catch (Exception ex)
+        {
+            await bot.SendMessage(chatId, $"❌ {ex.Message}", cancellationToken: ct);
+        }
+    }
+    else if (data.StartsWith("end:"))
+    {
+        var sid = data["end:".Length..];
+        await daemon.CloseSessionAsync(sid, ct);
     }
 }
 
-async Task HandlePrintDocument(long chatId, Document doc, CancellationToken ct)
+async Task StartScanFlowAsync(long chatId, string userName, CancellationToken ct)
 {
-    var status = await bot.SendMessage(chatId, $"🖨️ Printing <code>{doc.FileName}</code>...",
+    // single-step: ask format first. DPI follows after format selection.
+    await bot.SendMessage(chatId, "📷 Pick a file format:",
+        parseMode: ParseMode.Html,
+        replyMarkup: ScanMenu.RenderFormat(), cancellationToken: ct);
+}
+
+async Task TryOpenSessionAsync(
+    long chatId, int msgId, string userName, ScanParams parms,
+    bool takeover, CancellationToken ct)
+{
+    // We first edit the callback message into "opening…", then use its id
+    // as the session's status message id. Single message, no flicker.
+    await bot.EditMessageText(chatId, msgId,
+        "⏳ Opening session…", cancellationToken: ct);
+
+    var req = new OpenSessionRequest(
+        OwnerBot: "telegram",
+        OwnerChatId: chatId,
+        OwnerStatusMessageId: msgId,
+        OwnerDisplayName: "@" + userName,
+        Params: parms);
+
+    var (outcome, session, conflict) = await daemon.OpenSessionAsync(req, takeover, ct);
+    if (outcome == DaemonClient.OpenResult.Conflict && conflict is not null)
+    {
+        // Two buttons with the chosen params baked into the callback data
+        var kb = new InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton.WithCallbackData("Take over",
+                    $"confirm_takeover:{parms.Format.ToString().ToLowerInvariant()}:{parms.Dpi}:yes"),
+                InlineKeyboardButton.WithCallbackData("Cancel",
+                    $"confirm_takeover:{parms.Format.ToString().ToLowerInvariant()}:{parms.Dpi}:no")
+            ]
+        ]);
+        await bot.EditMessageText(chatId, msgId,
+            $"🔒 {conflict.Current.OwnerDisplayName} has an active session " +
+            $"({conflict.Current.ScanCount} scans). Take it over?",
+            replyMarkup: kb, cancellationToken: ct);
+        return;
+    }
+    if (session is null)
+    {
+        await bot.EditMessageText(chatId, msgId,
+            "❌ Couldn't open session.", cancellationToken: ct);
+        return;
+    }
+    // Register locally; SSE primer will confirm.
+    lock (sessionsLock)
+    {
+        sessions[session.Id] = new BotSession
+        {
+            DaemonSessionId = session.Id,
+            ChatId = chatId,
+            StatusMessageId = msgId,
+            Params = session.Params,
+            ExpiresAt = session.ExpiresAt,
+            ScanCount = session.ScanCount,
+            FirstScanPending = true,
+        };
+    }
+    await RerenderAsync(session.Id, ct);
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// Print path (as before)
+// ────────────────────────────────────────────────────────────────────────────
+
+async Task HandlePrintDocumentAsync(long chatId, Document doc, CancellationToken ct)
+{
+    var status = await bot.SendMessage(chatId,
+        $"🖨️ Printing <code>{doc.FileName}</code>…",
         parseMode: ParseMode.Html, cancellationToken: ct);
-
     try
     {
         using var ms = new MemoryStream();
         await bot.GetInfoAndDownloadFile(doc.FileId, ms, ct);
         ms.Position = 0;
-
         using var content = new MultipartFormDataContent();
-        var fileContent = new StreamContent(ms);
-        fileContent.Headers.ContentType = new MediaTypeHeaderValue("application/octet-stream");
-        content.Add(fileContent, "file", doc.FileName ?? "document");
-
-        var response = await daemonClient.PostAsync("/print", content, ct);
-        if (response.IsSuccessStatusCode)
-            await bot.EditMessageText(chatId, status.Id, $"✅ Printed <code>{doc.FileName}</code>",
-                parseMode: ParseMode.Html, cancellationToken: ct);
-        else
-            await bot.EditMessageText(chatId, status.Id, $"❌ Print failed: {response.StatusCode}",
-                cancellationToken: ct);
-    }
-    catch (Exception ex)
-    {
-        await bot.EditMessageText(chatId, status.Id, $"❌ Print error: {ex.Message}",
-            cancellationToken: ct);
-    }
-}
-
-async Task HandlePrintPhoto(long chatId, PhotoSize photo, CancellationToken ct)
-{
-    var status = await bot.SendMessage(chatId, "🖨️ Printing photo...", cancellationToken: ct);
-
-    try
-    {
-        using var ms = new MemoryStream();
-        await bot.GetInfoAndDownloadFile(photo.FileId, ms, ct);
-        ms.Position = 0;
-
-        using var content = new MultipartFormDataContent();
-        var fileContent = new StreamContent(ms);
-        fileContent.Headers.ContentType = new MediaTypeHeaderValue("image/jpeg");
-        content.Add(fileContent, "file", "photo.jpg");
-
-        var response = await daemonClient.PostAsync("/print", content, ct);
-        if (response.IsSuccessStatusCode)
-            await bot.EditMessageText(chatId, status.Id, "✅ Photo printed", cancellationToken: ct);
-        else
-            await bot.EditMessageText(chatId, status.Id, $"❌ Print failed: {response.StatusCode}",
-                cancellationToken: ct);
-    }
-    catch (Exception ex)
-    {
-        await bot.EditMessageText(chatId, status.Id, $"❌ Print error: {ex.Message}",
-            cancellationToken: ct);
-    }
-}
-
-async Task ShowScanOptions(long chatId, CancellationToken ct)
-{
-    var keyboard = new InlineKeyboardMarkup()
-        .AddButton("📷 200 dpi (fast)", "scan:200:jpeg:90")
-        .AddNewRow()
-        .AddButton("📷 300 dpi", "scan:300:jpeg:90")
-        .AddNewRow()
-        .AddButton("📷 600 dpi (quality)", "scan:600:jpeg:95")
-        .AddNewRow()
-        .AddButton("🖼️ PNG 300 dpi (lossless)", "scan:300:png:0")
-        .AddNewRow()
-        .AddButton("🖼️ TIFF 600 dpi (archive)", "scan:600:tiff:0");
-
-    await bot.SendMessage(chatId, "Choose scan settings:", replyMarkup: keyboard, cancellationToken: ct);
-}
-
-async Task HandleCallback(CallbackQuery callback, CancellationToken ct)
-{
-    var chatId = callback.Message!.Chat.Id;
-    // Auth already checked in HandleUpdate
-
-    var data = callback.Data ?? "";
-    if (data.StartsWith("scan:"))
-    {
-        var parts = data.Split(':');
-        if (parts.Length >= 4)
+        var file = new StreamContent(ms);
+        file.Headers.ContentType = new MediaTypeHeaderValue("application/octet-stream");
+        content.Add(file, "file", doc.FileName ?? "document");
+        using var http = new HttpClient(new SocketsHttpHandler
         {
-            var dpi = parts[1];
-            var format = parts[2];
-            var quality = parts[3];
-
-            await bot.AnswerCallbackQuery(callback.Id, "Scanning...", cancellationToken: ct);
-            await bot.EditMessageText(chatId, callback.Message.Id,
-                $"📷 Scanning at {dpi} dpi ({format})...", cancellationToken: ct);
-
-            try
+            ConnectCallback = async (_, innerCt) =>
             {
-                // Start scan
-                using var scanContent = new FormUrlEncodedContent(new Dictionary<string, string>
+                var sock = new System.Net.Sockets.Socket(
+                    System.Net.Sockets.AddressFamily.Unix,
+                    System.Net.Sockets.SocketType.Stream,
+                    System.Net.Sockets.ProtocolType.Unspecified);
+                await sock.ConnectAsync(new System.Net.Sockets.UnixDomainSocketEndPoint(socketPath), innerCt);
+                return new System.Net.Sockets.NetworkStream(sock, ownsSocket: true);
+            }
+        }) { BaseAddress = new Uri("http://localhost") };
+        var resp = await http.PostAsync("/print", content, ct);
+        await bot.EditMessageText(chatId, status.Id,
+            resp.IsSuccessStatusCode ? $"✅ Printed <code>{doc.FileName}</code>"
+                                     : $"❌ Print failed: {resp.StatusCode}",
+            parseMode: ParseMode.Html, cancellationToken: ct);
+    }
+    catch (Exception ex)
+    {
+        await bot.EditMessageText(chatId, status.Id, $"❌ Print error: {ex.Message}", cancellationToken: ct);
+    }
+}
+
+async Task HandlePrintPhotoAsync(long chatId, PhotoSize photo, CancellationToken ct)
+{
+    // Same pipeline as document path with a fixed filename/content-type.
+    var fake = new Document
+    {
+        FileId = photo.FileId,
+        FileName = "photo.jpg"
+    };
+    await HandlePrintDocumentAsync(chatId, fake, ct);
+}
+
+async Task ShowStatusAsync(long chatId, CancellationToken ct)
+{
+    var st = await daemon.GetStatusAsync(ct);
+    if (st is null)
+    {
+        await bot.SendMessage(chatId, "📊 Daemon unreachable", cancellationToken: ct);
+        return;
+    }
+    await bot.SendMessage(chatId, $"""
+        📊 <b>Status</b>
+
+        🖨️ Printer: {(st.Printer.Online ? "✅ online" : "⚠️ offline")}
+        📷 Scanner: {(st.Scanner.Online ? "✅ online" : "⚠️ offline")}
+        """, parseMode: ParseMode.Html, cancellationToken: ct);
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// SSE consumer
+// ────────────────────────────────────────────────────────────────────────────
+
+async Task RunSseLoopAsync(CancellationToken ct)
+{
+    await foreach (var ev in daemon.SubscribeAsync(ct))
+    {
+        try { await HandleEventAsync(ev, ct); }
+        catch (Exception ex) { log.LogError(ex, "event handler failed: {Type}", ev.Type); }
+    }
+}
+
+async Task HandleEventAsync(SessionEvent ev, CancellationToken ct)
+{
+    switch (ev.Type)
+    {
+        case SessionEventType.SessionOpened when ev.Session is not null:
+        {
+            var s = ev.Session;
+            lock (sessionsLock)
+            {
+                if (!sessions.ContainsKey(s.Id) && s.OwnerBot == "telegram")
                 {
-                    ["dpi"] = dpi,
-                    ["format"] = format,
-                    ["quality"] = quality,
-                });
-                var scanResp = await daemonClient.PostAsync("/scan", scanContent, ct);
-                var scanJson = await scanResp.Content.ReadAsStringAsync(ct);
-                var jobId = System.Text.Json.JsonDocument.Parse(scanJson)
-                    .RootElement.GetProperty("id").GetString();
-
-                // Poll for completion
-                for (var i = 0; i < 120; i++) // up to 2 minutes
-                {
-                    await Task.Delay(1000, ct);
-                    var jobResp = await daemonClient.GetAsync($"/scan/{jobId}", ct);
-
-                    if (jobResp.Content.Headers.ContentType?.MediaType?.StartsWith("image/") == true)
+                    // Reconstruct from primer (daemon restart) — we don't
+                    // own this in memory, rebuild it.
+                    sessions[s.Id] = new BotSession
                     {
-                        // Scan complete — download and send to user
-                        var imageStream = await jobResp.Content.ReadAsStreamAsync(ct);
-                        var fileName = $"scan-{jobId}.{format}";
-
-                        await bot.SendDocument(chatId, new InputFileStream(imageStream, fileName),
-                            caption: $"✅ Scanned at {dpi} dpi", cancellationToken: ct);
-
-                        await bot.DeleteMessage(chatId, callback.Message.Id, ct);
-                        return;
-                    }
-
-                    var status = System.Text.Json.JsonDocument.Parse(
-                        await jobResp.Content.ReadAsStringAsync(ct));
-                    var jobStatus = status.RootElement.GetProperty("status").GetString();
-
-                    if (jobStatus == "Failed")
-                    {
-                        var error = status.RootElement.GetProperty("error").GetString();
-                        await bot.EditMessageText(chatId, callback.Message.Id,
-                            $"❌ Scan failed: {error}", cancellationToken: ct);
-                        return;
-                    }
+                        DaemonSessionId = s.Id,
+                        ChatId = s.OwnerChatId,
+                        StatusMessageId = s.OwnerStatusMessageId,
+                        Params = s.Params,
+                        ExpiresAt = s.ExpiresAt,
+                        ScanCount = s.ScanCount,
+                    };
                 }
-
-                await bot.EditMessageText(chatId, callback.Message.Id,
-                    "❌ Scan timed out", cancellationToken: ct);
+                else if (sessions.TryGetValue(s.Id, out var bs))
+                {
+                    bs.ExpiresAt = s.ExpiresAt;
+                    bs.ScanCount = s.ScanCount;
+                }
             }
-            catch (Exception ex)
+            await RerenderAsync(s.Id, ct);
+            break;
+        }
+        case SessionEventType.SessionExtended when ev.Session is not null:
+        {
+            lock (sessionsLock)
             {
-                await bot.EditMessageText(chatId, callback.Message.Id,
-                    $"❌ Scan error: {ex.Message}", cancellationToken: ct);
+                if (sessions.TryGetValue(ev.Session.Id, out var bs))
+                    bs.ExpiresAt = ev.Session.ExpiresAt;
             }
+            await RerenderAsync(ev.Session.Id, ct);
+            break;
+        }
+        case SessionEventType.SessionScanning when ev.SessionId is not null:
+        {
+            lock (sessionsLock)
+            {
+                if (sessions.TryGetValue(ev.SessionId, out var bs))
+                    bs.Scanning = true;
+            }
+            await RerenderAsync(ev.SessionId, ct);
+            break;
+        }
+        case SessionEventType.SessionImageReady when ev.SessionId is not null && ev.Seq is int seq:
+        {
+            await DeliverImageAsync(ev.SessionId, seq, ev.ContentType ?? "image/jpeg",
+                ev.FileName ?? $"scan-{seq}.jpg", ct);
+            lock (sessionsLock)
+            {
+                if (sessions.TryGetValue(ev.SessionId, out var bs))
+                {
+                    bs.Scanning = false;
+                    bs.ScanCount = seq;
+                    bs.LastUploadedSeq = seq;
+                }
+            }
+            await RerenderAsync(ev.SessionId, ct);
+            break;
+        }
+        case SessionEventType.SessionScanFailed when ev.SessionId is not null:
+        {
+            lock (sessionsLock)
+            {
+                if (sessions.TryGetValue(ev.SessionId, out var bs))
+                {
+                    bs.Scanning = false;
+                }
+            }
+            if (sessions.TryGetValue(ev.SessionId, out var s0))
+                await bot.SendMessage(s0.ChatId,
+                    $"❌ Scan failed: {ev.Error}", cancellationToken: ct);
+            await RerenderAsync(ev.SessionId, ct);
+            break;
+        }
+        case SessionEventType.ScannerOnline:
+        {
+            List<(string sid, bool auto)> toNotify;
+            lock (sessionsLock)
+            {
+                foreach (var s in sessions.Values) s.ScannerOnline = true;
+                toNotify = sessions.Values.Select(s => (s.DaemonSessionId, s.FirstScanPending)).ToList();
+                foreach (var s in sessions.Values) s.FirstScanPending = false;
+            }
+            foreach (var (sid, auto) in toNotify)
+            {
+                await RerenderAsync(sid, ct);
+                if (auto)
+                {
+                    try { await daemon.RequestScanAsync(sid, ct); }
+                    catch (Exception ex) { log.LogWarning("auto-scan failed: {Err}", ex.Message); }
+                }
+            }
+            break;
+        }
+        case SessionEventType.ScannerOffline:
+        {
+            List<string> sids;
+            lock (sessionsLock)
+            {
+                foreach (var s in sessions.Values) s.ScannerOnline = false;
+                sids = [.. sessions.Keys];
+            }
+            foreach (var sid in sids) await RerenderAsync(sid, ct);
+            break;
+        }
+        case SessionEventType.ScannerButton:
+        {
+            // future: button poller. Translate to a scan request for the
+            // active session on this bot.
+            List<string> sids;
+            lock (sessionsLock) { sids = [.. sessions.Keys]; }
+            foreach (var sid in sids)
+            {
+                try { await daemon.RequestScanAsync(sid, ct); }
+                catch (Exception ex) { log.LogWarning("button scan failed: {Err}", ex.Message); }
+            }
+            break;
+        }
+        case SessionEventType.SessionTerminated when ev.SessionId is not null:
+        {
+            BotSession? s;
+            lock (sessionsLock)
+            {
+                sessions.TryGetValue(ev.SessionId, out s);
+                sessions.Remove(ev.SessionId);
+            }
+            if (s is not null)
+            {
+                try
+                {
+                    await bot.EditMessageText(s.ChatId, s.StatusMessageId,
+                        StatusMessage.RenderTerminated(s, ev.Reason ?? SessionTerminationReason.Closed, ev.NewOwner),
+                        parseMode: ParseMode.Html, replyMarkup: null,
+                        cancellationToken: ct);
+                }
+                catch { /* message may have been deleted */ }
+                staging.WipeSession(ev.SessionId);
+            }
+            break;
         }
     }
 }
 
-async Task ShowStatus(long chatId, CancellationToken ct)
+async Task RerenderAsync(string sessionId, CancellationToken ct)
 {
+    BotSession? s;
+    lock (sessionsLock) { sessions.TryGetValue(sessionId, out s); }
+    if (s is null) return;
+    var (html, kb) = StatusMessage.Render(s);
     try
     {
-        var resp = await daemonClient.GetAsync("/status", ct);
-        var json = await resp.Content.ReadAsStringAsync(ct);
-        var status = System.Text.Json.JsonDocument.Parse(json);
-        var printer = status.RootElement.GetProperty("printer");
-        var scanner = status.RootElement.GetProperty("scanner");
-
-        var printerOnline = printer.GetProperty("online").GetBoolean();
-        var scannerOnline = scanner.GetProperty("online").GetBoolean();
-
-        await bot.SendMessage(chatId, $"""
-            📊 <b>Status</b>
-
-            🖨️ Printer: {(printerOnline ? "✅ online" : "⚠️ offline")}
-            📷 Scanner: {(scannerOnline ? "✅ online" : "⚠️ offline")}
-            """, parseMode: ParseMode.Html, cancellationToken: ct);
+        await bot.EditMessageText(s.ChatId, s.StatusMessageId, html,
+            parseMode: ParseMode.Html, replyMarkup: kb, cancellationToken: ct);
     }
-    catch (Exception)
+    catch (Exception ex)
     {
-        await bot.SendMessage(chatId, """
-            📊 <b>Status</b>
-
-            🖨️ Printer: 🔌 unreachable
-            📷 Scanner: 🔌 unreachable
-            """, parseMode: ParseMode.Html, cancellationToken: ct);
+        // Most common: "message is not modified" — ignore.
+        if (!ex.Message.Contains("not modified", StringComparison.OrdinalIgnoreCase))
+            log.LogDebug("edit failed: {Err}", ex.Message);
     }
 }
 
+// ────────────────────────────────────────────────────────────────────────────
+// Image delivery: fetch from daemon, stage to disk, upload to TG, unstage.
+// ────────────────────────────────────────────────────────────────────────────
+
+async Task DeliverImageAsync(string sessionId, int seq, string contentType,
+    string fileName, CancellationToken ct)
+{
+    Interlocked.Increment(ref inFlight);
+    try { await inFlightDrained.WaitAsync(ct); } catch { }
+    try
+    {
+        BotSession? bs;
+        lock (sessionsLock) { sessions.TryGetValue(sessionId, out bs); }
+        if (bs is null) return;
+
+        var ext = Path.GetExtension(fileName).TrimStart('.');
+        string path;
+        await using (var stream = await daemon.FetchImageAsync(sessionId, seq, ct))
+        {
+            path = await staging.StageAsync(sessionId, seq, ext, stream, ct);
+        }
+        staging.RecordManifest(sessionId, seq, new StagedEntry(
+            ChatId: bs.ChatId, FileName: fileName, ContentType: contentType,
+            Caption: $"📷 {bs.Params.Dpi} dpi · scan #{seq}"));
+
+        await UploadStagedAsync(sessionId, seq, path, bs.ChatId, fileName,
+            $"📷 {bs.Params.Dpi} dpi · scan #{seq}", ct);
+    }
+    finally
+    {
+        if (Interlocked.Decrement(ref inFlight) == 0)
+            inFlightDrained.Release();
+    }
+}
+
+async Task UploadStagedAsync(
+    string sessionId, int seq, string path, long chatId,
+    string fileName, string caption, CancellationToken ct)
+{
+    try
+    {
+        await using var stream = File.OpenRead(path);
+        await bot.SendDocument(chatId, new InputFileStream(stream, fileName),
+            caption: caption, cancellationToken: ct);
+        staging.Remove(sessionId, seq);
+        log.LogInformation("delivered {Session}#{Seq} → {Chat}", sessionId, seq, chatId);
+    }
+    catch (Exception ex)
+    {
+        log.LogError(ex, "upload of {Session}#{Seq} failed, staging kept for retry", sessionId, seq);
+    }
+}
+
+async Task SweepStagingAsync(CancellationToken ct)
+{
+    // Called once at startup: any scans in the staging dir are unfinished
+    // uploads from a previous bot process. Retry them in order.
+    try { await Task.Delay(2000, ct); } catch { return; }
+    foreach (var (sessionId, seq, entry, path) in staging.EnumeratePending())
+    {
+        if (ct.IsCancellationRequested) return;
+        log.LogInformation("retry upload {Session}#{Seq} from staging", sessionId, seq);
+        await UploadStagedAsync(sessionId, seq, path, entry.ChatId,
+            entry.FileName, entry.Caption, ct);
+    }
+}
+
+// ────────────────────────────────────────────────────────────────────────────
 record AllowedUser(long Id, string Name);
