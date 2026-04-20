@@ -102,6 +102,16 @@
     settings = {
       experimental-features = [ "nix-command" "flakes" ];
       auto-optimise-store = true;  # hardlink identical store paths — saves SD card space
+
+      # Keep build closures (toolchains, buildInputs) alive as long as the
+      # system generation that built them is still within gc retention.
+      # Without these, every on-push rebuild would re-fetch rustc / gcc /
+      # autoreconfHook etc. as soon as a gc swept the previous one away —
+      # which defeats the point of iterating on the Pi at all. The cost is
+      # a larger store (build deps linger with their generation); monthly
+      # gc with 30d retention keeps that bounded.
+      keep-outputs = true;
+      keep-derivations = true;
     };
     # Run gc once a month, the day after system.autoUpgrade. On-push rebuilds
     # don't trigger gc — between monthly upgrades the store barely changes, and
