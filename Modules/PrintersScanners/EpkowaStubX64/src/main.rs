@@ -413,15 +413,20 @@ fn handle_int_read(sock: &mut UnixStream, payload: &[u8]) -> std::io::Result<()>
         (p.read)(buf.as_mut_ptr() as *mut libc::c_void, length)
     });
     check_canary("int_read", &buf, length);
-    let got = if ret > 0 { ret as usize } else { 0 };
+    // Native iscan's _recv wrapper treats the plugin's int_read return as
+    // a boolean success flag and uses the full `size` buffer regardless
+    // (epkowa_ip.c:_recv). So the plugin fills up to `length` bytes and
+    // returns 1 to mean "OK". Ship the whole caller-facing window back to
+    // the proxy — picking subsets based on `ret` would hide real data
+    // (e.g. this was truncating the 42-byte firmware-name reply to 1 byte).
     eprintln!(
-        "[stub]    int_read len={} ret={} got={}: {}",
-        length, ret, got, hex_short(&buf[..got], 48)
+        "[stub]    int_read len={} ret={}: {}",
+        length, ret, hex_short(&buf[..length], 48)
     );
-    let mut resp = Vec::with_capacity(4 + 4 + got);
+    let mut resp = Vec::with_capacity(4 + 4 + length);
     resp.extend_from_slice(&ret.to_le_bytes());
-    resp.extend_from_slice(&(got as u32).to_le_bytes());
-    resp.extend_from_slice(&buf[..got]);
+    resp.extend_from_slice(&(length as u32).to_le_bytes());
+    resp.extend_from_slice(&buf[..length]);
     write_frame(sock, OP_INT_READ_RESP, &resp)
 }
 
