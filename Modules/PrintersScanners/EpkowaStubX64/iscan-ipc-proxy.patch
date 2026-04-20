@@ -124,7 +124,7 @@
 new file mode 100644
 --- /dev/null
 +++ backend/epkowa_ipc.c
-@@ -0,0 +1,589 @@
+@@ -0,0 +1,598 @@
 +/* epkowa_ipc.c — proxy side of the stub/proxy split.
 + *
 + * On architectures that can't load the proprietary esci-interpreter plugin
@@ -508,8 +508,17 @@ new file mode 100644
 +  g_cb_write = w;
 +  g_cb_ctrl = c;
 +
++  /* Don't leak our USB fd number into the stub. File descriptors are
++   * process-local — the value iscan got from sanei_usb_open is meaningful
++   * only here, and any syscall the plugin does on it in the stub process
++   * would hit unrelated state. Pass -1 so a stray direct syscall fails
++   * fast with EBADF rather than silently corrupting something. The
++   * plugin's legitimate I/O goes through our USB callbacks, which resolve
++   * on the proxy side and never consult the fd value. */
++  (void)fd;
++  int32_t wire_fd = -1;
 +  uint8_t payload[5];
-+  memcpy(payload, &fd, 4);
++  memcpy(payload, &wire_fd, 4);
 +  payload[4] = use_ctrl ? 1 : 0;
 +  if (write_frame(g_sock, OP_INT_INIT_WITH_CTRL, payload, 5) < 0) return false;
 +
