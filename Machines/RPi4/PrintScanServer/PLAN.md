@@ -34,14 +34,22 @@ Controls (via bot UI):
 The scan path should support both bot-initiated and physical-button-initiated scans:
 
 - **Bot-initiated**: user sends a command (or taps a button in bot UI), selecting:
-  - Resolution: 200 dpi (default), with other options available
-  - Format: JPEG 90% quality (default), PNG or TIFF as lossless alternatives
-  - Scan result is sent back over the bot as a file
+  - **Resolution**: offer scanner-native DPIs only — 100, 200 (default-marked),
+    300, 600, 1200. These are the values the V33 plugin accepts without
+    rounding (verified empirically — 75 silently rounded to 100).
+  - **Format**: JPEG 90% quality (default), PNG or TIFF as lossless alternatives.
+  - **Color mode**: not offered — always scan color. For JPEG output the visual
+    difference is negligible; PNG/TIFF are intermediate formats where the user
+    can post-process if needed. One less decision for the user to make.
+  - Scan result is sent as a **document** (not photo) to preserve quality —
+    Telegram compresses anything sent via the photo path. Enforced with
+    `bot.SendDocument(InputFileStream)` never `SendPhoto`.
 
 - **Physical button**: pressing the scanner's hardware button triggers a scan
-  automatically, but only if a bot session is active (someone requested a scan
-  within the last ~10 minutes). Uses the same settings as the last bot request.
-  Result goes to the same user's chat.
+  automatically, but only if a bot session is active. A session is a
+  sliding 10-minute window (each button press / scan / explicit activity
+  refreshes it). Uses the session's settings. Result goes to the session
+  owner's chat. See the Session Model section below for details.
 
 ### IM Bot Interface
 
@@ -106,8 +114,9 @@ be the killer feature that makes this unnecessary, but worth knowing the options
 - Open-source backends (`epson2`, `epsonds`) do NOT support this scanner
 - USB ID: `04b8:0142` covers both V33 and V330 (same hardware)
 - Optical resolution: 4800 x 9600 dpi, CCD sensor, 48-bit color, A4 max area, LED (no warm-up)
-- Hardware button: epkowa does NOT expose button sensors, so scanbd/scanbuttond can't poll it.
-  Workaround: monitor USB HID interrupt endpoint directly for button press events, bypass SANE
+- Hardware button: epkowa does NOT expose button sensors via SANE, AND the button is
+  NOT on a USB HID endpoint. It's polled over vendor-specific bulk (ESC/I) commands —
+  see the "Scanner Button Detection (Epson V33)" section below for the correct approach.
 - iscan package is in nixpkgs as `epkowa`, V330 plugin as `epkowa.plugins.v330` (unfree)
 - Epson's udev rules are broken on NixOS — manual `services.udev.extraRules` needed
 - Custom `SANE_CONFIG_DIR` with only `epkowa` in `dll.conf` recommended for fast enumeration
@@ -201,6 +210,102 @@ be the killer feature that makes this unnecessary, but worth knowing the options
 
 Both shell out to `scanimage` for SANE and `lp` for CUPS (or use IPP libraries).
 Rust wins on footprint and NixOS packaging. C# wins on familiarity and SharpIpp.
+
+### Epson V33 on aarch64 — Driver Saga
+
+The single hardest part of the project so far. Recording the story so
+future-us doesn't re-try the dead ends.
+
+**The problem.** `epkowa` needs `libesci-interpreter-perfection-v330.so`
+(plus firmware `esfwad.bin`) to drive this scanner. Epson ships the plugin
+**x86_64 only**. No aarch64 build exists and it's proprietary — we can't
+rebuild it.
+
+**Dead ends — emulating the whole stack:**
+
+- **qemu-user** of the entire SANE stack: scanner enumerates, then bulk
+  transfers hang. qemu-user's syscall translator doesn't implement
+  libusb's async `USBDEVFS_SUBMITURB` / `REAPURB` ioctls, and those are
+  the plugin's USB path.
+- **box64**: gets further — the plugin loads — but crashes in variadic
+  libc wrappers during init (vfprintf-family argument handling under
+  translation). Never reaches the USB path.
+- **FEX-Emu**: same class of issue, different break point. Plus rootfs
+  juggling.
+- **Open-source SANE backends** (`epson2`, `epsonds`): explicitly don't
+  support V33/V330. `epsonscan2` (proprietary, newer) same story.
+
+**The architecture that works — proxy / stub split.** Keep USB +
+`libsane-epkowa.so` **native aarch64**; isolate *only* the proprietary
+plugin in a short-lived **x86_64 Rust stub** process spawned per scan via
+`socketpair + fork + exec`. The stub inherits an IPC socket on fd 3,
+`dlopen`s the plugin, and serves wire-format requests for every plugin
+entry point. USB callbacks forward back over the same socket to the
+aarch64 side so libusb stays native. qemu-user only ever sees the
+plugin's pure CPU work (ESC/I byte munging) which it handles fine — no
+USB ioctls ever reach it.
+
+The stub is cross-compiled natively on aarch64 via `rustPlatform`'s cross
+support — no qemu at build time.
+
+Code lives under:
+- `Modules/PrintersScanners/EpkowaStubX64/` — Rust stub + `PROTOCOL.md`
+  wire format + cross-build derivation
+- `Modules/PrintersScanners/EpkowaStubX64/iscan-ipc-proxy.patch` — iscan
+  patch on top of nixpkgs' stock epkowa, adding `--enable-ipc-proxy` and
+  a new `backend/epkowa_ipc.c` that routes through the stub
+- `Modules/PrintersScanners/EpkowaScanner/default.nix` — glue + udev
+  rules + SANE config
+
+**The one thing we don't understand well.** `int_init(fd, …)` takes the
+USB file descriptor. File descriptors are process-local, so iscan's fd
+is meaningless in the stub process. Empirically:
+- Passing `-1` sends the plugin down its `fd < 0` sentinel branches and
+  it corrupts its own heap a few commands later.
+- Passing `INT32_MAX` keeps the plugin on its normal "non-negative fd"
+  path and scans work end-to-end.
+
+Any syscall the plugin might issue on either value fails `EBADF` anyway
+— `INT32_MAX` can't be a real open fd in the stub. We don't know which
+internal plugin paths these steer it down. If the plugin ever uses the
+fd for something load-bearing (e.g. buffer-size math — improbable but
+not ruled out), the `INT32_MAX` happy path could break in interesting
+ways. If we see flakiness, this is the first thing to re-examine.
+
+**Small technical details** (mostly routine, here for search):
+
+- iscan's `bool` is `typedef enum { false, true }` — int-sized on amd64,
+  not `_Bool`. Our Rust-side FFI slots using `bool` (1 byte) leaked
+  garbage into the plugin; need an explicit `IscanBool = c_int` alias.
+- iscan's `_recv` treats `int_read`'s return as a boolean success flag
+  and reads the whole `size`-byte buffer regardless. The stub must ship
+  `buf[..size]` back over IPC, not a subset based on the return value.
+- `function_s_1` has no byte-length parameter — the caller passes width
+  (pixels) + color (bool) and the plugin infers `bytes_per_line`. We
+  extend the `_s_1` slot signature with an ifdef'd `size_t line_bytes`
+  under `USE_IPC_PROXY` so `_ftor0` hands over the authoritative
+  `params->bytes_per_line` directly.
+- Some plugin commands overrun the caller's buffer (decode the scanner
+  response in place). Native iscan absorbed this into stack neighbours
+  it never re-read; our heap buffers get `PLUGIN_OVERRUN_PAD = 64` so
+  the overrun stays inside our own `Vec<u8>`.
+
+**What's still fragile:**
+
+- **Scanner stays powered on after a scan.** The Windows Epson Scan 2
+  app idles it, so there's presumably a USB command sequence; we'd have
+  to capture it with Wireshark + `usbmon`. Parked.
+- **USB cable sensitivity.** Rare chirp-handshake downgrades to USB 1.1
+  during enumeration, cable-dependent. The original Epson cable (ferrite
+  coils on both ends) is clearly serious about interference; generic
+  replacements are less happy. The scanner *is* slightly pickier than it
+  used to be years ago even on the original cable, so the USB-B jack
+  might have degraded some, but not enough to justify opening the unit
+  in a dusty home. Workaround: use the original cable.
+- **Multi-scan within one stub process** not yet exercised. The stub has
+  only been tested with a single scan followed by `fini` + exit. The
+  session model we're about to build will push this path and may surface
+  new behaviour (plugin state carry-over between scans, etc.).
 
 ### Scanner Button Detection (Epson V33)
 
@@ -309,19 +414,115 @@ Exposes a local API consumed by bots, web UI, or any future client.
   (Google/Microsoft account gating) which forwards authenticated requests with
   the API key. Same pattern as Syncthing.
 
-**Endpoints (draft):**
+**Endpoints (revised):**
 - `POST /print` — accept file (PDF/image), options (page range, copies)
-- `POST /scan` — start scan with options (resolution, format), returns job ID
-- `GET /scan/{id}` — poll scan status, download result when done
-- `GET /status` — printer/scanner status (online, paper, errors)
-- `POST /button/subscribe` — register for scanner button events (with callback)
-- `GET /jobs` — list recent print/scan jobs
+- `POST /sessions` — open a scan session with DPI/format/chatId; returns session ID, or 409 if one is already open (takeover via `?takeover=true`)
+- `DELETE /sessions/{id}` — close a session explicitly
+- `GET /sessions/{id}` — inspect session state (params, scans-so-far, expires-at)
+- `POST /sessions/{id}/scan` — ask for one scan now (not waiting for the button)
+- `GET /sessions/{id}/image/{seq}` — stream an already-captured image (octet-stream, chunked; bot uses this on restart-retry)
+- `GET /status` — printer/scanner instantaneous status
+- `GET /events` — SSE stream: `scanner.online`, `scanner.offline`, `scanner.button`, `session.opened`, `session.scanning`, `session.image-ready { sessionId, seq, bytes, contentType }`, `session.terminated { reason: timeout|takeover|closed, newOwner? }`, `session.extended`
+- `GET /jobs` — list recent print jobs (scan jobs are session-scoped now)
 
-**Scanner button integration:** the daemon's button poller thread monitors the
-scanner via ESC/I bulk commands (every 500ms). On button press, it checks for
-active subscriptions (e.g., a Telegram user requested scan within 10 min) and
-auto-starts a scan with that user's last settings. Result is pushed to the
-subscriber via their bot.
+**Scanner button integration.** The daemon's button poller thread monitors the
+scanner via ESC/I bulk commands (polling period TBD during reverse-engineering,
+500ms is the starting estimate). Button presses go out as `scanner.button` SSE
+events. The daemon itself does **not** auto-scan on button press — the bot
+(which knows the session state and user context) calls `POST /sessions/{id}/scan`
+in response. This keeps scan-on-button policy in the bot so different media
+(TG/WhatsApp/web) can customize behavior without daemon changes.
+
+### Session Model
+
+The daemon holds the session as durable state (single source of truth for
+multi-bot support). Bots are stateless — they reconstruct their view from
+daemon events on startup.
+
+**Record** (persisted to `/var/lib/printscan/sessions.json` on every mutation):
+```
+{
+  "id": "abc123",
+  "ownerBot": "telegram",
+  "ownerChatId": 12345,
+  "ownerStatusMessageId": 67890,   // for the bot to edit on events
+  "ownerDisplayName": "@alice",     // for takeover messages
+  "params": { "dpi": 200, "format": "jpg" },
+  "opened": "2026-04-20T01:23:45Z",
+  "expiresAt": "2026-04-20T01:33:45Z",  // sliding 10-min window
+  "scanCount": 3,
+  "inFlightScan": false  // only true during scanimage + delivery
+}
+```
+
+**Lifecycle:**
+- **Open** — bot `POST /sessions` with `params + chatId + statusMessageId`.
+  Returns `409 Conflict` with the current session summary if one exists. Bot
+  shows user a confirmation; on confirm, bot retries with `?takeover=true`.
+- **Takeover** — daemon waits for any `inFlightScan` on the existing session
+  to complete delivery first (hard-cut is bad UX), then emits
+  `session.terminated { reason: takeover, newOwner: … }`, creates the new
+  session. Previous bot sees the event and edits its status message to
+  "🚪 Session ended — taken over by @bob".
+- **Sliding window** — each button press / scan / explicit poke refreshes
+  `expiresAt` to `now + 10min`. A background task in the daemon closes
+  expired sessions and emits `session.terminated { reason: timeout }`.
+- **Close** — explicit `DELETE /sessions/{id}` from any bot action.
+- **Persistence across daemon restart** — on boot daemon reads
+  `sessions.json`, re-emits current `session.opened` state on first SSE
+  subscription, bot-side status messages still work because `chatId +
+  messageId` live in Telegram forever.
+
+**In-flight scans do not survive daemon restart** — they're active process
+state, not persisted. If the daemon is SIGTERMed mid-scan the shutdown
+handler lets the current scan+delivery complete (see "Graceful Shutdown").
+Hard-kill/power-loss loses the in-flight scan; bot shows
+"🔁 Service restarted, press the button to rescan", session stays open.
+
+### Bot-Side Materialization & Delivery Pipeline
+
+**Dataflow (happy path):**
+```
+scanimage stdout → daemon RecyclableMemoryStream → SSE chunked → bot
+   → bot writes /var/lib/printscan-bot/<session>/<seq>.<ext>
+   → bot.SendDocument(InputFileStream) → Telegram
+   → on 200 OK: delete staged file; emit bot-side log
+```
+
+The daemon end uses `Microsoft.IO.RecyclableMemoryStream` — chunked pool-backed,
+no LOH pressure, swap-friendly. The bot end stages to disk *before* attempting
+the TG upload so an upload failure (network, TG rate-limit, bot crash) leaves
+the scan recoverable.
+
+**On bot startup**, scan directory is swept: any files still present are
+uncommitted uploads to retry. Small per-session metadata file (`manifest.json`)
+captures `seq → { chatId, filename, caption, contentType }` so retries don't
+need session-server coordination.
+
+**Media group delivery.** Telegram's `sendMediaGroup` is atomic — up to 10
+items per call, cannot edit to add more. Default UX: each scan streamed to
+the user as an individual document during the session (immediate feedback);
+on session close, all staged files gathered into one or more media-groups
+of 10 as a "📚 Session summary". Toggle available per-session.
+
+**Hi-resolution over the 50MB TG limit.** Multi-page high-res sessions can
+exceed the single-file limit; plan is ZIP-first, shell out to `7z -v50m` for
+multi-volume output only when the ZIP would exceed 50MB. Materialization
+means no data is lost while we decide what to do.
+
+### Graceful Shutdown
+
+Both `printscan-daemon.service` and `printscan-bot.service` participate in
+generous, bounded shutdown:
+
+- `TimeoutStopSec=20min` on both units (cover worst-case scan+upload).
+- Services trap SIGTERM via `IHostApplicationLifetime`, refuse to exit while
+  any `inFlightScan` or upload is active. A simple gauge; tasks increment/
+  decrement and the handler `await`s it to drain before calling `StopAsync`.
+- nixos-rebuild swaps happen cleanly: in-flight work completes, service
+  restarts, session reloaded from disk.
+- Hard kill (OOM, panic, power): in-flight scan lost (see session lifecycle
+  above); persisted session + staged files recover everything else.
 
 ### Relationship with AirSane/CUPS
 
@@ -407,11 +608,21 @@ Each component can use the best-fit stack since REST/socket boundaries decouple 
 
 Using a camcorder-grade high-endurance SD card. Measures in the config:
 - `boot.tmp.useTmpfs = true` — /tmp in RAM
-- `services.journald.extraConfig = "Storage=volatile"` — journal in RAM only
 - `fileSystems."/".options = [ "noatime" ]` — no access time writes
 - `nix.settings.auto-optimise-store = true` — dedup hard links in store
-- `nix-collect-garbage` weekly (7-day retention)
+- `nix.gc`: monthly on the 2nd at 04:00 + 6h randomized, 30-day retention,
+  `persistent = true`. Coupled with `system.autoUpgrade` on the 1st so gc
+  runs after the upgrade has settled. On-push rebuilds don't trigger gc —
+  between monthly upgrades the store barely changes and that window also
+  happens to be when rollback is most likely needed.
+- `nix.settings.keep-outputs = true` + `keep-derivations = true` — build
+  closures (rustc, cross toolchain, autoreconfHook) stay alive as long as
+  the generation that used them is still in gc retention. Without these,
+  every iteration rebuild re-fetches the toolchain the moment the previous
+  one gets pruned, which defeats the point of iterating on the Pi.
 - `boot.growPartition = true` — auto-expand root on first boot
+- Persistent journal left on; earlier `Storage=volatile` was commented out
+  during the scanner-driver investigation to keep diagnostic history.
 
 ### Memory Management
 
@@ -453,33 +664,49 @@ Could add bot UI for this later (print odd → prompt user to flip → print eve
 4. **WiFi**: added later, EAP-PEAP with Unifi built-in RADIUS, password via sops-nix
 5. **Public repo**: readonly GitHub access, no deploy key needed
 
-### TODO: Push-triggered rebuild
+### Push-triggered rebuild — DONE
 
-Poll GitHub every 5-15 minutes for new upstream commits. If changed, update only
-the upstream input (not nixpkgs) and rebuild. This makes config pushes to
-HyperNix take effect on the machine within minutes, without a full nixpkgs update.
+Implemented as `services.auto-rebuild-on-push` in
+`Modules/System/AutoRebuildOnPush/`. 5-minute systemd timer runs a shell
+script that compares upstream `github:hypersw/HyperNix` against the locked
+rev, and on change runs `nix flake update --flake /etc/nixos` + full
+`nixos-rebuild switch`. Monthly full autoUpgrade continues to cover
+nixpkgs refreshes.
 
-Approach: systemd timer runs `git ls-remote` to compare upstream rev against
-the locked rev in `/etc/nixos/flake.lock`. If different:
-```bash
-nix flake update --update-input upstream /etc/nixos
-nixos-rebuild switch --flake /etc/nixos
-```
-
-Alternative: use Telegram as a push channel — a GitHub Action sends a message
-to the bot on push, the bot triggers rebuild. Zero polling, uses existing infra.
+(Telegram-push alternative parked — polling cost is trivial and the
+GitHub webhook setup would need a public endpoint we don't have.)
 
 ### Implementation Order
 
 1. ~~Machine flake (NixOS config, SD image, boot on RPi4 via Ethernet)~~ DONE
-2. Scanner button reverse-engineering (pyusb script on dev host with scanner connected)
-3. LaserJetPrinter module (CUPS + foo2zjs, verify printing works on RPi)
-4. EpkowaScanner module (SANE + epkowa, verify scanning works on RPi)
-5. Print/Scan daemon (C#, Unix socket API, print/scan job handling, button poller)
-6. Telegram bot (C#, long-polling, file receive → print, /scan command → scan)
-7. AirSane (LAN scanning for iOS/macOS/Android)
-8. Monitoring module (OnFailure + health timer → Telegram)
-9. Push-triggered rebuild (polling or Telegram-based)
-10. WiFi configuration (EAP-PEAP, separate SSID)
-11. WhatsApp bot (Node.js/Baileys, same Unix socket API)
-12. Web UI (SPA + oauth2-proxy → Unix socket via oauth2-proxy upstream)
+2. ~~EpkowaScanner module: SANE + epkowa + aarch64/x86_64 IPC proxy/stub.
+   End-to-end Color A4 scan working end-to-end (see "Driver Saga" above)~~ DONE
+3. ~~Push-triggered rebuild (auto-rebuild-on-push service polling GitHub)~~ DONE
+4. ~~Monitoring module (OnFailure + Telegram alerts + boot confirmation)~~ DONE
+5. ~~LaserJetPrinter module (CUPS + foo2zjs)~~ DONE (printing untested end-to-end)
+6. **Daemon redesign — session model + streaming pipeline + SSE events.** Refactor
+   existing `PrintScan.Daemon` to session-based API, in-memory
+   `RecyclableMemoryStream` scan pipeline, SSE `/events` stream, persistent
+   session store under `/var/lib/printscan/sessions.json`. No hardware required,
+   all testable with `scanimage --test` or a mock.
+7. **Bot redesign — status-message UX + materialized staging + takeover flow.**
+   Refactor `PrintScan.TelegramBot` to consume daemon SSE, stage scans under
+   `/var/lib/printscan-bot/…`, edit status message on events, handle
+   `session.terminated` gracefully. Still no hardware; mock the daemon in unit
+   tests or run daemon with a fake scanner.
+8. **Graceful-shutdown plumbing on both services**: SIGTERM handler that drains
+   in-flight ops, `TimeoutStopSec=20min` in the unit files.
+9. **Scanner button reverse-engineering** (now that the driver works, pyusb
+   script on the Pi with the scanner attached; map button bytes). Integrate
+   as a daemon poller thread emitting `scanner.button` events.
+10. **AirSane** (LAN scanning for iOS/macOS/Android) — independent of the bot path.
+11. **Scanner power-off-via-USB** — capture Windows Epson app idle sequence
+    with Wireshark + `usbmon`, replay on session close.
+12. **Zigbee relay** to power-cycle scanner + RPi on session open. Hardware
+    not yet available — parked, not in any phase.
+13. **WiFi** (EAP-PEAP, separate SSID, sops-nix for creds).
+14. **WhatsApp bot** (Node.js/Baileys, same daemon API).
+15. **Web UI** (SPA + oauth2-proxy → daemon API).
+
+Current focus: **6 → 7 → 8**, all implementable without hardware access, then
+boot the rig for end-to-end validation on 9.
