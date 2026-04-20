@@ -103,10 +103,17 @@
       experimental-features = [ "nix-command" "flakes" ];
       auto-optimise-store = true;  # hardlink identical store paths — saves SD card space
     };
+    # Run gc once a month, the day after system.autoUpgrade. On-push rebuilds
+    # don't trigger gc — between monthly upgrades the store barely changes, and
+    # gc scans are writes the SD card doesn't need. The 1-day lag past
+    # autoUpgrade leaves a rollback window; --delete-older-than 30d then keeps
+    # at least the previous month's generation once we collect.
     gc = {
       automatic = true;
-      dates = "weekly";
-      options = "--delete-older-than 7d";
+      dates = "*-*-02 04:00";
+      randomizedDelaySec = "6h";
+      options = "--delete-older-than 30d";
+      persistent = true;
     };
   };
   nixpkgs.config.allowUnfree = true;
