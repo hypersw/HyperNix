@@ -63,10 +63,12 @@ type CtrlCallback = unsafe extern "C" fn(
     libc::size_t, *mut libc::c_void,
 ) -> libc::ssize_t;
 
-type FnIntInit = unsafe extern "C" fn(libc::c_int, IoCallback, IoCallback) -> bool;
+type IscanBool = libc::c_int;
+
+type FnIntInit = unsafe extern "C" fn(libc::c_int, IoCallback, IoCallback) -> IscanBool;
 type FnIntInitWithCtrl = unsafe extern "C" fn(
     libc::c_int, IoCallback, IoCallback, CtrlCallback,
-) -> bool;
+) -> IscanBool;
 type FnIntFini = unsafe extern "C" fn();
 type FnIntRead = unsafe extern "C" fn(*mut libc::c_void, libc::size_t) -> libc::c_int;
 type FnIntWrite = unsafe extern "C" fn(*mut libc::c_void, libc::size_t) -> libc::c_int;
@@ -75,7 +77,7 @@ type FnFunctionS0 = unsafe extern "C" fn(
     libc::c_uint, libc::c_uint, libc::c_uint, libc::c_uint, *mut f64,
 ) -> libc::c_int;
 type FnFunctionS1 = unsafe extern "C" fn(
-    *mut u8, *mut u8, libc::c_uint, bool, *mut f64,
+    *mut u8, *mut u8, libc::c_uint, IscanBool, *mut f64,
 );
 
 struct LoadedPlugin {
@@ -349,12 +351,12 @@ fn handle_int_init(sock: &mut UnixStream, payload: &[u8]) -> std::io::Result<()>
     let ok = with_plugin(false, |p| unsafe {
         if use_ctrl {
             match p.init_with_ctrl {
-                Some(f) => f(fd, cb_usb_read, cb_usb_write, cb_usb_ctrl),
+                Some(f) => f(fd, cb_usb_read, cb_usb_write, cb_usb_ctrl) != 0,
                 None => false,
             }
         } else {
             match p.init {
-                Some(f) => f(fd, cb_usb_read, cb_usb_write),
+                Some(f) => f(fd, cb_usb_read, cb_usb_write) != 0,
                 None => false,
             }
         }
@@ -468,8 +470,9 @@ fn handle_function_s_1(sock: &mut UnixStream, payload: &[u8]) -> std::io::Result
     // per-line shading operations; revisit once we have the plugin's
     // actual behavior mapped out.
     let mut outbuf = vec![0u8; inb_len];
+    let color_flag: IscanBool = if color { 1 } else { 0 };
     with_plugin((), |p| unsafe {
-        (p.function_s_1)(inbuf.as_mut_ptr(), outbuf.as_mut_ptr(), width, color, table.as_mut_ptr());
+        (p.function_s_1)(inbuf.as_mut_ptr(), outbuf.as_mut_ptr(), width, color_flag, table.as_mut_ptr());
     });
     let mut resp = Vec::with_capacity(4 + outbuf.len() + 4 + tlen * 8);
     resp.extend_from_slice(&(outbuf.len() as u32).to_le_bytes());
