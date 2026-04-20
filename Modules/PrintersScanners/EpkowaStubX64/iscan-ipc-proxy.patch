@@ -94,10 +94,37 @@
    /* FIXME: if we are still here, we should set up the alarm stuff
       here because _load is really a sort of ctor.  Note that open
       should disarm the alarm and close should re-arm it.  Our dtor
+@@ -542,6 +595,12 @@ _ftor0 (device_type *device, SANE_Parameters *params,
+ 	      params->bytes_per_line);
+       device->interpreter->_s_1 (device->interpreter->_buffer,
+ 				 ptr + i * params->bytes_per_line,
++#ifdef USE_IPC_PROXY
++				 /* IPC path: authoritative byte length for
++				    in/out buffers — the stub has no other
++				    way to compute it from width alone. */
++				 params->bytes_per_line,
++#endif
+ 				 params->pixels_per_line,
+ 				 params->format == SANE_FRAME_RGB,
+ 				 device->interpreter->_table);
+--- backend/epkowa_ip.h
++++ backend/epkowa_ip.h
+@@ -113,6 +113,11 @@ struct interpreter_type
+ 		  unsigned int resolution, unsigned int opt_resolution,
+ 		  double *table);
+   void (*_s_1)   (uint8_t *in_buf, uint8_t *out_buf,
++#ifdef USE_IPC_PROXY
++		  /* IPC path: pass byte length explicitly so the stub
++		     can size its outbuf without guessing from width. */
++		  size_t line_bytes,
++#endif
+ 		  unsigned int width, bool color, double *table);
+ };
+ 
 new file mode 100644
 --- /dev/null
 +++ backend/epkowa_ipc.c
-@@ -0,0 +1,592 @@
+@@ -0,0 +1,589 @@
 +/* epkowa_ipc.c — proxy side of the stub/proxy split.
 + *
 + * On architectures that can't load the proprietary esci-interpreter plugin
@@ -618,18 +645,15 @@ new file mode 100644
 +}
 +
 +void ipc_function_s_1(uint8_t *in_buf, uint8_t *out_buf,
++                      size_t line_bytes,
 +                      unsigned int width, bool color, double *table)
 +{
 +  if (g_sock < 0) return;
-+  /* Actual byte lengths of in/out buffers aren't passed as arguments by
-+   * the interpreter API — the caller (_ftor0) knows them as bytes_per_line
-+   * but only passes `pixels_per_line` as `width`. We need byte lengths.
-+   *
-+   * The convention is: buffer length is `width * bytes_per_pixel`. For the
-+   * supported V33 depth-8 formats: grayscale = width*1, RGB = width*3.
-+   * (Depth-1 never reaches here per _ftor0's guard.) */
-+  unsigned int bytes_per_pixel = color ? 3 : 1;
-+  uint32_t buflen = (uint32_t)(width * bytes_per_pixel);
++  if (line_bytes > UINT32_MAX) return;
++  /* in_buf and out_buf are each exactly `line_bytes` bytes (= caller's
++   * params->bytes_per_line). Depth, color, and width-to-bytes math all
++   * stay on the caller's side; we just forward the authoritative count. */
++  uint32_t buflen = (uint32_t)line_bytes;
 +  uint32_t tlen = (uint32_t)width;
 +
 +  size_t payload_len = 4 + 1 + 4 + (size_t)tlen * 8 + 4 + (size_t)buflen;
@@ -693,7 +717,7 @@ new file mode 100644
 new file mode 100644
 --- /dev/null
 +++ backend/epkowa_ipc.h
-@@ -0,0 +1,51 @@
+@@ -0,0 +1,52 @@
 +/* epkowa_ipc.h — proxy-side IPC interface (see epkowa_ipc.c).
 + *
 + * These functions mirror the signatures expected by epkowa_ip.c's
@@ -738,6 +762,7 @@ new file mode 100644
 +                             unsigned int resolution, unsigned int opt_resolution,
 +                             double *table);
 +void ipc_function_s_1       (uint8_t *in_buf, uint8_t *out_buf,
++                             size_t line_bytes,
 +                             unsigned int width, bool color, double *table);
 +
 +#ifdef __cplusplus
