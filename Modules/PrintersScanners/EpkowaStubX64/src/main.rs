@@ -54,32 +54,17 @@ const OP_CB_USB_CTRL_RESP: u8 = 0xD3;
 /// stdin/stdout/stderr.
 const IPC_FD: RawFd = 3;
 
-/// Tail-guard bytes we pad every plugin-exposed read/write buffer with so
-/// a plugin overrun shows up as a canary-fill change rather than random
-/// heap corruption detected minutes later.
-const CANARY_SIZE: usize = 64;
-const CANARY_BYTE: u8 = 0xA5;
-
-/// Hex dump of a byte slice, capped at `cap` bytes of hex, with a "..."
-/// suffix if truncated. Pair with a length field in the caller's log
-/// line so capped dumps stay unambiguous.
-fn hex_short(data: &[u8], cap: usize) -> String {
-    let n = data.len().min(cap);
-    let hex: Vec<String> = data[..n].iter().map(|b| format!("{:02x}", b)).collect();
-    let suffix = if data.len() > cap { " ..." } else { "" };
-    format!("{}{}", hex.join(" "), suffix)
-}
-
-fn check_canary(op: &str, buf: &[u8], requested: usize) {
-    let tail = &buf[requested..];
-    if let Some(off) = tail.iter().position(|&b| b != CANARY_BYTE) {
-        let end = (off + 16).min(tail.len());
-        eprintln!(
-            "[stub] CANARY CORRUPT in {}: requested={}, first-bad-offset=+{}, tail[{}..{}]={:02x?}",
-            op, requested, off, off, end, &tail[off..end]
-        );
-    }
-}
+/// Extra bytes padded onto every plugin-exposed read/write buffer.
+///
+/// Some ESC/I interpreters decode scanner responses *into the caller's
+/// command buffer*, overrunning its declared size. Native iscan tolerates
+/// this because the overrun lands in adjacent stack locals that are never
+/// re-read (iscan's `_send` even carries an `ASSUMPTION: Interpreter does
+/// NOT change buffer's content` comment). Our heap allocations have no
+/// equivalent throwaway neighbours, so without padding the overrun would
+/// hit allocator metadata and trip glibc's heap check on the next free.
+/// The pad keeps overruns inside our own Vec.
+const PLUGIN_OVERRUN_PAD: usize = 64;
 
 // ──────────────────────────────────────────────────────────────────────────
 // Interpreter ABI (from epkowa_ip_api.h — matches the proprietary .so)
@@ -186,7 +171,6 @@ fn write_frame(s: &mut UnixStream, op: u8, payload: &[u8]) -> std::io::Result<()
 // safe regardless of what the plugin does with its input buffers.
 
 unsafe extern "C" fn cb_usb_read(buffer: *mut libc::c_void, length: libc::size_t) -> libc::ssize_t {
-    eprintln!("[stub]   cb_usb_read({} bytes)", length);
     let mut s = cb_sock();
     if write_frame(&mut s, OP_CB_USB_READ, &(length as u32).to_le_bytes()).is_err() {
         return -1;
@@ -206,7 +190,6 @@ unsafe extern "C" fn cb_usb_read(buffer: *mut libc::c_void, length: libc::size_t
 }
 
 unsafe extern "C" fn cb_usb_write(buffer: *mut libc::c_void, length: libc::size_t) -> libc::ssize_t {
-    eprintln!("[stub]   cb_usb_write({} bytes)", length);
     let mut s = cb_sock();
     let data = std::slice::from_raw_parts(buffer as *const u8, length);
     let mut payload = Vec::with_capacity(4 + data.len());
@@ -403,26 +386,17 @@ fn handle_int_read(sock: &mut UnixStream, payload: &[u8]) -> std::io::Result<()>
         return write_frame(sock, OP_INT_READ_RESP, &resp);
     }
     let length = u32::from_le_bytes([payload[0], payload[1], payload[2], payload[3]]) as usize;
-    // Overallocate with a 0xA5 canary tail so we can detect the plugin
-    // writing past the `length` byte window it was asked to fill. Cheap
-    // in-band overrun check: if the canary tail changes after the call,
-    // the plugin went past the end of our buffer.
-    let mut buf = vec![CANARY_BYTE; length + CANARY_SIZE];
-    buf[..length].fill(0);
+    // Overallocate by PLUGIN_OVERRUN_PAD to absorb any plugin overrun;
+    // we only ship buf[..length] back, the padding stays private.
+    let mut buf = vec![0u8; length + PLUGIN_OVERRUN_PAD];
     let ret = with_plugin(-1, |p| unsafe {
         (p.read)(buf.as_mut_ptr() as *mut libc::c_void, length)
     });
-    check_canary("int_read", &buf, length);
-    // Native iscan's _recv wrapper treats the plugin's int_read return as
-    // a boolean success flag and uses the full `size` buffer regardless
-    // (epkowa_ip.c:_recv). So the plugin fills up to `length` bytes and
-    // returns 1 to mean "OK". Ship the whole caller-facing window back to
-    // the proxy — picking subsets based on `ret` would hide real data
-    // (e.g. this was truncating the 42-byte firmware-name reply to 1 byte).
-    eprintln!(
-        "[stub]    int_read len={} ret={}: {}",
-        length, ret, hex_short(&buf[..length], 48)
-    );
+    // Native iscan's _recv wrapper (epkowa_ip.c) uses the plugin's return
+    // as a boolean success flag and passes the whole `size` buffer up
+    // regardless. So we ship the full window — reading bytes-written out
+    // of `ret` would truncate real data (that's how the 42-byte firmware
+    // identity reply once collapsed to its first byte).
     let mut resp = Vec::with_capacity(4 + 4 + length);
     resp.extend_from_slice(&ret.to_le_bytes());
     resp.extend_from_slice(&(length as u32).to_le_bytes());
@@ -438,28 +412,17 @@ fn handle_int_write(sock: &mut UnixStream, payload: &[u8]) -> std::io::Result<()
     if payload.len() < 4 + dlen {
         return write_frame(sock, OP_INT_WRITE_RESP, &(-1i32).to_le_bytes());
     }
-    // Copy into an owned Vec — the plugin may call into its own USB callbacks
-    // (which use cb_sock), so we don't want to hold a slice into our payload
-    // buffer any longer than necessary.
-    // Canary tail: in_buf is nominally read-only for int_write, but some
-    // ESC/I interpreters munge the command bytes in place (encryption /
-    // checksumming), and a stray store past `dlen` would corrupt our
-    // heap silently. Detect it cheaply.
-    let mut data = Vec::with_capacity(dlen + CANARY_SIZE);
-    data.extend_from_slice(&payload[4..4 + dlen]);
-    data.resize(dlen + CANARY_SIZE, CANARY_BYTE);
-    eprintln!(
-        "[stub]    int_write in  len={}: {}",
-        dlen, hex_short(&data[..dlen], 48)
-    );
+    // Copy into an owned Vec — the plugin may call back into our USB
+    // callbacks (which use cb_sock), so we don't want to hold a slice into
+    // our wire payload buffer any longer than necessary. Pad by
+    // PLUGIN_OVERRUN_PAD: `int_write` is nominally read-only for the
+    // caller's buffer, but some ESC/I interpreters decode responses in
+    // place and overshoot — same defensive pad as `int_read`.
+    let mut data = vec![0u8; dlen + PLUGIN_OVERRUN_PAD];
+    data[..dlen].copy_from_slice(&payload[4..4 + dlen]);
     let ret = with_plugin(-1, |p| unsafe {
         (p.write)(data.as_mut_ptr() as *mut libc::c_void, dlen)
     });
-    check_canary("int_write", &data, dlen);
-    eprintln!(
-        "[stub]    int_write out len={} ret={}: {}",
-        dlen, ret, hex_short(&data[..dlen], 48)
-    );
     write_frame(sock, OP_INT_WRITE_RESP, &ret.to_le_bytes())
 }
 
@@ -522,10 +485,10 @@ fn handle_function_s_1(sock: &mut UnixStream, payload: &[u8]) -> std::io::Result
     if payload.len() < inb_start + 4 + inb_len {
         return write_frame(sock, OP_FUNCTION_S_1_RESP, &[]);
     }
+    // in_buf and out_buf are both `inb_len` bytes — that's the authoritative
+    // `params->bytes_per_line` the caller passed on the wire, not a guess
+    // from width×bpp. See the ifdef'd line_bytes slot in epkowa_ip.h.
     let mut inbuf = payload[inb_start + 4..inb_start + 4 + inb_len].to_vec();
-    // Heuristic: out_buf is same length as in_buf. True for typical
-    // per-line shading operations; revisit once we have the plugin's
-    // actual behavior mapped out.
     let mut outbuf = vec![0u8; inb_len];
     let color_flag: IscanBool = if color { 1 } else { 0 };
     with_plugin((), |p| unsafe {
@@ -551,38 +514,20 @@ fn serve(mut sock: UnixStream) -> std::io::Result<()> {
         let plen = read_u32(&mut sock)? as usize;
         let payload = read_exact(&mut sock, plen)?;
 
-        // Per-op log to stderr — catches which call was in flight when the
-        // loaded proprietary .so aborts the process (e.g. glibc double-free
-        // detection). `eprintln!` flushes, so the final line before a crash
-        // survives to the caller's stderr.
-        let op_name = match op {
-            OP_OPEN_LIBRARY => "OPEN_LIBRARY",
-            OP_INT_INIT_WITH_CTRL => "INT_INIT[_WITH_CTRL]",
-            OP_INT_FINI => "INT_FINI",
-            OP_INT_READ => "INT_READ",
-            OP_INT_WRITE => "INT_WRITE",
-            OP_INT_POWER_SAVING_MODE => "INT_POWER_SAVING_MODE",
-            OP_FUNCTION_S_0 => "FUNCTION_S_0",
-            OP_FUNCTION_S_1 => "FUNCTION_S_1",
-            _ => "?",
-        };
-        eprintln!("[stub] -> {} ({} bytes)", op_name, plen);
-        let r = match op {
-            OP_OPEN_LIBRARY => handle_open_library(&mut sock, &payload),
-            OP_INT_INIT_WITH_CTRL => handle_int_init(&mut sock, &payload),
-            OP_INT_FINI => handle_int_fini(&mut sock),
-            OP_INT_READ => handle_int_read(&mut sock, &payload),
-            OP_INT_WRITE => handle_int_write(&mut sock, &payload),
-            OP_INT_POWER_SAVING_MODE => handle_power_saving(&mut sock),
-            OP_FUNCTION_S_0 => handle_function_s_0(&mut sock, &payload),
-            OP_FUNCTION_S_1 => handle_function_s_1(&mut sock, &payload),
+        match op {
+            OP_OPEN_LIBRARY => handle_open_library(&mut sock, &payload)?,
+            OP_INT_INIT_WITH_CTRL => handle_int_init(&mut sock, &payload)?,
+            OP_INT_FINI => handle_int_fini(&mut sock)?,
+            OP_INT_READ => handle_int_read(&mut sock, &payload)?,
+            OP_INT_WRITE => handle_int_write(&mut sock, &payload)?,
+            OP_INT_POWER_SAVING_MODE => handle_power_saving(&mut sock)?,
+            OP_FUNCTION_S_0 => handle_function_s_0(&mut sock, &payload)?,
+            OP_FUNCTION_S_1 => handle_function_s_1(&mut sock, &payload)?,
             other => {
                 eprintln!("[stub] unknown op 0x{:02x}", other);
                 return Ok(());
             }
-        };
-        eprintln!("[stub] <- {} done", op_name);
-        r?;
+        }
     }
 }
 
