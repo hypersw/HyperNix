@@ -69,7 +69,9 @@ in
         RuntimeDirectoryPreserve = "yes";
 
         # Allow graceful drain of in-flight TG uploads on SIGTERM.
-        TimeoutStopSec = "20min";
+        # 5min upper bound on a single upload (TG's 50MB cap / typical
+        # LAN speeds).
+        TimeoutStopSec = "5min";
         KillSignal = "SIGTERM";
         SendSIGHUP = false;
 

@@ -180,12 +180,21 @@ app.MapGet("/events", async (HttpContext ctx, EventBroker broker, SessionService
 
 app.Logger.LogInformation("PrintScan daemon starting (state={StateDir})", stateDir);
 
-// Clean up session expiry timer on shutdown.
+// Shutdown-phase diagnostic logging. The 2026-04-21 hang showed the
+// process stuck in futex_wait on the main thread — classic sync-over-
+// async deadlock — for 2+ minutes after "All in-flight ops drained".
+// Logs below pinpoint which shutdown phase any future hang reaches.
+//
+// We intentionally do NOT register a DisposeAsync callback here —
+// SessionService implements IAsyncDisposable, and the DI container
+// calls that naturally during host shutdown. A manual callback with
+// .GetAwaiter().GetResult() blocked the shutdown thread and was the
+// root cause of the previous hang.
 var lifetime = app.Services.GetRequiredService<IHostApplicationLifetime>();
 lifetime.ApplicationStopping.Register(() =>
-{
-    var svc = app.Services.GetRequiredService<SessionService>();
-    svc.DisposeAsync().AsTask().GetAwaiter().GetResult();
-});
+    app.Logger.LogInformation("lifetime: ApplicationStopping fired"));
+lifetime.ApplicationStopped.Register(() =>
+    app.Logger.LogInformation("lifetime: ApplicationStopped fired"));
 
 app.Run();
+app.Logger.LogInformation("main: app.Run returned, about to exit");

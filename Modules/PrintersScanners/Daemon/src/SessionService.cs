@@ -240,14 +240,21 @@ public sealed class SessionService : IAsyncDisposable
 
     public async ValueTask DisposeAsync()
     {
+        _logger.LogInformation("SessionService.DisposeAsync: entry");
         _expiryCts.Cancel();
+        _logger.LogInformation("SessionService.DisposeAsync: expiry-cts cancelled");
         if (_expiryTask is not null)
-            try { await _expiryTask; } catch { }
+        {
+            try { await _expiryTask; }
+            catch (Exception ex) { _logger.LogDebug(ex, "expiry task exit"); }
+        }
+        _logger.LogInformation("SessionService.DisposeAsync: expiry task joined");
         lock (_lock)
         {
             foreach (var img in _images.Values) img.Dispose();
             _images.Clear();
         }
+        _logger.LogInformation("SessionService.DisposeAsync: done");
     }
 }
 

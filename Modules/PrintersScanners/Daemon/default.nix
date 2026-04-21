@@ -77,9 +77,11 @@ in
         StateDirectory = "printscan";
         StateDirectoryMode = "0750";
 
-        # Give in-flight scan + TG upload plenty of time to finish on
-        # SIGTERM. Hard cap still enforced.
-        TimeoutStopSec = "20min";
+        # Give in-flight scan + TG upload time to finish on SIGTERM.
+        # 5min is an upper bound on real scan+deliver time (single 1200dpi
+        # color A4 scan tops out around ~2 min; 5 min gives head-room
+        # without leaving hung processes around for 20).
+        TimeoutStopSec = "5min";
         KillSignal = "SIGTERM";
         SendSIGHUP = false;
 
