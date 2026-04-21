@@ -2,6 +2,12 @@
 let
   cfg = config.services.epkowa-scanner;
 
+  # Single source of truth for the SANE config directory path. Used below
+  # for the /etc files we install, the login-shell env, the systemd
+  # global env, and anywhere else that needs to point scanimage at our
+  # custom dll.conf + epkowa.conf.
+  saneConfigDir = "/etc/sane-config-epkowa";
+
   # ──────────────────────────────────────────────────────────────────────
   # x86_64 side of the proxy/stub split.
   #
@@ -96,12 +102,20 @@ in
     # Custom SANE config dir: only epkowa enabled, V33 USB ID mapped to
     # model name. Without the ID line, epkowa detects the scanner as
     # "Epson (unknown model)" and sane_open fails with EINVAL.
-    environment.etc."sane-config-epkowa/dll.conf".text = "epkowa";
-    environment.etc."sane-config-epkowa/epkowa.conf".text = lib.strings.concatLines [
+    #
+    # Single source of truth for the path — used by the /etc files below,
+    # by environment.variables (login-shell $SANE_CONFIG_DIR), AND by
+    # systemd.globalEnvironment (so any systemd service spawning scanimage
+    # automatically sees the same config — otherwise it gets /etc/sane.d
+    # which lacks our USB-ID → model mapping and reports "no SANE devices
+    # found" despite the scanner being present).
+    environment.etc."${lib.removePrefix "/etc/" saneConfigDir}/dll.conf".text = "epkowa";
+    environment.etc."${lib.removePrefix "/etc/" saneConfigDir}/epkowa.conf".text = lib.strings.concatLines [
       "usb"
       ''usb 0x04b8 0x0142 "Perfection V33" "Epson Perfection V33/V330"''
     ];
-    environment.variables.SANE_CONFIG_DIR = lib.mkForce "/etc/sane-config-epkowa";
+    environment.variables.SANE_CONFIG_DIR = lib.mkForce saneConfigDir;
+    systemd.globalEnvironment.SANE_CONFIG_DIR = saneConfigDir;
 
     services.saned.enable = true;
     networking.firewall.allowedTCPPorts = [ 6566 ];

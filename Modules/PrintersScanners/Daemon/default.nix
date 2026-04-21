@@ -69,15 +69,9 @@ in
         # systemd (UseSystemd + ConfigureKestrel.ListenHandle in code).
         # If LISTEN_FDS is missing the daemon now fails fast rather than
         # silently TCP-binding to :5000 — see src/Program.cs.
-
-        # EpkowaScanner module sets SANE_CONFIG_DIR globally via
-        # environment.variables (which populates login-shell env only —
-        # systemd services don't inherit it). Without this the daemon's
-        # spawned scanimage uses the default /etc/sane.d which lacks the
-        # usb 04b8:0142 → "Perfection V33" mapping needed to unlock the
-        # scanner, and reports "no SANE devices found" despite the
-        # scanner being physically present and working from a shell.
-        SANE_CONFIG_DIR = "/etc/sane-config-epkowa";
+        #
+        # SANE_CONFIG_DIR comes from EpkowaScanner's
+        # systemd.globalEnvironment so we don't duplicate the path here.
       };
 
       serviceConfig = {
