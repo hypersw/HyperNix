@@ -469,20 +469,75 @@ in
       };
     };
 
-    # Previous boot panic check → alerts channel
+    # Boot-health check → alerts channel.
+    #
+    # Two separate concerns, each with its own alert:
+    #   1. Boot loops: count how many consecutive boots prior to this one
+    #      terminated without a graceful shutdown sequence. A single
+    #      unclean boot is noise (somebody pulled the plug). Two or more
+    #      in a row points at power/hardware/firmware trouble and is worth
+    #      surfacing.
+    #   2. Real kernel panics in the previous boot: Oops / BUG: / Kernel
+    #      panic / stack-protector. Userspace crit-priority chatter
+    #      (netdata "No charts to collect" etc.) is specifically excluded.
     systemd.services.check-previous-boot = {
-      description = "Check previous boot for kernel panics or critical errors";
+      description = "Summarise boot-health: unclean-shutdown streak + kernel panics";
       after = [ "multi-user.target" "network-online.target" ];
       wants = [ "network-online.target" ];
       wantedBy = [ "multi-user.target" ];
-      # no condition — script checks uptime internally
       serviceConfig = {
         Type = "oneshot";
         ExecStart = pkgs.writeShellScript "check-previous-boot" ''
+          set -u
           HOST=$(${pkgs.hostname}/bin/hostname)
-          PANICS=$(${pkgs.systemd}/bin/journalctl -b -1 -p 0..2 --no-pager -q 2>/dev/null | head -20)
-          if [ -n "$PANICS" ]; then
-            ${sendAlert} "💥 <b>$HOST</b>: critical errors in previous boot%0A<pre>$PANICS</pre>"
+          JCTL=${pkgs.systemd}/bin/journalctl
+
+          # A boot is "clean" iff its journal contains one of systemd's
+          # shutdown-target markers. Anything else = terminated abruptly.
+          is_clean_boot() {
+            "$JCTL" -b "$1" --no-pager -q 2>/dev/null \
+              | ${pkgs.gnugrep}/bin/grep -q -E \
+                'Reached target (Power-Off|Reboot|System Shutdown|Halt|Kexec)|systemd-journald.*Journal stopped' \
+              && return 0 || return 1
+          }
+
+          # Walk backwards from boot -1, stop at the first clean boot or
+          # after a safety cap, count unclean ones.
+          UNCLEAN_COUNT=0
+          LAST_UNCLEAN_TAIL=""
+          FIRST_UNCLEAN_IDX=""
+          for idx in $(seq 1 30); do
+            # Does boot "-$idx" exist? If not, list-boots won't have it.
+            BID=$("$JCTL" --list-boots --no-pager 2>/dev/null \
+              | ${pkgs.gawk}/bin/awk -v idx="-$idx" '$1==idx {print $2; exit}')
+            [ -z "$BID" ] && break
+            if is_clean_boot "$BID"; then
+              break
+            fi
+            UNCLEAN_COUNT=$((UNCLEAN_COUNT+1))
+            FIRST_UNCLEAN_IDX="-$idx"
+            # Remember the tail of the most recent unclean boot for context.
+            if [ "$idx" = "1" ]; then
+              LAST_UNCLEAN_TAIL=$("$JCTL" -b "$BID" --no-pager -q 2>/dev/null \
+                | ${pkgs.coreutils}/bin/tail -3 \
+                | ${pkgs.coreutils}/bin/cut -c1-180)
+            fi
+          done
+
+          if [ "$UNCLEAN_COUNT" -ge 2 ]; then
+            ${sendAlert} "💥 <b>$HOST</b>: $UNCLEAN_COUNT consecutive unclean boots before the current one — suspect power / USB-peripheral / hardware.%0ALast failing boot ended with:%0A<pre>$LAST_UNCLEAN_TAIL</pre>"
+          elif [ "$UNCLEAN_COUNT" = "1" ]; then
+            # One-off — might just be a hard power-cycle. Low priority note.
+            ${sendAlert} "⚠️ <b>$HOST</b>: previous boot ended abruptly (no shutdown marker). Isolated event — worth noting only if it recurs."
+          fi
+
+          # Separately: genuine kernel panics in the immediately previous
+          # boot. Narrow patterns only — don't alert on userspace noise.
+          PANIC=$("$JCTL" -b -1 -k --no-pager -q 2>/dev/null \
+            | ${pkgs.gnugrep}/bin/grep -E 'Oops|Kernel panic|BUG:|stack-protector|end Kernel panic|unable to handle kernel' \
+            | ${pkgs.coreutils}/bin/head -5)
+          if [ -n "$PANIC" ]; then
+            ${sendAlert} "☠️ <b>$HOST</b>: kernel panic/oops in previous boot:%0A<pre>$PANIC</pre>"
           fi
         '';
       };
