@@ -40,6 +40,62 @@
   #   boot.kernelPackages = pkgs.linuxPackages_rpi4;
   boot.kernelPackages = pkgs.linuxPackages;
 
+  # ── Boot-stability tweaks ─────────────────────────────────────────────────
+  #
+  # Context: on 2026-04-21 we observed this Pi enter a 19-cycle boot loop,
+  # each cycle dying silently at ~monotonic 8-10 s into systemd startup
+  # with no kernel log, no Under-voltage detected! message, no SD errors,
+  # no watchdog trace — just a hard reset. Eventually self-stabilised.
+  # Brand-new official Pi PSU + cable, sustained CPU-100% works fine.
+  # Root cause not identified; see PLAN.md "Driver Saga" + troubleshooting
+  # notes. The PMIC warning threshold is ABOVE the brownout-reset
+  # threshold, so "silent reset with no warning log" is consistent with a
+  # transient 5 V droop that trips the reset path but never the warning
+  # path (see https://forums.raspberrypi.com/viewtopic.php?t=290853).
+  #
+  # The settings below don't fix a specific cause — they reduce the
+  # transient-current area-under-curve during the first 10 s of boot by
+  # removing unused subsystems that init in parallel there. If the
+  # root cause WAS an overlapped transient spike during peripheral
+  # bring-up, these help; if it was something else, they don't hurt.
+
+  # Blacklist unused radios + camera stack. WiFi stays, we use it.
+  # NOTE on Bluetooth: the Wi-Fi and Bluetooth share one silicon die
+  # (BCM4345). Blacklisting BT does NOT skip the big Wi-Fi firmware load
+  # (the ~1.5 MB transfer over SDIO is the heavy transient). It skips the
+  # separate BT "patchram" upload over HCI-UART (~30-80 KB) and the BT
+  # RF calibration pass. Modest transient-load reduction, not dramatic.
+  # Worth it because we don't use BT at all on this headless server.
+  #
+  # Camera (bcm2835_v4l2 + bcm2835_mmal_vchiq) loads at boot via VCHIQ,
+  # probes the CSI ribbon connector. No camera attached — pure waste.
+  boot.blacklistedKernelModules = [
+    # Bluetooth — unused, and removes one transient overlap during init
+    "btbcm"        # Broadcom BT firmware loader
+    "hci_uart"     # HCI-over-UART transport (how BT attaches on Pi)
+    "bluetooth"    # core BT stack
+    # Camera — no CSI camera, no need to probe/load
+    "bcm2835_v4l2"
+    "bcm2835_mmal_vchiq"
+  ];
+  # Belt-and-braces — disable the top-level bluetooth service stack too
+  # so no userspace tries to talk to a blacklisted module.
+  hardware.bluetooth.enable = false;
+
+  # Kernel-level HDMI disable for headless boot. Tells the DRM driver to
+  # not activate either HDMI output, which skips display-pipeline bring-up
+  # (HPD probing, EDID read, pixel-clock programming). Minor power saver
+  # on boot for a server that never has a monitor attached.
+  #
+  # Note: the Pi's GPU firmware may still probe HDMI BEFORE handing off
+  # to Linux — a fuller disable would need hdmi_blanking=2 in
+  # /boot/firmware/config.txt. We're leaving that alone for now to avoid
+  # touching the boot partition from NixOS, which is fiddly on the Pi.
+  boot.kernelParams = [
+    "video=HDMI-A-1:d"
+    "video=HDMI-A-2:d"
+  ];
+
   networking = {
     useDHCP = true;
     firewall = {

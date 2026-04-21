@@ -312,6 +312,24 @@ in
 
     # ── Netdata: system metrics + built-in alarms + Telegram delivery ──
 
+    # Delay the netdata spawn by 30 s past service-start to push its
+    # CPU/IO-intensive plugin startup past the kernel's peripheral
+    # bring-up window (the first ~10-15 s of boot where we've seen
+    # this Pi occasionally brown-out-reset silently — see the
+    # "Boot-stability tweaks" block in PrintScanServer/configuration.nix
+    # for the context). Netdata on startup forks many plugins, reads
+    # /proc extensively, does a one-shot hw-discovery pass — if that
+    # overlaps with WiFi firmware load + USB enumeration, it's an
+    # easy CPU spike to schedule out of that window.
+    #
+    # This is a pragmatic ExecStartPre=sleep rather than a timer unit;
+    # systemd has no `StartDelaySec=` property and a timer-driven
+    # variant would require unpinning netdata from multi-user.target.
+    # One forked sleep for 30 s is fine.
+    systemd.services.netdata.serviceConfig.ExecStartPre = [
+      "${pkgs.coreutils}/bin/sleep 30"
+    ];
+
     services.netdata = {
       enable = true;
       config = {
