@@ -489,28 +489,39 @@ in
 
     # Boot-health check → alerts channel.
     #
-    # Two separate concerns, each with its own alert:
-    #   1. Boot loops: count how many consecutive boots prior to this one
-    #      terminated without a graceful shutdown sequence. A single
-    #      unclean boot is noise (somebody pulled the plug). Two or more
-    #      in a row points at power/hardware/firmware trouble and is worth
-    #      surfacing.
-    #   2. Real kernel panics in the previous boot: Oops / BUG: / Kernel
-    #      panic / stack-protector. Userspace crit-priority chatter
-    #      (netdata "No charts to collect" etc.) is specifically excluded.
+    # Trigger semantics: runs at most ONCE per actual boot.
+    # RemainAfterExit=true keeps the unit "active" after first completion
+    # so nixos-rebuild switches that touch this unit's graph don't
+    # re-execute it and re-send the same alert.
+    #
+    # Alert logic:
+    #   - Look at the immediately-previous boot (-1) only. If it ended
+    #     without a shutdown-target marker → alert. If it was clean →
+    #     silent, whatever happened further back is historical and has
+    #     already been surfaced (if at all).
+    #   - If (-1) was unclean, walk backwards to report how long the
+    #     streak goes for context — "N unclean in a row" — but the
+    #     trigger is whether (-1) itself is dirty, not the size of the
+    #     historical streak.
+    #   - Real kernel panics in (-1) get their own separate alert.
+    #     Narrow regex — userspace crit-priority chatter (netdata "No
+    #     charts to collect" etc.) is specifically excluded.
     systemd.services.check-previous-boot = {
-      description = "Summarise boot-health: unclean-shutdown streak + kernel panics";
+      description = "Check boot -1 for unclean shutdown or kernel panic, alert once per boot";
       after = [ "multi-user.target" "network-online.target" ];
       wants = [ "network-online.target" ];
       wantedBy = [ "multi-user.target" ];
       serviceConfig = {
         Type = "oneshot";
+        # Run once per boot. Stays "active" after first completion so a
+        # nixos-rebuild switch that restarts dependencies doesn't re-fire.
+        RemainAfterExit = true;
         ExecStart = pkgs.writeShellScript "check-previous-boot" ''
           set -u
           HOST=$(${pkgs.hostname}/bin/hostname)
           JCTL=${pkgs.systemd}/bin/journalctl
 
-          # A boot is "clean" iff its journal contains one of systemd's
+          # Boot is "clean" iff its journal contains one of systemd's
           # shutdown-target markers. Anything else = terminated abruptly.
           is_clean_boot() {
             "$JCTL" -b "$1" --no-pager -q 2>/dev/null \
@@ -519,34 +530,37 @@ in
               && return 0 || return 1
           }
 
-          # Walk backwards from boot -1, stop at the first clean boot or
-          # after a safety cap, count unclean ones.
-          UNCLEAN_COUNT=0
-          LAST_UNCLEAN_TAIL=""
-          FIRST_UNCLEAN_IDX=""
-          for idx in $(seq 1 30); do
-            # Does boot "-$idx" exist? If not, list-boots won't have it.
+          # Resolve boot -1's id. If no -1 (fresh install, first boot),
+          # nothing to say.
+          PREV_BID=$("$JCTL" --list-boots --no-pager 2>/dev/null \
+            | ${pkgs.gawk}/bin/awk '$1=="-1" {print $2; exit}')
+          [ -z "$PREV_BID" ] && exit 0
+
+          # Trigger: whether boot -1 itself was unclean. Don't alert on
+          # old history alone.
+          if is_clean_boot "$PREV_BID"; then
+            exit 0
+          fi
+
+          # Boot -1 was unclean → gather context.
+          LAST_UNCLEAN_TAIL=$("$JCTL" -b "$PREV_BID" --no-pager -q 2>/dev/null \
+            | ${pkgs.coreutils}/bin/tail -3 \
+            | ${pkgs.coreutils}/bin/cut -c1-180)
+
+          # Count streak backwards for context only — bounded safety cap.
+          STREAK=1
+          for idx in $(seq 2 30); do
             BID=$("$JCTL" --list-boots --no-pager 2>/dev/null \
               | ${pkgs.gawk}/bin/awk -v idx="-$idx" '$1==idx {print $2; exit}')
             [ -z "$BID" ] && break
-            if is_clean_boot "$BID"; then
-              break
-            fi
-            UNCLEAN_COUNT=$((UNCLEAN_COUNT+1))
-            FIRST_UNCLEAN_IDX="-$idx"
-            # Remember the tail of the most recent unclean boot for context.
-            if [ "$idx" = "1" ]; then
-              LAST_UNCLEAN_TAIL=$("$JCTL" -b "$BID" --no-pager -q 2>/dev/null \
-                | ${pkgs.coreutils}/bin/tail -3 \
-                | ${pkgs.coreutils}/bin/cut -c1-180)
-            fi
+            if is_clean_boot "$BID"; then break; fi
+            STREAK=$((STREAK+1))
           done
 
-          if [ "$UNCLEAN_COUNT" -ge 2 ]; then
-            ${sendAlert} "💥 <b>$HOST</b>: $UNCLEAN_COUNT consecutive unclean boots before the current one — suspect power / USB-peripheral / hardware.%0ALast failing boot ended with:%0A<pre>$LAST_UNCLEAN_TAIL</pre>"
-          elif [ "$UNCLEAN_COUNT" = "1" ]; then
-            # One-off — might just be a hard power-cycle. Low priority note.
-            ${sendAlert} "⚠️ <b>$HOST</b>: previous boot ended abruptly (no shutdown marker). Isolated event — worth noting only if it recurs."
+          if [ "$STREAK" -ge 2 ]; then
+            ${sendAlert} "💥 <b>$HOST</b>: previous boot ended abruptly (no shutdown marker). Streak of $STREAK unclean boots back — suspect power / USB-peripheral / hardware.%0ALast failing boot ended with:%0A<pre>$LAST_UNCLEAN_TAIL</pre>"
+          else
+            ${sendAlert} "⚠️ <b>$HOST</b>: previous boot ended abruptly (no shutdown marker). Isolated event — worth noting only if it recurs.%0ALast failing boot ended with:%0A<pre>$LAST_UNCLEAN_TAIL</pre>"
           fi
 
           # Separately: genuine kernel panics in the immediately previous
