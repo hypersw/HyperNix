@@ -56,6 +56,13 @@ in
       after = [ "printscan-daemon.socket" "cups.service" ];
       wants = [ "cups.service" ];
 
+      # StartLimit* belong in [Unit] (NixOS unitConfig), not [Service].
+      # With serviceConfig they're silently ignored.
+      unitConfig = {
+        StartLimitIntervalSec = "60s";
+        StartLimitBurst = 5;
+      };
+
       environment = {
         PRINTSCAN_SOCKET = cfg.socketPath;
         # ASPNETCORE_URLS deliberately unset. Kestrel picks up fd 3 from
@@ -74,9 +81,8 @@ in
         # misread config), bring it back. Bounded retry burst below keeps
         # runaway loops from consuming the CPU or beating the SD card.
         Restart = "always";
-        RestartSec = "5s";                    # cooldown between crashes
-        StartLimitIntervalSec = "60s";        # window to count failures in
-        StartLimitBurst = 5;                  # 5 failures in 60s → give up
+        RestartSec = "5s";  # cooldown between crashes
+        # StartLimit* are in unitConfig above (they belong to [Unit]).
 
         User = "printscan-daemon";
         Group = cfg.group;

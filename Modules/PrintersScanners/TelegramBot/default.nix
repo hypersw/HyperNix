@@ -44,6 +44,12 @@ in
       wants = [ "printscan-daemon.service" "network-online.target" ];
       wantedBy = [ "multi-user.target" ];
 
+      # StartLimit* go in [Unit] = unitConfig, not [Service]. See daemon.
+      unitConfig = {
+        StartLimitIntervalSec = "60s";
+        StartLimitBurst = 5;
+      };
+
       # Token provided via systemd LoadCredential → $CREDENTIALS_DIRECTORY/telegram-token
       environment = {
         PRINTSCAN_SOCKET = daemonCfg.socketPath;
@@ -56,11 +62,10 @@ in
 
         # Always restart — long-running loop consuming TG long-poll.
         # Any exit we don't ask for should bounce back; bounded by
-        # StartLimit* so we don't hot-loop on a broken token etc.
+        # StartLimit* in unitConfig above so we don't hot-loop on a
+        # broken token etc.
         Restart = "always";
         RestartSec = "5s";
-        StartLimitIntervalSec = "60s";
-        StartLimitBurst = 5;
 
         # systemd credential — decrypted file available at $CREDENTIALS_DIRECTORY/telegram-token
         LoadCredential = "telegram-token:${cfg.tokenFile}";
