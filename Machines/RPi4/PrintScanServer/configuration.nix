@@ -7,6 +7,7 @@
     ../../../Modules/PrintersScanners/TelegramBot
     ../../../Modules/Monitoring/TelegramAlerts
     ../../../Modules/System/AutoRebuildOnPush
+    ../../../Modules/System/BootStabilityProbe
   ];
 
   networking.hostName = "printscan";
@@ -95,6 +96,15 @@
     "video=HDMI-A-1:d"
     "video=HDMI-A-2:d"
   ];
+
+  # Staged-peripheral-bringup diagnostic. Off by default (module is imported
+  # so the option exists and is explicit). Flip to true + rebuild + reboot
+  # when reproducing the boot-loop symptom is desirable — it defers
+  # USB-A (xhci_pci) and Wi-Fi (brcmfmac) past the brownout-prone window
+  # and brings them up serially with journal syncs, so the journal
+  # durably records which stage was in flight if a reset occurs.
+  # See Modules/System/BootStabilityProbe/default.nix for rescue notes.
+  services.boot-stability-probe.enable = false;
 
   networking = {
     useDHCP = true;
