@@ -243,7 +243,23 @@ async Task TryOpenSessionAsync(
         OwnerDisplayName: "@" + userName,
         Params: parms);
 
-    var (outcome, session, conflict) = await daemon.OpenSessionAsync(req, takeover, ct);
+    DaemonClient.OpenResult outcome;
+    SessionRecord? session;
+    SessionConflict? conflict;
+    try
+    {
+        (outcome, session, conflict) = await daemon.OpenSessionAsync(req, takeover, ct);
+    }
+    catch (Exception ex)
+    {
+        // Daemon rejected the request or is unreachable. Surface it —
+        // otherwise the "Opening session…" message sits forever.
+        log.LogError(ex, "OpenSessionAsync failed");
+        await bot.EditMessageText(chatId, msgId,
+            $"❌ Daemon error — couldn't open session.\n<code>{ex.Message}</code>",
+            parseMode: ParseMode.Html, cancellationToken: ct);
+        return;
+    }
     if (outcome == DaemonClient.OpenResult.Conflict && conflict is not null)
     {
         // Two buttons with the chosen params baked into the callback data

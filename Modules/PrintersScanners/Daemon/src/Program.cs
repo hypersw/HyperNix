@@ -7,6 +7,17 @@ var builder = WebApplication.CreateBuilder(args);
 
 builder.Host.UseSystemd();
 
+// Bot and daemon both use System.Text.Json but the bot opts into
+// JsonStringEnumConverter (ScanFormat serialized as "Jpeg"/"Png"/"Tiff").
+// Minimal-APIs' default serializer expects enums as integers, so without
+// this bot requests get 400 Bad Request on the enum field. Register the
+// string-enum converter on the daemon side so both sides agree.
+builder.Services.ConfigureHttpJsonOptions(options =>
+{
+    options.SerializerOptions.Converters.Add(
+        new System.Text.Json.Serialization.JsonStringEnumConverter());
+});
+
 // Systemd socket activation — pick up fd 3 if LISTEN_FDS is set.
 var listenFds = Environment.GetEnvironmentVariable("LISTEN_FDS");
 if (listenFds is not null && int.TryParse(listenFds, out var fdCount) && fdCount > 0)
