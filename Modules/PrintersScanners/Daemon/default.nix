@@ -46,27 +46,37 @@ in
 
     systemd.services.printscan-daemon = {
       description = "Print/Scan Daemon";
-      after = [ "cups.service" ];
+      # Long-running state-holding service — pulled into multi-user.target
+      # rather than purely socket-activated. The socket is still primary
+      # (Kestrel binds fd 3 from it via systemd activation), but we no
+      # longer rely on "first connection starts the service" semantics.
+      # Explicit Requires on the socket so we never start without the fd.
+      wantedBy = [ "multi-user.target" ];
+      requires = [ "printscan-daemon.socket" ];
+      after = [ "printscan-daemon.socket" "cups.service" ];
       wants = [ "cups.service" ];
-      # No wantedBy — socket activation starts the service on first connection
-
-      # Tool paths are baked into the DLL at build time (ToolPaths.g.cs)
-      # — no PATH needed, no env vars for tool locations.
 
       environment = {
         PRINTSCAN_SOCKET = cfg.socketPath;
-        # Don't set ASPNETCORE_URLS — Kestrel picks up the socket fd from
-        # systemd via LISTEN_FDS (UseSystemd()). Setting ASPNETCORE_URLS
-        # would make Kestrel try to bind a second socket, failing with
-        # "address already in use".
+        # ASPNETCORE_URLS deliberately unset. Kestrel picks up fd 3 from
+        # systemd (UseSystemd + ConfigureKestrel.ListenHandle in code).
+        # If LISTEN_FDS is missing the daemon now fails fast rather than
+        # silently TCP-binding to :5000 — see src/Program.cs.
       };
 
       serviceConfig = {
         # notify: UseSystemd() sends sd_notify(READY=1) when the app is ready
         Type = "notify";
         ExecStart = "${daemonPackage}/bin/PrintScan.Daemon";
-        Restart = "on-failure";
-        RestartSec = "5s";
+
+        # Always restart. We want this daemon continuously running; if it
+        # exits for any reason (crash, clean-exit-we-didn't-ask-for, OOM,
+        # misread config), bring it back. Bounded retry burst below keeps
+        # runaway loops from consuming the CPU or beating the SD card.
+        Restart = "always";
+        RestartSec = "5s";                    # cooldown between crashes
+        StartLimitIntervalSec = "60s";        # window to count failures in
+        StartLimitBurst = 5;                  # 5 failures in 60s → give up
 
         User = "printscan-daemon";
         Group = cfg.group;
@@ -78,9 +88,9 @@ in
         StateDirectoryMode = "0750";
 
         # Give in-flight scan + TG upload time to finish on SIGTERM.
-        # 5min is an upper bound on real scan+deliver time (single 1200dpi
-        # color A4 scan tops out around ~2 min; 5 min gives head-room
-        # without leaving hung processes around for 20).
+        # 5 min upper-bounds a 1200dpi A4 color scan + delivery. Past
+        # that, systemd SIGKILLs; the service unit's Restart=always
+        # brings it back within RestartSec.
         TimeoutStopSec = "5min";
         KillSignal = "SIGTERM";
         SendSIGHUP = false;
@@ -90,6 +100,17 @@ in
         ProtectHome = true;
         PrivateTmp = true;
         NoNewPrivileges = true;
+
+        # Belt-and-braces against "daemon silently binds TCP" bugs:
+        # put the daemon in its own empty network namespace. It literally
+        # cannot bind a TCP port, cannot resolve DNS, cannot talk to the
+        # LAN. Unix sockets still work (namespace-local transport) — the
+        # activated fd 3 comes through fine. CUPS/lp uses its own Unix
+        # socket, scanimage talks USB not network, so nothing legitimate
+        # breaks. If a future bug tries to bind something on a TCP port,
+        # it fails at syscall level instead of quietly listening on the
+        # wrong transport.
+        PrivateNetwork = true;
       };
     };
   };

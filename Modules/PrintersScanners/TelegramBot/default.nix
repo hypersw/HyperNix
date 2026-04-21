@@ -53,8 +53,14 @@ in
       serviceConfig = {
         Type = "simple";
         ExecStart = "${botPackage}/bin/PrintScan.TelegramBot";
-        Restart = "on-failure";
-        RestartSec = "10s";
+
+        # Always restart — long-running loop consuming TG long-poll.
+        # Any exit we don't ask for should bounce back; bounded by
+        # StartLimit* so we don't hot-loop on a broken token etc.
+        Restart = "always";
+        RestartSec = "5s";
+        StartLimitIntervalSec = "60s";
+        StartLimitBurst = 5;
 
         # systemd credential — decrypted file available at $CREDENTIALS_DIRECTORY/telegram-token
         LoadCredential = "telegram-token:${cfg.tokenFile}";

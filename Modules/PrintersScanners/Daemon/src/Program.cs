@@ -18,12 +18,20 @@ builder.Services.ConfigureHttpJsonOptions(options =>
         new System.Text.Json.Serialization.JsonStringEnumConverter());
 });
 
-// Systemd socket activation — pick up fd 3 if LISTEN_FDS is set.
+// Systemd socket activation — we REQUIRE fd 3 from systemd. Running
+// without LISTEN_FDS means the socket unit didn't activate us properly
+// and Kestrel would silently fall back to its default TCP binding on
+// :5000, which nothing talks to. Fail fast instead of half-serving.
 var listenFds = Environment.GetEnvironmentVariable("LISTEN_FDS");
-if (listenFds is not null && int.TryParse(listenFds, out var fdCount) && fdCount > 0)
+if (listenFds is null || !int.TryParse(listenFds, out var fdCount) || fdCount <= 0)
 {
-    builder.WebHost.ConfigureKestrel(options => options.ListenHandle(3));
+    // Top-level-statements: throw to exit non-zero.
+    throw new InvalidOperationException(
+        "LISTEN_FDS not set — this daemon only serves the systemd-activated "
+        + "Unix socket. Start via `systemctl start printscan-daemon.socket` "
+        + "and ensure the service is Requires=printscan-daemon.socket.");
 }
+builder.WebHost.ConfigureKestrel(options => options.ListenHandle(3));
 
 // systemd sets STATE_DIRECTORY when StateDirectory= is configured.
 // Fall back to /var/lib/printscan when running outside systemd.
