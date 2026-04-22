@@ -264,12 +264,26 @@
   systemd.network = {
     wait-online.enable = false;
 
+    # Route metrics: end0 strongly preferred over wlan0 for both IPv4
+    # and IPv6. networkd defaults every interface to metric 1024, which
+    # means when both links are up on the same subnet the kernel has two
+    # equally-good default routes and two equally-good on-link routes —
+    # so replies to incoming traffic can leave via the "wrong" interface.
+    # That asymmetric egress is then dropped by rp_filter / AP L2
+    # forwarding rules, manifesting as "Pi doesn't answer pings on .129"
+    # even though end0 is up. dhcpcd previously assigned 1002/3003
+    # automatically based on interface type; networkd doesn't, so we
+    # pin them explicitly here. Gap size (3x) makes accidental ties
+    # impossible if either side gets bumped by a stray tie-breaker.
     networks."20-end0" = {
       matchConfig.Name = "end0";
       networkConfig = {
         DHCP = "yes";
         IPv6AcceptRA = "yes";
       };
+      dhcpV4Config.RouteMetric = 1002;
+      dhcpV6Config.RouteMetric = 1002;
+      ipv6AcceptRAConfig.RouteMetric = 1002;
     };
 
     networks."20-wlan0" = {
@@ -278,6 +292,9 @@
         DHCP = "yes";
         IPv6AcceptRA = "yes";
       };
+      dhcpV4Config.RouteMetric = 3003;
+      dhcpV6Config.RouteMetric = 3003;
+      ipv6AcceptRAConfig.RouteMetric = 3003;
       linkConfig.RequiredForOnline = "no";
     };
   };
