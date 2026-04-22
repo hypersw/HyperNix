@@ -282,7 +282,6 @@
         IPv6AcceptRA = "yes";
       };
       dhcpV4Config.RouteMetric = 1002;
-      dhcpV6Config.RouteMetric = 1002;
       ipv6AcceptRAConfig.RouteMetric = 1002;
     };
 
@@ -293,7 +292,6 @@
         IPv6AcceptRA = "yes";
       };
       dhcpV4Config.RouteMetric = 3003;
-      dhcpV6Config.RouteMetric = 3003;
       ipv6AcceptRAConfig.RouteMetric = 3003;
       linkConfig.RequiredForOnline = "no";
     };
