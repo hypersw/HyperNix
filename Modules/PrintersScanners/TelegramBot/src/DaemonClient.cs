@@ -62,6 +62,15 @@ public sealed class DaemonClient : IDisposable
         return (OpenResult.Opened, s, null);
     }
 
+    public async Task<SessionRecord?> PatchSessionParamsAsync(
+        string sessionId, ScanParams newParams, CancellationToken ct)
+    {
+        using var resp = await _http.PatchAsJsonAsync(
+            $"/sessions/{sessionId}", newParams, Json, ct);
+        resp.EnsureSuccessStatusCode();
+        return await resp.Content.ReadFromJsonAsync<SessionRecord>(Json, ct);
+    }
+
     public async Task CloseSessionAsync(string sessionId, CancellationToken ct)
     {
         using var resp = await _http.DeleteAsync($"/sessions/{sessionId}", ct);

@@ -57,12 +57,12 @@ var inFlightDrained = new SemaphoreSlim(1, 1);
 // ── Bot commands ────────────────────────────────────────────────────────────
 
 await bot.SetMyCommands([
-    new() { Command = "scan", Description = "📷 Start a scan session" },
+    new() { Command = "scanner", Description = "📷 Open scanner session" },
     new() { Command = "status", Description = "📊 Printer & scanner status" },
     new() { Command = "help",   Description = "❓ How to use this bot" },
 ]);
 var mainKeyboard = new ReplyKeyboardMarkup(
-    new[] { new KeyboardButton[] { "📷 Scan", "📊 Status" } })
+    new[] { new KeyboardButton[] { "📷 Scanner", "📊 Status" } })
 { ResizeKeyboard = true, IsPersistent = true };
 
 log.LogInformation("bot starting, allowed users: {Users}, socket: {Sock}, staging: {Stg}",
@@ -146,8 +146,9 @@ async Task HandleMessageAsync(string userName, Message msg, CancellationToken ct
 
     var text = (msg.Text ?? "").Trim();
     var slash = text.Split(' ', '@')[0].ToLower();
-    if (text.Equals("📷 Scan", StringComparison.OrdinalIgnoreCase) || slash == "/scan")
-        await StartScanFlowAsync(msg.Chat.Id, userName, ct);
+    if (text.Equals("📷 Scanner", StringComparison.OrdinalIgnoreCase)
+        || slash is "/scanner" or "/scan")
+        await OpenScannerSessionAsync(msg.Chat.Id, userName, ct);
     else if (text.Equals("📊 Status", StringComparison.OrdinalIgnoreCase) || slash == "/status")
         await ShowStatusAsync(msg.Chat.Id, ct);
     else if (slash is "/help" or "/start")
@@ -155,11 +156,11 @@ async Task HandleMessageAsync(string userName, Message msg, CancellationToken ct
             🖨️ <b>PrintScan Bot</b>
 
             📄 Send a PDF or image to print it
-            📷 /scan — start a scan session
-            📊 /status — printer & scanner
+            📷 /scanner — open scanner session
+            📊 /status — printer &amp; scanner
             """, parseMode: ParseMode.Html, replyMarkup: mainKeyboard, cancellationToken: ct);
     else
-        await bot.SendMessage(msg.Chat.Id, "Send a file to print, or tap 📷 Scan.",
+        await bot.SendMessage(msg.Chat.Id, "Send a file to print, or tap 📷 Scanner.",
             replyMarkup: mainKeyboard, cancellationToken: ct);
 }
 
@@ -170,35 +171,67 @@ async Task HandleCallbackAsync(string userName, CallbackQuery cb, CancellationTo
     var data = cb.Data ?? "";
     await bot.AnswerCallbackQuery(cb.Id, cancellationToken: ct);
 
-    if (data.StartsWith("open:"))
+    // Format: pick:<fmt|dpi>:<sessionId>  — open a picker view
+    //         set:<fmt|dpi>:<sessionId>:<value>  — apply change + back to main
+    //         cancel:<sessionId>  — back to main (abandon picker)
+    //         scan:<sessionId>  — trigger a scan
+    //         end:<sessionId>  — close the session
+    //         takeover:yes|no  — response to takeover confirmation
+    if (data.StartsWith("pick:"))
     {
-        // format chosen → show DPI menu
-        var fmt = data["open:".Length..];
-        await bot.EditMessageText(chatId, msgId,
-            $"📷 Format: <b>{fmt.ToUpperInvariant()}</b>. Choose resolution:",
-            parseMode: ParseMode.Html,
-            replyMarkup: ScanMenu.RenderDpi(fmt), cancellationToken: ct);
-    }
-    else if (data.StartsWith("dpi:"))
-    {
-        // format + dpi chosen → try to open daemon session
         var parts = data.Split(':');
         if (parts.Length != 3) return;
-        var fmt = Enum.TryParse<ScanFormat>(parts[1], ignoreCase: true, out var f) ? f : ScanFormat.Jpeg;
-        var dpi = int.TryParse(parts[2], out var d) ? d : ScanMenu.DefaultDpi;
-        await TryOpenSessionAsync(chatId, msgId, userName, new ScanParams(dpi, fmt), takeover: false, ct);
+        var what = parts[1];
+        var sid = parts[2];
+        var view = what switch
+        {
+            "fmt" => PickerView.Format,
+            "dpi" => PickerView.Dpi,
+            _     => PickerView.Main,
+        };
+        await RerenderAsync(sid, ct, view);
     }
-    else if (data.StartsWith("confirm_takeover:"))
+    else if (data.StartsWith("set:"))
     {
+        // set:fmt:<sid>:jpeg    OR    set:dpi:<sid>:300
         var parts = data.Split(':');
         if (parts.Length != 4) return;
-        var fmt = Enum.TryParse<ScanFormat>(parts[1], ignoreCase: true, out var f) ? f : ScanFormat.Jpeg;
-        var dpi = int.TryParse(parts[2], out var d) ? d : ScanMenu.DefaultDpi;
-        var answer = parts[3];
-        if (answer == "yes")
-            await TryOpenSessionAsync(chatId, msgId, userName, new ScanParams(dpi, fmt), takeover: true, ct);
-        else
-            await bot.EditMessageText(chatId, msgId, "Cancelled.", cancellationToken: ct);
+        var what = parts[1];
+        var sid = parts[2];
+        var value = parts[3];
+
+        BotSession? s;
+        lock (sessionsLock) { sessions.TryGetValue(sid, out s); }
+        if (s is null) return;
+
+        var newParams = what switch
+        {
+            "fmt" when Enum.TryParse<ScanFormat>(value, ignoreCase: true, out var f) =>
+                s.Params with { Format = f },
+            "dpi" when int.TryParse(value, out var d) =>
+                s.Params with { Dpi = d },
+            _ => s.Params,
+        };
+        try
+        {
+            await daemon.PatchSessionParamsAsync(sid, newParams, ct);
+        }
+        catch (Exception ex)
+        {
+            log.LogWarning("PATCH session params failed: {Err}", ex.Message);
+        }
+        // SessionOpened event from daemon will pick up new params and
+        // re-render; render now too so the UI doesn't lag the SSE roundtrip.
+        lock (sessionsLock)
+        {
+            if (sessions.TryGetValue(sid, out var bs)) bs.Params = newParams;
+        }
+        await RerenderAsync(sid, ct, PickerView.Main);
+    }
+    else if (data.StartsWith("cancel:"))
+    {
+        var sid = data["cancel:".Length..];
+        await RerenderAsync(sid, ct, PickerView.Main);
     }
     else if (data.StartsWith("scan:"))
     {
@@ -217,31 +250,43 @@ async Task HandleCallbackAsync(string userName, CallbackQuery cb, CancellationTo
         var sid = data["end:".Length..];
         await daemon.CloseSessionAsync(sid, ct);
     }
+    else if (data == "takeover:yes")
+    {
+        await OpenScannerSessionAsync(chatId, userName, ct, takeover: true, reuseMsgId: msgId);
+    }
+    else if (data == "takeover:no")
+    {
+        await bot.EditMessageText(chatId, msgId, "Cancelled.", cancellationToken: ct);
+    }
 }
 
-async Task StartScanFlowAsync(long chatId, string userName, CancellationToken ct)
+async Task OpenScannerSessionAsync(
+    long chatId, string userName, CancellationToken ct,
+    bool takeover = false, int? reuseMsgId = null)
 {
-    // single-step: ask format first. DPI follows after format selection.
-    await bot.SendMessage(chatId, "📷 Pick a file format:",
-        parseMode: ParseMode.Html,
-        replyMarkup: ScanMenu.RenderFormat(), cancellationToken: ct);
-}
-
-async Task TryOpenSessionAsync(
-    long chatId, int msgId, string userName, ScanParams parms,
-    bool takeover, CancellationToken ct)
-{
-    // We first edit the callback message into "opening…", then use its id
-    // as the session's status message id. Single message, no flicker.
-    await bot.EditMessageText(chatId, msgId,
-        "⏳ Opening session…", cancellationToken: ct);
+    // Send (or reuse) the status message FIRST — we need its id for the
+    // session record's OwnerStatusMessageId, which SSE re-renders then
+    // edit in place.
+    int msgId;
+    if (reuseMsgId is int rid)
+    {
+        msgId = rid;
+        await bot.EditMessageText(chatId, msgId, "⏳ Opening session…",
+            cancellationToken: ct);
+    }
+    else
+    {
+        var placeholder = await bot.SendMessage(chatId, "⏳ Opening session…",
+            cancellationToken: ct);
+        msgId = placeholder.Id;
+    }
 
     var req = new OpenSessionRequest(
         OwnerBot: "telegram",
         OwnerChatId: chatId,
         OwnerStatusMessageId: msgId,
         OwnerDisplayName: "@" + userName,
-        Params: parms);
+        Params: StatusMessage.Defaults());
 
     DaemonClient.OpenResult outcome;
     SessionRecord? session;
@@ -252,8 +297,6 @@ async Task TryOpenSessionAsync(
     }
     catch (Exception ex)
     {
-        // Daemon rejected the request or is unreachable. Surface it —
-        // otherwise the "Opening session…" message sits forever.
         log.LogError(ex, "OpenSessionAsync failed");
         await bot.EditMessageText(chatId, msgId,
             $"❌ Daemon error — couldn't open session.\n<code>{ex.Message}</code>",
@@ -262,14 +305,11 @@ async Task TryOpenSessionAsync(
     }
     if (outcome == DaemonClient.OpenResult.Conflict && conflict is not null)
     {
-        // Two buttons with the chosen params baked into the callback data
         var kb = new InlineKeyboardMarkup(
         [
             [
-                InlineKeyboardButton.WithCallbackData("Take over",
-                    $"confirm_takeover:{parms.Format.ToString().ToLowerInvariant()}:{parms.Dpi}:yes"),
-                InlineKeyboardButton.WithCallbackData("Cancel",
-                    $"confirm_takeover:{parms.Format.ToString().ToLowerInvariant()}:{parms.Dpi}:no")
+                InlineKeyboardButton.WithCallbackData("Take over", "takeover:yes"),
+                InlineKeyboardButton.WithCallbackData("Cancel",    "takeover:no"),
             ]
         ]);
         await bot.EditMessageText(chatId, msgId,
@@ -295,7 +335,6 @@ async Task TryOpenSessionAsync(
             Params = session.Params,
             ExpiresAt = session.ExpiresAt,
             ScanCount = session.ScanCount,
-            FirstScanPending = true,
         };
     }
     await RerenderAsync(session.Id, ct);
@@ -408,8 +447,11 @@ async Task HandleEventAsync(SessionEvent ev, CancellationToken ct)
                 }
                 else if (sessions.TryGetValue(s.Id, out var bs))
                 {
+                    // SessionOpened is also re-emitted on PATCH-params
+                    // so pick up param changes here.
                     bs.ExpiresAt = s.ExpiresAt;
                     bs.ScanCount = s.ScanCount;
+                    bs.Params    = s.Params;
                 }
             }
             await RerenderAsync(s.Id, ct);
@@ -468,22 +510,17 @@ async Task HandleEventAsync(SessionEvent ev, CancellationToken ct)
         }
         case SessionEventType.ScannerOnline:
         {
-            List<(string sid, bool auto)> toNotify;
+            // New UX: never auto-scan on scanner-online. User must tap
+            // [📷 Scan] in the session (or press the physical button —
+            // hardware-TBD) to confirm intent. We just re-render so the
+            // status reflects scanner readiness.
+            List<string> sids;
             lock (sessionsLock)
             {
                 foreach (var s in sessions.Values) s.ScannerOnline = true;
-                toNotify = sessions.Values.Select(s => (s.DaemonSessionId, s.FirstScanPending)).ToList();
-                foreach (var s in sessions.Values) s.FirstScanPending = false;
+                sids = [.. sessions.Keys];
             }
-            foreach (var (sid, auto) in toNotify)
-            {
-                await RerenderAsync(sid, ct);
-                if (auto)
-                {
-                    try { await daemon.RequestScanAsync(sid, ct); }
-                    catch (Exception ex) { log.LogWarning("auto-scan failed: {Err}", ex.Message); }
-                }
-            }
+            foreach (var sid in sids) await RerenderAsync(sid, ct);
             break;
         }
         case SessionEventType.ScannerOffline:
@@ -535,12 +572,13 @@ async Task HandleEventAsync(SessionEvent ev, CancellationToken ct)
     }
 }
 
-async Task RerenderAsync(string sessionId, CancellationToken ct)
+async Task RerenderAsync(string sessionId, CancellationToken ct,
+    PickerView view = PickerView.Main)
 {
     BotSession? s;
     lock (sessionsLock) { sessions.TryGetValue(sessionId, out s); }
     if (s is null) return;
-    var (html, kb) = StatusMessage.Render(s);
+    var (html, kb) = StatusMessage.Render(s, view);
     try
     {
         await bot.EditMessageText(s.ChatId, s.StatusMessageId, html,

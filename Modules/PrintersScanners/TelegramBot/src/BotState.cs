@@ -1,7 +1,4 @@
 using PrintScan.Shared;
-using Telegram.Bot;
-using Telegram.Bot.Types;
-using Telegram.Bot.Types.Enums;
 using Telegram.Bot.Types.ReplyMarkups;
 
 namespace PrintScan.TelegramBot;
@@ -15,88 +12,134 @@ public sealed class BotSession
     public required string DaemonSessionId { get; init; }
     public required long ChatId { get; init; }
     public required int StatusMessageId { get; init; }
-    public required ScanParams Params { get; init; }
+    public required ScanParams Params { get; set; }   // mutable: PATCH updates
     public DateTimeOffset ExpiresAt { get; set; }
     public int ScanCount { get; set; }
     public bool ScannerOnline { get; set; }
     public bool Scanning { get; set; }
-    public bool FirstScanPending { get; set; }   // auto-scan when scanner first appears
     public int LastUploadedSeq { get; set; }
 }
 
 /// <summary>
-/// Composes the status-message body + inline keyboard shown to the user.
-/// Pure function of <see cref="BotSession"/> state — call on every event.
+/// Inline "which picker is currently expanded" for the session status
+/// message. We edit the same message between these views so the user
+/// never gets a new message per interaction.
 /// </summary>
+public enum PickerView
+{
+    Main,       // [Fmt] [DPI] / [Scan] / [End]
+    Format,     // JPG / PNG / TIFF / [back]
+    Dpi,        // 100 / 200 / 300 / 600 / 1200 / [back]
+}
+
 public static class StatusMessage
 {
-    public static (string Html, InlineKeyboardMarkup Keyboard) Render(BotSession s)
+    public static readonly int[] NativeDpis = [100, 200, 300, 600, 1200];
+    public const int DefaultDpi = 200;
+    public const ScanFormat DefaultFormat = ScanFormat.Jpeg;
+
+    public static ScanParams Defaults() => new(
+        Dpi: DefaultDpi,
+        Format: DefaultFormat,
+        JpegQuality: 90);
+
+    public static (string Html, InlineKeyboardMarkup Keyboard) Render(
+        BotSession s, PickerView view = PickerView.Main)
+    {
+        var html = RenderHtml(s);
+        var keyboard = view switch
+        {
+            PickerView.Format => RenderFormatPicker(s),
+            PickerView.Dpi    => RenderDpiPicker(s),
+            _                 => RenderMain(s),
+        };
+        return (html, keyboard);
+    }
+
+    public static string RenderTerminated(
+        BotSession s, SessionTerminationReason reason, string? newOwner)
+    {
+        var reasonText = reason switch
+        {
+            SessionTerminationReason.Timeout  => "⏰ Session expired",
+            SessionTerminationReason.Takeover => $"🚪 Session taken over by {newOwner ?? "another user"}",
+            SessionTerminationReason.Closed   => "🚪 Session ended",
+            _ => "Session ended"
+        };
+        return $"{reasonText}\n📑 Final count: <b>{s.ScanCount}</b>";
+    }
+
+    // ─── HTML body ─────────────────────────────────────────────────────────
+
+    private static string RenderHtml(BotSession s)
     {
         var remain = s.ExpiresAt - DateTimeOffset.UtcNow;
         var mins = remain.TotalSeconds < 0 ? 0 : (int)Math.Ceiling(remain.TotalMinutes);
         var fmt = s.Params.Format.ToString().ToUpperInvariant();
 
-        var line1 = $"📷 <b>Session</b> · {s.Params.Dpi} dpi · {fmt} · {mins} min left";
-        var line2 = (s.Scanning, s.ScannerOnline) switch
+        var scannerLine = (s.Scanning, s.ScannerOnline) switch
         {
             (true, _)      => "📡 Scanner: 📷 <i>scanning…</i>",
-            (false, true)  => "📡 Scanner: ✅ ready — press its button or tap Scan",
-            (false, false) => "📡 Scanner: ⏳ <i>waiting — power on or press its button</i>",
+            (false, true)  => "📡 Scanner: ✅ ready — tap Scan (or press scanner button)",
+            (false, false) => "📡 Scanner: ⏳ <i>waiting — power on or press scanner button</i>",
         };
-        var line3 = $"📑 Scans delivered: <b>{s.ScanCount}</b>";
 
-        var html = $"{line1}\n{line2}\n{line3}";
+        return $"""
+            📷 <b>Scanner session</b> · {mins} min left
+            Format: <b>{fmt}</b> · Resolution: <b>{s.Params.Dpi} dpi</b>
+            {scannerLine}
+            📑 Scans delivered: <b>{s.ScanCount}</b>
+            """;
+    }
 
-        var buttons = new List<InlineKeyboardButton[]>();
+    // ─── Keyboards ─────────────────────────────────────────────────────────
+
+    private static InlineKeyboardMarkup RenderMain(BotSession s)
+    {
+        var sid = s.DaemonSessionId;
+        var fmt = s.Params.Format.ToString().ToUpperInvariant();
+        var rows = new List<InlineKeyboardButton[]>();
+        // Row 1: tap-to-change parameter buttons
+        rows.Add(new[]
+        {
+            InlineKeyboardButton.WithCallbackData($"📄 {fmt}",              $"pick:fmt:{sid}"),
+            InlineKeyboardButton.WithCallbackData($"📏 {s.Params.Dpi} dpi", $"pick:dpi:{sid}"),
+        });
         if (!s.Scanning)
-            buttons.Add([
-                InlineKeyboardButton.WithCallbackData("📷 Scan now", $"scan:{s.DaemonSessionId}")
-            ]);
-        buttons.Add([
-            InlineKeyboardButton.WithCallbackData("🚪 End session", $"end:{s.DaemonSessionId}")
-        ]);
-        return (html, new InlineKeyboardMarkup(buttons));
-    }
-
-    public static string RenderTerminated(BotSession s, SessionTerminationReason reason, string? newOwner)
-    {
-        var reasonText = reason switch
         {
-            SessionTerminationReason.Timeout => "⏰ Session expired",
-            SessionTerminationReason.Takeover => $"🚪 Session taken over by {newOwner ?? "another user"}",
-            SessionTerminationReason.Closed => "🚪 Session ended",
-            _ => "Session ended"
-        };
-        return $"{reasonText}\n📑 Final count: <b>{s.ScanCount}</b>";
-    }
-}
-
-/// <summary>
-/// Menu shown after /scan. User picks format + DPI before the session opens.
-/// DPI list is the V33's native set (75 rounds to 100, so 75 is omitted).
-/// </summary>
-public static class ScanMenu
-{
-    public static readonly int[] NativeDpis = [100, 200, 300, 600, 1200];
-    public const int DefaultDpi = 200;
-
-    public static InlineKeyboardMarkup RenderFormat()
-    {
-        return new InlineKeyboardMarkup(
-        [
-            [InlineKeyboardButton.WithCallbackData("📄 JPG (default)", "open:jpeg")],
-            [InlineKeyboardButton.WithCallbackData("🖼️ PNG (lossless)", "open:png")],
-            [InlineKeyboardButton.WithCallbackData("🗄️ TIFF (archive)", "open:tiff")]
-        ]);
-    }
-
-    public static InlineKeyboardMarkup RenderDpi(string format)
-    {
-        var rows = NativeDpis.Select(dpi =>
-        {
-            var label = dpi == DefaultDpi ? $"⭐ {dpi} dpi" : $"{dpi} dpi";
-            return new[] { InlineKeyboardButton.WithCallbackData(label, $"dpi:{format}:{dpi}") };
-        }).ToArray();
+            rows.Add(new[] { InlineKeyboardButton.WithCallbackData("📷 Scan", $"scan:{sid}") });
+        }
+        rows.Add(new[] { InlineKeyboardButton.WithCallbackData("🚪 End session", $"end:{sid}") });
         return new InlineKeyboardMarkup(rows);
+    }
+
+    private static InlineKeyboardMarkup RenderFormatPicker(BotSession s)
+    {
+        var sid = s.DaemonSessionId;
+        var cur = s.Params.Format;
+        string mark(ScanFormat f) => f == cur ? " ✓" : "";
+        return new InlineKeyboardMarkup(new[]
+        {
+            new[]
+            {
+                InlineKeyboardButton.WithCallbackData($"JPG{mark(ScanFormat.Jpeg)}",  $"set:fmt:{sid}:jpeg"),
+                InlineKeyboardButton.WithCallbackData($"PNG{mark(ScanFormat.Png)}",   $"set:fmt:{sid}:png"),
+                InlineKeyboardButton.WithCallbackData($"TIFF{mark(ScanFormat.Tiff)}", $"set:fmt:{sid}:tiff"),
+            },
+            new[] { InlineKeyboardButton.WithCallbackData("↩ back", $"cancel:{sid}") },
+        });
+    }
+
+    private static InlineKeyboardMarkup RenderDpiPicker(BotSession s)
+    {
+        var sid = s.DaemonSessionId;
+        var cur = s.Params.Dpi;
+        string label(int d) => d == cur ? $"{d} ✓" : $"{d}";
+        return new InlineKeyboardMarkup(new[]
+        {
+            NativeDpis.Select(d =>
+                InlineKeyboardButton.WithCallbackData(label(d), $"set:dpi:{sid}:{d}")).ToArray(),
+            new[] { InlineKeyboardButton.WithCallbackData("↩ back", $"cancel:{sid}") },
+        });
     }
 }

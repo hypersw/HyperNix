@@ -89,6 +89,30 @@ public sealed class SessionService : IAsyncDisposable
         return (OpenOutcome.Opened, session, null);
     }
 
+    /// <summary>
+    /// Update the session's scan parameters mid-flight. In-flight scans
+    /// keep the params they started with; next scan uses the new values.
+    /// Emits a <c>SessionOpened</c> event with the updated record so
+    /// subscribers re-render.
+    /// </summary>
+    public SessionRecord UpdateParams(string sessionId, ScanParams newParams)
+    {
+        lock (_lock)
+        {
+            var current = _store.Current
+                ?? throw new InvalidOperationException("No active session");
+            if (current.Id != sessionId)
+                throw new InvalidOperationException("Session ID mismatch");
+            var updated = _store.Mutate(s => s with { Params = newParams });
+            _broker.Publish(new SessionEvent(
+                SessionEventType.SessionOpened,
+                SessionId: updated.Id, Session: updated));
+            _logger.LogInformation("session {Id} params updated: dpi={Dpi} fmt={Fmt}",
+                updated.Id, newParams.Dpi, newParams.Format);
+            return updated;
+        }
+    }
+
     public bool Close(string sessionId, SessionTerminationReason reason)
     {
         SessionRecord? current;

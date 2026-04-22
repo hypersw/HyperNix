@@ -104,6 +104,19 @@ app.MapGet("/sessions/{id}", (string id, SessionService svc) =>
     return Results.Ok(cur);
 });
 
+app.MapPatch("/sessions/{id}", (string id, ScanParams newParams, SessionService svc) =>
+{
+    try
+    {
+        var updated = svc.UpdateParams(id, newParams);
+        return Results.Ok(updated);
+    }
+    catch (InvalidOperationException ex)
+    {
+        return Results.BadRequest(ex.Message);
+    }
+});
+
 app.MapDelete("/sessions/{id}", (string id, SessionService svc) =>
 {
     var ok = svc.Close(id, SessionTerminationReason.Closed);
