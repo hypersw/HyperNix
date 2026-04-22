@@ -95,7 +95,39 @@
   boot.kernelParams = [
     "video=HDMI-A-1:d"
     "video=HDMI-A-2:d"
+
+    # pstore/ramoops forensics. If a future reset is kernel-triggered
+    # (oops, panic, BUG:), ramoops writes the last bytes of the kernel
+    # log into a RAM region that survives a warm reboot; next boot,
+    # systemd-pstore.service copies /sys/fs/pstore/* into
+    # /var/lib/systemd/pstore/ for post-mortem inspection.
+    #
+    # Two caveats:
+    #  1. Full power-loss / brownout clears RAM, so ramoops will NOT
+    #     catch the silent-reset pattern suspected on 2026-04-21. It
+    #     only catches kernel-triggered resets where power stays on.
+    #  2. Memory reservation on ARM64 wants a device-tree reserved-
+    #     memory node — the `memmap=` kernel param works only on x86.
+    #     Doing DT reservation from NixOS means rebuilding the Pi's
+    #     device tree, which is fiddly. We're doing best-effort here:
+    #     ramoops tries to ioremap the given region at module load; if
+    #     the kernel already allocated there, ramoops logs a failure
+    #     and pstore is quietly unavailable (check `dmesg | grep
+    #     ramoops` after boot, and `/sys/fs/pstore/` should be a
+    #     non-empty directory on a working setup).
+    #
+    # Address 0x08000000 (128 MiB) is above the typical kernel+initrd
+    # load area on Pi 4 (~16 MiB from 0x00080000) but well below where
+    # modules and slab live at runtime; gives the best chance. ecc=1
+    # makes marginal voltage corruption detectable, not silently wrong.
+    "ramoops.mem_address=0x08000000"
+    "ramoops.mem_size=0x100000"
+    "ramoops.record_size=0x20000"
+    "ramoops.console_size=0x20000"
+    "ramoops.ecc=1"
   ];
+
+  boot.kernelModules = [ "ramoops" ];
 
   # Staged-peripheral-bringup diagnostic. Defers USB-A (xhci_pci) and
   # Wi-Fi (brcmfmac) past the brownout-prone first ~10 s of boot, then
@@ -117,6 +149,44 @@
   # See Modules/System/BootStabilityProbe/default.nix for rescue notes
   # (U-Boot menu rollback, SD-card extlinux.conf edit).
   services.boot-stability-probe.enable = true;
+
+  # ── Throttle history ────────────────────────────────────────────────────
+  #
+  # vcgencmd's get_throttled register reports whether the Pi has detected
+  # undervoltage / thermal throttle / capped-clock events — but the value
+  # reads "events since last boot", so a brownout-induced reset wipes it
+  # clean before we can see anything. Sample every 5 min and append to a
+  # persistent log so sub-brownout voltage sags (which set the bit without
+  # triggering a full reset) accumulate a visible history. If the log
+  # shows 0x50000 right before a silent reset, power supply is confirmed
+  # as the trigger.
+  #
+  # Run as root (needs /dev/vcio). ~80 bytes/sample × 288/day ≈ 23 KB/day,
+  # no rotation needed for years.
+  systemd.services.throttle-history = {
+    description = "Log RPi undervoltage/throttle state to /var/log/throttle.log";
+    serviceConfig = {
+      Type = "oneshot";
+      ExecStart = pkgs.writeShellScript "throttle-history" ''
+        VCGENCMD=${pkgs.libraspberrypi}/bin/vcgencmd
+        TS=$(${pkgs.coreutils}/bin/date -u +%Y-%m-%dT%H:%M:%SZ)
+        VAL=$("$VCGENCMD" get_throttled 2>&1 | ${pkgs.coreutils}/bin/tr -d '\n')
+        VOLT=$("$VCGENCMD" measure_volts core 2>&1 | ${pkgs.coreutils}/bin/tr -d '\n')
+        TEMP=$("$VCGENCMD" measure_temp 2>&1 | ${pkgs.coreutils}/bin/tr -d '\n')
+        ${pkgs.coreutils}/bin/echo "$TS $VAL $VOLT $TEMP" >> /var/log/throttle.log
+      '';
+    };
+  };
+
+  systemd.timers.throttle-history = {
+    description = "Sample RPi throttle state every 5 min";
+    wantedBy = [ "timers.target" ];
+    timerConfig = {
+      OnBootSec = "1min";
+      OnUnitActiveSec = "5min";
+      AccuracySec = "30s";
+    };
+  };
 
   networking = {
     useDHCP = true;
