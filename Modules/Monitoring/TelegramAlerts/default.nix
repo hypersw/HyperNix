@@ -37,7 +37,10 @@ let
       *) echo "alert-telegram-enqueue: unknown severity '$SEV'" >&2; exit 1 ;;
     esac
     TS=$(${pkgs.coreutils}/bin/date +%s)
-    NONCE=$(${pkgs.coreutils}/bin/tr -dc 'a-z0-9' </dev/urandom | ${pkgs.coreutils}/bin/head -c 8)
+    # 2>/dev/null on tr: head -c 8 closes the pipe which sends SIGPIPE to
+    # tr; without stderr suppression that writes a cosmetic "tr: write
+    # error: Broken pipe" to the journal even though the script works.
+    NONCE=$(${pkgs.coreutils}/bin/tr -dc 'a-z0-9' </dev/urandom 2>/dev/null | ${pkgs.coreutils}/bin/head -c 8)
     CHAT_ID=$(${pkgs.coreutils}/bin/cat "$CHAT_ID_FILE" 2>/dev/null || true)
     if [ -z "$CHAT_ID" ]; then
       echo "alert-telegram-enqueue: no chat id from $CHAT_ID_FILE" >&2

@@ -42,12 +42,19 @@ let
       BRANCH="''${BRANCH:-master}"
     fi
 
-    LATEST_REV=$(${pkgs.git}/bin/git ls-remote "https://github.com/$OWNER_REPO" "refs/heads/$BRANCH" \
-      | ${pkgs.coreutils}/bin/cut -f1)
+    # git ls-remote over flaky / missing network is expected — do NOT treat
+    # it as a service failure (would otherwise cascade through netdata's
+    # systemd-unit-failed alarm into a false-positive alert). Capture both
+    # stdout and exit status; on network error, log and exit 0 so systemd
+    # counts this tick as a clean no-op and the next timer firing retries.
+    if ! LATEST_REV=$(${pkgs.git}/bin/git ls-remote "https://github.com/$OWNER_REPO" "refs/heads/$BRANCH" 2>/dev/null | ${pkgs.coreutils}/bin/cut -f1); then
+      echo "$LOG_TAG: git ls-remote failed (likely transient network issue) — will retry next tick" >&2
+      exit 0
+    fi
 
     if [ -z "$LATEST_REV" ]; then
-      echo "$LOG_TAG: could not resolve latest rev for $OWNER_REPO/$BRANCH" >&2
-      exit 1
+      echo "$LOG_TAG: empty ls-remote response — will retry next tick" >&2
+      exit 0
     fi
 
     if [ "$CURRENT_REV" = "$LATEST_REV" ]; then
@@ -57,10 +64,17 @@ let
 
     echo "$LOG_TAG: upstream changed $CURRENT_REV -> $LATEST_REV, updating..."
 
-    # Update only the upstream input, not nixpkgs
-    ${pkgs.nix}/bin/nix flake update "$INPUT_NAME" --flake "$FLAKE_DIR"
+    # flake update needs network too — same treatment.
+    if ! ${pkgs.nix}/bin/nix flake update "$INPUT_NAME" --flake "$FLAKE_DIR"; then
+      echo "$LOG_TAG: flake update failed (likely transient network issue) — will retry next tick" >&2
+      exit 0
+    fi
 
     echo "$LOG_TAG: rebuilding..."
+    # nixos-rebuild switch failure IS a real error worth alerting on —
+    # it means the fetched flake actually built/activated badly. No soft-
+    # fail here. Note this path requires `set +e` around the git/flake
+    # ls-remote parts; pipefail stays on for rebuild's subprocesses.
     ${config.system.build.nixos-rebuild}/bin/nixos-rebuild switch --flake "$FLAKE_DIR#${cfg.configName}"
   '';
 in

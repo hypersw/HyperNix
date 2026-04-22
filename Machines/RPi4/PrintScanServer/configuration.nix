@@ -243,6 +243,7 @@
       matchConfig.Name = "end0";
       networkConfig = {
         DHCP = "yes";
+        # Publish printscan.local here (and only here). See wlan0 below.
         MulticastDNS = "yes";
         IPv6AcceptRA = "yes";
       };
@@ -252,7 +253,15 @@
       matchConfig.Name = "wlan0";
       networkConfig = {
         DHCP = "yes";
-        MulticastDNS = "yes";
+        # "resolve" = answer queries for local names but DON'T publish our
+        # own hostname here. With both interfaces on the same L2 segment
+        # (AP bridges wlan0 to end0's subnet), publishing on both causes
+        # resolved to see its OWN announcement reflected back and trigger
+        # RFC 6762 conflict-resolution — renaming the host to
+        # printscan7.local, then printscan11.local, leaving
+        # printscan.local unreachable. Observed on 2026-04-22: fixed by
+        # making end0 the sole publisher.
+        MulticastDNS = "resolve";
         IPv6AcceptRA = "yes";
       };
       linkConfig.RequiredForOnline = "no";
