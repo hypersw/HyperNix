@@ -5,6 +5,20 @@ let
   checkScript = pkgs.writeShellScript "check-upstream-and-rebuild" ''
     set -euo pipefail
 
+    # Mutex via flock — if a previous rebuild is still running (long build
+    # on slow hardware or a stalled network call), skip this tick cleanly
+    # rather than cancelling the in-flight job. JobMode=replace (systemd's
+    # default) would otherwise kill the earlier activation mid-stream,
+    # leaving a partially-applied switch. Kernel releases the flock if
+    # the holder dies unexpectedly — unlike stamp files, no stale-lock
+    # wedge on crash.
+    LOCK=/run/auto-rebuild-on-push.lock
+    exec 9>>"$LOCK"
+    if ! ${pkgs.util-linux}/bin/flock -n 9; then
+      echo "auto-rebuild-on-push: previous run still active — skipping this tick"
+      exit 0
+    fi
+
     FLAKE_DIR="${cfg.flakeDir}"
     INPUT_NAME="${cfg.inputName}"
     LOG_TAG="auto-rebuild-on-push"
