@@ -189,11 +189,17 @@
   };
 
   networking = {
-    useDHCP = true;
+    # systemd-networkd + systemd-resolved (modern stack), matching HyperJetHV.
+    # Replaces the legacy dhcpcd + Avahi pair. Wi-Fi auth still goes through
+    # wpa_supplicant; networkd takes over L3 after association.
+    useNetworkd = true;
+    useDHCP = false;         # per-interface via .network files below
+    dhcpcd.enable = false;   # networkd has its own DHCP client
+
     firewall = {
       enable = true;
       allowedTCPPorts = [ 22 ];
-      allowedUDPPorts = [ 5353 ];  # mDNS (Avahi)
+      allowedUDPPorts = [ 5353 ];  # mDNS (systemd-resolved)
     };
 
     # WiFi client — connect to IoT PPSK network
@@ -216,14 +222,40 @@
     wants = [ "sops-nix.service" ];
   };
 
-  # Advertise hostname on the LAN via mDNS (multicast DNS).
-  # Lets clients reach this machine as printscan.local without DNS config.
-  services.avahi = {
+  # systemd-resolved — stub resolver + mDNS publisher.
+  # Replaces Avahi: one daemon owns /etc/resolv.conf (127.0.0.53 stub),
+  # handles per-link DNS from DHCP, AND publishes printscan.local over
+  # mDNS. Without MulticastDNS=yes this is query-only (default "resolve").
+  services.resolved = {
     enable = true;
-    nssmdns4 = true;  # resolve .local names on this machine too
-    publish = {
-      enable = true;
-      addresses = true;
+    settings.Resolve.MulticastDNS = "yes";  # default is 'resolve' (query-only)
+  };
+
+  # Per-interface networkd config. Both interfaces do DHCP + mDNS.
+  # wlan0 is RequiredForOnline=no so boot doesn't block if Wi-Fi isn't
+  # associated yet (we reach network-online as soon as end0 is up).
+  # anyInterface=true on wait-online reinforces that: any link being
+  # routable is enough.
+  systemd.network = {
+    wait-online.anyInterface = true;
+
+    networks."20-end0" = {
+      matchConfig.Name = "end0";
+      networkConfig = {
+        DHCP = "yes";
+        MulticastDNS = "yes";
+        IPv6AcceptRA = "yes";
+      };
+    };
+
+    networks."20-wlan0" = {
+      matchConfig.Name = "wlan0";
+      networkConfig = {
+        DHCP = "yes";
+        MulticastDNS = "yes";
+        IPv6AcceptRA = "yes";
+      };
+      linkConfig.RequiredForOnline = "no";
     };
   };
 
