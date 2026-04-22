@@ -97,14 +97,26 @@
     "video=HDMI-A-2:d"
   ];
 
-  # Staged-peripheral-bringup diagnostic. Off by default (module is imported
-  # so the option exists and is explicit). Flip to true + rebuild + reboot
-  # when reproducing the boot-loop symptom is desirable — it defers
-  # USB-A (xhci_pci) and Wi-Fi (brcmfmac) past the brownout-prone window
-  # and brings them up serially with journal syncs, so the journal
+  # Staged-peripheral-bringup diagnostic. Defers USB-A (xhci_pci) and
+  # Wi-Fi (brcmfmac) past the brownout-prone first ~10 s of boot, then
+  # brings them up serially with aggressive journal syncs, so the journal
   # durably records which stage was in flight if a reset occurs.
-  # See Modules/System/BootStabilityProbe/default.nix for rescue notes.
-  services.boot-stability-probe.enable = false;
+  #
+  # Activated 2026-04-22 after the 74-cycle silent-reset boot loop: the
+  # fact that every failed boot died at the same journald-flush milestone
+  # (~3 s in, "flushed 552 entries") strongly suggested an issue during
+  # early peripheral init; this module will either make the reset go
+  # away (if the cause was transient-current overlap, now serialised) or
+  # make the journal pinpoint which stage triggers it.
+  #
+  # Side effect: USB + Wi-Fi unavailable for ~30-40 s after boot. SSH
+  # over Wi-Fi is unreachable during that window — use Ethernet if you
+  # need reliable early-boot access. Scanner and printer come up after
+  # the USB stage completes.
+  #
+  # See Modules/System/BootStabilityProbe/default.nix for rescue notes
+  # (U-Boot menu rollback, SD-card extlinux.conf edit).
+  services.boot-stability-probe.enable = true;
 
   networking = {
     useDHCP = true;
