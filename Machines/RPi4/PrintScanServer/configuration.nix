@@ -222,16 +222,41 @@
     wants = [ "sops-nix.service" ];
   };
 
-  # systemd-resolved — stub resolver + mDNS publisher.
-  # Replaces Avahi: one daemon owns /etc/resolv.conf (127.0.0.53 stub),
-  # handles per-link DNS from DHCP, AND publishes printscan.local over
-  # mDNS. Without MulticastDNS=yes this is query-only (default "resolve").
+  # systemd-resolved — stub resolver ONLY; mDNS deliberately disabled.
+  #
+  # Why split resolved (DNS) and avahi (mDNS) on the same host:
+  #
+  # resolved's mDNS implementation has a structural issue on hosts with
+  # multiple interfaces on the same L2 segment (our case: end0 + wlan0
+  # both bridged by the AP into 192.168.1.0/24). Each link owns its own
+  # mDNS scope independently, with no cross-link coordination — so the
+  # end0 scope publishes "printscan.local → 192.168.1.129", and the
+  # wlan0 scope publishes "printscan.local → 192.168.1.130". When the
+  # AP bridges the multicast traffic between wlan0 and end0, resolved
+  # sees its own sibling-link announcement and treats it as another
+  # device claiming the name with a different IP. It then runs RFC 6762
+  # conflict resolution, renaming the host to printscan7.local, then
+  # printscan11.local, leaving printscan.local unreachable. Observed
+  # on 2026-04-22. See upstream systemd issues #28491, #23910.
+  #
+  # Avahi handles multi-interface mDNS coherently (knows about its own
+  # links, avoids self-conflict, publishes correctly across all of them)
+  # because it was designed for exactly this case — eth+wifi laptops.
+  # That's why every major Linux distro with dual-NIC expectations
+  # (Fedora Workstation, Ubuntu, ChromeOS) ships Avahi regardless of
+  # whether resolved is also present.
+  #
+  # So: resolved owns DNS (stub at 127.0.0.53, per-link DNS from DHCP)
+  # but NOT mDNS. Avahi owns mDNS. They don't collide on :5353 because
+  # resolved with MulticastDNS=no doesn't bind that socket.
   services.resolved = {
     enable = true;
-    settings.Resolve.MulticastDNS = "yes";  # default is 'resolve' (query-only)
+    settings.Resolve.MulticastDNS = "no";  # Avahi does mDNS, not us
   };
 
-  # Per-interface networkd config. Both interfaces do DHCP + mDNS.
+  # Per-interface networkd config. DHCP + IPv6 RA on both interfaces.
+  # MulticastDNS deliberately NOT set — Avahi handles mDNS on all
+  # interfaces directly, independently of networkd's per-link flags.
   # wait-online is disabled entirely — nothing in this flake depends on
   # network-online.target anymore (notifications go through the alert
   # outbox, which tolerates offline indefinitely). Boot proceeds as fast
@@ -243,8 +268,6 @@
       matchConfig.Name = "end0";
       networkConfig = {
         DHCP = "yes";
-        # Publish printscan.local here (and only here). See wlan0 below.
-        MulticastDNS = "yes";
         IPv6AcceptRA = "yes";
       };
     };
@@ -253,18 +276,23 @@
       matchConfig.Name = "wlan0";
       networkConfig = {
         DHCP = "yes";
-        # "resolve" = answer queries for local names but DON'T publish our
-        # own hostname here. With both interfaces on the same L2 segment
-        # (AP bridges wlan0 to end0's subnet), publishing on both causes
-        # resolved to see its OWN announcement reflected back and trigger
-        # RFC 6762 conflict-resolution — renaming the host to
-        # printscan7.local, then printscan11.local, leaving
-        # printscan.local unreachable. Observed on 2026-04-22: fixed by
-        # making end0 the sole publisher.
-        MulticastDNS = "resolve";
         IPv6AcceptRA = "yes";
       };
       linkConfig.RequiredForOnline = "no";
+    };
+  };
+
+  # Avahi — mDNS publisher and resolver. Announces printscan.local on
+  # every interface it sees, in a self-conflict-aware way (see comment
+  # above resolved for why we can't let resolved do this). nssmdns4=true
+  # installs the nsswitch glue so local apps resolve *.local via avahi
+  # directly (glibc → nss_mdns4), bypassing resolved for those names.
+  services.avahi = {
+    enable = true;
+    nssmdns4 = true;
+    publish = {
+      enable = true;
+      addresses = true;
     };
   };
 
