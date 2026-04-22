@@ -232,12 +232,12 @@
   };
 
   # Per-interface networkd config. Both interfaces do DHCP + mDNS.
-  # wlan0 is RequiredForOnline=no so boot doesn't block if Wi-Fi isn't
-  # associated yet (we reach network-online as soon as end0 is up).
-  # anyInterface=true on wait-online reinforces that: any link being
-  # routable is enough.
+  # wait-online is disabled entirely — nothing in this flake depends on
+  # network-online.target anymore (notifications go through the alert
+  # outbox, which tolerates offline indefinitely). Boot proceeds as fast
+  # as sysinit finishes, regardless of Wi-Fi/Ethernet state.
   systemd.network = {
-    wait-online.anyInterface = true;
+    wait-online.enable = false;
 
     networks."20-end0" = {
       matchConfig.Name = "end0";

@@ -2,26 +2,151 @@
 let
   cfg = config.services.telegram-alerts;
 
-  # Script to send a Telegram message — reads token and chat ID from files at runtime
-  sendTelegram = pkgs.writeShellScript "send-telegram" ''
-    CHAT_ID_FILE="$1"
+  # ─── Alert pipeline ──────────────────────────────────────────────────────
+  #
+  # Notifications are never sent inline by individual notify services. The
+  # media-agnostic `sendAlert` / `sendLog` fan out over every configured
+  # medium; each medium has its own persistent outbox and async drainer.
+  # This decouples event emission from network status — services always
+  # succeed locally, messages accumulate (with original event timestamps)
+  # until the medium's transport works. When one medium's network is down
+  # but another's isn't, delivery still happens via the healthy path.
+  #
+  # Today only Telegram is implemented. To add a medium (email, Pushover,
+  # etc.), define a new `<medium>Enqueue` helper + `<medium>Drain` script
+  # + per-medium spool + service/path/timer triplet, and append the
+  # enqueue call to `sendAlert` / `sendLog` below.
+
+  telegramSpool = "/var/spool/alert-telegram-outbox";
+
+  # Per-medium enqueue: severity-aware (maps to this medium's channel),
+  # atomic write (mktemp+rename), no network required. File format:
+  #   line 1: unix timestamp (event time, not delivery time)
+  #   line 2: chat id (medium-specific routing key)
+  #   line 3+: body (may contain newlines)
+  # Filename: <ts>-<nonce>.msg — ts prefix makes lexicographic sort
+  # equivalent to chronological sort.
+  telegramEnqueue = pkgs.writeShellScript "alert-telegram-enqueue" ''
+    set -eu
+    SEV="$1"      # alert | log
     shift
-    MESSAGE="$*"
-    CHAT_ID=$(cat "$CHAT_ID_FILE")
-    TOKEN=$(cat ${cfg.tokenFile})
-    ${pkgs.curl}/bin/curl -s -X POST \
-      "https://api.telegram.org/bot$TOKEN/sendMessage" \
-      -d "chat_id=$CHAT_ID" \
-      -d "text=$MESSAGE" \
-      -d "parse_mode=HTML" >/dev/null
+    TEXT="$*"
+    case "$SEV" in
+      alert) CHAT_ID_FILE=${cfg.alertsChatIdFile} ;;
+      log)   CHAT_ID_FILE=${cfg.logChatIdFile} ;;
+      *) echo "alert-telegram-enqueue: unknown severity '$SEV'" >&2; exit 1 ;;
+    esac
+    TS=$(${pkgs.coreutils}/bin/date +%s)
+    NONCE=$(${pkgs.coreutils}/bin/tr -dc 'a-z0-9' </dev/urandom | ${pkgs.coreutils}/bin/head -c 8)
+    CHAT_ID=$(${pkgs.coreutils}/bin/cat "$CHAT_ID_FILE" 2>/dev/null || true)
+    if [ -z "$CHAT_ID" ]; then
+      echo "alert-telegram-enqueue: no chat id from $CHAT_ID_FILE" >&2
+      exit 1
+    fi
+    ${pkgs.coreutils}/bin/mkdir -p "${telegramSpool}"
+    TMP=$(${pkgs.coreutils}/bin/mktemp -p "${telegramSpool}" ".tmp.XXXXXX")
+    # mktemp creates 0600; relax to 0644 — queue content is no more
+    # sensitive than the journal (chat ids + event descriptions).
+    ${pkgs.coreutils}/bin/chmod 0644 "$TMP"
+    {
+      ${pkgs.coreutils}/bin/printf '%s\n' "$TS"
+      ${pkgs.coreutils}/bin/printf '%s\n' "$CHAT_ID"
+      ${pkgs.coreutils}/bin/printf '%s' "$TEXT"
+    } > "$TMP"
+    ${pkgs.coreutils}/bin/mv "$TMP" "${telegramSpool}/$TS-$NONCE.msg"
   '';
 
+  # Media-agnostic entry points. Every call fans out to every configured
+  # medium's enqueue. Callers just pick severity (alert vs log). Currently
+  # only the telegram medium is hooked in; add more lines when media are added.
   sendAlert = pkgs.writeShellScript "send-alert" ''
-    ${sendTelegram} ${cfg.alertsChatIdFile} "$@"
+    ${telegramEnqueue} alert "$@" || true
+    # ${"$"}{emailEnqueue} alert "$@" || true     # when configured
   '';
 
   sendLog = pkgs.writeShellScript "send-log" ''
-    ${sendTelegram} ${cfg.logChatIdFile} "$@"
+    ${telegramEnqueue} log "$@" || true
+    # ${"$"}{emailEnqueue} log "$@" || true       # when configured
+  '';
+
+  # Drain: process spool oldest-first, send to Telegram, delete on success.
+  # On any send failure we break out (don't burn retries on a likely-down
+  # network) and exit non-zero so systemd treats the run as failed — the
+  # timer will re-fire in 30s. Crash-resilient locking via flock on fd 9:
+  # if the drain dies mid-flight (signal, panic, whatever) the kernel
+  # releases the lock automatically — unlike a .lock marker file which
+  # would wedge future drains until manual cleanup.
+  telegramDrain = pkgs.writeShellScript "alert-telegram-outbox-drain" ''
+    set -u
+    DIR="${telegramSpool}"
+    LOCK="$DIR/.drain.lock"
+
+    ${pkgs.coreutils}/bin/mkdir -p "$DIR"
+
+    # Exclusive flock on fd 9. -n: bail if another drain is active;
+    # Path/Timer will fire another attempt shortly.
+    exec 9>>"$LOCK"
+    ${pkgs.util-linux}/bin/flock -n 9 || { echo "drain: busy, skipping" >&2; exit 0; }
+
+    TOKEN=$(${pkgs.coreutils}/bin/cat ${cfg.tokenFile} 2>/dev/null || true)
+    if [ -z "$TOKEN" ]; then
+      echo "drain: no bot token — aborting" >&2
+      exit 1
+    fi
+
+    # Purge messages older than 7 days — historical at this point.
+    ${pkgs.findutils}/bin/find "$DIR" -maxdepth 1 -name '*.msg' -mtime +7 -delete 2>/dev/null || true
+
+    # Cap queue at 1000 files. Drop oldest beyond that.
+    count=$(${pkgs.coreutils}/bin/ls -1 "$DIR"/*.msg 2>/dev/null | ${pkgs.coreutils}/bin/wc -l || echo 0)
+    if [ "$count" -gt 1000 ]; then
+      excess=$((count - 1000))
+      ${pkgs.coreutils}/bin/ls -1 "$DIR"/*.msg | ${pkgs.coreutils}/bin/head -n "$excess" | ${pkgs.findutils}/bin/xargs -r rm -f
+    fi
+
+    rc=0
+    for msg in $(${pkgs.coreutils}/bin/ls -1 "$DIR"/*.msg 2>/dev/null || true); do
+      [ -f "$msg" ] || continue
+
+      ts=$(${pkgs.coreutils}/bin/head -n 1 "$msg")
+      chat=$(${pkgs.gnused}/bin/sed -n '2p' "$msg")
+      text=$(${pkgs.coreutils}/bin/tail -n +3 "$msg")
+
+      # Stale-message decoration: if the event is older than 60s at
+      # delivery time, prepend queued-ago so the reader sees event time,
+      # not delivery time.
+      now=$(${pkgs.coreutils}/bin/date +%s)
+      age=$((now - ts))
+      if [ "$age" -gt 60 ]; then
+        if [ "$age" -ge 86400 ]; then
+          dur="$((age / 86400))d $((age / 3600 % 24))h"
+        elif [ "$age" -ge 3600 ]; then
+          dur="$((age / 3600))h $((age / 60 % 60))m"
+        else
+          dur="$((age / 60))m"
+        fi
+        text="⏱ queued $dur ago — $text"
+      fi
+
+      # --data-urlencode so message text can contain any chars without
+      # breaking the curl command line.
+      if ${pkgs.curl}/bin/curl -sf --max-time 10 -X POST \
+          "https://api.telegram.org/bot$TOKEN/sendMessage" \
+          --data-urlencode "chat_id=$chat" \
+          --data-urlencode "text=$text" \
+          -d "parse_mode=HTML" >/dev/null 2>&1; then
+        ${pkgs.coreutils}/bin/rm -f "$msg"
+        # Per-chat rate limit: ~1 msg/sec. Sleep 1.1s/send to stay safe
+        # even if all queued messages target the same chat.
+        ${pkgs.coreutils}/bin/sleep 1.1
+      else
+        echo "drain: send failed for $(${pkgs.coreutils}/bin/basename "$msg") — leaving for retry" >&2
+        rc=1
+        break
+      fi
+    done
+
+    exit $rc
   '';
 
   # Query GitHub API for commit details (owner/repo, rev) → "short_hash date subject"
@@ -38,8 +163,14 @@ let
     [ -n "$DATE" ] && echo "$SHORT $DATE $MSG"
   '';
 
-  # Send switch notification: immediate basic message, then edit with enriched git info.
-  # Entirely fault-tolerant — failures at any stage don't block activation or lose the message.
+  # Build a config-switch notification and enqueue it.
+  # The old implementation sent a basic message, fetched GitHub details,
+  # and edited the message in place — which couldn't work with the outbox
+  # (no message_id until delivery). New approach: fetch everything up-front
+  # (best-effort, ~10s worst case per GitHub lookup), compose one final
+  # message, hand it to the outbox. GitHub being unreachable at enqueue
+  # time just means the message says "details unavailable"; no retry
+  # dance, no in-place edits.
   enrichedSwitchNotify = pkgs.writeShellScript "enriched-switch-notify" ''
     LOG_TAG="config-switch-notify"
     PREV="$1"
@@ -66,48 +197,10 @@ let
     NEW_NIXPKGS_REV=$(echo "$NEW_INFO" | ${pkgs.jq}/bin/jq -r '.nixpkgsRev // empty')
     CFG_REPO=$(echo "$NEW_INFO" | ${pkgs.jq}/bin/jq -r '.configRepo // empty')
 
-    # Read secrets — error if missing (module is enabled, secrets must exist)
-    if ! CHAT_ID=$(${pkgs.coreutils}/bin/cat ${cfg.logChatIdFile} 2>/dev/null) || [ -z "$CHAT_ID" ]; then
-      echo "$LOG_TAG: ERROR: cannot read chat ID from ${cfg.logChatIdFile}" >&2
-      exit 1
-    fi
-    if ! TOKEN=$(${pkgs.coreutils}/bin/cat ${cfg.tokenFile} 2>/dev/null) || [ -z "$TOKEN" ]; then
-      echo "$LOG_TAG: ERROR: cannot read token from ${cfg.tokenFile}" >&2
-      exit 1
-    fi
-
     PREV_CFG_SHORT="''${PREV_CFG_REV:+$(echo "$PREV_CFG_REV" | ${pkgs.coreutils}/bin/cut -c1-7)}"
     NEW_CFG_SHORT="''${NEW_CFG_REV:+$(echo "$NEW_CFG_REV" | ${pkgs.coreutils}/bin/cut -c1-7)}"
     PREV_LABEL="''${PREV_CFG_SHORT:-n/a} $PREV_STORE"
     NEW_LABEL="''${NEW_CFG_SHORT:-n/a} $NEW_STORE"
-    BASIC_MSG="🔄 <b>$HOST</b>: config switched%0A<code>$PREV_LABEL</code>%0A→ <code>$NEW_LABEL</code>%0A%0ALoading commit details..."
-    echo "$LOG_TAG: sending notification (chat=$CHAT_ID, msg length=''${#BASIC_MSG})" >&2
-
-    # Send with retry (3 attempts, 5s delay) — network may not be ready right after switch
-    SEND_RESP=""
-    for attempt in 1 2 3; do
-      SEND_RESP=$(${pkgs.curl}/bin/curl -s --max-time 15 -X POST \
-        "https://api.telegram.org/bot''${TOKEN}/sendMessage" \
-        -d "chat_id=$CHAT_ID" \
-        -d "text=$BASIC_MSG" \
-        -d "parse_mode=HTML" 2>&1)
-      CURL_RC=$?
-      if [ $CURL_RC -eq 0 ] && echo "$SEND_RESP" | ${pkgs.gnugrep}/bin/grep -q '"ok":true'; then
-        echo "$LOG_TAG: sent successfully (attempt $attempt)" >&2
-        break
-      fi
-      echo "$LOG_TAG: send attempt $attempt failed (curl rc=$CURL_RC, resp=$SEND_RESP)" >&2
-      [ "$attempt" -lt 3 ] && ${pkgs.coreutils}/bin/sleep 5
-    done
-    if ! echo "$SEND_RESP" | ${pkgs.gnugrep}/bin/grep -q '"ok":true'; then
-      echo "$LOG_TAG: ERROR: all send attempts failed" >&2
-      exit 1
-    fi
-    MSG_ID=$(echo "$SEND_RESP" | ${pkgs.jq}/bin/jq -r '.result.message_id // empty')
-    if [ -z "$MSG_ID" ]; then
-      echo "$LOG_TAG: ERROR: Telegram API returned no message_id" >&2
-      exit 1
-    fi
 
     # Enrich with GitHub commit details (10s timeout per call, warn on failure)
     CFG_INFO=""
@@ -126,7 +219,6 @@ let
       fi
     fi
 
-    # Determine nixpkgs change status
     if [ -z "$PREV_NIXPKGS_REV" ] || [ -z "$NEW_NIXPKGS_REV" ]; then
       NIXPKGS_CHANGED="n/a"
     elif [ "$PREV_NIXPKGS_REV" = "$NEW_NIXPKGS_REV" ]; then
@@ -135,35 +227,28 @@ let
       NIXPKGS_CHANGED="updated"
     fi
 
-    # Build enriched message — always show all fields, use n/a for missing
-    RICH_MSG="🔄 <b>$HOST</b>: config switched%0A<code>$PREV_LABEL</code> → <code>$NEW_LABEL</code>"
+    # Build final message body. Uses newlines (not %0A) since enqueue
+    # preserves newlines; Telegram parses them as-is.
+    MSG="🔄 <b>$HOST</b>: config switched"$'\n'"<code>$PREV_LABEL</code> → <code>$NEW_LABEL</code>"
 
     if [ -n "$CFG_INFO" ]; then
-      RICH_MSG="$RICH_MSG%0A%0A⚙️ Config: <code>$CFG_INFO</code>"
+      MSG="$MSG"$'\n\n'"⚙️ Config: <code>$CFG_INFO</code>"
     elif [ -n "$NEW_CFG_SHORT" ]; then
-      RICH_MSG="$RICH_MSG%0A%0A⚙️ Config: <code>$NEW_CFG_SHORT</code> (details unavailable)"
+      MSG="$MSG"$'\n\n'"⚙️ Config: <code>$NEW_CFG_SHORT</code> (details unavailable)"
     else
-      RICH_MSG="$RICH_MSG%0A%0A⚙️ Config: n/a"
+      MSG="$MSG"$'\n\n'"⚙️ Config: n/a"
     fi
 
     if [ -n "$NIXPKGS_INFO" ]; then
-      RICH_MSG="$RICH_MSG%0A📦 Nixpkgs ($NIXPKGS_CHANGED): <code>$NIXPKGS_INFO</code>"
+      MSG="$MSG"$'\n'"📦 Nixpkgs ($NIXPKGS_CHANGED): <code>$NIXPKGS_INFO</code>"
     elif [ -n "$NEW_NIXPKGS_REV" ]; then
       NIXPKGS_SHORT=$(echo "$NEW_NIXPKGS_REV" | ${pkgs.coreutils}/bin/cut -c1-7)
-      RICH_MSG="$RICH_MSG%0A📦 Nixpkgs ($NIXPKGS_CHANGED): <code>$NIXPKGS_SHORT</code>"
+      MSG="$MSG"$'\n'"📦 Nixpkgs ($NIXPKGS_CHANGED): <code>$NIXPKGS_SHORT</code>"
     else
-      RICH_MSG="$RICH_MSG%0A📦 Nixpkgs: n/a"
+      MSG="$MSG"$'\n'"📦 Nixpkgs: n/a"
     fi
 
-    # Edit the original message with enriched content
-    if ! ${pkgs.curl}/bin/curl -sf -X POST \
-      "https://api.telegram.org/bot$TOKEN/editMessageText" \
-      -d "chat_id=$CHAT_ID" \
-      -d "message_id=$MSG_ID" \
-      -d "text=$RICH_MSG" \
-      -d "parse_mode=HTML" >/dev/null 2>&1; then
-      echo "$LOG_TAG: WARNING: failed to edit message with enriched content" >&2
-    fi
+    ${sendLog} "$MSG"
   '';
 
   # Format seconds into human-readable duration (like TimeSpan)
@@ -181,32 +266,24 @@ let
     fi
   '';
 
-  # Custom notification script for netdata — reads secrets from files at runtime.
-  # Netdata's built-in health_alarm_notify.conf can't read from files,
-  # so we use a custom script that netdata calls for all alarm transitions.
+  # Custom notification script for netdata. Routes by $NETDATA_ALARM_ROLE
+  # through the media-agnostic sendLog/sendAlert so rate limits and the
+  # outbox fan-out work identically to every other notify in this module.
   notifyScript = pkgs.writeShellScript "netdata-telegram-notify" ''
     # Netdata passes alarm info via environment variables:
     # $NETDATA_ALARM_STATUS (CRITICAL, WARNING, CLEAR)
     # $NETDATA_ALARM_NAME, $NETDATA_ALARM_CHART, $NETDATA_ALARM_INFO
     # $NETDATA_ALARM_ROLE
 
-    TOKEN=$(cat ${cfg.tokenFile} 2>/dev/null) || exit 0
+    HOST=$(${pkgs.hostname}/bin/hostname)
+    MSG="<b>$HOST [$NETDATA_ALARM_STATUS]</b> $NETDATA_ALARM_NAME
+$NETDATA_ALARM_INFO
+Chart: $NETDATA_ALARM_CHART"
 
-    # Route by role: "log" → low-priority, everything else → alerts
     case "$NETDATA_ALARM_ROLE" in
-      log) CHAT_ID=$(cat ${cfg.logChatIdFile} 2>/dev/null) ;;
-      *)   CHAT_ID=$(cat ${cfg.alertsChatIdFile} 2>/dev/null) ;;
+      log) ${sendLog} "$MSG" ;;
+      *)   ${sendAlert} "$MSG" ;;
     esac
-    [ -z "$CHAT_ID" ] && exit 0
-
-    HOST=$(hostname)
-    MSG="<b>$HOST [$NETDATA_ALARM_STATUS]</b> $NETDATA_ALARM_NAME%0A$NETDATA_ALARM_INFO%0AChart: $NETDATA_ALARM_CHART"
-
-    ${pkgs.curl}/bin/curl -s -X POST \
-      "https://api.telegram.org/bot$TOKEN/sendMessage" \
-      -d "chat_id=$CHAT_ID" \
-      -d "text=$MSG" \
-      -d "parse_mode=HTML" >/dev/null
   '';
 
   notifyConf = pkgs.writeText "health_alarm_notify.conf" ''
@@ -435,6 +512,49 @@ in
     #   ⚠️  netdata warning
     #   🔴 netdata critical
 
+    # ── Telegram outbox: spool + drain service/path/timer ──────────────
+    #
+    # Every notify in this module enqueues into this per-medium spool via
+    # `sendAlert` / `sendLog` (which fan out over all configured media).
+    # This drainer handles Telegram delivery specifically. When more media
+    # are added (email, Pushover, etc.), each gets its own parallel set
+    # of units named alert-<medium>-outbox-* so queues don't collide.
+    #
+    # Spool is world-readable (0755 dir, 0644 files) — content is no
+    # more sensitive than the journal (chat ids + event descriptions,
+    # no secrets). Writes are root-only.
+    systemd.tmpfiles.rules = [
+      "d ${telegramSpool} 0755 root root -"
+    ];
+
+    systemd.services.alert-telegram-outbox-drain = {
+      description = "Deliver pending Telegram alerts from the outbox";
+      # No After=network-online.target — drain tolerates network-down by
+      # failing (systemd re-runs per timer). Boot never waits for this.
+      serviceConfig = {
+        Type = "oneshot";
+        ExecStart = telegramDrain;
+      };
+    };
+
+    systemd.paths.alert-telegram-outbox-drain = {
+      description = "Fire drain when a message lands in the Telegram outbox";
+      wantedBy = [ "multi-user.target" ];
+      # PathChanged fires on CLOSE_WRITE in the directory. enqueue's
+      # mktemp+rename triggers a CLOSE_WRITE on the final .msg file.
+      pathConfig.PathChanged = telegramSpool;
+    };
+
+    systemd.timers.alert-telegram-outbox-drain = {
+      description = "Periodic retry drain (covers downtime past Path events)";
+      wantedBy = [ "timers.target" ];
+      timerConfig = {
+        OnBootSec = "15s";
+        OnUnitActiveSec = "30s";
+        AccuracySec = "5s";
+      };
+    };
+
     # Boot notification → log channel.
     #
     # Dedupe by /proc/sys/kernel/random/boot_id — a UUID the kernel assigns
@@ -447,12 +567,12 @@ in
     #
     # Also emits a persistent sequence number so gaps in the Telegram log
     # are visible at a glance — if you see "#100" then "#103", two boots
-    # were missed entirely (telemetry never sent, e.g., boot died before
-    # network-online.target). StateDirectory creates /var/lib/boot-notify.
+    # were missed entirely (we enqueue unconditionally; a persistent
+    # counter that ticks in a proper early-boot unit is the next step).
+    # StateDirectory creates /var/lib/boot-notify.
     systemd.services.boot-notify = {
-      description = "Notify Telegram on successful boot";
-      after = [ "multi-user.target" "network-online.target" ];
-      wants = [ "network-online.target" ];
+      description = "Enqueue Telegram boot notification";
+      after = [ "multi-user.target" ];
       wantedBy = [ "multi-user.target" ];
       serviceConfig = {
         Type = "oneshot";
@@ -474,21 +594,28 @@ in
           HOST=$(${pkgs.hostname}/bin/hostname)
           KERNEL=$(${pkgs.coreutils}/bin/uname -r)
           UPTIME=$(${formatUptime} "$UPTIME_S")
-          ${sendLog} "🟢 <b>$HOST</b> booted #$COUNT%0AKernel: $KERNEL%0AUptime: $UPTIME"
+          ${sendLog} "🟢 <b>$HOST</b> booted #$COUNT
+Kernel: $KERNEL
+Uptime: $UPTIME"
         '';
       };
     };
 
     # Shutdown notification → log channel.
-    # Runs on graceful shutdown/reboot via ExecStop (ExecStart is a no-op).
-    # Must complete while network is still up. systemd stops units in reverse
-    # dependency order, so After=network-online.target means network is up
-    # when we start AND still up when we stop (network-online waits for us).
+    # Runs on graceful shutdown/reboot via ExecStop. Enqueues the message
+    # AND forces a synchronous drain (bounded by timeout) so delivery
+    # happens before shutdown continues rather than "on next boot".
+    #
+    # Ordering: After=network.target means we start AFTER network at boot,
+    # and during shutdown systemd stops units in REVERSE order — so our
+    # ExecStop runs BEFORE network.target stops, i.e., network is still up
+    # for the drain call. If drain times out anyway (e.g., Wi-Fi AP gone),
+    # the message stays in the spool and delivers on next boot with an
+    # automatic "⏱ queued Xm ago" prefix.
     systemd.services.shutdown-notify = {
-      description = "Notify Telegram on graceful shutdown";
+      description = "Enqueue + force-drain Telegram shutdown notification";
       wantedBy = [ "multi-user.target" ];
-      after = [ "network-online.target" ];
-      wants = [ "network-online.target" ];
+      after = [ "network.target" ];
       serviceConfig = {
         Type = "oneshot";
         RemainAfterExit = true;
@@ -503,7 +630,12 @@ in
           HOST=$(${pkgs.hostname}/bin/hostname)
           UPTIME_S=$(${pkgs.coreutils}/bin/cat /proc/uptime | ${pkgs.coreutils}/bin/cut -d. -f1)
           UPTIME=$(${formatUptime} "$UPTIME_S")
-          ${sendLog} "🔴 <b>$HOST</b> shutting down%0AUptime: $UPTIME"
+          ${sendLog} "🔴 <b>$HOST</b> shutting down
+Uptime: $UPTIME"
+          # Force synchronous drain — bounded by timeout so we don't hold
+          # up shutdown on a dead network. If it fails, message remains in
+          # spool and delivers on next boot with "queued ago" decoration.
+          ${pkgs.coreutils}/bin/timeout 10 ${telegramDrain} || true
         '';
       };
     };
@@ -529,8 +661,7 @@ in
     #     charts to collect" etc.) is specifically excluded.
     systemd.services.check-previous-boot = {
       description = "Check boot -1 for unclean shutdown or kernel panic, alert once per boot";
-      after = [ "multi-user.target" "network-online.target" ];
-      wants = [ "network-online.target" ];
+      after = [ "multi-user.target" ];
       wantedBy = [ "multi-user.target" ];
       serviceConfig = {
         Type = "oneshot";
@@ -579,9 +710,13 @@ in
           done
 
           if [ "$STREAK" -ge 2 ]; then
-            ${sendAlert} "💥 <b>$HOST</b>: previous boot ended abruptly (no shutdown marker). Streak of $STREAK unclean boots back — suspect power / USB-peripheral / hardware.%0ALast failing boot ended with:%0A<pre>$LAST_UNCLEAN_TAIL</pre>"
+            ${sendAlert} "💥 <b>$HOST</b>: previous boot ended abruptly (no shutdown marker). Streak of $STREAK unclean boots back — suspect power / USB-peripheral / hardware.
+Last failing boot ended with:
+<pre>$LAST_UNCLEAN_TAIL</pre>"
           else
-            ${sendAlert} "⚠️ <b>$HOST</b>: previous boot ended abruptly (no shutdown marker). Isolated event — worth noting only if it recurs.%0ALast failing boot ended with:%0A<pre>$LAST_UNCLEAN_TAIL</pre>"
+            ${sendAlert} "⚠️ <b>$HOST</b>: previous boot ended abruptly (no shutdown marker). Isolated event — worth noting only if it recurs.
+Last failing boot ended with:
+<pre>$LAST_UNCLEAN_TAIL</pre>"
           fi
 
           # Separately: genuine kernel panics in the immediately previous
@@ -590,7 +725,8 @@ in
             | ${pkgs.gnugrep}/bin/grep -E 'Oops|Kernel panic|BUG:|stack-protector|end Kernel panic|unable to handle kernel' \
             | ${pkgs.coreutils}/bin/head -5)
           if [ -n "$PANIC" ]; then
-            ${sendAlert} "☠️ <b>$HOST</b>: kernel panic/oops in previous boot:%0A<pre>$PANIC</pre>"
+            ${sendAlert} "☠️ <b>$HOST</b>: kernel panic/oops in previous boot:
+<pre>$PANIC</pre>"
           fi
         '';
       };
@@ -620,7 +756,8 @@ in
         ExecStart = pkgs.writeShellScript "upgrade-failure-notify" ''
           HOST=$(${pkgs.hostname}/bin/hostname)
           LOG=$(${pkgs.systemd}/bin/journalctl -u nixos-upgrade --no-pager -n 15 -q 2>/dev/null)
-          ${sendAlert} "❌ <b>$HOST</b>: NixOS upgrade FAILED%0A<pre>$LOG</pre>"
+          ${sendAlert} "❌ <b>$HOST</b>: NixOS upgrade FAILED
+<pre>$LOG</pre>"
         '';
       };
     };
@@ -639,8 +776,7 @@ in
 
     systemd.services.config-switch-notify = {
       description = "Notify Telegram on config switch";
-      after = [ "multi-user.target" "network-online.target" ];
-      wants = [ "network-online.target" ];
+      after = [ "multi-user.target" ];
       wantedBy = [ "multi-user.target" ];
       # Stopped by activation script, then re-triggered by wantedBy on each switch.
       # ExecStart checks if system actually changed before notifying.
@@ -656,11 +792,9 @@ in
       };
     };
 
-    # SSH login notifications — uses journal cursor to avoid replays on service restart
+    # SSH login notifications — follows journal, enqueues on each event.
     systemd.services.ssh-login-notify = {
       description = "Notify Telegram on SSH logins";
-      after = [ "network-online.target" ];
-      wants = [ "network-online.target" ];
       wantedBy = [ "multi-user.target" ];
       serviceConfig = {
         Type = "simple";
