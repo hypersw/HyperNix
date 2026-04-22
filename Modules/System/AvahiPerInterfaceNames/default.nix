@@ -183,7 +183,13 @@ in
       serviceConfig = {
         Type = "notify";
         NotifyAccess = "all";
-        Restart = "on-failure";
+        # `always` not `on-failure`: `ip monitor address` is supposed to
+        # run forever, so any exit (including the clean exit 0 that
+        # would happen if its pipe closes) is a failure mode for us.
+        # systemd correctly distinguishes operator-initiated stops
+        # (systemctl stop) from process exits and doesn't re-spawn on
+        # the former, so this is safe.
+        Restart = "always";
         RestartSec = "5s";
         RuntimeDirectory = "avahi-per-interface-names";
         RuntimeDirectoryMode = "0755";
