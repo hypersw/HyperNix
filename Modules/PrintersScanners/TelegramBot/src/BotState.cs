@@ -75,7 +75,6 @@ public static class StatusMessage
     {
         var remain = s.ExpiresAt - DateTimeOffset.UtcNow;
         var mins = remain.TotalSeconds < 0 ? 0 : (int)Math.Ceiling(remain.TotalMinutes);
-        var fmt = s.Params.Format.ToString().ToUpperInvariant();
 
         var scannerLine = (s.Scanning, s.ScannerOnline) switch
         {
@@ -84,9 +83,12 @@ public static class StatusMessage
             (false, false) => "📡 Scanner: ⏳ <i>waiting — power on or press scanner button</i>",
         };
 
+        // Format + DPI are shown as tap-to-edit buttons below; the body
+        // used to repeat them as a "Format: X · Resolution: Y dpi" line,
+        // which duplicated the buttons and took a row of vertical space
+        // without new information.
         return $"""
             📷 <b>Scanner session</b> · {mins} min left
-            Format: <b>{fmt}</b> · Resolution: <b>{s.Params.Dpi} dpi</b>
             {scannerLine}
             📑 Scans delivered: <b>{s.ScanCount}</b>
             """;
@@ -99,17 +101,28 @@ public static class StatusMessage
         var sid = s.DaemonSessionId;
         var fmt = s.Params.Format.ToString().ToUpperInvariant();
         var rows = new List<InlineKeyboardButton[]>();
-        // Row 1: tap-to-change parameter buttons
+        // Row 1: tap-to-change parameter buttons; button labels carry
+        // what was previously duplicated in the body text.
         rows.Add(new[]
         {
-            InlineKeyboardButton.WithCallbackData($"📄 {fmt}",              $"pick:fmt:{sid}"),
-            InlineKeyboardButton.WithCallbackData($"📏 {s.Params.Dpi} dpi", $"pick:dpi:{sid}"),
+            InlineKeyboardButton.WithCallbackData($"📄 Format: {fmt}",              $"pick:fmt:{sid}"),
+            InlineKeyboardButton.WithCallbackData($"📏 Resolution: {s.Params.Dpi} dpi", $"pick:dpi:{sid}"),
         });
+        // Row 2: primary action + demoted End. End used to be its own full
+        // row and was the most visually prominent button, which is backwards
+        // for what the user actually does most often (scan).
         if (!s.Scanning)
         {
-            rows.Add(new[] { InlineKeyboardButton.WithCallbackData("📷 Scan", $"scan:{sid}") });
+            rows.Add(new[]
+            {
+                InlineKeyboardButton.WithCallbackData("📷 Scan", $"scan:{sid}"),
+                InlineKeyboardButton.WithCallbackData("🚪 end",  $"end:{sid}"),
+            });
         }
-        rows.Add(new[] { InlineKeyboardButton.WithCallbackData("🚪 End session", $"end:{sid}") });
+        else
+        {
+            rows.Add(new[] { InlineKeyboardButton.WithCallbackData("🚪 end", $"end:{sid}") });
+        }
         return new InlineKeyboardMarkup(rows);
     }
 
