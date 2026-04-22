@@ -69,10 +69,11 @@ in
         # systemd (UseSystemd + ConfigureKestrel.ListenHandle in code).
         # If LISTEN_FDS is missing the daemon now fails fast rather than
         # silently TCP-binding to :5000 — see src/Program.cs.
-        #
-        # SANE_CONFIG_DIR comes from EpkowaScanner's
-        # systemd.globalEnvironment so we don't duplicate the path here.
-      };
+      }
+      # SANE backend lookup vars (SANE_CONFIG_DIR + LD_LIBRARY_PATH).
+      # Must be service-level, not globalEnvironment, to avoid triggering
+      # systemd PID 1 reexec on switch-to-configuration.
+      // config.services.epkowa-scanner.serviceEnvironment;
 
       serviceConfig = {
         # notify: UseSystemd() sends sd_notify(READY=1) when the app is ready

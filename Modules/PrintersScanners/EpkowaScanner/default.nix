@@ -3,10 +3,18 @@ let
   cfg = config.services.epkowa-scanner;
 
   # Single source of truth for the SANE config directory path. Used below
-  # for the /etc files we install, the login-shell env, the systemd
-  # global env, and anywhere else that needs to point scanimage at our
-  # custom dll.conf + epkowa.conf.
+  # for the /etc files we install, the login-shell env, and anywhere else
+  # that needs to point scanimage at our custom dll.conf + epkowa.conf.
   saneConfigDir = "/etc/sane-config-epkowa";
+
+  # NixOS's `hardware.sane` module installs backend libraries (including
+  # our iscanWithIpcProxy) into /etc/sane-libs as a symlink farm. Login
+  # shells get this path via `environment.variables.LD_LIBRARY_PATH`, but
+  # systemd services do NOT inherit login-shell env — so a service running
+  # `scanimage` fails with "no SANE devices found" despite the scanner
+  # being present. Consumers must add this directory to their own service
+  # environment; see `serviceEnvironment` option below.
+  saneLibDir = "/etc/sane-libs";
 
   # ──────────────────────────────────────────────────────────────────────
   # x86_64 side of the proxy/stub split.
@@ -84,6 +92,27 @@ in
       default = true;
       description = "Expose scanner to LAN via eSCL/AirScan (iOS/macOS/Android native)";
     };
+
+    # Env vars that any systemd service calling `scanimage` must set.
+    # Exposed here so consumer modules don't hardcode the paths AND so we
+    # stay out of `systemd.globalEnvironment` — changing that option
+    # forces a PID 1 reexec during switch-to-configuration, which on
+    # 2026-04-21 triggered a 74-cycle silent-reset boot loop taking ~4 min
+    # to self-recover. Composing into per-service `environment=` blocks
+    # keeps switch-time change surface on the affected services only.
+    #
+    # Usage:
+    #   systemd.services.foo.environment =
+    #     config.services.epkowa-scanner.serviceEnvironment // { ... };
+    serviceEnvironment = lib.mkOption {
+      type = lib.types.attrsOf lib.types.str;
+      readOnly = true;
+      default = {
+        SANE_CONFIG_DIR = saneConfigDir;
+        LD_LIBRARY_PATH = saneLibDir;
+      };
+      description = "Env vars for services that run scanimage / open SANE backends.";
+    };
   };
 
   config = lib.mkIf cfg.enable {
@@ -103,19 +132,15 @@ in
     # model name. Without the ID line, epkowa detects the scanner as
     # "Epson (unknown model)" and sane_open fails with EINVAL.
     #
-    # Single source of truth for the path — used by the /etc files below,
-    # by environment.variables (login-shell $SANE_CONFIG_DIR), AND by
-    # systemd.globalEnvironment (so any systemd service spawning scanimage
-    # automatically sees the same config — otherwise it gets /etc/sane.d
-    # which lacks our USB-ID → model mapping and reports "no SANE devices
-    # found" despite the scanner being present).
+    # Login shells get SANE_CONFIG_DIR via environment.variables (/etc/profile).
+    # Systemd services don't inherit that — they read `serviceEnvironment`
+    # (see option above) and compose it into their own `environment=` block.
     environment.etc."${lib.removePrefix "/etc/" saneConfigDir}/dll.conf".text = "epkowa";
     environment.etc."${lib.removePrefix "/etc/" saneConfigDir}/epkowa.conf".text = lib.strings.concatLines [
       "usb"
       ''usb 0x04b8 0x0142 "Perfection V33" "Epson Perfection V33/V330"''
     ];
     environment.variables.SANE_CONFIG_DIR = lib.mkForce saneConfigDir;
-    systemd.globalEnvironment.SANE_CONFIG_DIR = saneConfigDir;
 
     services.saned.enable = true;
     networking.firewall.allowedTCPPorts = [ 6566 ];
