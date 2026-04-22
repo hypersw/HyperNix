@@ -435,8 +435,20 @@ in
     #   ⚠️  netdata warning
     #   🔴 netdata critical
 
-    # Boot notification → log channel (only on real boot, not activation).
-    # Detects real boot by checking uptime < 5 minutes.
+    # Boot notification → log channel.
+    #
+    # Dedupe by /proc/sys/kernel/random/boot_id — a UUID the kernel assigns
+    # at boot. Stamp file in /run (tmpfs, cleared on reboot) remembers which
+    # boot we've already notified about. This replaces the earlier "uptime
+    # < 5 min" heuristic which misfired on switch-to-configuration within
+    # the first 5 min of boot: Type=oneshot without RemainAfterExit goes
+    # inactive after each run, so wantedBy=multi-user.target re-triggers it
+    # on every switch, and if uptime was still < 300s the guard passed.
+    #
+    # Also emits a persistent sequence number so gaps in the Telegram log
+    # are visible at a glance — if you see "#100" then "#103", two boots
+    # were missed entirely (telemetry never sent, e.g., boot died before
+    # network-online.target). StateDirectory creates /var/lib/boot-notify.
     systemd.services.boot-notify = {
       description = "Notify Telegram on successful boot";
       after = [ "multi-user.target" "network-online.target" ];
@@ -444,16 +456,25 @@ in
       wantedBy = [ "multi-user.target" ];
       serviceConfig = {
         Type = "oneshot";
+        StateDirectory = "boot-notify";
         ExecStart = pkgs.writeShellScript "boot-notify" ''
-          UPTIME_S=$(${pkgs.coreutils}/bin/cat /proc/uptime | ${pkgs.coreutils}/bin/cut -d. -f1)
-          # Only notify on actual boot (uptime < 300s), not config switches
-          if [ "$UPTIME_S" -gt 300 ]; then
+          BOOT_ID=$(${pkgs.coreutils}/bin/cat /proc/sys/kernel/random/boot_id)
+          STAMP=/run/boot-notify.stamp
+          if [ -f "$STAMP" ] && [ "$(${pkgs.coreutils}/bin/cat "$STAMP" 2>/dev/null)" = "$BOOT_ID" ]; then
             exit 0
           fi
+
+          COUNTER=/var/lib/boot-notify/counter
+          COUNT=$(${pkgs.coreutils}/bin/cat "$COUNTER" 2>/dev/null || ${pkgs.coreutils}/bin/echo 0)
+          COUNT=$((COUNT + 1))
+          ${pkgs.coreutils}/bin/echo "$COUNT" > "$COUNTER"
+          ${pkgs.coreutils}/bin/echo "$BOOT_ID" > "$STAMP"
+
+          UPTIME_S=$(${pkgs.coreutils}/bin/cat /proc/uptime | ${pkgs.coreutils}/bin/cut -d. -f1)
           HOST=$(${pkgs.hostname}/bin/hostname)
           KERNEL=$(${pkgs.coreutils}/bin/uname -r)
           UPTIME=$(${formatUptime} "$UPTIME_S")
-          ${sendLog} "🟢 <b>$HOST</b> booted%0AKernel: $KERNEL%0AUptime: $UPTIME"
+          ${sendLog} "🟢 <b>$HOST</b> booted #$COUNT%0AKernel: $KERNEL%0AUptime: $UPTIME"
         '';
       };
     };
