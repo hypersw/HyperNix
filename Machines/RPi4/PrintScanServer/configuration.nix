@@ -7,8 +7,17 @@
     ../../../Modules/PrintersScanners/TelegramBot
     ../../../Modules/Monitoring/TelegramAlerts
     ../../../Modules/System/AutoRebuildOnPush
+    ../../../Modules/System/AvahiPerInterfaceNames
     ../../../Modules/System/BootStabilityProbe
   ];
+
+  # Publish per-interface mDNS names (printscan-eth.local, printscan-wifi.local)
+  # instead of a single printscan.local. end0 and wlan0 are on the same L2
+  # segment (AP bridges them), which triggers Avahi's cross-interface
+  # self-conflict if both announce the same name. See the module for the
+  # full story; we reached this after observing printscan7.local through
+  # printscan190.local fallbacks on 2026-04-22.
+  services.avahi-per-interface-names.enable = true;
 
   networking.hostName = "printscan";
   system.stateVersion = "25.05";
@@ -222,36 +231,15 @@
     wants = [ "sops-nix.service" ];
   };
 
-  # systemd-resolved — stub resolver ONLY; mDNS deliberately disabled.
-  #
-  # Why split resolved (DNS) and avahi (mDNS) on the same host:
-  #
-  # resolved's mDNS implementation has a structural issue on hosts with
-  # multiple interfaces on the same L2 segment (our case: end0 + wlan0
-  # both bridged by the AP into 192.168.1.0/24). Each link owns its own
-  # mDNS scope independently, with no cross-link coordination — so the
-  # end0 scope publishes "printscan.local → 192.168.1.129", and the
-  # wlan0 scope publishes "printscan.local → 192.168.1.130". When the
-  # AP bridges the multicast traffic between wlan0 and end0, resolved
-  # sees its own sibling-link announcement and treats it as another
-  # device claiming the name with a different IP. It then runs RFC 6762
-  # conflict resolution, renaming the host to printscan7.local, then
-  # printscan11.local, leaving printscan.local unreachable. Observed
-  # on 2026-04-22. See upstream systemd issues #28491, #23910.
-  #
-  # Avahi handles multi-interface mDNS coherently (knows about its own
-  # links, avoids self-conflict, publishes correctly across all of them)
-  # because it was designed for exactly this case — eth+wifi laptops.
-  # That's why every major Linux distro with dual-NIC expectations
-  # (Fedora Workstation, Ubuntu, ChromeOS) ships Avahi regardless of
-  # whether resolved is also present.
-  #
-  # So: resolved owns DNS (stub at 127.0.0.53, per-link DNS from DHCP)
-  # but NOT mDNS. Avahi owns mDNS. They don't collide on :5353 because
-  # resolved with MulticastDNS=no doesn't bind that socket.
+  # systemd-resolved — stub resolver ONLY. mDNS is handled by Avahi via
+  # the AvahiPerInterfaceNames module; resolved's per-link mDNS scopes
+  # don't coordinate across interfaces and self-conflict on bridged L2
+  # segments (see AvahiPerInterfaceNames/default.nix for the full story).
+  # MulticastDNS=no makes sure resolved doesn't try to bind :5353,
+  # leaving it free for Avahi.
   services.resolved = {
     enable = true;
-    settings.Resolve.MulticastDNS = "no";  # Avahi does mDNS, not us
+    settings.Resolve.MulticastDNS = "no";
   };
 
   # Per-interface networkd config. DHCP + IPv6 RA on both interfaces.
@@ -297,18 +285,16 @@
     };
   };
 
-  # Avahi — mDNS publisher and resolver. Announces printscan.local on
-  # every interface it sees, in a self-conflict-aware way (see comment
-  # above resolved for why we can't let resolved do this). nssmdns4=true
-  # installs the nsswitch glue so local apps resolve *.local via avahi
-  # directly (glibc → nss_mdns4), bypassing resolved for those names.
+  # Avahi — mDNS publisher and resolver. publish.addresses is forced to
+  # false inside the AvahiPerInterfaceNames module (we don't want the
+  # conflicting single-hostname publication); instead per-interface
+  # names are announced via /etc/avahi/hosts maintained by a watcher.
+  # nssmdns4=true installs the nsswitch glue so local apps resolve
+  # *.local via avahi directly (glibc → nss_mdns4), bypassing resolved.
   services.avahi = {
     enable = true;
     nssmdns4 = true;
-    publish = {
-      enable = true;
-      addresses = true;
-    };
+    publish.enable = true;
   };
 
   services.openssh = {

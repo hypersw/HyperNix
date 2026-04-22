@@ -113,6 +113,7 @@
         Modules-PrintersScanners-TelegramBot = import ./Modules/PrintersScanners/TelegramBot;
         Modules-Monitoring-TelegramAlerts = import ./Modules/Monitoring/TelegramAlerts;
         Modules-System-AutoRebuildOnPush = import ./Modules/System/AutoRebuildOnPush;
+        Modules-System-AvahiPerInterfaceNames = import ./Modules/System/AvahiPerInterfaceNames;
         Modules-System-BootStabilityProbe = import ./Modules/System/BootStabilityProbe;
       };
 
