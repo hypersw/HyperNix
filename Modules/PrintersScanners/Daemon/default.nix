@@ -120,6 +120,14 @@ in
         PrivateTmp = true;
         NoNewPrivileges = true;
 
+        # Needed for the in-process shutdown diagnostic in Program.cs to
+        # (a) read /proc/<pid>/task/<tid>/stack of sibling threads and
+        # (b) invoke createdump on the hung process. yama.ptrace_scope=1
+        # blocks even same-process peeking without this cap. Scoped to
+        # ambient so no setuid shenanigans are possible.
+        AmbientCapabilities = [ "CAP_SYS_PTRACE" ];
+        CapabilityBoundingSet = [ "CAP_SYS_PTRACE" ];
+
         # Belt-and-braces against "daemon silently binds TCP" bugs:
         # put the daemon in its own empty network namespace. It literally
         # cannot bind a TCP port, cannot resolve DNS, cannot talk to the
