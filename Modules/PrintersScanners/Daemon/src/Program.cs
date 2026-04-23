@@ -26,7 +26,31 @@ AppDomain.CurrentDomain.AssemblyLoad += (_, e) =>
 // GCKeyword=0x1. EventLevel.Informational keeps volume sane.
 var _runtimeListener = new PrintScan.Daemon.BootEventListener(_bootSw);
 
-var builder = WebApplication.CreateBuilder(args);
+// Pin ContentRoot to the binary directory. Default is Environment.CurrentDirectory,
+// which is "/" under systemd — and a "/" ContentRoot torpedoes startup
+// (see the JSON-source drop below for the mechanism). Even with the JSON
+// sources removed, a deterministic ContentRoot is what ASP.NET semantically
+// expects.
+var builder = WebApplication.CreateBuilder(new WebApplicationOptions
+{
+    Args = args,
+    ContentRootPath = AppContext.BaseDirectory,
+});
+
+// Drop the default JSON config sources (appsettings.json +
+// appsettings.{Environment}.json). CreateBuilder adds them with
+// reloadOnChange: true, which installs a PhysicalFilesWatcher. On Linux
+// that translates to per-subdirectory inotify_add_watch calls across the
+// ContentRoot tree. We don't ship or read appsettings.json at all — env
+// vars and args cover our (very small) config surface — so the watcher is
+// pure overhead. Removing the source disposes the provider and its watcher.
+// Observed cost on a Pi 4 with CWD=/: 16 s and ~84 000 stat calls inside
+// CreateBuilder.
+var jsonSources = builder.Configuration.Sources
+    .OfType<Microsoft.Extensions.Configuration.Json.JsonConfigurationSource>()
+    .ToList();
+foreach (var src in jsonSources) builder.Configuration.Sources.Remove(src);
+
 BootLog(_bootSw, "WebApplication.CreateBuilder done");
 _runtimeListener.Summarize();
 
