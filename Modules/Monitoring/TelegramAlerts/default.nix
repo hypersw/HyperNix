@@ -37,6 +37,12 @@ let
       *) echo "alert-telegram-enqueue: unknown severity '$SEV'" >&2; exit 1 ;;
     esac
     TS=$(${pkgs.coreutils}/bin/date +%s)
+    # boot_id is used by the drainer to detect same-boot messages and
+    # cap the "queued ago" computation at monotonic uptime — prevents
+    # the RTC-less clock-jumped-forward-after-NTP bug where messages
+    # enqueued pre-NTP sync read as "queued 35m ago" even though the
+    # system has only been up 90s.
+    BOOT_ID=$(${pkgs.coreutils}/bin/cat /proc/sys/kernel/random/boot_id 2>/dev/null || true)
     # 2>/dev/null on tr: head -c 8 closes the pipe which sends SIGPIPE to
     # tr; without stderr suppression that writes a cosmetic "tr: write
     # error: Broken pipe" to the journal even though the script works.
@@ -54,6 +60,7 @@ let
     {
       ${pkgs.coreutils}/bin/printf '%s\n' "$TS"
       ${pkgs.coreutils}/bin/printf '%s\n' "$CHAT_ID"
+      ${pkgs.coreutils}/bin/printf '%s\n' "$BOOT_ID"
       ${pkgs.coreutils}/bin/printf '%s' "$TEXT"
     } > "$TMP"
     ${pkgs.coreutils}/bin/mv "$TMP" "${telegramSpool}/$TS-$NONCE.msg"
@@ -107,13 +114,32 @@ let
       ${pkgs.coreutils}/bin/ls -1 "$DIR"/*.msg | ${pkgs.coreutils}/bin/head -n "$excess" | ${pkgs.findutils}/bin/xargs -r rm -f
     fi
 
+    # Current boot_id + uptime — used to fix the queued-ago value when
+    # the host has no RTC and wall clock was stale at enqueue time.
+    # /proc/uptime's first field is monotonic seconds since boot, which
+    # bounds "how old can a same-boot message possibly be".
+    current_boot_id=$(${pkgs.coreutils}/bin/cat /proc/sys/kernel/random/boot_id 2>/dev/null || echo "")
+    current_uptime=$(${pkgs.gawk}/bin/awk '{print int($1)}' /proc/uptime)
+
     rc=0
     for msg in $(${pkgs.coreutils}/bin/ls -1 "$DIR"/*.msg 2>/dev/null || true); do
       [ -f "$msg" ] || continue
 
       ts=$(${pkgs.coreutils}/bin/head -n 1 "$msg")
       chat=$(${pkgs.gnused}/bin/sed -n '2p' "$msg")
-      text=$(${pkgs.coreutils}/bin/tail -n +3 "$msg")
+      msg_boot_id=$(${pkgs.gnused}/bin/sed -n '3p' "$msg")
+      # Backward-compat: pre-boot-id format had body starting at line 3
+      # and no boot_id line. Detect by UUID shape of line 3; if it
+      # doesn't look like a UUID, treat as old format.
+      case "$msg_boot_id" in
+        [0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]-*-*-*-*[0-9a-f])
+          text=$(${pkgs.coreutils}/bin/tail -n +4 "$msg")
+          ;;
+        *)
+          msg_boot_id=""
+          text=$(${pkgs.coreutils}/bin/tail -n +3 "$msg")
+          ;;
+      esac
 
       # Stale-message decoration: if the event is older than 60s at
       # delivery time, append a queued-ago note on its own italicised
@@ -121,8 +147,19 @@ let
       # the real message's icon + heading aligned with real-time
       # siblings in Telegram's chat view; italics make the metadata
       # visually distinct from the message body itself.
+      #
+      # Clock-skew guard: on RTC-less hosts the wall clock at enqueue
+      # time can be wildly stale (pre-NTP), making the recorded ts look
+      # minutes in the past once NTP corrects. If the message is from
+      # THIS boot (boot_id matches), cap the computed age at the
+      # current monotonic uptime — the msg can't be older than the boot.
       now=$(${pkgs.coreutils}/bin/date +%s)
       age=$((now - ts))
+      if [ -n "$msg_boot_id" ] && [ "$msg_boot_id" = "$current_boot_id" ]; then
+        if [ "$age" -gt "$current_uptime" ]; then
+          age=$current_uptime
+        fi
+      fi
       if [ "$age" -gt 60 ]; then
         if [ "$age" -ge 86400 ]; then
           dur="$((age / 86400))d $((age / 3600 % 24))h"
@@ -584,8 +621,9 @@ in
       serviceConfig = {
         Type = "oneshot";
         RemainAfterExit = true;
+        StateDirectory = "boot-started";   # /var/lib/boot-started for counter
         ExecStart = pkgs.writeShellScript "boot-started-notify" ''
-          # Dedupe per actual boot, same pattern as boot-notify:
+          # Dedupe per actual boot (see same pattern on boot-notify):
           # RemainAfterExit=true normally keeps us "active" after first
           # run, but a switch-to-configuration that changes our content
           # (ExecStart text, description, etc.) causes systemd to
@@ -600,9 +638,21 @@ in
           fi
           ${pkgs.coreutils}/bin/echo "$BOOT_ID" > "$STAMP"
 
+          # Persistent boot counter owned by boot-started (not by boot-
+          # notify): boot-started fires on every actual boot, including
+          # ones that fail before multi-user.target. If the system
+          # bootloops, you'll see "boot started #100, #101, #102, …"
+          # but only the occasional "booted" (without number) — the
+          # gap between started-count and completed-occurrences is the
+          # diagnostic signal.
+          COUNTER=/var/lib/boot-started/counter
+          COUNT=$(${pkgs.coreutils}/bin/cat "$COUNTER" 2>/dev/null || ${pkgs.coreutils}/bin/echo 0)
+          COUNT=$((COUNT + 1))
+          ${pkgs.coreutils}/bin/echo "$COUNT" > "$COUNTER"
+
           HOST=$(${pkgs.hostname}/bin/hostname)
           KERNEL=$(${pkgs.coreutils}/bin/uname -r)
-          ${sendLog} "⚪ <b>$HOST</b> boot started
+          ${sendLog} "⚪ <b>$HOST</b> boot started #$COUNT
 Kernel: $KERNEL"
         '';
       };
@@ -618,36 +668,29 @@ Kernel: $KERNEL"
     # inactive after each run, so wantedBy=multi-user.target re-triggers it
     # on every switch, and if uptime was still < 300s the guard passed.
     #
-    # Also emits a persistent sequence number so gaps in the Telegram log
-    # are visible at a glance — if you see "#100" then "#103", two boots
-    # were missed entirely (we enqueue unconditionally; a persistent
-    # counter that ticks in a proper early-boot unit is the next step).
-    # StateDirectory creates /var/lib/boot-notify.
+    # The persistent boot counter lives on boot-started-notify (above),
+    # not here — boot-started fires on EVERY actual boot, including
+    # those that never reach multi-user.target, so it's a more reliable
+    # counter for bootloop visibility.
     systemd.services.boot-notify = {
       description = "Enqueue Telegram boot notification";
       after = [ "multi-user.target" ];
       wantedBy = [ "multi-user.target" ];
       serviceConfig = {
         Type = "oneshot";
-        StateDirectory = "boot-notify";
         ExecStart = pkgs.writeShellScript "boot-notify" ''
           BOOT_ID=$(${pkgs.coreutils}/bin/cat /proc/sys/kernel/random/boot_id)
           STAMP=/run/boot-notify.stamp
           if [ -f "$STAMP" ] && [ "$(${pkgs.coreutils}/bin/cat "$STAMP" 2>/dev/null)" = "$BOOT_ID" ]; then
             exit 0
           fi
-
-          COUNTER=/var/lib/boot-notify/counter
-          COUNT=$(${pkgs.coreutils}/bin/cat "$COUNTER" 2>/dev/null || ${pkgs.coreutils}/bin/echo 0)
-          COUNT=$((COUNT + 1))
-          ${pkgs.coreutils}/bin/echo "$COUNT" > "$COUNTER"
           ${pkgs.coreutils}/bin/echo "$BOOT_ID" > "$STAMP"
 
           UPTIME_S=$(${pkgs.coreutils}/bin/cat /proc/uptime | ${pkgs.coreutils}/bin/cut -d. -f1)
           HOST=$(${pkgs.hostname}/bin/hostname)
           KERNEL=$(${pkgs.coreutils}/bin/uname -r)
           UPTIME=$(${formatUptime} "$UPTIME_S")
-          ${sendLog} "🟢 <b>$HOST</b> booted #$COUNT
+          ${sendLog} "🟢 <b>$HOST</b> booted
 Kernel: $KERNEL
 Uptime: $UPTIME"
         '';
