@@ -13,8 +13,22 @@ static void BootLog(System.Diagnostics.Stopwatch sw, string phase) =>
     Console.Error.WriteLine($"[boot +{sw.ElapsedMilliseconds,6} ms] {phase}");
 BootLog(_bootSw, "entered Main (CLR init complete)");
 
+// Subscribe to AssemblyLoad before CreateBuilder so we see the load wave
+// it triggers. Each line shows the cumulative ms at load — a load "wave"
+// concentrated around a specific time tells us which phase is heavy.
+AppDomain.CurrentDomain.AssemblyLoad += (_, e) =>
+    Console.Error.WriteLine(
+        $"[boot +{_bootSw.ElapsedMilliseconds,6} ms] asm: {e.LoadedAssembly.GetName().Name}");
+
+// EventListener for CLR runtime JIT/Loader events. If JIT is dominating
+// we'll see hundreds of method-compile events; if not, we've ruled it out.
+// Keywords: JitKeyword=0x10, LoaderKeyword=0x8, TypeKeyword=0x80,
+// GCKeyword=0x1. EventLevel.Informational keeps volume sane.
+var _runtimeListener = new PrintScan.Daemon.BootEventListener(_bootSw);
+
 var builder = WebApplication.CreateBuilder(args);
 BootLog(_bootSw, "WebApplication.CreateBuilder done");
+_runtimeListener.Summarize();
 
 builder.Host.UseSystemd();
 BootLog(_bootSw, "UseSystemd done");
