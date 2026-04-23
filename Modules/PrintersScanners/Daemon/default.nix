@@ -70,14 +70,34 @@ in
         # If LISTEN_FDS is missing the daemon now fails fast rather than
         # silently TCP-binding to :5000 — see src/Program.cs.
 
-        # Disable the CLR managed-debugger IPC port. The DebugPipe thread
-        # is non-daemon and blocks in open() on a FIFO waiting for a
-        # debugger partner that never arrives; on SIGTERM the runtime
-        # can't shut down until that thread exits, so the daemon hangs
-        # until TimeoutStopSec=5min SIGKILLs it. We never attach a remote
-        # debugger to this daemon in prod, so turning the IPC off avoids
-        # the hang. EventPipe/profiler/createdump-on-crash stay available.
-        DOTNET_EnableDiagnostics_IPC = "0";
+        # Disable the CLR managed-debugger transport. Addresses a .NET 10
+        # shutdown hang: CoreCLR spawns a native pthread ("DebugPipe") that
+        # opens FIFOs at /tmp/clr-debug-pipe-<pid>-<disambig>-{in,out} and
+        # blocks in open() waiting for a partner (Linux FIFO open blocks
+        # until both ends are opened). In prod no debugger attaches, so
+        # the thread is parked forever. It's a raw pthread — not a managed
+        # thread, so Thread.IsBackground doesn't apply; it's also not
+        # pthread_detach'd, and CoreCLR shutdown waits for it.
+        #
+        # Why this only hurts on .NET 10: earlier runtimes installed a
+        # default SIGTERM handler that ultimately called _exit() and
+        # steamrolled stuck native threads. .NET 10 removed it (see
+        # https://learn.microsoft.com/en-us/dotnet/core/compatibility/core-libraries/10.0/sigterm-signal-handler),
+        # so SIGTERM now runs a cooperative shutdown via ConsoleLifetime /
+        # UseSystemd — Main returns, CLR then sits waiting for the
+        # DebugPipe thread that never wakes, TimeoutStopSec=5min SIGKILLs.
+        #
+        # Correct env var: *_Debugger (managed-debugger FIFO transport),
+        # NOT *_IPC. DOTNET_EnableDiagnostics_IPC controls a different
+        # channel — the dotnet-diagnostic-<pid>-<ts>-socket UDS used by
+        # dotnet-trace / dotnet-counters / dotnet-dump attach — which we
+        # keep on so we can still introspect a live process. Trade-off:
+        # we lose IDE Attach-to-Process (VS/VS Code/Rider managed stacks
+        # over the FIFO protocol). We keep: core dumps via createdump,
+        # dotnet-dump collect (over the IPC UDS), dotnet-trace,
+        # dotnet-counters, native lldb + SOS (ptrace + DAC — doesn't use
+        # any CLR-owned IPC). Upstream bug: coreclr#8844 (open since 2017).
+        DOTNET_EnableDiagnostics_Debugger = "0";
       }
       # SANE backend lookup vars (SANE_CONFIG_DIR + LD_LIBRARY_PATH).
       # Must be service-level, not globalEnvironment, to avoid triggering

@@ -577,16 +577,27 @@ lacked `CAP_SYS_PTRACE` at the time) pinned the culprit: the CLR's
 channel at `/tmp/clr-debug-pipe-<pid>-<ts>-{in,out}`. Linux `open()`
 on a named pipe blocks until both ends are opened; nothing ever
 connects in prod, so the thread is permanently parked in `openat()`.
-Because it's a non-daemon thread, the CLR can't tear down the
-process until it exits — and it never will. All 26 other threads
-were parked in benign `futex_wait`/`poll`/`epoll_wait` — waiting for
-*this* thread to let the runtime finish.
+It's a raw pthread (not a managed thread, so `Thread.IsBackground`
+doesn't apply) and not `pthread_detach`'d, so CoreCLR shutdown waits
+for it. All 26 other threads parked in benign `futex_wait`/`poll`/
+`epoll_wait`, waiting for this one thread to unstick.
 
-**Fix**: set `DOTNET_EnableDiagnostics_IPC=0` in the daemon service
-environment. Disables the managed-debugger IPC port (we never attach
-a remote debugger in prod), so the DebugPipe thread is not created,
-so shutdown completes promptly. Profiler + EventPipe + crash
-createdump remain available.
+**Why only on .NET 10**: earlier runtimes installed a default SIGTERM
+handler that eventually `_exit()`ed, steamrolling any stuck native
+thread. .NET 10 removed that handler ([breaking change](https://learn.microsoft.com/en-us/dotnet/core/compatibility/core-libraries/10.0/sigterm-signal-handler)),
+so SIGTERM now runs a cooperative shutdown via `ConsoleLifetime`/
+`UseSystemd`: `Main` returns, CLR then sits waiting for DebugPipe
+which never wakes. Upstream bug known since 2017 — [coreclr#8844](https://github.com/dotnet/coreclr/issues/8844).
+
+**Fix**: set `DOTNET_EnableDiagnostics_Debugger=0` in the daemon
+service environment. Prevents the DebugPipe thread from being created
+at CLR init. (`DOTNET_EnableDiagnostics_IPC` — a first guess of ours
+— is a different channel: the `dotnet-diagnostic-<pid>-<ts>-socket`
+UDS for `dotnet-trace`/`dotnet-counters`/`dotnet-dump attach`. We
+keep that one on.) Trade-off: we lose IDE Attach-to-Process for live
+managed debugging (VS/VS Code/Rider over the FIFO transport). We
+keep: `createdump` core dumps, `dotnet-dump collect` (UDS), trace/
+counters, and native `lldb` + SOS (uses `ptrace` + DAC, no CLR IPC).
 
 **Standing diagnostic**: a two-part capture inside
 `ApplicationStopped`, scheduled 10 seconds after the event fires.
