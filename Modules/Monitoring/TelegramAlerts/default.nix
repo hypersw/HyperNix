@@ -575,6 +575,7 @@ in
       # No After=network-online.target — drain tolerates network-down by
       # failing (systemd re-runs per timer). Boot never waits for this.
       serviceConfig = {
+        WorkingDirectory = "/var/empty";  # safe CWD — see Modules/PrintersScanners/Daemon/default.nix
         Type = "oneshot";
         ExecStart = telegramDrain;
       };
@@ -619,6 +620,7 @@ in
       conflicts = [ "shutdown.target" ];
       unitConfig.DefaultDependencies = false;
       serviceConfig = {
+        WorkingDirectory = "/var/empty";  # safe CWD — see Modules/PrintersScanners/Daemon/default.nix
         Type = "oneshot";
         RemainAfterExit = true;
         StateDirectory = "boot-started";   # /var/lib/boot-started for counter
@@ -677,6 +679,7 @@ Kernel: $KERNEL"
       after = [ "multi-user.target" ];
       wantedBy = [ "multi-user.target" ];
       serviceConfig = {
+        WorkingDirectory = "/var/empty";  # safe CWD — see Modules/PrintersScanners/Daemon/default.nix
         Type = "oneshot";
         ExecStart = pkgs.writeShellScript "boot-notify" ''
           BOOT_ID=$(${pkgs.coreutils}/bin/cat /proc/sys/kernel/random/boot_id)
@@ -717,6 +720,7 @@ Uptime: $UPTIME"
       description = "Watch kernel log for SD card / MMC / ext4 errors, alert on match";
       wantedBy = [ "multi-user.target" ];
       serviceConfig = {
+        WorkingDirectory = "/var/empty";  # safe CWD — see Modules/PrintersScanners/Daemon/default.nix
         Type = "simple";
         Restart = "always";
         RestartSec = "30s";
@@ -759,6 +763,7 @@ Uptime: $UPTIME"
       wantedBy = [ "multi-user.target" ];
       after = [ "network.target" ];
       serviceConfig = {
+        WorkingDirectory = "/var/empty";  # safe CWD — see Modules/PrintersScanners/Daemon/default.nix
         Type = "oneshot";
         RemainAfterExit = true;
         ExecStart = "${pkgs.coreutils}/bin/true";
@@ -806,6 +811,7 @@ Uptime: $UPTIME"
       after = [ "multi-user.target" ];
       wantedBy = [ "multi-user.target" ];
       serviceConfig = {
+        WorkingDirectory = "/var/empty";  # safe CWD — see Modules/PrintersScanners/Daemon/default.nix
         Type = "oneshot";
         # Run once per boot. Stays "active" after first completion so a
         # nixos-rebuild switch that restarts dependencies doesn't re-fire.
@@ -883,6 +889,7 @@ Last failing boot ended with:
     systemd.services.upgrade-success-notify = {
       description = "Notify Telegram that upgrade service completed";
       serviceConfig = {
+        WorkingDirectory = "/var/empty";  # safe CWD — see Modules/PrintersScanners/Daemon/default.nix
         Type = "oneshot";
         ExecStart = pkgs.writeShellScript "upgrade-success-notify" ''
           HOST=$(${pkgs.hostname}/bin/hostname)
@@ -894,6 +901,7 @@ Last failing boot ended with:
     systemd.services.upgrade-failure-notify = {
       description = "Notify Telegram on upgrade failure";
       serviceConfig = {
+        WorkingDirectory = "/var/empty";  # safe CWD — see Modules/PrintersScanners/Daemon/default.nix
         Type = "oneshot";
         ExecStart = pkgs.writeShellScript "upgrade-failure-notify" ''
           HOST=$(${pkgs.hostname}/bin/hostname)
@@ -923,6 +931,7 @@ Last failing boot ended with:
       # Stopped by activation script, then re-triggered by wantedBy on each switch.
       # ExecStart checks if system actually changed before notifying.
       serviceConfig = {
+        WorkingDirectory = "/var/empty";  # safe CWD — see Modules/PrintersScanners/Daemon/default.nix
         Type = "oneshot";
         ExecStart = pkgs.writeShellScript "config-switch-notify-check" ''
           PREV=$(${pkgs.coreutils}/bin/cat /run/previous-system-path 2>/dev/null || echo "none")
@@ -939,6 +948,7 @@ Last failing boot ended with:
       description = "Notify Telegram on SSH logins";
       wantedBy = [ "multi-user.target" ];
       serviceConfig = {
+        WorkingDirectory = "/var/empty";  # safe CWD — see Modules/PrintersScanners/Daemon/default.nix
         Type = "simple";
         Restart = "on-failure";
         RestartSec = "10s";
@@ -974,6 +984,7 @@ Last failing boot ended with:
     systemd.services.nix-gc-notify = {
       description = "Notify Telegram on nix GC completion";
       serviceConfig = {
+        WorkingDirectory = "/var/empty";  # safe CWD — see Modules/PrintersScanners/Daemon/default.nix
         Type = "oneshot";
         ExecStart = pkgs.writeShellScript "nix-gc-notify" ''
           HOST=$(${pkgs.hostname}/bin/hostname)

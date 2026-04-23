@@ -74,6 +74,7 @@
   systemd.services.heartbeat = {
     description = "VM heartbeat with system metrics";
     serviceConfig = {
+      WorkingDirectory = "/var/empty";  # safe CWD — see Modules/PrintersScanners/Daemon/default.nix
       Type = "oneshot";
       ExecStart = "/bin/sh -c " + "''" + ''
         read up_raw idle < /proc/uptime

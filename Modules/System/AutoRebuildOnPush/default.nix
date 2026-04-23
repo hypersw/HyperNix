@@ -135,6 +135,10 @@ in
     systemd.services.auto-rebuild-on-push = {
       description = "Check upstream flake and rebuild if changed";
       serviceConfig = {
+        # Safe CWD — see Modules/PrintersScanners/Daemon/default.nix. checkScript
+        # passes --flake "$FLAKE_DIR" (absolute) to every nix operation and uses
+        # explicit URLs for git ls-remote, so CWD is irrelevant here.
+        WorkingDirectory = "/var/empty";
         Type = "oneshot";
         ExecStart = checkScript;
 

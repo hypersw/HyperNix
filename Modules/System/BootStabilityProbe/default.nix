@@ -114,6 +114,7 @@ in
       wantedBy = [ "multi-user.target" ];
 
       serviceConfig = {
+        WorkingDirectory = "/var/empty";  # safe CWD — see Modules/PrintersScanners/Daemon/default.nix
         Type = "oneshot";
         RemainAfterExit = true;
         # Outer-bound: if something in the script hangs, don't wedge boot.

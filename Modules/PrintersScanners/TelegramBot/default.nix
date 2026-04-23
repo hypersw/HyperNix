@@ -57,6 +57,9 @@ in
       };
 
       serviceConfig = {
+        # Defense-in-depth CWD pin (see Daemon/default.nix for rationale).
+        WorkingDirectory = "/var/empty";
+
         Type = "simple";
         ExecStart = "${botPackage}/bin/PrintScan.TelegramBot";
 

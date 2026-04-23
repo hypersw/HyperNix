@@ -209,6 +209,7 @@ in
       wants = [ "systemd-networkd.service" ];
       before = [ "avahi-daemon.service" ];
       serviceConfig = {
+        WorkingDirectory = "/var/empty";  # safe CWD — see Modules/PrintersScanners/Daemon/default.nix
         Type = "notify";
         NotifyAccess = "all";
         # `always` not `on-failure`: `ip monitor route` running forever

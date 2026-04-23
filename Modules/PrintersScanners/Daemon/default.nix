@@ -105,6 +105,14 @@ in
       // config.services.epkowa-scanner.serviceEnvironment;
 
       serviceConfig = {
+        # Pin CWD to a guaranteed-empty read-only dir. systemd's default is
+        # CWD=/ for system services, which is the worst case: a buggy file-
+        # system op rooted at CWD can walk the entire filesystem (see the
+        # ContentRootPath pin in src/Program.cs — a real incident from this
+        # codebase). /var/empty on NixOS is mode 0555 root:root with +i
+        # immutable; any accidental CWD-relative write fails immediately.
+        WorkingDirectory = "/var/empty";
+
         # notify: UseSystemd() sends sd_notify(READY=1) when the app is ready
         Type = "notify";
         ExecStart = "${daemonPackage}/bin/PrintScan.Daemon";

@@ -175,6 +175,7 @@
   systemd.services.throttle-history = {
     description = "Log RPi undervoltage/throttle state to /var/log/throttle.log";
     serviceConfig = {
+      WorkingDirectory = "/var/empty";  # safe CWD — see Modules/PrintersScanners/Daemon/default.nix
       Type = "oneshot";
       ExecStart = pkgs.writeShellScript "throttle-history" ''
         VCGENCMD=${pkgs.libraspberrypi}/bin/vcgencmd
