@@ -573,22 +573,36 @@ dispose cleanup** — probably Kestrel's socket teardown waiting for a
 peer-RST that never comes, or a non-daemon thread in a native library
 we've linked.
 
-**Mitigation**: a diagnostic capture inside `ApplicationStopped`
-scheduled for 10 seconds after the event. If the process is still
-alive at that point, dump per-thread kernel stacks by reading
-`/proc/<pid>/task/<tid>/stack`, along with each thread's `comm` and
-`state` (`R`/`S`/`D`/etc.), and log them to the journal. Then let
-systemd SIGKILL at the 5-minute mark — the 5-min timeout is
-intentional (gives in-flight scans + uploads time to finish when the
-system decides to switch mid-scan) so we don't want to lower it; and
-preserving the evidence for post-mortem beats forcing a clean exit.
+**Mitigation**: a two-part diagnostic capture inside
+`ApplicationStopped`, scheduled 10 seconds after the event fires:
 
-Once we have the kernel-stack dump from a real hang, we know which
-syscall each thread is blocking in, which nails down the specific
-subsystem to investigate. Managed-stack complement (via
-`dotnet-stack report --process-id <pid>` from an external helper, or
-`gcore` + `dotnet-dump analyze`) available if the kernel view isn't
-enough.
+  1. Per-thread kernel stack dump via `/proc/<pid>/task/<tid>/stack`,
+     with `comm` and `state` (R/S/D/...). Cheap, always works — tells
+     us *which syscall* each thread is blocked in (typically
+     `futex_wait_queue_me` or `ep_poll`).
+
+  2. Managed-aware full core dump via `createdump -f <path> --normal
+     <pid>`. createdump is shipped as a sibling of
+     `System.Private.CoreLib.dll` in every .NET runtime — we locate it
+     via `typeof(object).Assembly.Location`, no extra packaging
+     needed. The resulting .core file is analyzable offline with
+     `dotnet-dump analyze <file>`, which exposes the SOS/WinDbg
+     equivalents on Linux: `clrstack -all`, `threads`, `dumpheap`,
+     etc. — the managed-side view that corresponds to the kernel
+     stacks from (1).
+
+Kernel stacks alone aren't useful for a .NET hang because every
+managed thread parks in a futex or epoll call when it's waiting; the
+syscall doesn't tell you *what managed task* is behind the wait.
+createdump gives the full picture. We store the dump under the
+service's state dir (`STATE_DIRECTORY`, i.e. `/var/lib/printscan/`)
+so it survives a reboot and can be `scp`'d off for workstation
+analysis.
+
+Then systemd SIGKILLs at the 5-minute mark. The 5-min timeout stays
+intentional (gives in-flight scans + uploads time to finish when the
+system decides to switch mid-scan); preserving the evidence for
+post-mortem beats forcing a clean exit.
 
 ### Relationship with AirSane/CUPS
 

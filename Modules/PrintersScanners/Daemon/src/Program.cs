@@ -227,20 +227,31 @@ lifetime.ApplicationStopped.Register(() =>
     // teardown? non-daemon thread in a native lib?) keeps the
     // process alive past any code we own.
     //
-    // Dumping /proc/<pid>/task/*/stack tells us which syscall each
-    // thread is blocking in (kernel view); managed stacks via the
-    // runtime's diagnostic port would complement that with CLR
-    // context. We then let systemd SIGKILL at the real timeout so
-    // next-time evidence is preserved.
+    // Two complementary captures (kernel-only stacks would show all
+    // threads in futex_wait / ep_poll — accurate but unhelpful
+    // without managed context):
+    //
+    //   1. /proc/<pid>/task/<tid>/stack → kernel syscall each thread
+    //      is blocked in. Cheap, always works.
+    //   2. createdump <pid> -f <path> → a .core file of the whole
+    //      process, including managed heap + thread states, which we
+    //      can scp off and analyze offline with `dotnet-dump analyze`
+    //      (equivalent to WinDbg + SOS: `clrstack -all`, `threads`,
+    //      `dumpheap`, etc.). createdump ships with every .NET
+    //      runtime as a sibling of System.Private.CoreLib.dll.
+    //
+    // Then let systemd SIGKILL at the real timeout so next-time
+    // evidence is preserved.
     _ = Task.Run(async () =>
     {
         await Task.Delay(TimeSpan.FromSeconds(10));
         var log = app.Logger;
         var pid = Environment.ProcessId;
         log.LogWarning(
-            "lingering {Seconds}s after ApplicationStopped — dumping per-thread kernel stacks (pid={Pid})",
+            "lingering {Seconds}s after ApplicationStopped — dumping diagnostics (pid={Pid})",
             10, pid);
 
+        // ── 1. per-thread kernel stack dump ────────────────────────
         try
         {
             foreach (var tdir in Directory.EnumerateDirectories($"/proc/{pid}/task"))
@@ -259,7 +270,8 @@ lifetime.ApplicationStopped.Register(() =>
                         state = statLine[rp + 2].ToString();
                 }
                 catch { }
-                try { stack = File.ReadAllText(Path.Combine(tdir, "stack")).TrimEnd(); } catch (Exception ex) { stack = $"(unreadable: {ex.Message})"; }
+                try { stack = File.ReadAllText(Path.Combine(tdir, "stack")).TrimEnd(); }
+                catch (Exception ex) { stack = $"(unreadable: {ex.Message})"; }
                 log.LogWarning("thread tid={Tid} comm={Comm} state={State}\n{Stack}",
                     tid, comm, state, stack);
             }
@@ -267,6 +279,60 @@ lifetime.ApplicationStopped.Register(() =>
         catch (Exception ex)
         {
             log.LogWarning(ex, "thread stack enumeration failed");
+        }
+
+        // ── 2. createdump: managed-aware full process core ─────────
+        try
+        {
+            // createdump is shipped alongside CoreCLR. System.Private
+            // .CoreLib.dll lives in the runtime directory, so its
+            // directory is where we find createdump.
+            var coreclrDir = Path.GetDirectoryName(typeof(object).Assembly.Location)!;
+            var createdumpPath = Path.Combine(coreclrDir, "createdump");
+            var ts = DateTimeOffset.UtcNow.ToString("yyyyMMdd-HHmmss");
+            var dumpDir = Environment.GetEnvironmentVariable("STATE_DIRECTORY")?.Split(':')[0]
+                ?? "/var/lib/printscan";
+            var dumpPath = Path.Combine(dumpDir, $"hang-{ts}.core");
+            log.LogWarning("creating managed-aware core dump via {Cd} → {Path}",
+                createdumpPath, dumpPath);
+
+            // -f <file>     : output path
+            // --normal      : full core (default); smaller options exist but we
+            //                 want complete managed-heap context for analysis
+            var psi = new System.Diagnostics.ProcessStartInfo(createdumpPath)
+            {
+                RedirectStandardOutput = true,
+                RedirectStandardError = true,
+                UseShellExecute = false,
+            };
+            psi.ArgumentList.Add("-f");
+            psi.ArgumentList.Add(dumpPath);
+            psi.ArgumentList.Add("--normal");
+            psi.ArgumentList.Add(pid.ToString());
+            using var proc = System.Diagnostics.Process.Start(psi);
+            if (proc is not null)
+            {
+                // createdump is a quick pause-and-snapshot; should finish
+                // in seconds. Cap in case something goes sideways.
+                if (await Task.Run(() => proc.WaitForExit(30_000)))
+                {
+                    log.LogWarning(
+                        "createdump finished rc={Rc}. Analyze with: dotnet-dump analyze {Path}",
+                        proc.ExitCode, dumpPath);
+                    var err = await proc.StandardError.ReadToEndAsync();
+                    if (!string.IsNullOrWhiteSpace(err))
+                        log.LogWarning("createdump stderr: {Err}", err.TrimEnd());
+                }
+                else
+                {
+                    log.LogWarning("createdump did not finish within 30s — killing");
+                    try { proc.Kill(entireProcessTree: true); } catch { }
+                }
+            }
+        }
+        catch (Exception ex)
+        {
+            log.LogWarning(ex, "createdump invocation failed — offline managed-stack analysis unavailable for this hang");
         }
 
         log.LogWarning("diagnostic dump complete; leaving the rest to systemd's TimeoutStopSec (SIGKILL)");
