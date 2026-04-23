@@ -236,36 +236,41 @@
       allowedTCPPorts = [ 22 ];
       allowedUDPPorts = [ 5353 ];  # mDNS (systemd-resolved)
 
-      # Per-interface source routing via CONNMARK.
-      # PREROUTING: tag each incoming packet's CONNTRACK entry with a
-      #   per-interface mark (end0 → 100, wlan0 → 200). The mark sticks
-      #   to the whole connection, so the reply will carry the same mark.
-      # OUTPUT: for locally-generated replies, restore the connection's
-      #   mark onto the outgoing packet. networkd's routing-policy rules
-      #   (FirewallMark=100 → Table=100, etc.) then route the reply via
-      #   the interface it arrived on — symmetric reply, no AP MAC-IP
-      #   binding trouble. Pi-originated new connections have no mark
-      #   and fall through to the main table (end0 metric wins).
+      # Per-interface source routing via packet-mark + conntrack persistence.
       #
-      # The CONNMARK rules MUST be inserted at the top of PREROUTING
-      # (before nixos-fw-rpfilter). NixOS's rpfilter runs with
-      # `--validmark`, meaning it consults the packet mark + policy
-      # rules to determine reverse path. If our mark isn't set when
-      # rpfilter runs, mark=0 falls through to the main table, which
-      # has both interfaces — and lower-metric end0 wins for all source
-      # IPs on 192.168.1.0/24. That makes any packet arriving on wlan0
-      # look like a reverse-path mismatch. Dropped. Symmetrical routing
-      # machinery never gets a chance. By inserting CONNMARK at the
-      # top, the mark is set before rpfilter checks, and --validmark
-      # correctly follows our per-interface policy rules.
+      # PREROUTING: every incoming packet gets:
+      #   1. PACKET mark (nfmark) set to per-interface ID (end0 → 100,
+      #      wlan0 → 200) via `MARK --set-mark`. This is what
+      #      rpfilter's `--validmark` consults. We MUST set nfmark,
+      #      NOT ctmark — `CONNMARK --set-mark` only touches ctmark
+      #      (the conntrack entry's mark), leaving nfmark=0, which
+      #      makes rpfilter fall back to main table where end0
+      #      (lower metric) wins as reverse path for any .1.0/24
+      #      source. Wlan0 packets then look like reverse-path
+      #      mismatches and get dropped (1119 drops observed).
+      #   2. `CONNMARK --save-mark` persists nfmark → ctmark, so the
+      #      mark survives on the conntrack entry for replies.
+      #
+      # OUTPUT: `CONNMARK --restore-mark` copies ctmark → nfmark on
+      # locally-generated reply packets. Kernel's output-reroute then
+      # honours our fwmark → table policy rule → egress out the same
+      # interface the request arrived on.
+      #
+      # The three PREROUTING rules MUST be inserted at the top of the
+      # chain (before nixos-fw-rpfilter, which is NixOS's first rule).
+      # Otherwise rpfilter evaluates before our mark is set and drops.
+      # Pi-originated new outbound connections have no mark, fall
+      # through to main table, end0 (lower metric) wins for egress.
       extraCommands = ''
-        iptables -t mangle -I PREROUTING 1 -i end0 -j CONNMARK --set-mark 100
-        iptables -t mangle -I PREROUTING 2 -i wlan0 -j CONNMARK --set-mark 200
+        iptables -t mangle -I PREROUTING 1 -i end0 -j MARK --set-mark 100
+        iptables -t mangle -I PREROUTING 2 -i wlan0 -j MARK --set-mark 200
+        iptables -t mangle -I PREROUTING 3 -j CONNMARK --save-mark
         iptables -t mangle -A OUTPUT -j CONNMARK --restore-mark
       '';
       extraStopCommands = ''
-        iptables -t mangle -D PREROUTING -i end0 -j CONNMARK --set-mark 100 2>/dev/null || true
-        iptables -t mangle -D PREROUTING -i wlan0 -j CONNMARK --set-mark 200 2>/dev/null || true
+        iptables -t mangle -D PREROUTING -i end0 -j MARK --set-mark 100 2>/dev/null || true
+        iptables -t mangle -D PREROUTING -i wlan0 -j MARK --set-mark 200 2>/dev/null || true
+        iptables -t mangle -D PREROUTING -j CONNMARK --save-mark 2>/dev/null || true
         iptables -t mangle -D OUTPUT -j CONNMARK --restore-mark 2>/dev/null || true
       '';
     };
