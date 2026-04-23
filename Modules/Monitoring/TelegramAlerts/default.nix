@@ -585,6 +585,21 @@ in
         Type = "oneshot";
         RemainAfterExit = true;
         ExecStart = pkgs.writeShellScript "boot-started-notify" ''
+          # Dedupe per actual boot, same pattern as boot-notify:
+          # RemainAfterExit=true normally keeps us "active" after first
+          # run, but a switch-to-configuration that changes our content
+          # (ExecStart text, description, etc.) causes systemd to
+          # restart the unit, which re-executes ExecStart. Without this
+          # guard, every deploy triggers a duplicate "boot started"
+          # telegram. /run is tmpfs — cleared on real reboot — so the
+          # stamp naturally invalidates only on actual boots.
+          BOOT_ID=$(${pkgs.coreutils}/bin/cat /proc/sys/kernel/random/boot_id)
+          STAMP=/run/boot-started-notify.stamp
+          if [ -f "$STAMP" ] && [ "$(${pkgs.coreutils}/bin/cat "$STAMP" 2>/dev/null)" = "$BOOT_ID" ]; then
+            exit 0
+          fi
+          ${pkgs.coreutils}/bin/echo "$BOOT_ID" > "$STAMP"
+
           HOST=$(${pkgs.hostname}/bin/hostname)
           KERNEL=$(${pkgs.coreutils}/bin/uname -r)
           ${sendLog} "⚪ <b>$HOST</b> boot started
