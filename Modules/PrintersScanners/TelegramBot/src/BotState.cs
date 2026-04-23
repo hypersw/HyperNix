@@ -123,18 +123,25 @@ public static class StatusMessage
         return new InlineKeyboardMarkup(rows);
     }
 
+    // Radio-button emojis for current-selection indication in the
+    // format / DPI pickers. The previous " ✓" suffix got lost next
+    // to the emoji-heavy labels; filled-circle vs open-circle is
+    // unambiguous at a glance and consistent across platforms.
+    private const string SelectedMark   = "🔘 ";
+    private const string UnselectedMark = "⚪ ";
+
     private static InlineKeyboardMarkup RenderFormatPicker(BotSession s)
     {
         var sid = s.DaemonSessionId;
         var cur = s.Params.Format;
-        string mark(ScanFormat f) => f == cur ? " ✓" : "";
+        string mark(ScanFormat f) => f == cur ? SelectedMark : UnselectedMark;
         return new InlineKeyboardMarkup(new[]
         {
             new[]
             {
-                InlineKeyboardButton.WithCallbackData($"JPG{mark(ScanFormat.Jpeg)}",  $"set:fmt:{sid}:jpeg"),
-                InlineKeyboardButton.WithCallbackData($"PNG{mark(ScanFormat.Png)}",   $"set:fmt:{sid}:png"),
-                InlineKeyboardButton.WithCallbackData($"TIFF{mark(ScanFormat.Tiff)}", $"set:fmt:{sid}:tiff"),
+                InlineKeyboardButton.WithCallbackData($"{mark(ScanFormat.Jpeg)}JPG",  $"set:fmt:{sid}:jpeg"),
+                InlineKeyboardButton.WithCallbackData($"{mark(ScanFormat.Png)}PNG",   $"set:fmt:{sid}:png"),
+                InlineKeyboardButton.WithCallbackData($"{mark(ScanFormat.Tiff)}TIFF", $"set:fmt:{sid}:tiff"),
             },
             new[] { InlineKeyboardButton.WithCallbackData("↩ back", $"cancel:{sid}") },
         });
@@ -144,7 +151,7 @@ public static class StatusMessage
     {
         var sid = s.DaemonSessionId;
         var cur = s.Params.Dpi;
-        string label(int d) => d == cur ? $"{d} ✓" : $"{d}";
+        string label(int d) => d == cur ? $"{SelectedMark}{d}" : $"{UnselectedMark}{d}";
         return new InlineKeyboardMarkup(new[]
         {
             NativeDpis.Select(d =>
