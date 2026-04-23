@@ -587,7 +587,7 @@ in
         ExecStart = pkgs.writeShellScript "boot-started-notify" ''
           HOST=$(${pkgs.hostname}/bin/hostname)
           KERNEL=$(${pkgs.coreutils}/bin/uname -r)
-          ${sendLog} "🚀 <b>$HOST</b> boot started
+          ${sendLog} "⚪ <b>$HOST</b> boot started
 Kernel: $KERNEL"
         '';
       };
