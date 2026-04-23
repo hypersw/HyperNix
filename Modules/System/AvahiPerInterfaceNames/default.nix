@@ -95,41 +95,52 @@ let
     set -u
     CONF=${confFile}
 
-    regen() {
+    # Write the conf with a given allow-interfaces value. Idempotent:
+    # only diffs + rewrites if content changed, so repeat calls don't
+    # rapid-restart avahi.
+    write_conf() {
+      local iface="$1"
       local tmp="$CONF.new"
-      local primary
-      # Determine the current primary default-route interface. With our
-      # DHCP metrics pinned (end0=1002, wlan0=3003), `head -1` gives us
-      # the winner — lowest-metric first. If no default route exists
-      # yet, keep the existing config.
-      primary=$(${pkgs.iproute2}/bin/ip -4 route show default 2>/dev/null \
-        | ${pkgs.coreutils}/bin/head -n1 \
-        | ${pkgs.gawk}/bin/awk '{for (i=1;i<NF;i++) if ($i=="dev") {print $(i+1); exit}}')
-      if [ -z "$primary" ]; then
-        echo "avahi-primary-interface: no default route, keeping last config"
-        return
-      fi
-
-      # Inject allow-interfaces=<primary> into the [server] section of baseConf.
-      ${pkgs.gawk}/bin/awk -v primary="$primary" '
+      ${pkgs.gawk}/bin/awk -v primary="$iface" '
         /^\[server\]/ { print; print "allow-interfaces=" primary; next }
         { print }
       ' ${baseConf} > "$tmp"
 
       if ! ${pkgs.diffutils}/bin/diff -q "$tmp" "$CONF" >/dev/null 2>&1; then
         ${pkgs.coreutils}/bin/mv "$tmp" "$CONF"
-        echo "avahi-primary-interface: primary='$primary', regenerated conf"
-        # Restart only if avahi is already up. On boot the initial
-        # regen happens BEFORE avahi starts (ordering below), so this
-        # branch is skipped at startup — no pointless immediate restart.
-        # SIGHUP doesn't re-read allow-interfaces, only static-hosts;
-        # full restart is the only way to apply a server-level change.
-        if ${pkgs.systemd}/bin/systemctl is-active --quiet avahi-daemon.service; then
+        echo "avahi-primary-interface: allow-interfaces='$iface', conf regenerated"
+        # Kick avahi. Treat `failed` like `active` — it may have crashed
+        # earlier (e.g., tried to start before the initial conf was in
+        # place). systemctl restart works for both states; is-enabled
+        # gates us from trying on a disabled unit.
+        if ${pkgs.systemd}/bin/systemctl is-enabled --quiet avahi-daemon.service; then
           ${pkgs.systemd}/bin/systemctl restart avahi-daemon.service &
         fi
       else
         ${pkgs.coreutils}/bin/rm -f "$tmp"
       fi
+    }
+
+    regen() {
+      local primary
+      # Determine the current primary default-route interface. With our
+      # DHCP metrics pinned (end0=1002, wlan0=3003), `head -1` gives us
+      # the winner — lowest-metric first.
+      primary=$(${pkgs.iproute2}/bin/ip -4 route show default 2>/dev/null \
+        | ${pkgs.coreutils}/bin/head -n1 \
+        | ${pkgs.gawk}/bin/awk '{for (i=1;i<NF;i++) if ($i=="dev") {print $(i+1); exit}}')
+      if [ -z "$primary" ]; then
+        # No default route yet (early boot, before DHCP). Write a safe
+        # placeholder: allow-interfaces=lo restricts Avahi to loopback,
+        # which means no real mDNS announcements — but crucially, the
+        # conf file exists so avahi-daemon can start without error.
+        # When the real default route arrives, netlink wakes us up and
+        # we regenerate with the actual primary interface.
+        echo "avahi-primary-interface: no default route yet, writing placeholder (allow-interfaces=lo)"
+        write_conf "lo"
+        return
+      fi
+      write_conf "$primary"
     }
 
     regen
