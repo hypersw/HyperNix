@@ -197,6 +197,32 @@
     };
   };
 
+  # Multi-homed ARP behavior on same-subnet interfaces.
+  #
+  # With default arp_ignore=0, both end0 and wlan0 answer ARP requests
+  # for both .129 AND .130, because they're on the same subnet. The
+  # race is usually won by Ethernet, so a laptop querying ARP for .130
+  # gets end0's MAC in reply and then sends traffic intended for wlan0
+  # to the wrong physical interface. Our CONNMARK source-routing then
+  # routes replies back via the interface matching the MAC the packet
+  # arrived on (end0), with source IP .130 — AP drops on MAC-IP mismatch.
+  #
+  # arp_ignore=1 makes each interface reply ONLY if the requested IP is
+  # local to THAT interface. arp_announce=2 makes outgoing ARP use the
+  # source address matching the interface's subnet. Together they enforce
+  # strict per-interface L2 identity, which is what we need for the
+  # CONNMARK source-routing scheme to work as designed.
+  #
+  # These are the well-known sysctls for multi-homed hosts; see
+  # Documentation/networking/ip-sysctl.txt. Single-interface hosts are
+  # unaffected.
+  boot.kernel.sysctl = {
+    "net.ipv4.conf.all.arp_ignore" = 1;
+    "net.ipv4.conf.all.arp_announce" = 2;
+    "net.ipv4.conf.default.arp_ignore" = 1;
+    "net.ipv4.conf.default.arp_announce" = 2;
+  };
+
   networking = {
     # systemd-networkd + systemd-resolved (modern stack), matching HyperJetHV.
     # Replaces the legacy dhcpcd + Avahi pair. Wi-Fi auth still goes through
