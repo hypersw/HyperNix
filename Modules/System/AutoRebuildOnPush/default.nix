@@ -9,12 +9,13 @@ let
   # can do is drop a trigger file.
   checkerUser = "auto-rebuild-github-checker";
 
-  # /run/auto-rebuild/ is owned by the checker (via RuntimeDirectory=)
-  # and watched by the switcher's path unit (DirectoryNotEmpty=). The
-  # checker mktemp's a unique filename per trigger; the switcher sweeps
-  # the dir in ExecStartPre and then runs. If the switcher fails after
-  # the sweep, the dir is already empty, so no path-unit re-fire storm.
-  triggerDir = "/run/auto-rebuild";
+  # /run/auto-rebuild/ holds bookkeeping files owned by the checker
+  # (lock file, cache etc). /run/auto-rebuild/triggers/ is the watched
+  # inbox — the switcher's path unit fires on any file there, so we
+  # MUST keep sibling files (check.lock, nix cache) out of it or the
+  # path unit loops forever.
+  runtimeDir = "/run/auto-rebuild";
+  triggerDir = "${runtimeDir}/triggers";
 
   checkerScript = pkgs.writeShellScript "auto-rebuild-github-check" ''
     set -euo pipefail
@@ -23,9 +24,9 @@ let
     # stalled nix flake metadata) skip this tick cleanly rather than
     # queueing concurrent checks. Kernel releases the flock if the holder
     # dies unexpectedly — no stale-lock wedge on crash.
-    # Lock lives inside the RuntimeDirectory (owned by this user) because
-    # /run proper is root-writable only.
-    LOCK=${triggerDir}/check.lock
+    # Lock sits in the parent runtime dir, not the watched trigger subdir
+    # (which would make DirectoryNotEmpty always true).
+    LOCK=${runtimeDir}/check.lock
     exec 9>>"$LOCK"
     if ! ${pkgs.util-linux}/bin/flock -n 9; then
       echo "previous check still active — skipping this tick"
@@ -144,6 +145,16 @@ in
     };
     users.groups.${checkerUser} = {};
 
+    # Pre-create both dirs at activation time (via systemd-tmpfiles) so the
+    # path unit has something to watch at boot, before the checker has ever
+    # run. RuntimeDirectory= on the checker would also create them but only
+    # when the checker runs first — risk of a race where the path unit's
+    # inotify fails on a missing dir.
+    systemd.tmpfiles.rules = [
+      "d ${runtimeDir}          0700 ${checkerUser} ${checkerUser} -"
+      "d ${triggerDir}          0700 ${checkerUser} ${checkerUser} -"
+    ];
+
     # Timer drives the *checker*. The switcher is path-activated — it
     # fires when (and only when) the checker has decided to trigger a
     # switch. No direct timer → switcher coupling.
@@ -172,14 +183,14 @@ in
         User = checkerUser;
         Group = checkerUser;
 
-        # Owns /run/auto-rebuild/ where trigger files land. Switcher is
-        # root so it can sweep regardless of ownership. RuntimeDirectory
-        # auto-creates the dir before we exec. Preserve=yes so the dir
-        # (and any pending trigger files we drop in it) survives the
-        # checker's oneshot exit — otherwise systemd would GC the dir
-        # immediately after ExecStart returns, and the path unit would
-        # never see the trigger.
-        RuntimeDirectory = "auto-rebuild";
+        # Owns /run/auto-rebuild/ (parent — holds lock + $HOME cache) and
+        # /run/auto-rebuild/triggers/ (watched inbox — only trigger files
+        # go here so DirectoryNotEmpty= doesn't trip on sibling bookkeeping).
+        # Switcher is root so it can sweep regardless of ownership.
+        # Preserve=yes so pending trigger files survive the checker's
+        # oneshot exit — otherwise systemd would GC the dir immediately
+        # after ExecStart returns, and the path unit would never see it.
+        RuntimeDirectory = [ "auto-rebuild" "auto-rebuild/triggers" ];
         RuntimeDirectoryMode = "0700";
         RuntimeDirectoryPreserve = "yes";
 
