@@ -44,9 +44,9 @@ public static class StatusMessage
         JpegQuality: 90);
 
     public static (string Html, InlineKeyboardMarkup Keyboard) Render(
-        BotSession s, PickerView view = PickerView.Main)
+        BotSession s, string botUsername, PickerView view = PickerView.Main)
     {
-        var html = RenderHtml(s);
+        var html = RenderHtml(s, botUsername);
         var keyboard = view switch
         {
             PickerView.Format => RenderFormatPicker(s),
@@ -71,7 +71,7 @@ public static class StatusMessage
 
     // ─── HTML body ─────────────────────────────────────────────────────────
 
-    private static string RenderHtml(BotSession s)
+    private static string RenderHtml(BotSession s, string botUsername)
     {
         var remain = s.ExpiresAt - DateTimeOffset.UtcNow;
         var mins = remain.TotalSeconds < 0 ? 0 : (int)Math.Ceiling(remain.TotalMinutes);
@@ -83,12 +83,16 @@ public static class StatusMessage
             (false, false) => "📡 Scanner: ⏳ <i>waiting — power on or press scanner button</i>",
         };
 
-        // Format + DPI are shown as tap-to-edit buttons below; the body
-        // used to repeat them as a "Format: X · Resolution: Y dpi" line,
-        // which duplicated the buttons and took a row of vertical space
-        // without new information.
+        // "end" rendered as a hyperlink deep-link instead of a keyboard
+        // button. Tapping it navigates to `t.me/<bot>?start=end_<sid>`,
+        // which inside this chat triggers /start end_<sid> on our bot;
+        // the message handler recognises the payload, closes the session,
+        // and deletes the user's /start message to keep the chat clean.
+        // Keeps the Scan button big and alone on its row.
+        var endLink = $"<a href=\"https://t.me/{botUsername}?start=end_{s.DaemonSessionId}\">end</a>";
+
         return $"""
-            📷 <b>Scanner session</b> · {mins} min left
+            📷 <b>Scanner session</b> · {mins} min left · {endLink}
             {scannerLine}
             📑 Scans delivered: <b>{s.ScanCount}</b>
             """;
@@ -108,20 +112,13 @@ public static class StatusMessage
             InlineKeyboardButton.WithCallbackData($"📄 Format: {fmt}",              $"pick:fmt:{sid}"),
             InlineKeyboardButton.WithCallbackData($"📏 Resolution: {s.Params.Dpi} dpi", $"pick:dpi:{sid}"),
         });
-        // Row 2: primary action + demoted End. End used to be its own full
-        // row and was the most visually prominent button, which is backwards
-        // for what the user actually does most often (scan).
+        // Row 2: Scan alone — full-width, primary action. "end" lives
+        // as a hyperlink in the body text (see RenderHtml). During an
+        // in-flight scan, row 2 is omitted entirely; end-link in the
+        // body remains clickable.
         if (!s.Scanning)
         {
-            rows.Add(new[]
-            {
-                InlineKeyboardButton.WithCallbackData("📷 Scan", $"scan:{sid}"),
-                InlineKeyboardButton.WithCallbackData("🚪 end",  $"end:{sid}"),
-            });
-        }
-        else
-        {
-            rows.Add(new[] { InlineKeyboardButton.WithCallbackData("🚪 end", $"end:{sid}") });
+            rows.Add(new[] { InlineKeyboardButton.WithCallbackData("📷 Scan", $"scan:{sid}") });
         }
         return new InlineKeyboardMarkup(rows);
     }

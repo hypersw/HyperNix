@@ -54,7 +54,16 @@ var sessionsLock = new Lock();
 var inFlight = 0;
 var inFlightDrained = new SemaphoreSlim(1, 1);
 
-// ── Bot commands ────────────────────────────────────────────────────────────
+// ── Bot identity + commands ─────────────────────────────────────────────────
+
+// Fetch the bot's own username once at startup. Used to build deep-link
+// URLs inside status messages (e.g. the "end" hyperlink points at
+// https://t.me/<username>?start=end_<sid>, which triggers /start on
+// this bot when tapped — see HandleMessageAsync).
+var me = await bot.GetMe();
+var botUsername = me.Username
+    ?? throw new Exception("bot.GetMe() returned no username — token may be wrong");
+log.LogInformation("bot identity: @{Username} (id={Id})", botUsername, me.Id);
 
 await bot.SetMyCommands([
     new() { Command = "scanner", Description = "📷 Open scanner session" },
@@ -146,6 +155,36 @@ async Task HandleMessageAsync(string userName, Message msg, CancellationToken ct
 
     var text = (msg.Text ?? "").Trim();
     var slash = text.Split(' ', '@')[0].ToLower();
+
+    // Deep-link payloads arrive as "/start <payload>". Our hyperlinks
+    // in session bodies use the payload "end_<sid>" to close a session
+    // via link-tap. Parse first so we recognise actionable payloads
+    // before the generic /start help handler below.
+    if (slash == "/start")
+    {
+        var parts = text.Split(' ', 2);
+        var payload = parts.Length > 1 ? parts[1].Trim() : "";
+        if (payload.StartsWith("end_"))
+        {
+            var sid = payload["end_".Length..];
+            try
+            {
+                await daemon.CloseSessionAsync(sid, ct);
+                // Clean up the user's /start message so the chat stays
+                // tidy — the session-ended render in the status message
+                // is the feedback.
+                try { await bot.DeleteMessage(msg.Chat.Id, msg.Id, ct); }
+                catch (Exception ex) { log.LogDebug("delete of /start end_ msg failed: {Err}", ex.Message); }
+            }
+            catch (Exception ex)
+            {
+                log.LogWarning(ex, "CloseSessionAsync({Sid}) via /start end_ failed", sid);
+            }
+            return;
+        }
+        // fall through to standard /start help below
+    }
+
     if (text.Equals("📷 Scanner", StringComparison.OrdinalIgnoreCase)
         || slash is "/scanner" or "/scan")
         await OpenScannerSessionAsync(msg.Chat.Id, userName, ct);
@@ -578,11 +617,15 @@ async Task RerenderAsync(string sessionId, CancellationToken ct,
     BotSession? s;
     lock (sessionsLock) { sessions.TryGetValue(sessionId, out s); }
     if (s is null) return;
-    var (html, kb) = StatusMessage.Render(s, view);
+    var (html, kb) = StatusMessage.Render(s, botUsername, view);
     try
     {
         await bot.EditMessageText(s.ChatId, s.StatusMessageId, html,
-            parseMode: ParseMode.Html, replyMarkup: kb, cancellationToken: ct);
+            parseMode: ParseMode.Html, replyMarkup: kb,
+            // Deep-link "end" in the body would otherwise render as a
+            // Telegram link-preview card ("t.me/yourbot"). Disable.
+            linkPreviewOptions: new() { IsDisabled = true },
+            cancellationToken: ct);
     }
     catch (Exception ex)
     {
