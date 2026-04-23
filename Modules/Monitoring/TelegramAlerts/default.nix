@@ -912,6 +912,41 @@ Last failing boot ended with:
       };
     };
 
+    # Our custom auto-rebuild path (not NixOS autoUpgrade). Wired via
+    # OnFailure= in Modules/System/AutoRebuildOnPush/default.nix. The
+    # switcher is the privileged component — its failure means a broken
+    # deployment or build error and wants a real alert. The checker's
+    # transient network issues soft-exit without firing its notifier;
+    # only parse errors / malformed state / unsupported-upstream-type
+    # bugs reach the checker notifier.
+    systemd.services.auto-rebuild-switch-failure-notify = {
+      description = "Notify Telegram on auto-rebuild-switch failure";
+      serviceConfig = {
+        WorkingDirectory = "/var/empty";  # safe CWD — see Modules/PrintersScanners/Daemon/default.nix
+        Type = "oneshot";
+        ExecStart = pkgs.writeShellScript "auto-rebuild-switch-failure-notify" ''
+          HOST=$(${pkgs.hostname}/bin/hostname)
+          LOG=$(${pkgs.systemd}/bin/journalctl -u auto-rebuild-switch --no-pager -n 30 -q 2>/dev/null)
+          ${sendAlert} "❌ <b>$HOST</b>: auto-rebuild switch FAILED
+<pre>$LOG</pre>"
+        '';
+      };
+    };
+
+    systemd.services.auto-rebuild-checker-failure-notify = {
+      description = "Notify Telegram on auto-rebuild-github-checker hard failure";
+      serviceConfig = {
+        WorkingDirectory = "/var/empty";  # safe CWD — see Modules/PrintersScanners/Daemon/default.nix
+        Type = "oneshot";
+        ExecStart = pkgs.writeShellScript "auto-rebuild-checker-failure-notify" ''
+          HOST=$(${pkgs.hostname}/bin/hostname)
+          LOG=$(${pkgs.systemd}/bin/journalctl -u auto-rebuild-github-checker --no-pager -n 30 -q 2>/dev/null)
+          ${sendLog} "⚠️ <b>$HOST</b>: auto-rebuild checker hard-failed (not transient)
+<pre>$LOG</pre>"
+        '';
+      };
+    };
+
     # System switch notification — runs as a oneshot service after every activation.
     # Uses activation script to record previous system path (before /run/current-system
     # is updated), then a systemd service sends the notification (after sops secrets
