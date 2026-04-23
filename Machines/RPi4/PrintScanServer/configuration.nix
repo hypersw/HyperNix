@@ -209,6 +209,27 @@
       enable = true;
       allowedTCPPorts = [ 22 ];
       allowedUDPPorts = [ 5353 ];  # mDNS (systemd-resolved)
+
+      # Per-interface source routing via CONNMARK.
+      # PREROUTING: tag each incoming packet's CONNTRACK entry with a
+      #   per-interface mark (end0 → 100, wlan0 → 200). The mark sticks
+      #   to the whole connection, so the reply will carry the same mark.
+      # OUTPUT: for locally-generated replies, restore the connection's
+      #   mark onto the outgoing packet. networkd's routing-policy rules
+      #   (FirewallMark=100 → Table=100, etc.) then route the reply via
+      #   the interface it arrived on — symmetric reply, no AP MAC-IP
+      #   binding trouble. Pi-originated new connections have no mark
+      #   and fall through to the main table (end0 metric wins).
+      extraCommands = ''
+        iptables -t mangle -A PREROUTING -i end0 -j CONNMARK --set-mark 100
+        iptables -t mangle -A PREROUTING -i wlan0 -j CONNMARK --set-mark 200
+        iptables -t mangle -A OUTPUT -j CONNMARK --restore-mark
+      '';
+      extraStopCommands = ''
+        iptables -t mangle -D PREROUTING -i end0 -j CONNMARK --set-mark 100 2>/dev/null || true
+        iptables -t mangle -D PREROUTING -i wlan0 -j CONNMARK --set-mark 200 2>/dev/null || true
+        iptables -t mangle -D OUTPUT -j CONNMARK --restore-mark 2>/dev/null || true
+      '';
     };
 
     # WiFi client — connect to IoT PPSK network
@@ -253,16 +274,24 @@
     wait-online.enable = false;
 
     # Route metrics: end0 strongly preferred over wlan0 for both IPv4
-    # and IPv6. networkd defaults every interface to metric 1024, which
-    # means when both links are up on the same subnet the kernel has two
-    # equally-good default routes and two equally-good on-link routes —
-    # so replies to incoming traffic can leave via the "wrong" interface.
-    # That asymmetric egress is then dropped by rp_filter / AP L2
-    # forwarding rules, manifesting as "Pi doesn't answer pings on .129"
-    # even though end0 is up. dhcpcd previously assigned 1002/3003
-    # automatically based on interface type; networkd doesn't, so we
-    # pin them explicitly here. Gap size (3x) makes accidental ties
-    # impossible if either side gets bumped by a stray tie-breaker.
+    # and IPv6 in the MAIN table (used for Pi-originated outbound).
+    # networkd defaults every interface to metric 1024 — equal-cost on
+    # the same subnet means kernel picks egress arbitrarily, producing
+    # asymmetric replies that AP MAC-IP-binding filters drop. dhcpcd
+    # used to assign 1002/3003 by interface type; networkd doesn't,
+    # so we pin them explicitly. Gap size (3x) keeps any stray tie-
+    # breaker from equalizing them.
+    #
+    # Per-interface source-routing (tables 100 for end0, 200 for wlan0)
+    # carries *reply* traffic back via the arriving interface — see the
+    # connmark rules in the firewall section. Each interface installs an
+    # ADDITIONAL default route into its own table, using the DHCP-
+    # learned gateway via networkd's `_dhcp4` magic (no hardcoded IPs).
+    # Main table is untouched — DHCP's default route still lands there
+    # as usual. If `_dhcp4` isn't supported by this networkd version,
+    # the table stays empty, the policy rule falls through to main, and
+    # we end up with the same asymmetric behavior as before: not ideal
+    # but not bricked.
     networks."20-end0" = {
       matchConfig.Name = "end0";
       networkConfig = {
@@ -271,6 +300,23 @@
       };
       dhcpV4Config.RouteMetric = 1002;
       ipv6AcceptRAConfig.RouteMetric = 1002;
+      routes = [
+        {
+          routeConfig = {
+            Destination = "0.0.0.0/0";
+            Gateway = "_dhcp4";
+            Table = 100;
+          };
+        }
+      ];
+      routingPolicyRules = [
+        {
+          routingPolicyRuleConfig = {
+            FirewallMark = 100;
+            Table = 100;
+          };
+        }
+      ];
     };
 
     networks."20-wlan0" = {
@@ -281,6 +327,23 @@
       };
       dhcpV4Config.RouteMetric = 3003;
       ipv6AcceptRAConfig.RouteMetric = 3003;
+      routes = [
+        {
+          routeConfig = {
+            Destination = "0.0.0.0/0";
+            Gateway = "_dhcp4";
+            Table = 200;
+          };
+        }
+      ];
+      routingPolicyRules = [
+        {
+          routingPolicyRuleConfig = {
+            FirewallMark = 200;
+            Table = 200;
+          };
+        }
+      ];
       linkConfig.RequiredForOnline = "no";
     };
   };
