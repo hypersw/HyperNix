@@ -1,144 +1,144 @@
 { config, lib, pkgs, ... }:
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Per-interface mDNS hostnames.
+# Dynamic Avahi primary-interface tracker.
 #
 # Why this module exists
 # ──────────────────────
-# Avahi (and systemd-resolved) publish a single hostname on all mDNS-enabled
-# interfaces. When a host has multiple interfaces on the same L2 segment —
-# most commonly eth + Wi-Fi bridged by the same AP — each interface announces
-# `<host>.local` with its own IP. The bridge loops each announcement back to
-# the other interface, which sees "another device claiming my name with a
-# different IP", triggers RFC 6762 conflict resolution, and renames itself
-# to `<host>7.local`, `<host>11.local`, `<host>190.local`, … whereupon
-# `<host>.local` is unreachable from anywhere on the LAN. See upstream
-# systemd issues #28491, #23910, and Avahi's long-standing lack of
-# cross-interface self-detection. Observed on this host 2026-04-22.
+# Avahi (like systemd-resolved) runs into a wall when a host has multiple
+# interfaces on the same L2 segment — the classic eth+Wi-Fi bridged case:
+# each interface announces the same name, the AP bridges the multicast
+# between them, each interface sees a sibling's announcement as "another
+# device claiming my name", runs RFC 6762 conflict resolution, and ends
+# up renaming the host to `<name>-2.local` and upward. `<name>.local`
+# becomes unreachable.
+#
+# Static per-interface names via /etc/avahi/hosts don't fix it either:
+# Avahi's static-hosts publisher uses AVAHI_IF_UNSPEC, so every static
+# entry is still broadcast on every interface. The self-reflection kicks
+# in on the `<prefix>-eth.local` / `<prefix>-wifi.local` entries too.
 #
 # What it does
 # ────────────
-# Instead of publishing one name on N interfaces (which conflicts), this
-# publishes N different names — one per interface — via Avahi's static-
-# hosts file (/etc/avahi/hosts). Each entry is a name→IP mapping that
-# Avahi announces only on interfaces where the target IP is locally
-# assigned. Different names for different interfaces means cross-bridge
-# echoes are not treated as conflicts.
+# Only publishes Avahi's main hostname on ONE interface at a time — the
+# current primary default-route interface (usually end0 when up, wlan0
+# otherwise). Implemented by:
+#  - Running avahi-daemon with a runtime-generated config file that has
+#    `allow-interfaces=<primary>` set to a single interface.
+#  - A watcher that subscribes to `ip monitor route` and restarts
+#    avahi-daemon whenever the primary interface changes (which is
+#    rare — cable unplug / Wi-Fi failover etc).
 #
-# Names look like <hostname>-<suffix>.local, where the suffix is derived
-# from the interface name:
-#   end0, eth0, enp0s1  → eth   → e.g. printscan-eth.local
-#   wlan0, wlp2s0       → wifi  → e.g. printscan-wifi.local
-#   usb0                → usb   → e.g. printscan-usb.local
-#   anything else       → the interface name itself
+# With single-interface publishing, cross-bridge self-reflection still
+# happens (the bridge doesn't care what we allow); but since Avahi isn't
+# PUBLISHING on the other interface, it doesn't have a registered claim
+# for the name there. The remote-looking announcement from the "other"
+# interface is just… an announcement, not a conflict.
 #
-# A companion systemd service watches `ip monitor address` for netlink
-# events and regenerates /run/avahi-per-interface-names/hosts whenever an
-# interface gains or loses an address. A SIGHUP to avahi-daemon reloads
-# the file (no service restart, no mDNS blackout).
+# Startup blackout on interface swap
+# ──────────────────────────────────
+# Switching allow-interfaces requires a full avahi-daemon restart (SIGHUP
+# doesn't pick up server-level options). That's a ~1-2s gap in mDNS
+# availability. Interface transitions are rare (cable pull, Wi-Fi AP
+# failure) so this is acceptable.
 #
 # Client side
 # ───────────
-# Clients use `ssh -o HostName=<host>-eth.local` or an ssh_config Match-
-# exec rule to probe Ethernet first and fall back to Wi-Fi:
-#
-#   Match host=<alias> exec "ping -c1 -W1 <host>-eth.local >/dev/null 2>&1"
-#       HostName <host>-eth.local
-#   Match host=<alias>
-#       HostName <host>-wifi.local
-#
-# Nothing about this module is Pi- or PrintScanServer-specific. Any
-# multi-NIC host on a bridged L2 segment hits the same problem and can
-# use this module.
+# Clients continue to use the plain `<hostname>.local` — no per-interface
+# SSH config needed. The mDNS record auto-follows whichever interface is
+# primary, so the client sees one stable name.
 # ──────────────────────────────────────────────────────────────────────────────
 
 let
   cfg = config.services.avahi-per-interface-names;
 
-  # Runtime path — watcher writes here, /etc/avahi/hosts is a symlink to it.
-  hostsPath = "/run/avahi-per-interface-names/hosts";
+  # Runtime directory for our generated avahi-daemon.conf.
+  runDir = "/run/avahi-primary-interface";
+  confFile = "${runDir}/avahi-daemon.conf";
 
-  watcherScript = pkgs.writeShellScript "avahi-per-interface-names-watcher" ''
+  # Base config — everything except allow-interfaces, which is appended
+  # at runtime by the watcher. Matches NixOS's own avahi module defaults
+  # as closely as possible for anything that matters (publish, wide-area,
+  # rlimits). Host name pulled from networking.hostName.
+  baseConf = pkgs.writeText "avahi-daemon.conf.base" ''
+    [server]
+    host-name=${config.networking.hostName}
+    browse-domains=
+    use-ipv4=yes
+    use-ipv6=yes
+    allow-point-to-point=no
+
+    [wide-area]
+    enable-wide-area=yes
+
+    [publish]
+    disable-publishing=no
+    disable-user-service-publishing=no
+    publish-addresses=yes
+    publish-hinfo=no
+    publish-workstation=no
+    publish-domain=yes
+
+    [reflector]
+    enable-reflector=no
+
+    [rlimits]
+    rlimit-core=0
+    rlimit-data=4194304
+    rlimit-fsize=0
+    rlimit-nofile=768
+    rlimit-stack=4194304
+    rlimit-nproc=3
+  '';
+
+  watcherScript = pkgs.writeShellScript "avahi-primary-interface-watcher" ''
     set -u
-
-    F=${hostsPath}
-
-    # Derive a short, human-friendly suffix from the interface name.
-    # Predictable-interface-name convention groups Ethernet under en*/eth*
-    # and Wi-Fi under wl*; older kernels still use eth0/wlan0.
-    name_for() {
-      case "$1" in
-        en*|eth*|end*) echo eth ;;
-        wl*)           echo wifi ;;
-        usb*)          echo usb ;;
-        *)             echo "$1" ;;
-      esac
-    }
-
-    host=$(${pkgs.nettools}/bin/hostname)
+    CONF=${confFile}
 
     regen() {
-      local tmp="$F.new"
+      local tmp="$CONF.new"
+      local primary
+      # Determine the current primary default-route interface. With our
+      # DHCP metrics pinned (end0=1002, wlan0=3003), `head -1` gives us
+      # the winner — lowest-metric first. If no default route exists
+      # yet, keep the existing config.
+      primary=$(${pkgs.iproute2}/bin/ip -4 route show default 2>/dev/null \
+        | ${pkgs.coreutils}/bin/head -n1 \
+        | ${pkgs.gawk}/bin/awk '{for (i=1;i<NF;i++) if ($i=="dev") {print $(i+1); exit}}')
+      if [ -z "$primary" ]; then
+        echo "avahi-primary-interface: no default route, keeping last config"
+        return
+      fi
 
-      # `scope global` excludes loopback 127.0.0.1, IPv4 link-local
-      # 169.254.x.y, and IPv6 link-local fe80::/10 — leaves only
-      # addresses we'd actually want to advertise. `ip -br` gives
-      # one line per link with all its addresses whitespace-separated.
-      #
-      # Output is piped through `sort` so byte-identical content across
-      # runs produces a byte-identical file, even if the kernel reorders
-      # interfaces after a link up/down event. Without this, netlink
-      # storm during boot would cause spurious diff-detected changes and
-      # needless SIGHUPs to avahi.
-      ${pkgs.iproute2}/bin/ip -br addr show scope global 2>/dev/null \
-        | while read -r iface _state addrs; do
-          [ "$iface" = "lo" ] && continue
-          [ -z "$addrs" ] && continue
-          local suffix
-          suffix=$(name_for "$iface")
-          # addrs is whitespace-separated. Newer iproute2 interleaves
-          # non-address tokens ("metric", "1002", "3003", flags, etc.)
-          # with actual CIDR addresses, so filter strictly: only tokens
-          # containing a slash AND only IP-charset characters survive.
-          for addr in $addrs; do
-            case "$addr" in
-              */*) ;;                             # must look like CIDR
-              *)   continue ;;
-            esac
-            case "''${addr%/*}" in
-              *[!0-9a-fA-F:.]*) continue ;;       # must be IP-shaped
-            esac
-            echo "''${addr%/*}  $host-$suffix.local"
-          done
-        done \
-        | ${pkgs.coreutils}/bin/sort > "$tmp"
+      # Inject allow-interfaces=<primary> into the [server] section of baseConf.
+      ${pkgs.gawk}/bin/awk -v primary="$primary" '
+        /^\[server\]/ { print; print "allow-interfaces=" primary; next }
+        { print }
+      ' ${baseConf} > "$tmp"
 
-      # Only update + HUP avahi if content actually changed. Netlink
-      # delivers a torrent of events during boot; most don't affect us.
-      if ! ${pkgs.diffutils}/bin/diff -q "$tmp" "$F" >/dev/null 2>&1; then
-        ${pkgs.coreutils}/bin/mv "$tmp" "$F"
-        echo "avahi-per-interface-names: /etc/avahi/hosts regenerated:"
-        ${pkgs.gnused}/bin/sed 's/^/  /' "$F"
-        # Reload avahi's static-hosts database. SIGHUP is the lightweight
-        # path — re-reads /etc/avahi/hosts + /etc/avahi/services/ without
-        # a full service restart, no mDNS blackout.
+      if ! ${pkgs.diffutils}/bin/diff -q "$tmp" "$CONF" >/dev/null 2>&1; then
+        ${pkgs.coreutils}/bin/mv "$tmp" "$CONF"
+        echo "avahi-primary-interface: primary='$primary', regenerated conf"
+        # Restart only if avahi is already up. On boot the initial
+        # regen happens BEFORE avahi starts (ordering below), so this
+        # branch is skipped at startup — no pointless immediate restart.
+        # SIGHUP doesn't re-read allow-interfaces, only static-hosts;
+        # full restart is the only way to apply a server-level change.
         if ${pkgs.systemd}/bin/systemctl is-active --quiet avahi-daemon.service; then
-          ${pkgs.systemd}/bin/systemctl kill -s HUP avahi-daemon.service || true
+          ${pkgs.systemd}/bin/systemctl restart avahi-daemon.service &
         fi
       else
         ${pkgs.coreutils}/bin/rm -f "$tmp"
       fi
     }
 
-    # Initial population before avahi starts — we're ordered Before=
-    # avahi-daemon so the first file write completes before the daemon
-    # opens the file.
     regen
     ${pkgs.systemd}/bin/systemd-notify --ready
 
-    # Long-running: consume netlink address events, regen on any change.
-    # `ip monitor address` is edge-triggered; each event is one line.
-    ${pkgs.iproute2}/bin/ip monitor address | while read -r _; do
+    # React to default-route changes via netlink. `ip monitor route`
+    # fires on add/remove/change of any route; regen() is idempotent
+    # when the primary hasn't actually changed.
+    ${pkgs.iproute2}/bin/ip monitor route | while read -r _; do
       regen
     done
   '';
@@ -146,61 +146,67 @@ in
 {
   options.services.avahi-per-interface-names = {
     enable = lib.mkEnableOption ''
-      per-interface mDNS hostnames.
+      dynamic Avahi primary-interface tracker.
 
-      Publishes `<hostname>-<interface-suffix>.local` for every non-loopback
-      interface with a global-scope address, instead of Avahi's default
-      single `<hostname>.local`. Solves the self-conflict Avahi hits on
-      hosts with multiple interfaces on the same L2 segment (eth+wifi
-      bridged by the same AP). Requires `services.avahi.enable = true`.
+      Avahi publishes on ONE interface at a time — the current primary
+      default-route interface. Watcher swaps it when the default route
+      moves (e.g., Ethernet carrier dropped → Wi-Fi becomes primary).
+      Restart-cost is ~1-2s of mDNS unavailability on each transition.
+
+      Solves the self-conflict hosts with multiple interfaces on the
+      same L2 segment hit with Avahi / systemd-resolved: by publishing
+      on only one interface, cross-interface reflections don't look
+      like conflicts because the other interface doesn't have a
+      registered claim for the name. Requires `services.avahi.enable`.
     '';
   };
 
   config = lib.mkIf cfg.enable {
-    # Don't publish the host's primary addresses under the plain hostname
-    # — that's exactly the publication that conflicts across interfaces.
-    # We publish per-interface-suffixed names via /etc/avahi/hosts instead.
     services.avahi = {
-      publish.addresses = lib.mkForce false;
-      publish.workstation = lib.mkForce false;
-      publish.hinfo = lib.mkForce false;
+      # Make sure Avahi is up with the standard publishing behaviour —
+      # single hostname, A+AAAA records. Single-interface publishing
+      # (enforced by our dynamic allow-interfaces) means this doesn't
+      # self-conflict.
+      enable = true;
+      nssmdns4 = true;
+      publish = {
+        enable = true;
+        addresses = lib.mkForce true;
+        workstation = lib.mkForce false;
+        hinfo = lib.mkForce false;
+      };
     };
 
-    # Symlink /etc/avahi/hosts → our runtime file. Avahi reads this file
-    # on start and on SIGHUP (via its static_hosts_load()).
-    environment.etc."avahi/hosts".source = hostsPath;
+    # Override ExecStart to point avahi at our runtime-generated conf.
+    # The NixOS-generated /etc/avahi/avahi-daemon.conf is still there
+    # but ignored — avahi reads what `-f` points to.
+    systemd.services.avahi-daemon = {
+      serviceConfig.ExecStart = lib.mkForce
+        "${config.services.avahi.package}/sbin/avahi-daemon --syslog -f ${confFile}";
+      # Wait for the watcher's READY (which fires only after the
+      # initial regen writes the conf). Without this ordering, avahi
+      # would race the watcher and could try to open a non-existent
+      # file on cold boot.
+      after = [ "avahi-primary-interface-watcher.service" ];
+      requires = [ "avahi-primary-interface-watcher.service" ];
+    };
 
-    systemd.services.avahi-per-interface-names-watcher = {
-      description = "Publish per-interface mDNS hostnames via /etc/avahi/hosts";
+    systemd.services.avahi-primary-interface-watcher = {
+      description = "Track primary default-route interface, update avahi allow-interfaces";
       wantedBy = [ "multi-user.target" ];
       after = [ "systemd-networkd.service" ];
       wants = [ "systemd-networkd.service" ];
-      # Startup ordering is load-bearing:
-      #   * /etc/avahi/hosts is a symlink into /run/..., created by NixOS
-      #     activation (environment.etc.source). At boot the symlink exists
-      #     from the start, but its target (our /run file) is absent until
-      #     RuntimeDirectory+regen writes it.
-      #   * Type=notify + `systemd-notify --ready` AFTER the initial regen
-      #     means we only report READY once the file is in place.
-      #   * Before= + requiredBy= make avahi-daemon Requires= us AND wait
-      #     until we notify. So avahi never opens a broken symlink.
-      #   * If we fail, Requires= propagates the failure — avahi stays
-      #     down rather than running without its hosts file (mDNS dark
-      #     but not misconfigured; fixable by healing the watcher).
       before = [ "avahi-daemon.service" ];
-      requiredBy = [ "avahi-daemon.service" ];
       serviceConfig = {
         Type = "notify";
         NotifyAccess = "all";
-        # `always` not `on-failure`: `ip monitor address` is supposed to
-        # run forever, so any exit (including the clean exit 0 that
-        # would happen if its pipe closes) is a failure mode for us.
-        # systemd correctly distinguishes operator-initiated stops
-        # (systemctl stop) from process exits and doesn't re-spawn on
-        # the former, so this is safe.
+        # `always` not `on-failure`: `ip monitor route` running forever
+        # means any exit is a failure mode, including clean exit 0
+        # when its pipe closes. systemd distinguishes operator stops
+        # from process exits, so we don't respawn on `systemctl stop`.
         Restart = "always";
         RestartSec = "5s";
-        RuntimeDirectory = "avahi-per-interface-names";
+        RuntimeDirectory = "avahi-primary-interface";
         RuntimeDirectoryMode = "0755";
         ExecStart = watcherScript;
       };
