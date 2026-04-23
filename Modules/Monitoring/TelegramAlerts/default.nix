@@ -116,8 +116,11 @@ let
       text=$(${pkgs.coreutils}/bin/tail -n +3 "$msg")
 
       # Stale-message decoration: if the event is older than 60s at
-      # delivery time, prepend queued-ago so the reader sees event time,
-      # not delivery time.
+      # delivery time, append a queued-ago note on its own italicised
+      # line at the bottom. Putting it at the end (not the start) keeps
+      # the real message's icon + heading aligned with real-time
+      # siblings in Telegram's chat view; italics make the metadata
+      # visually distinct from the message body itself.
       now=$(${pkgs.coreutils}/bin/date +%s)
       age=$((now - ts))
       if [ "$age" -gt 60 ]; then
@@ -128,7 +131,7 @@ let
         else
           dur="$((age / 60))m"
         fi
-        text="⏱ queued $dur ago — $text"
+        text="$text"$'\n'"<i>⏱ queued $dur ago</i>"
       fi
 
       # --data-urlencode so message text can contain any chars without
@@ -558,7 +561,39 @@ in
       };
     };
 
-    # Boot notification → log channel.
+    # Early boot-started notification → log channel.
+    #
+    # Ordered for "as early as possible that we can still enqueue": we
+    # need /var writable (so the enqueue helper can create the spool file)
+    # AND the spool directory to exist. Both conditions are satisfied
+    # after systemd-tmpfiles-setup has run. That's still well BEFORE
+    # network-online.target, dhcp, mDNS publishing, anything interactive.
+    # The message will sit in the outbox until drain gets a chance to
+    # send; it'll arrive with an "⏱ queued Nm ago" decoration.
+    #
+    # Paired with boot-notify (below) which fires after multi-user.target
+    # and signifies "boot complete". Together they bracket the boot window
+    # visibly in the Telegram log.
+    systemd.services.boot-started-notify = {
+      description = "Enqueue Telegram boot-started notification as early as possible";
+      wantedBy = [ "sysinit.target" ];
+      before = [ "sysinit.target" "shutdown.target" ];
+      after = [ "local-fs.target" "systemd-tmpfiles-setup.service" ];
+      conflicts = [ "shutdown.target" ];
+      unitConfig.DefaultDependencies = false;
+      serviceConfig = {
+        Type = "oneshot";
+        RemainAfterExit = true;
+        ExecStart = pkgs.writeShellScript "boot-started-notify" ''
+          HOST=$(${pkgs.hostname}/bin/hostname)
+          KERNEL=$(${pkgs.coreutils}/bin/uname -r)
+          ${sendLog} "🚀 <b>$HOST</b> boot started
+Kernel: $KERNEL"
+        '';
+      };
+    };
+
+    # Boot-complete notification → log channel.
     #
     # Dedupe by /proc/sys/kernel/random/boot_id — a UUID the kernel assigns
     # at boot. Stamp file in /run (tmpfs, cleared on reboot) remembers which
@@ -600,6 +635,52 @@ in
           ${sendLog} "🟢 <b>$HOST</b> booted #$COUNT
 Kernel: $KERNEL
 Uptime: $UPTIME"
+        '';
+      };
+    };
+
+    # SD / eMMC / filesystem kernel-error monitor → alerts channel.
+    #
+    # This consumer SD card (Samsung ED2S8) doesn't expose the MMC
+    # life_time or pre_eol_info sysfs attributes, so we can't read
+    # "remaining wear" directly. What we CAN do cheaply is watch the
+    # kernel log for the specific error patterns a failing / flaky
+    # SD card produces — CRC failures, I/O errors, ext4 corruption
+    # flags — and raise an alert the moment one appears. High
+    # signal-to-noise: these patterns are rare on healthy hardware
+    # and diagnostic when they do appear. Any occurrence is a signal
+    # to back up + replace the card.
+    #
+    # Runs `journalctl -kf --since=now` which follows the kernel log
+    # from this point forward (no replay of historical errors on
+    # service restart). Restart=always keeps it alive; crash-resilient
+    # because journald is the source of truth.
+    systemd.services.sd-health-monitor = {
+      description = "Watch kernel log for SD card / MMC / ext4 errors, alert on match";
+      wantedBy = [ "multi-user.target" ];
+      serviceConfig = {
+        Type = "simple";
+        Restart = "always";
+        RestartSec = "30s";
+        ExecStart = pkgs.writeShellScript "sd-health-monitor" ''
+          HOST=$(${pkgs.hostname}/bin/hostname)
+          ${pkgs.systemd}/bin/journalctl -kf --no-pager -q -o cat --since "now" \
+            | while read -r line; do
+            case "$line" in
+              *"mmc0: error"*|*"mmcblk0: error"*|*"sdhci"*" error"*|*"mmc0: "*"timeout"*)
+                ${sendAlert} "💾 <b>$HOST</b>: SD/MMC kernel error
+<pre>$line</pre>"
+                ;;
+              *"EXT4-fs error"*|*"EXT4-fs"*"warning"*|*"Buffer I/O error"*|*"blk_update_request"*)
+                ${sendAlert} "💾 <b>$HOST</b>: filesystem / block I/O error
+<pre>$line</pre>"
+                ;;
+              *"CRC failure"*|*"CRC error"*|*"command"*"CRC"*)
+                ${sendAlert} "💾 <b>$HOST</b>: SD CRC error — bit flip / aging card suspected
+<pre>$line</pre>"
+                ;;
+            esac
+          done
         '';
       };
     };
