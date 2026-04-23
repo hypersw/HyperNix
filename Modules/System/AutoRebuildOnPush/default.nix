@@ -160,6 +160,11 @@ in
     # ── Checker: unprivileged, hardened, internet-facing ────────────
     systemd.services.auto-rebuild-github-checker = {
       description = "Check upstream flake for changes; queue a switch if any";
+      # HOME defaults to /var/empty for isSystemUser (which is 0555 immutable),
+      # but `nix flake metadata` wants to mkdir $HOME/.cache/nix for its eval
+      # cache. Point HOME at the writable runtime directory instead. Cleared
+      # on reboot (tmpfs); acceptable for a 5-min-interval checker.
+      environment.HOME = "%t/auto-rebuild";
       serviceConfig = {
         Type = "oneshot";
         ExecStart = checkerScript;
