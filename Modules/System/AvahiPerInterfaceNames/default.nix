@@ -96,9 +96,18 @@ let
           [ -z "$addrs" ] && continue
           local suffix
           suffix=$(name_for "$iface")
-          # addrs is whitespace-separated CIDR (e.g. "192.168.1.129/24").
-          # Emit one A/AAAA-mapping line per address.
+          # addrs is whitespace-separated. Newer iproute2 interleaves
+          # non-address tokens ("metric", "1002", "3003", flags, etc.)
+          # with actual CIDR addresses, so filter strictly: only tokens
+          # containing a slash AND only IP-charset characters survive.
           for addr in $addrs; do
+            case "$addr" in
+              */*) ;;                             # must look like CIDR
+              *)   continue ;;
+            esac
+            case "''${addr%/*}" in
+              *[!0-9a-fA-F:.]*) continue ;;       # must be IP-shaped
+            esac
             echo "''${addr%/*}  $host-$suffix.local"
           done
         done \
