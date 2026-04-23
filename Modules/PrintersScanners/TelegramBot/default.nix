@@ -92,11 +92,39 @@ in
         User = "printscan-bot";
         Group = daemonCfg.group;  # access to daemon's socket
 
-        # Hardening
+        # Hardening.
+        #
+        # First-hop exposed: this process talks HTTPS to Telegram's Bot API
+        # and long-polls for messages. Every inbound message is attacker-
+        # shaped until the allowedUsers check passes (and deserialisation /
+        # callback-data parsing runs *before* that check). Apply the whole
+        # kitchen-sink bundle — we have no need for exotic syscalls, no JIT
+        # concerns beyond what .NET itself needs, and no device access.
         ProtectSystem = "strict";
         ProtectHome = true;
         PrivateTmp = true;
         NoNewPrivileges = true;
+        ProtectKernelTunables = true;
+        ProtectKernelModules = true;
+        ProtectKernelLogs = true;
+        ProtectControlGroups = true;
+        ProtectClock = true;
+        ProtectHostname = true;
+        ProtectProc = "invisible";      # /proc/<other-pid> invisible
+        PrivateDevices = true;          # no /dev/* beyond /dev/null, /dev/zero etc.
+        LockPersonality = true;
+        RestrictSUIDSGID = true;
+        RestrictRealtime = true;
+        RestrictNamespaces = true;
+        # Narrow the network syscalls: the bot needs IPv4/IPv6 for HTTPS to
+        # api.telegram.org and AF_UNIX for the daemon socket. Explicitly
+        # deny AF_NETLINK (no interface enumeration), AF_PACKET (no raw
+        # sockets), and every other family.
+        RestrictAddressFamilies = [ "AF_INET" "AF_INET6" "AF_UNIX" ];
+        # Skipped: MemoryDenyWriteExecute (breaks .NET JIT). SystemCallFilter
+        # is another option but .NET's syscall footprint is broad enough that
+        # @system-service-with-exclusions needs case-by-case tuning; leave
+        # for a follow-up if we decide we want it.
       };
     };
   };

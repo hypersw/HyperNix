@@ -142,11 +142,35 @@ in
         KillSignal = "SIGTERM";
         SendSIGHUP = false;
 
-        # Hardening
+        # Hardening.
+        #
+        # This daemon is "second-hop exposed": it has no direct internet
+        # surface (Unix socket only, PrivateNetwork=true below enforces
+        # that), but it receives JSON forwarded verbatim from the Telegram
+        # bot — scan params, session PATCHes, print payloads — originating
+        # from Telegram users. If the bot is ever owned, the daemon is the
+        # next target. We apply the "real protection, no fallout" bundle,
+        # skipping anything that would conflict with our need for /dev/bus/usb
+        # (scanner) and /run/cups/cups.sock (printer).
         ProtectSystem = "strict";
         ProtectHome = true;
         PrivateTmp = true;
         NoNewPrivileges = true;
+        ProtectKernelTunables = true;   # block writes to /proc/sys, /sys
+        ProtectKernelModules = true;    # no kernel module load
+        ProtectKernelLogs = true;       # no /dev/kmsg (we don't read kernel log)
+        ProtectControlGroups = true;    # cgroup ro — closes cgroup-escape
+        ProtectClock = true;            # no settime()/adjtimex()
+        ProtectHostname = true;         # no sethostname()
+        LockPersonality = true;         # block personality() ASLR-disable
+        RestrictSUIDSGID = true;        # no setuid/setgid file creation
+        RestrictRealtime = true;        # no SCHED_FIFO/RR DoS
+        RestrictNamespaces = true;      # no unshare()/setns()
+        # Skipped: PrivateDevices (need /dev/bus/usb for the scanner),
+        # MemoryDenyWriteExecute (breaks .NET JIT), ProtectProc=invisible
+        # (our in-process shutdown diagnostic reads /proc/<self>/task/*;
+        # self-proc is visible under "invisible" so it *should* work, but
+        # pending verification).
 
         # Needed for the in-process shutdown diagnostic in Program.cs to
         # (a) read /proc/<pid>/task/<tid>/stack of sibling threads and
