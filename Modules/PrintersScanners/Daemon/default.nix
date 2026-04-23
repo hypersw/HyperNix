@@ -69,6 +69,15 @@ in
         # systemd (UseSystemd + ConfigureKestrel.ListenHandle in code).
         # If LISTEN_FDS is missing the daemon now fails fast rather than
         # silently TCP-binding to :5000 — see src/Program.cs.
+
+        # Disable the CLR managed-debugger IPC port. The DebugPipe thread
+        # is non-daemon and blocks in open() on a FIFO waiting for a
+        # debugger partner that never arrives; on SIGTERM the runtime
+        # can't shut down until that thread exits, so the daemon hangs
+        # until TimeoutStopSec=5min SIGKILLs it. We never attach a remote
+        # debugger to this daemon in prod, so turning the IPC off avoids
+        # the hang. EventPipe/profiler/createdump-on-crash stay available.
+        DOTNET_EnableDiagnostics_IPC = "0";
       }
       # SANE backend lookup vars (SANE_CONFIG_DIR + LD_LIBRARY_PATH).
       # Must be service-level, not globalEnvironment, to avoid triggering

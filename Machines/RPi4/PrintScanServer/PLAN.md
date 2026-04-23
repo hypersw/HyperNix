@@ -567,14 +567,34 @@ with an outer sync boundary at `app.Run()` which is
 `host.WaitForShutdownAsync().GetAwaiter().GetResult()`. No
 `SynchronizationContext` in the console host = sync-over-async here
 doesn't deadlock — just blocks on what the async side is waiting on.
-Since every piece of the async side we control has already completed
-(per the log markers), the hang is in **framework-internal post-
-dispose cleanup** — probably Kestrel's socket teardown waiting for a
-peer-RST that never comes, or a non-daemon thread in a native library
-we've linked.
+Every piece of the async side we control completes cleanly (per the
+log markers), so the hang is in **framework-internal thread teardown**.
 
-**Mitigation**: a two-part diagnostic capture inside
-`ApplicationStopped`, scheduled 10 seconds after the event fires:
+Live kernel-stack capture during a hang (via `sudo` — the daemon user
+lacked `CAP_SYS_PTRACE` at the time) pinned the culprit: the CLR's
+`.NET DebugPipe` thread stuck in `wait_for_partner` → `fifo_open` →
+`__arm64_sys_openat`. That thread manages the managed-debugger IPC
+channel at `/tmp/clr-debug-pipe-<pid>-<ts>-{in,out}`. Linux `open()`
+on a named pipe blocks until both ends are opened; nothing ever
+connects in prod, so the thread is permanently parked in `openat()`.
+Because it's a non-daemon thread, the CLR can't tear down the
+process until it exits — and it never will. All 26 other threads
+were parked in benign `futex_wait`/`poll`/`epoll_wait` — waiting for
+*this* thread to let the runtime finish.
+
+**Fix**: set `DOTNET_EnableDiagnostics_IPC=0` in the daemon service
+environment. Disables the managed-debugger IPC port (we never attach
+a remote debugger in prod), so the DebugPipe thread is not created,
+so shutdown completes promptly. Profiler + EventPipe + crash
+createdump remain available.
+
+**Standing diagnostic**: a two-part capture inside
+`ApplicationStopped`, scheduled 10 seconds after the event fires.
+Retained even with the DebugPipe fix in place, so future shutdown
+hangs of a different flavor produce automatic evidence rather than
+requiring ad-hoc `sudo` on the device. Requires `CAP_SYS_PTRACE`
+(granted as an ambient cap in the service unit) to read the stacks
+of sibling threads and to exec `createdump`.
 
   1. Per-thread kernel stack dump via `/proc/<pid>/task/<tid>/stack`,
      with `comm` and `state` (R/S/D/...). Cheap, always works — tells
