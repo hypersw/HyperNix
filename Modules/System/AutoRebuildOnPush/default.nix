@@ -23,7 +23,9 @@ let
     # stalled nix flake metadata) skip this tick cleanly rather than
     # queueing concurrent checks. Kernel releases the flock if the holder
     # dies unexpectedly — no stale-lock wedge on crash.
-    LOCK=/run/auto-rebuild-github-checker.lock
+    # Lock lives inside the RuntimeDirectory (owned by this user) because
+    # /run proper is root-writable only.
+    LOCK=${triggerDir}/check.lock
     exec 9>>"$LOCK"
     if ! ${pkgs.util-linux}/bin/flock -n 9; then
       echo "previous check still active — skipping this tick"

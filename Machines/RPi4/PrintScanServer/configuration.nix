@@ -346,19 +346,15 @@
       ipv6AcceptRAConfig.RouteMetric = 1002;
       routes = [
         {
-          routeConfig = {
-            Destination = "0.0.0.0/0";
-            Gateway = "_dhcp4";
-            Table = 100;
-          };
+          Destination = "0.0.0.0/0";
+          Gateway = "_dhcp4";
+          Table = 100;
         }
       ];
       routingPolicyRules = [
         {
-          routingPolicyRuleConfig = {
-            FirewallMark = 100;
-            Table = 100;
-          };
+          FirewallMark = 100;
+          Table = 100;
         }
       ];
     };
@@ -373,19 +369,15 @@
       ipv6AcceptRAConfig.RouteMetric = 3003;
       routes = [
         {
-          routeConfig = {
-            Destination = "0.0.0.0/0";
-            Gateway = "_dhcp4";
-            Table = 200;
-          };
+          Destination = "0.0.0.0/0";
+          Gateway = "_dhcp4";
+          Table = 200;
         }
       ];
       routingPolicyRules = [
         {
-          routingPolicyRuleConfig = {
-            FirewallMark = 200;
-            Table = 200;
-          };
+          FirewallMark = 200;
+          Table = 200;
         }
       ];
       linkConfig.RequiredForOnline = "no";
