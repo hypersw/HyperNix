@@ -215,7 +215,63 @@ var lifetime = app.Services.GetRequiredService<IHostApplicationLifetime>();
 lifetime.ApplicationStopping.Register(() =>
     app.Logger.LogInformation("lifetime: ApplicationStopping fired"));
 lifetime.ApplicationStopped.Register(() =>
-    app.Logger.LogInformation("lifetime: ApplicationStopped fired"));
+{
+    app.Logger.LogInformation("lifetime: ApplicationStopped fired");
+
+    // Diagnostic capture for the post-stopped hang observed on
+    // 2026-04-23: after this callback fires, after every hosted
+    // service's StopAsync returns, after every IAsyncDisposable's
+    // DisposeAsync completes, the CLR process nonetheless refuses
+    // to exit — systemd waits out the full TimeoutStopSec before
+    // sending SIGKILL. Something framework-internal (Kestrel socket
+    // teardown? non-daemon thread in a native lib?) keeps the
+    // process alive past any code we own.
+    //
+    // Dumping /proc/<pid>/task/*/stack tells us which syscall each
+    // thread is blocking in (kernel view); managed stacks via the
+    // runtime's diagnostic port would complement that with CLR
+    // context. We then let systemd SIGKILL at the real timeout so
+    // next-time evidence is preserved.
+    _ = Task.Run(async () =>
+    {
+        await Task.Delay(TimeSpan.FromSeconds(10));
+        var log = app.Logger;
+        var pid = Environment.ProcessId;
+        log.LogWarning(
+            "lingering {Seconds}s after ApplicationStopped — dumping per-thread kernel stacks (pid={Pid})",
+            10, pid);
+
+        try
+        {
+            foreach (var tdir in Directory.EnumerateDirectories($"/proc/{pid}/task"))
+            {
+                var tid = Path.GetFileName(tdir);
+                string comm = "?", state = "?", stack = "?";
+                try { comm = File.ReadAllText(Path.Combine(tdir, "comm")).TrimEnd(); } catch { }
+                try
+                {
+                    var statLine = File.ReadAllText(Path.Combine(tdir, "stat"));
+                    // stat field 3 is state (R/S/D/Z/T/...); split carefully
+                    // because comm (field 2) can contain spaces, delimited by
+                    // parentheses.
+                    var rp = statLine.LastIndexOf(')');
+                    if (rp >= 0 && rp + 2 < statLine.Length)
+                        state = statLine[rp + 2].ToString();
+                }
+                catch { }
+                try { stack = File.ReadAllText(Path.Combine(tdir, "stack")).TrimEnd(); } catch (Exception ex) { stack = $"(unreadable: {ex.Message})"; }
+                log.LogWarning("thread tid={Tid} comm={Comm} state={State}\n{Stack}",
+                    tid, comm, state, stack);
+            }
+        }
+        catch (Exception ex)
+        {
+            log.LogWarning(ex, "thread stack enumeration failed");
+        }
+
+        log.LogWarning("diagnostic dump complete; leaving the rest to systemd's TimeoutStopSec (SIGKILL)");
+    });
+});
 
 app.Run();
 app.Logger.LogInformation("main: app.Run returned, about to exit");

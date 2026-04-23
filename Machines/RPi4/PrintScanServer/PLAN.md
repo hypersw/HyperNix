@@ -542,7 +542,10 @@ means no data is lost while we decide what to do.
 Both `printscan-daemon.service` and `printscan-bot.service` participate in
 generous, bounded shutdown:
 
-- `TimeoutStopSec=20min` on both units (cover worst-case scan+upload).
+- `TimeoutStopSec=5min` on the daemon (cover worst-case scan+upload; picked
+  down from an earlier 20min after observing that most real scans finish
+  well under a minute — 5min is plenty for the legitimate in-flight case,
+  and short enough that a hung shutdown is visibly recoverable).
 - Services trap SIGTERM via `IHostApplicationLifetime`, refuse to exit while
   any `inFlightScan` or upload is active. A simple gauge; tasks increment/
   decrement and the handler `await`s it to drain before calling `StopAsync`.
@@ -550,6 +553,42 @@ generous, bounded shutdown:
   restarts, session reloaded from disk.
 - Hard kill (OOM, panic, power): in-flight scan lost (see session lifecycle
   above); persisted session + staged files recover everything else.
+
+**Observed shutdown hang (2026-04-23).** After `ApplicationStopping` +
+`ApplicationStopped` callbacks fire, `ShutdownGate.StopAsync` returns
+with zero in-flight ops, `SessionService.DisposeAsync` completes — the
+CLR process nonetheless refuses to exit. systemd waits the full
+`TimeoutStopSec = 5min` and sends SIGKILL.
+
+**Diagnosis**: blocking shutdown sequence is async internally
+(`IHostedService.StopAsync` awaited; `IAsyncDisposable.DisposeAsync`
+awaited; each hosted service's cancellation token threaded through),
+with an outer sync boundary at `app.Run()` which is
+`host.WaitForShutdownAsync().GetAwaiter().GetResult()`. No
+`SynchronizationContext` in the console host = sync-over-async here
+doesn't deadlock — just blocks on what the async side is waiting on.
+Since every piece of the async side we control has already completed
+(per the log markers), the hang is in **framework-internal post-
+dispose cleanup** — probably Kestrel's socket teardown waiting for a
+peer-RST that never comes, or a non-daemon thread in a native library
+we've linked.
+
+**Mitigation**: a diagnostic capture inside `ApplicationStopped`
+scheduled for 10 seconds after the event. If the process is still
+alive at that point, dump per-thread kernel stacks by reading
+`/proc/<pid>/task/<tid>/stack`, along with each thread's `comm` and
+`state` (`R`/`S`/`D`/etc.), and log them to the journal. Then let
+systemd SIGKILL at the 5-minute mark — the 5-min timeout is
+intentional (gives in-flight scans + uploads time to finish when the
+system decides to switch mid-scan) so we don't want to lower it; and
+preserving the evidence for post-mortem beats forcing a clean exit.
+
+Once we have the kernel-stack dump from a real hang, we know which
+syscall each thread is blocking in, which nails down the specific
+subsystem to investigate. Managed-stack complement (via
+`dotnet-stack report --process-id <pid>` from an external helper, or
+`gcore` + `dotnet-dump analyze`) available if the kernel view isn't
+enough.
 
 ### Relationship with AirSane/CUPS
 
@@ -702,6 +741,162 @@ nixpkgs refreshes.
 
 (Telegram-push alternative parked — polling cost is trivial and the
 GitHub webhook setup would need a public endpoint we don't have.)
+
+### Recent Improvements and Discoveries (late April 2026)
+
+Concentrated hardening pass on network plumbing, boot observability,
+and alerting — documented here because several choices are non-obvious
+and easy to re-break.
+
+**Network stack: legacy → networkd + resolved + avahi (hybrid mDNS).**
+Migrated off `dhcpcd` + Avahi-only. Now systemd-networkd owns L3 and
+DHCP, systemd-resolved owns the DNS stub (`/etc/resolv.conf` →
+127.0.0.53). Per-link `MulticastDNS=no` on resolved so it doesn't
+contend with Avahi for `:5353`. Wi-Fi auth stays with `wpa_supplicant`
+(networkd doesn't do 802.11).
+
+**Dynamic Avahi primary-interface tracker.** Avahi (and resolved's
+mDNS) both hit self-conflict on multi-interface hosts whose
+interfaces share an L2 segment — the AP bridges multicast between
+wlan0 and end0, each interface sees its sibling's announcement as
+"another device claiming my name," runs RFC 6762 conflict resolution,
+and renames the host to `printscan7.local`, `printscan190.local`, etc.
+Observed in practice. `/etc/avahi/hosts` per-interface-names approach
+doesn't fix it (static-hosts are published with `AVAHI_IF_UNSPEC`,
+same bridging, same conflict). Fix: a watcher
+(`avahi-primary-interface-watcher`) writes
+`allow-interfaces=<primary>` into a runtime-generated
+`avahi-daemon.conf` that avahi is pointed at via `-f`. Subscribes to
+`ip monitor route`; when the default route's preferred interface
+changes (end0 carrier drop → wlan0 promoted), rewrites the conf and
+restarts avahi. ~1-2 sec mDNS blackout on interface transitions;
+acceptable given transitions are rare. Placeholder
+`allow-interfaces=lo` gets written if no default route exists yet
+(early boot before DHCP), so avahi-daemon starts cleanly and we
+regenerate on the first real route event. `Restart=always` on the
+watcher so any exit (including clean exit when `ip monitor` pipe
+closes) respawns.
+
+**Source-routing for symmetric replies.** Both interfaces on the same
+`/24` means a reply to incoming traffic on wlan0 can leave via end0
+(kernel's route lookup picks by metric), producing a frame whose
+src-IP (wlan0's) doesn't match its src-MAC (end0's) — UniFi APs drop
+that on per-client MAC-IP binding. The fix is a **connmark-based
+policy-routing chain**:
+
+  PREROUTING (iptables mangle):
+    -i end0  -j MARK --set-mark 100   # set packet nfmark
+    -i wlan0 -j MARK --set-mark 200
+    -j CONNMARK --save-mark           # persist nfmark → ctmark
+    -j nixos-fw-rpfilter              # NixOS's own rpfilter check
+  OUTPUT (iptables mangle):
+    -j CONNMARK --restore-mark        # ctmark → nfmark for replies
+
+Paired with networkd config:
+  - `dhcpV4Config.RouteMetric = 1002` on end0 / `3003` on wlan0
+    (replaces dhcpcd's automatic interface-type-based metrics that
+    networkd doesn't do).
+  - Per-interface tables 100/200 with `Route = Destination=0.0.0.0/0,
+    Gateway=_dhcp4` (uses the DHCP-learned gateway without hardcoding
+    an IP).
+  - `routingPolicyRules` with `FirewallMark=100 → Table=100` etc.
+
+Pi-originated connections have nfmark=0, fall through to main table,
+end0 metric wins = Ethernet preferred for egress. Replies to incoming
+traffic inherit the mark from conntrack and route out the arrival
+interface = symmetric.
+
+**Traps learned:**
+  1. `MARK --set-mark` sets packet nfmark; `CONNMARK --set-mark` sets
+     conntrack's ctmark. Rpfilter's `--validmark` reads nfmark. If you
+     use CONNMARK, mark stays 0 for rpfilter and rpfilter drops
+     wlan0 arrivals as reverse-path mismatch against the main table.
+  2. CONNMARK rules must be inserted at position 1 (`iptables -I`),
+     not appended — NixOS's rpfilter chain is appended as the first
+     PREROUTING rule, so our mark must set before it runs.
+  3. `net.ipv4.conf.all.arp_ignore = 1` + `arp_announce = 2` required:
+     without them both end0 and wlan0 answer ARP for either IP, and
+     whichever is faster wins — usually Ethernet, so the laptop caches
+     end0's MAC for .130 and all the above source-routing is useless
+     because packets arrive on the wrong physical interface.
+  4. `_dhcp4` / `_dhcp6` / `_ipv6ra` as `Gateway=` values in
+     `[Route]` sections of `.network` files: networkd substitutes the
+     DHCP-learned next-hop at runtime — no hardcoded IPs needed.
+
+**Alert outbox** (async, offline-resilient notifications). Previously,
+each notify script synchronously `curl`'d Telegram. Unreliable when
+network is flapping; silent loss on shutdown/brownout. Now every
+notify script enqueues a message file into
+`/var/spool/alert-telegram-outbox/` (atomic mktemp + rename). A
+drainer service + path-unit + timer consume the spool, send to
+Telegram, delete on success, retry on failure. Clock-skew-proof:
+enqueue records the host's `boot_id` alongside the wall-clock
+timestamp; drainer caps the computed "queued ago" age at
+`/proc/uptime` when the boot_ids match, so messages enqueued pre-NTP-
+sync don't read as "queued 35m ago" when the Pi has only been up for
+90s.
+
+**Boot telemetry.** Two separate notifications bracket the boot
+window:
+  - `boot-started-notify` fires very early (`DefaultDependencies=no`,
+    `Before=sysinit.target`, `After=local-fs.target`), enqueues a ⚪
+    message with persistent sequence number, dedupes per boot_id.
+    Sequence counter owned here (not boot-notify) because this fires
+    on EVERY boot, including ones that fail before multi-user — a
+    bootloop is visible as a gap between started-count and booted
+    occurrences.
+  - `boot-notify` fires after multi-user.target is reached (🟢). No
+    sequence number.
+Plus `shutdown-notify` (🔴) with a forced synchronous drain on its
+ExecStop so the shutdown telegram lands before the machine actually
+powers off.
+
+**SD health (MMC/eMMC) monitoring.** The installed Samsung ED2S8
+card doesn't expose `life_time` / `pre_eol_info` sysfs attributes
+(consumer cards rarely do — industrial/endurance cards typically do).
+Fallback: `sd-health-monitor` follows the kernel journal
+(`journalctl -kf`) and enqueues a 💾 alert on matching patterns —
+`mmc0/mmcblk0/sdhci error`, `EXT4-fs error/warning`, `Buffer I/O
+error`, `blk_update_request`, `CRC failure`. High signal-to-noise;
+any occurrence is a "replace the card" signal.
+
+**BootStabilityProbe staged peripheral bring-up.** Module already in
+tree (Modules/System/BootStabilityProbe), enabled on
+PrintScanServer after the silent-reset loop on 2026-04-21. Blacklists
+xhci_hcd_pci / xhci_pci / brcmfmac / brcmfmac_wcc / brcmutil at
+kernel cmdline, then modprobes them serially after a 20-sec settle,
+with aggressive journald sync between stages. Helps split peripheral
+init transients in time and makes the journal pinpoint which stage
+triggers a reset if one recurs.
+
+**Throttle / undervoltage persistent log.** `/var/log/throttle.log`
+sampled every 5 min via `vcgencmd get_throttled` + volt/temp. The
+register reads "events since last boot" — a full brownout wipes it,
+so only sub-brownout sags accumulate. Still useful: pre-brownout
+0x50000 in the log before a silent reset = definitive PSU evidence.
+
+**Pstore/ramoops best-effort.** Kernel cmdline sets
+`ramoops.mem_address=0x08000000 ramoops.mem_size=0x100000 ecc=1`
+etc. No DT `reserved-memory` node on Pi 4 without a custom overlay,
+so the region isn't formally reserved — kernel may use it for other
+purposes, ramoops headers get trashed, no data preserved. Left in
+because a future hardware / DT update might start honoring it; costs
+nothing on the failure path.
+
+**Bot UX polish** (end-user facing):
+  - Tap-to-edit Format/DPI buttons on session status message (no
+    modal wizard).
+  - Format/DPI picker submenus with 🔘/⚪ radio-button emoji for the
+    current selection (empty circle unselected as placeholder; user
+    may pick a different pair — several candidates discussed).
+  - "end session" is a Telegram hyperlink in the message body
+    (`https://t.me/<bot>?start=end_<sid>`), not a keyboard button.
+    Tap triggers `/start end_<sid>` to the bot, which closes the
+    session and deletes the user's `/start` message. Keeps Scan
+    prominent as the only button in the last row.
+  - Queued-ago decoration on delayed messages: `<i>⏱ queued Nm ago</i>`
+    on a separate italicised line at the END of the message (not the
+    start) so real-time siblings in the chat stay column-aligned.
 
 ### Implementation Order
 
