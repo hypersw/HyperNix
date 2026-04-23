@@ -3,9 +3,21 @@ using Microsoft.Extensions.Hosting.Systemd;
 using PrintScan.Daemon;
 using PrintScan.Shared;
 
+// Startup-phase timing probe. The daemon takes ~16 s on an RPi 4 between
+// systemd "Starting" and our first LogInformation — way higher than
+// expected for a minimal ASP.NET app. These Console.WriteLines are written
+// straight to stderr (systemd captures them into the journal); they're
+// independent of the logging pipeline, which isn't live until after Build().
+var _bootSw = System.Diagnostics.Stopwatch.StartNew();
+static void BootLog(System.Diagnostics.Stopwatch sw, string phase) =>
+    Console.Error.WriteLine($"[boot +{sw.ElapsedMilliseconds,6} ms] {phase}");
+BootLog(_bootSw, "entered Main (CLR init complete)");
+
 var builder = WebApplication.CreateBuilder(args);
+BootLog(_bootSw, "WebApplication.CreateBuilder done");
 
 builder.Host.UseSystemd();
+BootLog(_bootSw, "UseSystemd done");
 
 // Bot and daemon both use System.Text.Json but the bot opts into
 // JsonStringEnumConverter (ScanFormat serialized as "Jpeg"/"Png"/"Tiff").
@@ -51,8 +63,10 @@ builder.Services.AddSingleton<ScannerMonitor>();
 builder.Services.AddHostedService(sp => sp.GetRequiredService<ScannerMonitor>());
 builder.Services.AddSingleton<ButtonPoller>();
 builder.Services.AddHostedService(sp => sp.GetRequiredService<ButtonPoller>());
+BootLog(_bootSw, "service registration done");
 
 var app = builder.Build();
+BootLog(_bootSw, "builder.Build() done");
 
 // ── Status ──────────────────────────────────────────────────────────────────
 
@@ -199,6 +213,7 @@ app.MapGet("/events", async (HttpContext ctx, EventBroker broker, SessionService
     }
 });
 
+BootLog(_bootSw, "endpoint mapping done, about to start host");
 app.Logger.LogInformation("PrintScan daemon starting (state={StateDir})", stateDir);
 
 // Shutdown-phase diagnostic logging. The 2026-04-21 hang showed the
