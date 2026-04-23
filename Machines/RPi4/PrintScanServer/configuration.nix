@@ -246,9 +246,21 @@
       #   the interface it arrived on — symmetric reply, no AP MAC-IP
       #   binding trouble. Pi-originated new connections have no mark
       #   and fall through to the main table (end0 metric wins).
+      #
+      # The CONNMARK rules MUST be inserted at the top of PREROUTING
+      # (before nixos-fw-rpfilter). NixOS's rpfilter runs with
+      # `--validmark`, meaning it consults the packet mark + policy
+      # rules to determine reverse path. If our mark isn't set when
+      # rpfilter runs, mark=0 falls through to the main table, which
+      # has both interfaces — and lower-metric end0 wins for all source
+      # IPs on 192.168.1.0/24. That makes any packet arriving on wlan0
+      # look like a reverse-path mismatch. Dropped. Symmetrical routing
+      # machinery never gets a chance. By inserting CONNMARK at the
+      # top, the mark is set before rpfilter checks, and --validmark
+      # correctly follows our per-interface policy rules.
       extraCommands = ''
-        iptables -t mangle -A PREROUTING -i end0 -j CONNMARK --set-mark 100
-        iptables -t mangle -A PREROUTING -i wlan0 -j CONNMARK --set-mark 200
+        iptables -t mangle -I PREROUTING 1 -i end0 -j CONNMARK --set-mark 100
+        iptables -t mangle -I PREROUTING 2 -i wlan0 -j CONNMARK --set-mark 200
         iptables -t mangle -A OUTPUT -j CONNMARK --restore-mark
       '';
       extraStopCommands = ''
