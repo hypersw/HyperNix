@@ -17,83 +17,23 @@
   outputs = { self, nixpkgs, nixos-hardware, microvm, sops-nix }:
     let
       forAllSystems = nixpkgs.lib.genAttrs [ "x86_64-linux" "aarch64-linux" ];
-
-      # Package builders — parameterized by pkgs
-      mkClosefrom3 = pkgs: pkgs.stdenv.mkDerivation {
-        pname = "closefrom3";
-        version = "1.0.0";
-        src = ./Util/CloseFrom3;
-        buildPhase = "$CC -O2 -Wall -o closefrom3 closefrom3.c";
-        installPhase = "mkdir -p $out/bin; cp closefrom3 $out/bin/";
-        meta.platforms = pkgs.lib.platforms.linux;
-      };
-
-      mkSshAskpass = pkgs: { timeout ? 3600, perTokenPin ? false }:
-        let closefrom = mkClosefrom3 pkgs;
-        in pkgs.writeShellScriptBin "ssh-askpass-credential-helper" ''
-          prompt="''${1:-}"
-
-          case "$prompt" in
-            "Enter PIN for '"*)
-              ${if perTokenPin then ''
-              cache_key="$prompt"
-              '' else ''
-              cache_key="pkcs11-pin"
-              ''}
-              ;;
-            *)
-              cache_key="$prompt"
-              ;;
-          esac
-
-          cached=$(printf 'protocol=pkcs11\nhost=%s\n' "$cache_key" \
-            | ${pkgs.git}/bin/git credential-cache get 2>/dev/null \
-            | ${pkgs.gnugrep}/bin/grep '^password=' | cut -d= -f2-)
-
-          if [ -n "$cached" ]; then
-            echo "$cached"
-            exit 0
-          fi
-
-          value=$(${pkgs.zenity}/bin/zenity --password --title="$prompt" 2>/dev/null) || exit 1
-          echo "$value"
-
-          printf 'protocol=pkcs11\nhost=%s\nusername=tpm\npassword=%s\n' "$cache_key" "$value" \
-            | ${closefrom}/bin/closefrom3 \
-              ${pkgs.git}/bin/git credential-cache --timeout=${toString timeout} store \
-              >/dev/null 2>/dev/null
-        '';
-
-      mkSpaceGitCredential = pkgs:
-        let
-          oauth2c-wrapped = pkgs.symlinkJoin {
-            name = "oauth2c-wrapped";
-            paths = [ pkgs.oauth2c ];
-            nativeBuildInputs = [ pkgs.makeWrapper ];
-            postBuild = ''
-              wrapProgram $out/bin/oauth2c \
-                --prefix PATH : ${pkgs.lib.makeBinPath [ pkgs.xdg-utils ]}
-            '';
-          };
-        in pkgs.writeShellApplication {
-          name = "space-git-credential";
-          excludeShellChecks = [ "SC1091" ];
-          runtimeInputs = [ oauth2c-wrapped pkgs.jq pkgs.curl pkgs.coreutils ];
-          text = builtins.readFile ./Git/SpaceGitCredential/space-git-credential.sh;
-        };
     in
     {
       # ── Packages ──
+      # Each package lives in its own sibling package.nix and is imported here.
+      # Not flake `path:` inputs (those need lock entries and break `nix flake
+      # check`); plain `import` of a .nix file is just a function call.
       packages = forAllSystems (system:
         let
           pkgs = nixpkgs.legacyPackages.${system};
+          closefrom3 = import ./Util/CloseFrom3/package.nix { inherit pkgs; };
           printScanShared = import ./Modules/PrintersScanners/Shared/package.nix { inherit pkgs; };
           printScanDaemon = import ./Modules/PrintersScanners/Daemon/package.nix { inherit pkgs; sharedPackage = printScanShared; };
           printScanBot = import ./Modules/PrintersScanners/TelegramBot/package.nix { inherit pkgs; sharedPackage = printScanShared; };
         in {
-          Util-CloseFrom3 = mkClosefrom3 pkgs;
-          Git-SshAskpassCredentialHelper = mkSshAskpass pkgs {};
-          Git-SpaceGitCredential = mkSpaceGitCredential pkgs;
+          Util-CloseFrom3 = closefrom3;
+          Git-SshAskpassCredentialHelper = import ./Git/SshAskpassCredentialHelper/package.nix { inherit pkgs closefrom3; };
+          Git-SpaceGitCredential = import ./Git/SpaceGitCredential/package.nix { inherit pkgs; };
           Modules-PrintersScanners-Shared = printScanShared;
           Modules-PrintersScanners-Daemon = printScanDaemon;
           Modules-PrintersScanners-TelegramBot = printScanBot;
