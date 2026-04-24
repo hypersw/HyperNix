@@ -68,13 +68,13 @@ AppDomain.CurrentDomain.ProcessExit += (_, _) => cts.Cancel();
 // the Telegram client must never crash the process. Wrap any TG call we
 // make before the main poll loop (which has its own catch+sleep) in a
 // retry with capped exponential back-off.
-var me = await RetryTransient(
+var me = await Retry.Transient(
     () => bot.GetMe(), "bot.GetMe()", log, cts.Token);
 var botUsername = me.Username
     ?? throw new Exception("bot.GetMe() returned no username — token may be wrong");
 log.LogInformation("bot identity: @{Username} (id={Id})", botUsername, me.Id);
 
-await RetryTransient(
+await Retry.Transient(
     () => bot.SetMyCommands([
         new() { Command = "scanner", Description = "📷 Open scanner session" },
         new() { Command = "status", Description = "📊 Printer & scanner status" },
@@ -715,39 +715,45 @@ async Task SweepStagingAsync(CancellationToken ct)
 // 5s-delay retry path. We loop forever (until the passed CancellationToken
 // is tripped); if the box has no connectivity at all, the service just
 // sits here instead of crashing and being marked failed.
-static async Task<T> RetryTransient<T>(
-    Func<Task<T>> op, string what, ILogger log, CancellationToken ct)
+//
+// Lives in a static class (not a local function) because top-level
+// statements compile to one scope and don't permit function overloads;
+// we want both Func<Task<T>> and Func<Task> signatures.
+static class Retry
 {
-    var attempt = 0;
-    while (true)
+    public static async Task<T> Transient<T>(
+        Func<Task<T>> op, string what, ILogger log, CancellationToken ct)
     {
-        try { return await op(); }
-        catch (Exception ex) when (!ct.IsCancellationRequested && IsTransient(ex))
+        var attempt = 0;
+        while (true)
         {
-            attempt++;
-            var delay = TimeSpan.FromSeconds(Math.Min(30, 1 << Math.Min(attempt, 5)));
-            log.LogWarning(
-                "{What} attempt #{N} transient error: {Msg} — retry in {Sec}s",
-                what, attempt, ex.Message, (int)delay.TotalSeconds);
-            try { await Task.Delay(delay, ct); }
-            catch (OperationCanceledException) { throw; }
+            try { return await op(); }
+            catch (Exception ex) when (!ct.IsCancellationRequested && IsTransient(ex))
+            {
+                attempt++;
+                var delay = TimeSpan.FromSeconds(Math.Min(30, 1 << Math.Min(attempt, 5)));
+                log.LogWarning(
+                    "{What} attempt #{N} transient error: {Msg} — retry in {Sec}s",
+                    what, attempt, ex.Message, (int)delay.TotalSeconds);
+                await Task.Delay(delay, ct);
+            }
         }
     }
+
+    public static Task Transient(
+        Func<Task> op, string what, ILogger log, CancellationToken ct) =>
+        Transient<object?>(async () => { await op(); return null; }, what, log, ct);
+
+    // Any network-adjacent failure counts as transient. DNS name-not-known
+    // and socket errors bubble up via TG's RequestException (inner is
+    // HttpRequestException/SocketException). TaskCanceledException also
+    // appears on HTTP timeouts. Operator-signal cancellations are handled
+    // by the ct.IsCancellationRequested check in the outer `when` clause.
+    static bool IsTransient(Exception ex) =>
+        ex is System.Net.Http.HttpRequestException ||
+        ex is System.Net.Sockets.SocketException ||
+        ex is TaskCanceledException ||
+        (ex.InnerException is Exception inner && IsTransient(inner));
 }
-
-static async Task RetryTransient(
-    Func<Task> op, string what, ILogger log, CancellationToken ct) =>
-    await RetryTransient<object?>(async () => { await op(); return null; }, what, log, ct);
-
-// Any network-adjacent failure counts as transient. DNS name-not-known
-// and socket errors bubble up via TG's RequestException (inner is
-// HttpRequestException/SocketException). TaskCanceledException also
-// appears on HTTP timeouts. Operator-signal cancellations are handled
-// by the ct.IsCancellationRequested check in the outer `when` clause.
-static bool IsTransient(Exception ex) =>
-    ex is System.Net.Http.HttpRequestException ||
-    ex is System.Net.Sockets.SocketException ||
-    ex is TaskCanceledException ||
-    (ex.InnerException is Exception inner && IsTransient(inner));
 
 record AllowedUser(long Id, string Name);
