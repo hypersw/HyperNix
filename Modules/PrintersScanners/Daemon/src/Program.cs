@@ -192,10 +192,20 @@ app.MapPost("/sessions/{id}/scan", async (string id, SessionService svc, Cancell
     }
 });
 
+// Each scan may yield multiple encoded variants (one per format bit in
+// ScanParams.Format). The legacy URL `/image/{seq}` defaults to variant 0;
+// the new `/image/{seq}/{variant}` selects a specific variant.
+app.MapGet("/sessions/{id}/image/{seq:int}/{variant:int}",
+    async (string id, int seq, int variant, SessionService svc, HttpResponse response, CancellationToken ct) =>
+        await ServeImage(id, seq, variant, svc, response, ct));
 app.MapGet("/sessions/{id}/image/{seq:int}",
     async (string id, int seq, SessionService svc, HttpResponse response, CancellationToken ct) =>
+        await ServeImage(id, seq, 0, svc, response, ct));
+
+static async Task<IResult> ServeImage(
+    string id, int seq, int variant, SessionService svc, HttpResponse response, CancellationToken ct)
 {
-    var img = svc.GetImage(id, seq);
+    var img = svc.GetImage(id, seq, variant);
     if (img is null) return Results.NotFound();
     response.ContentType = img.ContentType;
     response.Headers.ContentDisposition =
@@ -203,7 +213,7 @@ app.MapGet("/sessions/{id}/image/{seq:int}",
     img.Data.Position = 0;
     await img.Data.CopyToAsync(response.Body, ct);
     return Results.Empty;
-});
+}
 
 // ── Debug / test hooks ──────────────────────────────────────────────────────
 

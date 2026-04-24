@@ -84,9 +84,11 @@ public sealed class DaemonClient : IDisposable
         resp.EnsureSuccessStatusCode();
     }
 
-    public async Task<Stream> FetchImageAsync(string sessionId, int seq, CancellationToken ct)
+    public async Task<Stream> FetchImageAsync(
+        string sessionId, int seq, int variant, CancellationToken ct)
     {
-        var resp = await _http.GetAsync($"/sessions/{sessionId}/image/{seq}",
+        var resp = await _http.GetAsync(
+            $"/sessions/{sessionId}/image/{seq}/{variant}",
             HttpCompletionOption.ResponseHeadersRead, ct);
         resp.EnsureSuccessStatusCode();
         return await resp.Content.ReadAsStreamAsync(ct);

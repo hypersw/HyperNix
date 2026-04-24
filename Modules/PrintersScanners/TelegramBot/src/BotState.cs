@@ -104,10 +104,20 @@ public static class StatusMessage
 
     // ─── Keyboards ─────────────────────────────────────────────────────────
 
+    private static string FormatsLabel(ScanFormat mask)
+    {
+        var parts = new List<string>();
+        if ((mask & ScanFormat.Jpeg)         != 0) parts.Add("JPG");
+        if ((mask & ScanFormat.Png)          != 0) parts.Add("PNG");
+        if ((mask & ScanFormat.WebpLossy)    != 0) parts.Add("WEBP");
+        if ((mask & ScanFormat.WebpLossless) != 0) parts.Add("WEBP-LL");
+        return parts.Count == 0 ? "—" : string.Join("+", parts);
+    }
+
     private static InlineKeyboardMarkup RenderMain(BotSession s)
     {
         var sid = s.DaemonSessionId;
-        var fmt = s.Params.Format.ToString().ToUpperInvariant();
+        var fmt = FormatsLabel(s.Params.Format);
         var rows = new List<InlineKeyboardButton[]>();
         // Row 1: tap-to-change parameter buttons; button labels carry
         // what was previously duplicated in the body text.
@@ -148,24 +158,37 @@ public static class StatusMessage
     private const string SelectedMark   = "🔘 ";
     private const string UnselectedMark = "⚪ ";
 
+    // Checkbox glyphs. ☑/☐ specifically because the ☑ form has a
+    // bolder fill that reads cleanly on both light and dark Telegram
+    // themes; the ✅/⬜ combo looks fine too but the emoji ⬜ forces
+    // a slightly larger glyph size on some clients and makes the row
+    // reflow visibly between toggles.
+    private const string CheckedMark   = "☑ ";
+    private const string UncheckedMark = "☐ ";
+
     private static InlineKeyboardMarkup RenderFormatPicker(BotSession s)
     {
         var sid = s.DaemonSessionId;
         var cur = s.Params.Format;
-        string mark(ScanFormat f) => f == cur ? SelectedMark : UnselectedMark;
-        // Four format choices split 2+2 so a single row doesn't get
-        // too cramped on narrow mobile widths.
+        string mark(ScanFormat f) => (cur & f) != 0 ? CheckedMark : UncheckedMark;
+        // Checkbox semantics: tap toggles the bit. Daemon then produces
+        // one encoded variant per set bit from the same decoded pixel
+        // buffer (cheap — one scan, N encodes). "toggle:fmt:<sid>:<name>"
+        // carries the single format being flipped; bot XOR-applies it
+        // onto the current mask, guarding against zero-selected state.
+        // Two rows of two so the widest label ("WEBP-LL") stays readable
+        // on narrow mobile.
         return new InlineKeyboardMarkup(new[]
         {
             new[]
             {
-                InlineKeyboardButton.WithCallbackData($"{mark(ScanFormat.Jpeg)}JPG",  $"set:fmt:{sid}:jpeg"),
-                InlineKeyboardButton.WithCallbackData($"{mark(ScanFormat.Png)}PNG",   $"set:fmt:{sid}:png"),
+                InlineKeyboardButton.WithCallbackData($"{mark(ScanFormat.Jpeg)}JPG",  $"toggle:fmt:{sid}:jpeg"),
+                InlineKeyboardButton.WithCallbackData($"{mark(ScanFormat.Png)}PNG",   $"toggle:fmt:{sid}:png"),
             },
             new[]
             {
-                InlineKeyboardButton.WithCallbackData($"{mark(ScanFormat.Webp)}WEBP", $"set:fmt:{sid}:webp"),
-                InlineKeyboardButton.WithCallbackData($"{mark(ScanFormat.Tiff)}TIFF", $"set:fmt:{sid}:tiff"),
+                InlineKeyboardButton.WithCallbackData($"{mark(ScanFormat.WebpLossy)}WEBP",     $"toggle:fmt:{sid}:webp-lossy"),
+                InlineKeyboardButton.WithCallbackData($"{mark(ScanFormat.WebpLossless)}WEBP-LL", $"toggle:fmt:{sid}:webp-lossless"),
             },
             new[] { InlineKeyboardButton.WithCallbackData("↩ back", $"cancel:{sid}") },
         });

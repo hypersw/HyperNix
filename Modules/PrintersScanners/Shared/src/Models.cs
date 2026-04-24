@@ -16,13 +16,28 @@ public record PrinterStatus(
 
 // ── Scan params ─────────────────────────────────────────────────────────────
 
-public enum ScanFormat { Jpeg, Png, Tiff, Webp }
+/// <summary>
+/// Output format bitmask — multiple can be selected for the same scan,
+/// and the daemon emits one encoded variant per set bit (same decoded
+/// pixel buffer, N encodes). TIFF dropped (larger than PNG, no Telegram
+/// inline preview). WebP split into lossless and lossy — the lossy
+/// encoder at default settings is typically ~30% smaller than JPG
+/// at visually equivalent quality on documents.
+/// </summary>
+[Flags]
+public enum ScanFormat
+{
+    None = 0,
+    Jpeg = 1 << 0,
+    Png = 1 << 1,
+    WebpLossless = 1 << 2,
+    WebpLossy = 1 << 3,
+}
 
 /// <summary>
-/// Parameters for one scan. Applies to every scan within a session.
+/// Parameters for one scan. Format is a bitmask — see ScanFormat.
 /// JpegQuality kept for wire-compat / future use; the daemon currently
-/// bakes in Q=85 regardless (see ScanPipeline). Users who need higher
-/// quality pick PNG, WEBP (lossless) or TIFF instead of tuning a knob.
+/// bakes in Q=85 regardless. Users who want knobs pick a lossless format.
 /// </summary>
 public record ScanParams(
     int Dpi = 200,
@@ -113,6 +128,11 @@ public record SessionEvent(
     string? SessionId = null,
     // session.scanning / session.image-ready / session.scan-failed
     int? Seq = null,
+    // session.image-ready: which variant within this scan this event
+    // refers to (0-based), and how many total variants to expect. Fires
+    // once per variant. Consumers deliver each file as it arrives.
+    int? Variant = null,
+    int? VariantCount = null,
     string? ContentType = null,
     string? FileName = null,
     long? BytesLength = null,

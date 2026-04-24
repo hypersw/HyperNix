@@ -20,8 +20,8 @@ public sealed class SessionService : IAsyncDisposable
     private readonly ShutdownGate _gate;
     private readonly ILogger<SessionService> _logger;
 
-    // per-session scan storage, keyed by sessionId + seq
-    private readonly Dictionary<(string SessionId, int Seq), CapturedImage> _images = [];
+    // per-session scan storage, keyed by sessionId + seq + variant-within-seq
+    private readonly Dictionary<(string SessionId, int Seq, int Variant), CapturedImage> _images = [];
 
     // lock covers: the image dictionary, in-flight flag transitions, takeover
     // handshake, session replacement.
@@ -205,12 +205,16 @@ public sealed class SessionService : IAsyncDisposable
                 _broker.Publish(new SessionEvent(
                     SessionEventType.SessionScanProgress,
                     SessionId: sessionId, Seq: seq, PercentDone: pct)));
-            var result = await _pipeline.ScanAsync(session.Params, progress, ct);
-            var captured = new CapturedImage(result.Data, result.ContentType,
-                $"scan-{sessionId}-{seq}.{result.FileExtension}");
+            var variants = await _pipeline.ScanAsync(session.Params, progress, ct);
+            var variantCount = variants.Count;
             lock (_lock)
             {
-                _images[(sessionId, seq)] = captured;
+                for (int i = 0; i < variants.Count; i++)
+                {
+                    var v = variants[i];
+                    _images[(sessionId, seq, i)] =
+                        new CapturedImage(v.Data, v.ContentType, v.FileName);
+                }
                 var extended = _store.Mutate(s => s with
                 {
                     InFlightScan = false,
@@ -219,11 +223,19 @@ public sealed class SessionService : IAsyncDisposable
                 // also bump the sliding window
                 ExtendWindow(extended);
             }
-            _broker.Publish(new SessionEvent(
-                SessionEventType.SessionImageReady,
-                SessionId: sessionId, Seq: seq,
-                ContentType: result.ContentType, FileName: captured.FileName,
-                BytesLength: result.Data.Length));
+            // Fire one image-ready event per variant. Bot delivers each
+            // as it arrives, giving the user live feedback (first file
+            // appears in chat while subsequent formats still encoding).
+            for (int i = 0; i < variants.Count; i++)
+            {
+                var v = variants[i];
+                _broker.Publish(new SessionEvent(
+                    SessionEventType.SessionImageReady,
+                    SessionId: sessionId, Seq: seq,
+                    Variant: i, VariantCount: variantCount,
+                    ContentType: v.ContentType, FileName: v.FileName,
+                    BytesLength: v.Data.Length));
+            }
             return seq;
         }
         catch (Exception ex)
@@ -259,11 +271,11 @@ public sealed class SessionService : IAsyncDisposable
 
     // ── Image fetch ─────────────────────────────────────────────────────────
 
-    public CapturedImage? GetImage(string sessionId, int seq)
+    public CapturedImage? GetImage(string sessionId, int seq, int variant = 0)
     {
         lock (_lock)
         {
-            _images.TryGetValue((sessionId, seq), out var img);
+            _images.TryGetValue((sessionId, seq, variant), out var img);
             return img;
         }
     }

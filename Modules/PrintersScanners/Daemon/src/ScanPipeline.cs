@@ -4,8 +4,6 @@ using PrintScan.Shared;
 using SixLabors.ImageSharp;
 using SixLabors.ImageSharp.Formats.Jpeg;
 using SixLabors.ImageSharp.Formats.Png;
-using SixLabors.ImageSharp.Formats.Tiff;
-using SixLabors.ImageSharp.Formats.Tiff.Constants;
 using SixLabors.ImageSharp.Formats.Webp;
 using SixLabors.ImageSharp.PixelFormats;
 
@@ -55,17 +53,39 @@ public sealed class ScanPipeline
 
     public ScanPipeline(ILogger<ScanPipeline> logger) { _logger = logger; }
 
-    public record Result(RecyclableMemoryStream Data, string ContentType, string FileExtension);
+    public record Variant(
+        RecyclableMemoryStream Data,
+        string ContentType,
+        string FileName,
+        string FileExtension,
+        bool IsLossless);
+
+    // Filename convention: Scan.<ISO-date>.<ISO-time>.[Lossless.]<ext>
+    // Local time (what the user reads on their phone). The "Lossless."
+    // infix only appears on lossless variants so lossy and lossless
+    // WebP of the same scan don't collide on .webp.
+    private static string BuildFileName(string ext, bool isLossless, DateTime stamp) =>
+        $"Scan.{stamp:yyyy-MM-dd.HH-mm-ss}.{(isLossless ? "Lossless." : "")}{ext}";
+
+    private static (string contentType, string ext, bool lossless) FormatMeta(ScanFormat f) => f switch
+    {
+        ScanFormat.Jpeg         => ("image/jpeg", "jpg",  false),
+        ScanFormat.Png          => ("image/png",  "png",  true),
+        ScanFormat.WebpLossless => ("image/webp", "webp", true),
+        ScanFormat.WebpLossy    => ("image/webp", "webp", false),
+        _ => throw new ArgumentOutOfRangeException(nameof(f), f, "not a single ScanFormat flag"),
+    };
 
     /// <summary>
-    /// Scan synchronously, decode, re-encode, return the encoded stream.
-    /// Caller owns the stream and must dispose it. Throws on non-zero
-    /// exit or spawn failure. Optional <paramref name="progress"/> is
-    /// reported 0..100 while scanimage is streaming bytes (estimated
-    /// from expected A4-page size — rough but close enough for a UI
-    /// progress bar), and then 100 when encoding completes.
+    /// Scan synchronously, decode, re-encode into every requested format
+    /// (p.Format is a bitmask), return one Variant per format. Callers
+    /// own the streams and must dispose them. Throws on non-zero exit
+    /// or spawn failure. Optional <paramref name="progress"/> is reported
+    /// 0..99 while scanimage is streaming bytes (estimated from expected
+    /// A4-page size — rough but close enough for a UI bar), and then 100
+    /// when the last encode completes.
     /// </summary>
-    public async Task<Result> ScanAsync(
+    public async Task<IReadOnlyList<Variant>> ScanAsync(
         ScanParams p, IProgress<int>? progress, CancellationToken ct)
     {
         // Field-test instrumentation: the whole pipeline is whole-buffer
@@ -162,102 +182,112 @@ public sealed class ScanPipeline
             decodeT.Elapsed.TotalSeconds,
             Fmt(MemRss()), Fmt(MemManaged()));
 
-        // ── Step 3: Image → target format re-encode ────────────────────────
-        var (contentType, ext) = p.Format switch
-        {
-            ScanFormat.Png => ("image/png", "png"),
-            ScanFormat.Tiff => ("image/tiff", "tiff"),
-            ScanFormat.Webp => ("image/webp", "webp"),
-            _ => ("image/jpeg", "jpg"),
-        };
-        var outStream = Pool.GetStream("scan-encoded");
-        var encodeT = Stopwatch.StartNew();
+        // ── Step 3: Image → N target formats (one per set bit) ─────────────
+        // Flatten the bitmask into an ordered list of individual formats.
+        // Fallback to Jpeg if caller somehow sent None (defensive; the
+        // bot UI enforces at-least-one).
+        var formats = new List<ScanFormat>();
+        if ((p.Format & ScanFormat.Jpeg)         != 0) formats.Add(ScanFormat.Jpeg);
+        if ((p.Format & ScanFormat.Png)          != 0) formats.Add(ScanFormat.Png);
+        if ((p.Format & ScanFormat.WebpLossless) != 0) formats.Add(ScanFormat.WebpLossless);
+        if ((p.Format & ScanFormat.WebpLossy)    != 0) formats.Add(ScanFormat.WebpLossy);
+        if (formats.Count == 0) formats.Add(ScanFormat.Jpeg);
+
+        var stamp = DateTime.Now;
+        var results = new List<Variant>(formats.Count);
+        var encodeTotal = Stopwatch.StartNew();
         try
         {
-            switch (p.Format)
+            foreach (var fmt in formats)
             {
-                case ScanFormat.Png:
-                    // BestCompression = zlib level 9. Extra ~300 ms on
-                    // a 200 dpi page vs Default but saves 15-20%.
-                    // Re-encode is offline from the scanner so this
-                    // doesn't back-pressure anything.
-                    await image.SaveAsPngAsync(outStream, new PngEncoder
+                var (contentType, ext, lossless) = FormatMeta(fmt);
+                var outStream = Pool.GetStream("scan-encoded");
+                var encodeT = Stopwatch.StartNew();
+                try
+                {
+                    switch (fmt)
                     {
-                        CompressionLevel = PngCompressionLevel.BestCompression,
-                    }, ct);
-                    break;
+                        case ScanFormat.Png:
+                            // BestCompression = zlib level 9. Extra ~300 ms on
+                            // a 200 dpi page vs Default but saves 15-20%.
+                            await image.SaveAsPngAsync(outStream, new PngEncoder
+                            {
+                                CompressionLevel = PngCompressionLevel.BestCompression,
+                            }, ct);
+                            break;
 
-                case ScanFormat.Tiff:
-                    // Deflate (zlib) — best lossless ratio that modern
-                    // viewers actually understand. LZW is the even-older
-                    // ultra-compat fallback but ~20% worse compression.
-                    // Preview / Photos / GIMP / ImageMagick / Photoshop
-                    // (CS4+) all read Deflate-TIFF.
-                    await image.SaveAsTiffAsync(outStream, new TiffEncoder
-                    {
-                        Compression = TiffCompression.Deflate,
-                    }, ct);
-                    break;
+                        case ScanFormat.WebpLossless:
+                            // Lossless WebP — typically ~55-65% the size of
+                            // a level-9 PNG on document scans, zero quality
+                            // loss, Telegram renders inline previews.
+                            await image.SaveAsWebpAsync(outStream, new WebpEncoder
+                            {
+                                FileFormat = WebpFileFormatType.Lossless,
+                                Method = WebpEncodingMethod.Default,
+                            }, ct);
+                            break;
 
-                case ScanFormat.Webp:
-                    // Lossless WebP — typically ~55-65% the size of a
-                    // level-9 PNG on document scans, zero quality loss,
-                    // and Telegram renders inline previews for WebP
-                    // attachments. FileFormat=Lossless plus a middle-of-
-                    // road encode method (4/6) balances compression vs
-                    // encode-time on the A72. Method 6 would squeeze
-                    // another ~5% but triples encode time — not worth
-                    // it at scanner feed rates.
-                    await image.SaveAsWebpAsync(outStream, new WebpEncoder
-                    {
-                        FileFormat = WebpFileFormatType.Lossless,
-                        Method = WebpEncodingMethod.Default,
-                    }, ct);
-                    break;
+                        case ScanFormat.WebpLossy:
+                            // Lossy WebP at Q=85 — same "no knob" rationale
+                            // as JPEG. Typically ~30% smaller than JPEG Q=85
+                            // for equal perceived quality on documents, with
+                            // better handling of text edges (no 8×8 DCT
+                            // ringing).
+                            await image.SaveAsWebpAsync(outStream, new WebpEncoder
+                            {
+                                FileFormat = WebpFileFormatType.Lossy,
+                                Quality = JpegQuality,
+                                Method = WebpEncodingMethod.Default,
+                            }, ct);
+                            break;
 
-                default:
-                    // Q=85 + 4:4:4 chroma (no subsampling). 4:2:0 is the
-                    // JPEG default but smears color in text — terrible
-                    // for document scans. The doubled chroma bandwidth
-                    // costs us maybe 30% more bytes but keeps glyph
-                    // edges crisp.
-                    await image.SaveAsJpegAsync(outStream, new JpegEncoder
-                    {
-                        Quality = JpegQuality,
-                        ColorType = JpegEncodingColor.YCbCrRatio444,
-                    }, ct);
-                    break;
+                        default:  // ScanFormat.Jpeg
+                            // Q=85 + 4:4:4 chroma. 4:2:0 default smears color
+                            // in text. +30% bytes vs 4:2:0 but crisp glyphs.
+                            await image.SaveAsJpegAsync(outStream, new JpegEncoder
+                            {
+                                Quality = JpegQuality,
+                                ColorType = JpegEncodingColor.YCbCrRatio444,
+                            }, ct);
+                            break;
+                    }
+                    encodeT.Stop();
+                    outStream.Position = 0;
+
+                    var fileName = BuildFileName(ext, lossless, stamp);
+                    results.Add(new Variant(outStream, contentType, fileName, ext, lossless));
+
+                    _logger.LogInformation(
+                        "encode {Fmt}: {Out} ({Pct}% of raw) in {Elapsed:F2}s " +
+                        "rss={Rss} heap={Heap}",
+                        fmt, Fmt(outStream.Length),
+                        tiffBytes > 0 ? 100L * outStream.Length / tiffBytes : 0,
+                        encodeT.Elapsed.TotalSeconds,
+                        Fmt(MemRss()), Fmt(MemManaged()));
+                }
+                catch
+                {
+                    outStream.Dispose();
+                    throw;
+                }
             }
-            encodeT.Stop();
-
-            outStream.Position = 0;
-            var outBytes = outStream.Length;
-            var encodeThroughput = encodeT.Elapsed.TotalSeconds > 0
-                ? pixelBytes / 1024.0 / 1024.0 / encodeT.Elapsed.TotalSeconds
-                : 0;
-            _logger.LogInformation(
-                "encode done: {Out} {Ext} ({Pct}% of raw) in {Elapsed:F2}s " +
-                "({Mbps:F1} MB/s pixels) rss={Rss} heap={Heap}",
-                Fmt(outBytes), ext,
-                tiffBytes > 0 ? 100L * outBytes / tiffBytes : 0,
-                encodeT.Elapsed.TotalSeconds, encodeThroughput,
-                Fmt(MemRss()), Fmt(MemManaged()));
+            encodeTotal.Stop();
 
             total.Stop();
             _logger.LogInformation(
-                "scan total: {Elapsed:F2}s (scanimage={Scan:F2}s decode={Dec:F2}s encode={Enc:F2}s)",
-                total.Elapsed.TotalSeconds,
+                "scan total: {Elapsed:F2}s ({NFmt} formats) — " +
+                "scanimage={Scan:F2}s decode={Dec:F2}s encode={Enc:F2}s",
+                total.Elapsed.TotalSeconds, formats.Count,
                 scanT.Elapsed.TotalSeconds,
                 decodeT.Elapsed.TotalSeconds,
-                encodeT.Elapsed.TotalSeconds);
-            // Final 100% belongs here — everything above it is "not done yet".
+                encodeTotal.Elapsed.TotalSeconds);
             progress?.Report(100);
 
-            return new Result(outStream, contentType, ext);
+            return results;
         }
         catch
         {
-            outStream.Dispose();
+            foreach (var v in results) v.Data.Dispose();
             throw;
         }
     }

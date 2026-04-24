@@ -236,11 +236,15 @@ async Task HandleCallbackAsync(string userName, CallbackQuery cb, CancellationTo
         };
         await RerenderAsync(sid, ct, view);
     }
-    else if (data.StartsWith("set:"))
+    else if (data.StartsWith("set:") || data.StartsWith("toggle:"))
     {
-        // set:fmt:<sid>:jpeg    OR    set:dpi:<sid>:300
+        // set:fmt:<sid>:jpeg        (legacy, used by dpi)
+        // set:dpi:<sid>:300
+        // toggle:fmt:<sid>:jpeg     (checkbox — XORs the bit; refuses to
+        //                            unset the last set bit)
         var parts = data.Split(':');
         if (parts.Length != 4) return;
+        var verb = parts[0];
         var what = parts[1];
         var sid = parts[2];
         var value = parts[3];
@@ -249,11 +253,27 @@ async Task HandleCallbackAsync(string userName, CallbackQuery cb, CancellationTo
         lock (sessionsLock) { sessions.TryGetValue(sid, out s); }
         if (s is null) return;
 
-        var newParams = what switch
+        static ScanFormat? ParseFormat(string v) => v switch
         {
-            "fmt" when Enum.TryParse<ScanFormat>(value, ignoreCase: true, out var f) =>
-                s.Params with { Format = f },
-            "dpi" when int.TryParse(value, out var d) =>
+            "jpeg" or "jpg"       => ScanFormat.Jpeg,
+            "png"                 => ScanFormat.Png,
+            "webp-lossy" or "webp" => ScanFormat.WebpLossy,
+            "webp-lossless" or "webpl" => ScanFormat.WebpLossless,
+            _ => null,
+        };
+
+        // Toggle with a "never leave zero formats selected" guard —
+        // daemon falls back to Jpeg on empty mask but we prefer the
+        // UI to make refusals explicit rather than silently force a
+        // format the user had just unchecked.
+        static ScanFormat Toggle(ScanFormat cur, ScanFormat bit) =>
+            ((cur ^ bit) == ScanFormat.None) ? cur : (cur ^ bit);
+
+        var newParams = (verb, what) switch
+        {
+            ("toggle", "fmt") when ParseFormat(value) is ScanFormat f =>
+                s.Params with { Format = Toggle(s.Params.Format, f) },
+            ("set", "dpi") when int.TryParse(value, out var d) =>
                 s.Params with { Dpi = d },
             _ => s.Params,
         };
@@ -271,7 +291,14 @@ async Task HandleCallbackAsync(string userName, CallbackQuery cb, CancellationTo
         {
             if (sessions.TryGetValue(sid, out var bs)) bs.Params = newParams;
         }
-        await RerenderAsync(sid, ct, PickerView.Main);
+        // Stay on the format picker when toggling so users can flip
+        // multiple boxes in a row without leaving the picker view.
+        var stayView = (verb, what) switch
+        {
+            ("toggle", "fmt") => PickerView.Format,
+            _ => PickerView.Main,
+        };
+        await RerenderAsync(sid, ct, stayView);
     }
     else if (data.StartsWith("cancel:"))
     {
@@ -545,11 +572,19 @@ async Task HandleEventAsync(SessionEvent ev, CancellationToken ct)
         }
         case SessionEventType.SessionImageReady when ev.SessionId is not null && ev.Seq is int seq:
         {
-            await DeliverImageAsync(ev.SessionId, seq, ev.ContentType ?? "image/jpeg",
+            // Daemon fires one image-ready event per variant (one per
+            // selected format bit). Deliver this specific variant now;
+            // flip Scanning=false and bump ScanCount only once the LAST
+            // variant has delivered, so the status bar keeps showing
+            // "scanning…" while additional formats are still streaming.
+            var variant = ev.Variant ?? 0;
+            var isLastVariant = ev.VariantCount is int vc ? variant == vc - 1 : true;
+            await DeliverImageAsync(ev.SessionId, seq, variant,
+                ev.ContentType ?? "image/jpeg",
                 ev.FileName ?? $"scan-{seq}.jpg", ct);
             lock (sessionsLock)
             {
-                if (sessions.TryGetValue(ev.SessionId, out var bs))
+                if (sessions.TryGetValue(ev.SessionId, out var bs) && isLastVariant)
                 {
                     bs.Scanning = false;
                     bs.ScanCount = seq;
@@ -666,7 +701,7 @@ async Task RerenderAsync(string sessionId, CancellationToken ct,
 // Image delivery: fetch from daemon, stage to disk, upload to TG, unstage.
 // ────────────────────────────────────────────────────────────────────────────
 
-async Task DeliverImageAsync(string sessionId, int seq, string contentType,
+async Task DeliverImageAsync(string sessionId, int seq, int variant, string contentType,
     string fileName, CancellationToken ct)
 {
     Interlocked.Increment(ref inFlight);
@@ -678,16 +713,20 @@ async Task DeliverImageAsync(string sessionId, int seq, string contentType,
         if (bs is null) return;
 
         var ext = Path.GetExtension(fileName).TrimStart('.');
+        // Stage key uses seq AND variant so distinct formats of the same
+        // scan don't collide (a WebP-lossy and JPG of scan #3 are both
+        // legitimately "scan 3, variant N").
+        var stageSeq = seq * 100 + variant;
         string path;
-        await using (var stream = await daemon.FetchImageAsync(sessionId, seq, ct))
+        await using (var stream = await daemon.FetchImageAsync(sessionId, seq, variant, ct))
         {
-            path = await staging.StageAsync(sessionId, seq, ext, stream, ct);
+            path = await staging.StageAsync(sessionId, stageSeq, ext, stream, ct);
         }
-        staging.RecordManifest(sessionId, seq, new StagedEntry(
+        staging.RecordManifest(sessionId, stageSeq, new StagedEntry(
             ChatId: bs.ChatId, FileName: fileName, ContentType: contentType,
             Caption: $"📷 {bs.Params.Dpi} dpi · scan #{seq}"));
 
-        await UploadStagedAsync(sessionId, seq, path, bs.ChatId, fileName,
+        await UploadStagedAsync(sessionId, stageSeq, path, bs.ChatId, fileName,
             $"📷 {bs.Params.Dpi} dpi · scan #{seq}", ct);
     }
     finally
