@@ -54,6 +54,15 @@ var sessionsLock = new Lock();
 var inFlight = 0;
 var inFlightDrained = new SemaphoreSlim(1, 1);
 
+// multi-variant accumulator. Keyed by (sessionId, seq); each entry
+// holds one variant's staged path while we wait for its siblings.
+// Cleared on send-complete (or lost on session terminate, which wipes
+// staging too). Kept at outer scope so DeliverImageAsync (a local async
+// function later in the file) can close over it — C# top-level-statement
+// scoping requires the lexical declaration to precede the function.
+var pendingBatches = new Dictionary<(string sessionId, int seq), List<BatchEntry>>();
+var batchesLock = new Lock();
+
 // ── Cancellation / shutdown ─────────────────────────────────────────────────
 
 using var cts = new CancellationTokenSource();
@@ -377,6 +386,34 @@ async Task OpenScannerSessionAsync(
     }
     if (outcome == DaemonClient.OpenResult.Conflict && conflict is not null)
     {
+        // Self-conflict: the "conflicting" session is this user's own.
+        // Offering to "take over your own session" is nonsense; send a
+        // reply that points at the existing session message instead.
+        // Telegram renders a reply-chip the user taps to jump to the
+        // referenced message — solves the "session scrolled far back
+        // after many scans" problem without us needing to re-render
+        // or move the session header.
+        if (conflict.Current.OwnerChatId == chatId)
+        {
+            await bot.DeleteMessage(chatId, msgId, ct);   // placeholder isn't needed
+            try
+            {
+                await bot.SendMessage(chatId,
+                    "📷 You already have an active scanner session — tap the reply above to jump to it.",
+                    replyParameters: new() { MessageId = conflict.Current.OwnerStatusMessageId },
+                    cancellationToken: ct);
+            }
+            catch (Exception ex)
+            {
+                // If the original session message was deleted, replying
+                // fails; fall back to a plain message.
+                log.LogDebug("self-conflict reply-to failed, falling back: {Err}", ex.Message);
+                await bot.SendMessage(chatId,
+                    "📷 You already have an active scanner session.",
+                    cancellationToken: ct);
+            }
+            return;
+        }
         var kb = new InlineKeyboardMarkup(
         [
             [
@@ -592,8 +629,9 @@ async Task HandleEventAsync(SessionEvent ev, CancellationToken ct)
             // variant has delivered, so the status bar keeps showing
             // "scanning…" while additional formats are still streaming.
             var variant = ev.Variant ?? 0;
-            var isLastVariant = ev.VariantCount is int vc ? variant == vc - 1 : true;
-            await DeliverImageAsync(ev.SessionId, seq, variant,
+            var variantCount = ev.VariantCount ?? 1;
+            var isLastVariant = variant == variantCount - 1;
+            await DeliverImageAsync(ev.SessionId, seq, variant, variantCount,
                 ev.ContentType ?? "image/jpeg",
                 ev.FileName ?? $"scan-{seq}.jpg", ct);
             lock (sessionsLock)
@@ -720,8 +758,8 @@ async Task RerenderAsync(string sessionId, CancellationToken ct,
 // Image delivery: fetch from daemon, stage to disk, upload to TG, unstage.
 // ────────────────────────────────────────────────────────────────────────────
 
-async Task DeliverImageAsync(string sessionId, int seq, int variant, string contentType,
-    string fileName, CancellationToken ct)
+async Task DeliverImageAsync(string sessionId, int seq, int variant, int variantCount,
+    string contentType, string fileName, CancellationToken ct)
 {
     Interlocked.Increment(ref inFlight);
     try { await inFlightDrained.WaitAsync(ct); } catch { }
@@ -741,17 +779,91 @@ async Task DeliverImageAsync(string sessionId, int seq, int variant, string cont
         {
             path = await staging.StageAsync(sessionId, stageSeq, ext, stream, ct);
         }
+        var caption = $"📷 {bs.Params.Dpi} dpi · scan #{seq}";
         staging.RecordManifest(sessionId, stageSeq, new StagedEntry(
             ChatId: bs.ChatId, FileName: fileName, ContentType: contentType,
-            Caption: $"📷 {bs.Params.Dpi} dpi · scan #{seq}"));
+            Caption: caption));
 
-        await UploadStagedAsync(sessionId, stageSeq, path, bs.ChatId, fileName,
-            $"📷 {bs.Params.Dpi} dpi · scan #{seq}", ct);
+        if (variantCount <= 1)
+        {
+            // Single-variant scan: direct upload, no batching needed.
+            await UploadStagedAsync(sessionId, stageSeq, path, bs.ChatId,
+                fileName, caption, ct);
+            return;
+        }
+
+        // Multi-variant: accumulate until the full set arrives, then
+        // send as a Telegram media group. That presents the N formats
+        // of one scan as a single album in the chat (much tidier than
+        // N loose file messages).
+        List<BatchEntry>? completeBatch = null;
+        long chatId = bs.ChatId;
+        lock (batchesLock)
+        {
+            var key = (sessionId, seq);
+            if (!pendingBatches.TryGetValue(key, out var list))
+            {
+                pendingBatches[key] = list = new List<BatchEntry>();
+            }
+            list.Add(new BatchEntry(variant, path, fileName, contentType));
+            if (list.Count >= variantCount)
+            {
+                completeBatch = list;
+                pendingBatches.Remove(key);
+            }
+        }
+        if (completeBatch is not null)
+        {
+            // Deterministic album order (variant index == format-flag
+            // order: Jpeg, Png, WebpLossless, WebpLossy).
+            completeBatch.Sort((a, b) => a.Variant.CompareTo(b.Variant));
+            await SendBatchAsMediaGroupAsync(sessionId, seq, completeBatch,
+                chatId, caption, ct);
+        }
     }
     finally
     {
         if (Interlocked.Decrement(ref inFlight) == 0)
             inFlightDrained.Release();
+    }
+}
+
+async Task SendBatchAsMediaGroupAsync(
+    string sessionId, int seq, List<BatchEntry> entries,
+    long chatId, string caption, CancellationToken ct)
+{
+    var streams = new List<FileStream>(entries.Count);
+    try
+    {
+        var medias = new List<IAlbumInputMedia>(entries.Count);
+        for (int i = 0; i < entries.Count; i++)
+        {
+            var e = entries[i];
+            var stream = File.OpenRead(e.Path);
+            streams.Add(stream);
+            var media = new InputMediaDocument(new InputFileStream(stream, e.FileName))
+            {
+                DisableContentTypeDetection = true,
+                // Only the first item's caption is shown above the album
+                // — the rest are hidden, so put the summary on slot 0.
+                Caption = i == 0 ? caption : null,
+            };
+            medias.Add(media);
+        }
+        await bot.SendMediaGroup(chatId, medias, cancellationToken: ct);
+        foreach (var e in entries) staging.Remove(sessionId, seq * 100 + e.Variant);
+        log.LogInformation("delivered {Session}#{Seq} as album of {N}",
+            sessionId, seq, entries.Count);
+    }
+    catch (Exception ex)
+    {
+        log.LogError(ex,
+            "media group upload of {Session}#{Seq} failed, staging kept for retry",
+            sessionId, seq);
+    }
+    finally
+    {
+        foreach (var s in streams) await s.DisposeAsync();
     }
 }
 
@@ -843,3 +955,6 @@ static class Retry
 }
 
 record AllowedUser(long Id, string Name);
+
+// One staged variant awaiting its siblings before a media-group send.
+record BatchEntry(int Variant, string Path, string FileName, string ContentType);
