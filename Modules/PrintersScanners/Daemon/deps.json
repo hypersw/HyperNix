@@ -13,5 +13,10 @@
     "pname": "SharpIpp",
     "version": "0.10.0",
     "hash": "sha256-UatEoMVfTZGdiG9MvIE8WxVPUQe+DN4ngo+LLQuhmYc="
+  },
+  {
+    "pname": "SixLabors.ImageSharp",
+    "version": "3.1.5",
+    "hash": "sha256-3UehX9T+I81nfgv2dTHlpoPgYzXFk7kHr1mmlQOCBfw="
   }
 ]

@@ -1,25 +1,54 @@
 using System.Diagnostics;
 using Microsoft.IO;
 using PrintScan.Shared;
+using SixLabors.ImageSharp;
+using SixLabors.ImageSharp.Formats.Jpeg;
+using SixLabors.ImageSharp.Formats.Png;
+using SixLabors.ImageSharp.Formats.Tiff;
+using SixLabors.ImageSharp.Formats.Tiff.Constants;
+using SixLabors.ImageSharp.PixelFormats;
 
 namespace PrintScan.Daemon;
 
 /// <summary>
-/// Runs a single <c>scanimage</c> invocation, piping its stdout into a
-/// <see cref="RecyclableMemoryStream"/> (chunked pool-backed — no LOH, no
-/// tempfiles, swap-friendly under memory pressure).
+/// Scans a page by driving <c>scanimage</c> at USB-limited speed (no
+/// on-the-fly compression at scanimage level) and then re-encoding the
+/// result in-process to the user's chosen container with sensible
+/// quality settings.
+///
+/// Why the two-step pipeline: scanimage's JPEG/PNG output path does
+/// libjpeg/libpng encoding synchronously per row. On a Pi 4 A72 the
+/// libpng zlib level-6 encoder runs at ~5-15 MB/s, which is slower
+/// than the scanner's ~3-5 MB/s feed at 200 dpi color but not by
+/// much — and enough to stall the USB read, back-pressure the SANE
+/// backend, and cause the scanner to pause the carriage mid-page
+/// (it literally retracts and re-scans to catch up).
+///
+/// Uncompressed TIFF from scanimage is effectively "header + raw
+/// pixel rows" — zero CPU at scanimage, USB-limited. We then do the
+/// "real" encode here, offline from the scanner, where nothing
+/// back-pressures. Even on a Pi, ImageSharp's JPEG encode on an A72
+/// is ~20-40 MB/s and PNG/TIFF-Deflate are in the same ballpark —
+/// well above the scanner's peak feed.
 /// </summary>
 public sealed class ScanPipeline
 {
     private static readonly RecyclableMemoryStreamManager Pool = new(
         new RecyclableMemoryStreamManager.Options
         {
-            BlockSize = 128 * 1024,          // 128 KB blocks
+            BlockSize = 128 * 1024,            // 128 KB blocks
             LargeBufferMultiple = 1024 * 1024, // 1 MB large-buffer step
             MaximumBufferSize = 16 * 1024 * 1024, // 16 MB cap per block
             GenerateCallStacks = false,
             AggressiveBufferReturn = true
         });
+
+    // Baked-in JPEG quality. Q=85 with 4:4:4 chroma is "document scan
+    // sensible" — noticeably better than libjpeg's Q=75 default which
+    // produces visible ringing around text and chroma smearing. Users
+    // who need reprint-grade output pick PNG or TIFF instead; there's
+    // deliberately no knob here.
+    private const int JpegQuality = 85;
 
     private readonly ILogger<ScanPipeline> _logger;
 
@@ -28,34 +57,32 @@ public sealed class ScanPipeline
     public record Result(RecyclableMemoryStream Data, string ContentType, string FileExtension);
 
     /// <summary>
-    /// Scan synchronously into a fresh RecyclableMemoryStream. Caller owns the
-    /// stream and must dispose it. Throws on non-zero exit or spawn failure.
+    /// Scan synchronously, decode, re-encode, return the encoded stream.
+    /// Caller owns the stream and must dispose it. Throws on non-zero
+    /// exit or spawn failure.
     /// </summary>
     public async Task<Result> ScanAsync(ScanParams p, CancellationToken ct)
     {
-        var formatArg = p.Format switch
-        {
-            ScanFormat.Png => "png",
-            ScanFormat.Tiff => "tiff",
-            _ => "jpeg",
-        };
-        var (contentType, ext) = p.Format switch
-        {
-            ScanFormat.Png => ("image/png", "png"),
-            ScanFormat.Tiff => ("image/tiff", "tiff"),
-            _ => ("image/jpeg", "jpg"),
-        };
+        // Field-test instrumentation: the whole pipeline is whole-buffer
+        // (scanimage → TIFF blob → Image<Rgb24> decode → encoded blob),
+        // so we log elapsed + memory at each phase transition. That lets
+        // us judge whether we're hitting buffer limits, GC pressure, or
+        // decode-bound CPU on the Pi without having to re-instrument.
+        var total = Stopwatch.StartNew();
+        var proc0 = Process.GetCurrentProcess();
+        long MemRss() { proc0.Refresh(); return proc0.WorkingSet64; }
+        long MemManaged() => GC.GetTotalMemory(false);
+        string Fmt(long bytes) => $"{bytes / 1024.0 / 1024.0:F1} MB";
+        _logger.LogInformation(
+            "scan start: dpi={Dpi} format={Format} rss={Rss} heap={Heap}",
+            p.Dpi, p.Format, Fmt(MemRss()), Fmt(MemManaged()));
 
-        var args = $"--resolution {p.Dpi} --format {formatArg}";
-        // NOTE: sane-backends 1.4.0's scanimage rejects --jpeg-quality as
-        // an unrecognized option (it's a backend-specific option and our
-        // epkowa backend doesn't expose it). Accept scanimage's built-in
-        // default JPEG quality (~75) for now. If we ever need finer
-        // control, pipe the PNM/TIFF output through cjpeg or ImageMagick
-        // rather than relying on scanimage's --jpeg-quality path.
-        // p.JpegQuality is kept in the config model for future use.
-        // --output-file omitted → scanimage writes to stdout
+        // ── Step 1: scanimage → uncompressed TIFF ──────────────────────────
+        // No CPU work at scanimage beyond reading from USB and writing
+        // a TIFF header + rows; USB-limited.
+        var args = $"--resolution {p.Dpi} --format tiff";
         _logger.LogInformation("scanimage {Args}", args);
+        var scanT = Stopwatch.StartNew();
 
         var psi = new ProcessStartInfo(ToolPaths.ScanImage, args)
         {
@@ -66,23 +93,123 @@ public sealed class ScanPipeline
         using var proc = Process.Start(psi)
             ?? throw new InvalidOperationException("Failed to start scanimage");
 
-        var memStream = Pool.GetStream("scan");
-        var copyTask = proc.StandardOutput.BaseStream.CopyToAsync(memStream, ct);
+        using var tiffStream = Pool.GetStream("scan-tiff");
+        var copyTask = proc.StandardOutput.BaseStream.CopyToAsync(tiffStream, ct);
         var stderrTask = proc.StandardError.ReadToEndAsync(ct);
-
         await copyTask;
         await proc.WaitForExitAsync(ct);
         var stderr = await stderrTask;
+        scanT.Stop();
 
         if (proc.ExitCode != 0)
         {
-            memStream.Dispose();
             throw new InvalidOperationException(
                 $"scanimage exited {proc.ExitCode}: {stderr.Trim()}");
         }
 
-        memStream.Position = 0;
-        _logger.LogInformation("scan complete: {Bytes} bytes {Ext}", memStream.Length, ext);
-        return new Result(memStream, contentType, ext);
+        var tiffBytes = tiffStream.Length;
+        tiffStream.Position = 0;
+        var tiffThroughput = scanT.Elapsed.TotalSeconds > 0
+            ? tiffBytes / 1024.0 / 1024.0 / scanT.Elapsed.TotalSeconds
+            : 0;
+        _logger.LogInformation(
+            "scanimage done: {Bytes} in {Elapsed:F2}s ({Mbps:F1} MB/s) rss={Rss} heap={Heap}",
+            Fmt(tiffBytes), scanT.Elapsed.TotalSeconds, tiffThroughput,
+            Fmt(MemRss()), Fmt(MemManaged()));
+
+        // ── Step 2: TIFF → Image<Rgb24> decode ─────────────────────────────
+        // Image.Load reads the whole TIFF into one decoded bitmap
+        // (~3 bytes/pixel). 200 dpi A4 color ≈ 22 MB, 600 dpi ≈ 200 MB.
+        // ImageSharp uses ArrayPool under the hood so managed-heap spike
+        // is smaller than raw allocation would suggest.
+        var decodeT = Stopwatch.StartNew();
+        using var image = await Image.LoadAsync<Rgb24>(tiffStream, ct);
+        decodeT.Stop();
+        var pixelBytes = (long)image.Width * image.Height * 3;
+        _logger.LogInformation(
+            "decode done: {W}x{H} ({Px} decoded) in {Elapsed:F2}s rss={Rss} heap={Heap}",
+            image.Width, image.Height, Fmt(pixelBytes),
+            decodeT.Elapsed.TotalSeconds,
+            Fmt(MemRss()), Fmt(MemManaged()));
+
+        // ── Step 3: Image → target format re-encode ────────────────────────
+        var (contentType, ext) = p.Format switch
+        {
+            ScanFormat.Png => ("image/png", "png"),
+            ScanFormat.Tiff => ("image/tiff", "tiff"),
+            _ => ("image/jpeg", "jpg"),
+        };
+        var outStream = Pool.GetStream("scan-encoded");
+        var encodeT = Stopwatch.StartNew();
+        try
+        {
+            switch (p.Format)
+            {
+                case ScanFormat.Png:
+                    // BestCompression = zlib level 9. Extra ~300 ms on
+                    // a 200 dpi page vs Default but saves 15-20%.
+                    // Re-encode is offline from the scanner so this
+                    // doesn't back-pressure anything.
+                    await image.SaveAsPngAsync(outStream, new PngEncoder
+                    {
+                        CompressionLevel = PngCompressionLevel.BestCompression,
+                    }, ct);
+                    break;
+
+                case ScanFormat.Tiff:
+                    // Deflate (zlib) — best lossless ratio that modern
+                    // viewers actually understand. LZW is the even-older
+                    // ultra-compat fallback but ~20% worse compression.
+                    // Preview / Photos / GIMP / ImageMagick / Photoshop
+                    // (CS4+) all read Deflate-TIFF.
+                    await image.SaveAsTiffAsync(outStream, new TiffEncoder
+                    {
+                        Compression = TiffCompression.Deflate,
+                    }, ct);
+                    break;
+
+                default:
+                    // Q=85 + 4:4:4 chroma (no subsampling). 4:2:0 is the
+                    // JPEG default but smears color in text — terrible
+                    // for document scans. The doubled chroma bandwidth
+                    // costs us maybe 30% more bytes but keeps glyph
+                    // edges crisp.
+                    await image.SaveAsJpegAsync(outStream, new JpegEncoder
+                    {
+                        Quality = JpegQuality,
+                        ColorType = JpegEncodingColor.YCbCrRatio444,
+                    }, ct);
+                    break;
+            }
+            encodeT.Stop();
+
+            outStream.Position = 0;
+            var outBytes = outStream.Length;
+            var encodeThroughput = encodeT.Elapsed.TotalSeconds > 0
+                ? pixelBytes / 1024.0 / 1024.0 / encodeT.Elapsed.TotalSeconds
+                : 0;
+            _logger.LogInformation(
+                "encode done: {Out} {Ext} ({Pct}% of raw) in {Elapsed:F2}s " +
+                "({Mbps:F1} MB/s pixels) rss={Rss} heap={Heap}",
+                Fmt(outBytes), ext,
+                tiffBytes > 0 ? 100L * outBytes / tiffBytes : 0,
+                encodeT.Elapsed.TotalSeconds, encodeThroughput,
+                Fmt(MemRss()), Fmt(MemManaged()));
+
+            total.Stop();
+            _logger.LogInformation(
+                "scan total: {Elapsed:F2}s (scanimage={Scan:F2}s decode={Dec:F2}s encode={Enc:F2}s)",
+                total.Elapsed.TotalSeconds,
+                scanT.Elapsed.TotalSeconds,
+                decodeT.Elapsed.TotalSeconds,
+                encodeT.Elapsed.TotalSeconds);
+
+            return new Result(outStream, contentType, ext);
+        }
+        catch
+        {
+            outStream.Dispose();
+            throw;
+        }
     }
 }

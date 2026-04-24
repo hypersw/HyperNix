@@ -20,11 +20,14 @@ public enum ScanFormat { Jpeg, Png, Tiff }
 
 /// <summary>
 /// Parameters for one scan. Applies to every scan within a session.
+/// JpegQuality kept for wire-compat / future use; the daemon currently
+/// bakes in Q=85 regardless (see ScanPipeline). Users who need higher
+/// quality pick PNG or TIFF instead of tuning a knob.
 /// </summary>
 public record ScanParams(
     int Dpi = 200,
     ScanFormat Format = ScanFormat.Jpeg,
-    int JpegQuality = 90
+    int JpegQuality = 85
 );
 
 public record ScannerStatus(

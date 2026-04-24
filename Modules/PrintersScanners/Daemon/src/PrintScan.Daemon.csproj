@@ -10,6 +10,10 @@
     <PackageReference Include="Microsoft.Extensions.Hosting.Systemd" Version="10.0.5" />
     <PackageReference Include="Microsoft.IO.RecyclableMemoryStream" Version="3.0.1" />
     <PackageReference Include="SharpIpp" Version="0.10.0" />
+    <!-- Image decode/re-encode pipeline. Used by ScanPipeline to turn
+         scanimage's uncompressed TIFF into the user's chosen format
+         with sensible quality defaults. Pure managed, no native deps. -->
+    <PackageReference Include="SixLabors.ImageSharp" Version="3.1.5" />
   </ItemGroup>
 
   <ItemGroup>
