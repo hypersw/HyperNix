@@ -79,6 +79,18 @@ let
     # ${"$"}{emailEnqueue} log "$@" || true       # when configured
   '';
 
+  # Prepare multi-line text (typically a journal extract) for inclusion in a
+  # Telegram sendMessage payload. Reads stdin, truncates to 3500 bytes (the
+  # API caps text at 4096; we leave ~600 bytes for the header + wrapper
+  # tags), and HTML-escapes &/</> so the message parses as valid entities
+  # regardless of what the journal happened to contain. Wrap the result in
+  # <blockquote expandable>…</blockquote> in the caller for a collapsible
+  # "Show more" section.
+  tgEscape = pkgs.writeShellScript "tg-escape" ''
+    ${pkgs.coreutils}/bin/head -c 3500 \
+      | ${pkgs.gnused}/bin/sed 's/&/\&amp;/g; s/</\&lt;/g; s/>/\&gt;/g'
+  '';
+
   # Drain: process spool oldest-first, send to Telegram, delete on success.
   # On any send failure we break out (don't burn retries on a likely-down
   # network) and exit non-zero so systemd treats the run as failed — the
@@ -172,21 +184,65 @@ let
       fi
 
       # --data-urlencode so message text can contain any chars without
-      # breaking the curl command line.
-      if ${pkgs.curl}/bin/curl -sf --max-time 10 -X POST \
+      # breaking the curl command line. We capture BOTH the HTTP status
+      # code (to decide permanent vs transient) AND the response body
+      # (to log Telegram's error description on failure).
+      BODY=$(${pkgs.coreutils}/bin/mktemp)
+      code=$(${pkgs.curl}/bin/curl -sS --max-time 10 -o "$BODY" \
+          -w "%{http_code}" -X POST \
           "https://api.telegram.org/bot$TOKEN/sendMessage" \
           --data-urlencode "chat_id=$chat" \
           --data-urlencode "text=$text" \
-          -d "parse_mode=HTML" >/dev/null 2>&1; then
-        ${pkgs.coreutils}/bin/rm -f "$msg"
-        # Per-chat rate limit: ~1 msg/sec. Sleep 1.1s/send to stay safe
-        # even if all queued messages target the same chat.
-        ${pkgs.coreutils}/bin/sleep 1.1
-      else
-        echo "drain: send failed for $(${pkgs.coreutils}/bin/basename "$msg") — leaving for retry" >&2
-        rc=1
-        break
-      fi
+          -d "parse_mode=HTML" 2>&1) || code="000"
+      # Guard: non-numeric or empty code (curl error, DNS fail, timeout) → 000.
+      case "$code" in ""|*[!0-9]*) code="000" ;; esac
+      msgname=$(${pkgs.coreutils}/bin/basename "$msg")
+
+      case "$code" in
+        2*)
+          # Success. Delete and respect the 1 msg/sec per-chat rate limit.
+          ${pkgs.coreutils}/bin/rm -f "$msg" "$BODY"
+          ${pkgs.coreutils}/bin/sleep 1.1
+          ;;
+        429)
+          # Rate limited. Telegram tells us how long to wait in
+          # parameters.retry_after (seconds). Log and bail; the timer will
+          # re-fire this drain.
+          retry=$(${pkgs.jq}/bin/jq -r '.parameters.retry_after // 10' < "$BODY" 2>/dev/null || echo "10")
+          echo "drain: 429 rate-limited (retry_after=''${retry}s) on $msgname — leaving for retry" >&2
+          ${pkgs.coreutils}/bin/rm -f "$BODY"
+          rc=1
+          break
+          ;;
+        4*)
+          # Permanent 4xx: 400 (too long / bad HTML), 401/403 (token/ACL),
+          # 404 (chat gone). The message will NEVER succeed on retry — drop
+          # it with a loud log, but carry on draining the rest of the queue
+          # (a single poison message shouldn't block unrelated messages
+          # behind it). rc stays 0: the drain is doing its job of clearing
+          # the queue; the operator sees the problem in this log line.
+          desc=$(${pkgs.jq}/bin/jq -r '.description // "(no description)"' < "$BODY" 2>/dev/null \
+              || ${pkgs.coreutils}/bin/cat "$BODY")
+          echo "drain: dropping $msgname — permanent HTTP $code: $desc" >&2
+          ${pkgs.coreutils}/bin/rm -f "$msg" "$BODY"
+          ;;
+        000)
+          # curl itself failed: DNS, timeout, no route, TLS error. Transient.
+          echo "drain: network failure on $msgname — leaving for retry" >&2
+          ${pkgs.coreutils}/bin/rm -f "$BODY"
+          rc=1
+          break
+          ;;
+        *)
+          # 5xx or other unexpected (should be rare). Transient.
+          desc=$(${pkgs.jq}/bin/jq -r '.description // "(no description)"' < "$BODY" 2>/dev/null \
+              || ${pkgs.coreutils}/bin/cat "$BODY" 2>/dev/null || echo "(no body)")
+          echo "drain: transient HTTP $code on $msgname: $desc — leaving for retry" >&2
+          ${pkgs.coreutils}/bin/rm -f "$BODY"
+          rc=1
+          break
+          ;;
+      esac
     done
 
     exit $rc
@@ -845,7 +901,8 @@ Uptime: $UPTIME"
           # Boot -1 was unclean → gather context.
           LAST_UNCLEAN_TAIL=$("$JCTL" -b "$PREV_BID" --no-pager -q 2>/dev/null \
             | ${pkgs.coreutils}/bin/tail -3 \
-            | ${pkgs.coreutils}/bin/cut -c1-180)
+            | ${pkgs.coreutils}/bin/cut -c1-180 \
+            | ${tgEscape})
 
           # Count streak backwards for context only — bounded safety cap.
           STREAK=1
@@ -860,21 +917,22 @@ Uptime: $UPTIME"
           if [ "$STREAK" -ge 2 ]; then
             ${sendAlert} "💥 <b>$HOST</b>: previous boot ended abruptly (no shutdown marker). Streak of $STREAK unclean boots back — suspect power / USB-peripheral / hardware.
 Last failing boot ended with:
-<pre>$LAST_UNCLEAN_TAIL</pre>"
+<blockquote expandable>$LAST_UNCLEAN_TAIL</blockquote>"
           else
             ${sendAlert} "⚠️ <b>$HOST</b>: previous boot ended abruptly (no shutdown marker). Isolated event — worth noting only if it recurs.
 Last failing boot ended with:
-<pre>$LAST_UNCLEAN_TAIL</pre>"
+<blockquote expandable>$LAST_UNCLEAN_TAIL</blockquote>"
           fi
 
           # Separately: genuine kernel panics in the immediately previous
           # boot. Narrow patterns only — don't alert on userspace noise.
           PANIC=$("$JCTL" -b -1 -k --no-pager -q 2>/dev/null \
             | ${pkgs.gnugrep}/bin/grep -E 'Oops|Kernel panic|BUG:|stack-protector|end Kernel panic|unable to handle kernel' \
-            | ${pkgs.coreutils}/bin/head -5)
+            | ${pkgs.coreutils}/bin/head -5 \
+            | ${tgEscape})
           if [ -n "$PANIC" ]; then
             ${sendAlert} "☠️ <b>$HOST</b>: kernel panic/oops in previous boot:
-<pre>$PANIC</pre>"
+<blockquote expandable>$PANIC</blockquote>"
           fi
         '';
       };
@@ -905,9 +963,9 @@ Last failing boot ended with:
         Type = "oneshot";
         ExecStart = pkgs.writeShellScript "upgrade-failure-notify" ''
           HOST=$(${pkgs.hostname}/bin/hostname)
-          LOG=$(${pkgs.systemd}/bin/journalctl -u nixos-upgrade --no-pager -n 15 -q 2>/dev/null)
+          LOG=$(${pkgs.systemd}/bin/journalctl -u nixos-upgrade --no-pager -n 15 -q 2>/dev/null | ${tgEscape})
           ${sendAlert} "❌ <b>$HOST</b>: NixOS upgrade FAILED
-<pre>$LOG</pre>"
+<blockquote expandable>$LOG</blockquote>"
         '';
       };
     };
@@ -926,9 +984,9 @@ Last failing boot ended with:
         Type = "oneshot";
         ExecStart = pkgs.writeShellScript "auto-rebuild-switch-failure-notify" ''
           HOST=$(${pkgs.hostname}/bin/hostname)
-          LOG=$(${pkgs.systemd}/bin/journalctl -u auto-rebuild-switch --no-pager -n 30 -q 2>/dev/null)
+          LOG=$(${pkgs.systemd}/bin/journalctl -u auto-rebuild-switch --no-pager -n 30 -q 2>/dev/null | ${tgEscape})
           ${sendAlert} "❌ <b>$HOST</b>: auto-rebuild switch FAILED
-<pre>$LOG</pre>"
+<blockquote expandable>$LOG</blockquote>"
         '';
       };
     };
@@ -940,9 +998,9 @@ Last failing boot ended with:
         Type = "oneshot";
         ExecStart = pkgs.writeShellScript "auto-rebuild-checker-failure-notify" ''
           HOST=$(${pkgs.hostname}/bin/hostname)
-          LOG=$(${pkgs.systemd}/bin/journalctl -u auto-rebuild-github-checker --no-pager -n 30 -q 2>/dev/null)
+          LOG=$(${pkgs.systemd}/bin/journalctl -u auto-rebuild-github-checker --no-pager -n 30 -q 2>/dev/null | ${tgEscape})
           ${sendLog} "⚠️ <b>$HOST</b>: auto-rebuild checker hard-failed (not transient)
-<pre>$LOG</pre>"
+<blockquote expandable>$LOG</blockquote>"
         '';
       };
     };
