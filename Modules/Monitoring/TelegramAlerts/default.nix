@@ -183,6 +183,17 @@ let
         text="$text"$'\n'"<i>⏱ queued $dur ago</i>"
       fi
 
+      # Hard size gate: Telegram sendMessage caps text at 4096 chars.
+      # Writers (upgrade-failure-notify et al) use tgEscape which already
+      # truncates to 3500 bytes, but we don't fully control every path
+      # that might enqueue a message — enforce the limit HERE as the
+      # final gatekeeper. Byte-truncate to 4080 (leaves a few bytes of
+      # safety). If this cuts an HTML tag mid-way, Telegram will 400 with
+      # "can't parse entities" and the message gets dropped-with-log by
+      # the 4xx branch below. Preferable to a poison message wedging the
+      # queue forever.
+      text=$(${pkgs.coreutils}/bin/printf '%s' "$text" | ${pkgs.coreutils}/bin/head -c 4080)
+
       # --data-urlencode so message text can contain any chars without
       # breaking the curl command line. We capture BOTH the HTTP status
       # code (to decide permanent vs transient) AND the response body

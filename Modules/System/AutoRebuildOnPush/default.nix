@@ -36,12 +36,22 @@ let
     FLAKE_DIR="${cfg.flakeDir}"
     INPUT_NAME="${cfg.inputName}"
 
+    # Single nix-daemon round-trip: fetch the flake metadata once, parse
+    # both the locked rev and the original input-spec from the same JSON.
+    # Avoids a race where flake.lock could change between two separate
+    # metadata calls, and halves the nix-daemon connections per tick.
+    FLAKE_META=$(${pkgs.nix}/bin/nix flake metadata "$FLAKE_DIR" --json 2>/dev/null)
+    if [ -z "$FLAKE_META" ]; then
+      echo "nix flake metadata failed for $FLAKE_DIR" >&2
+      exit 1
+    fi
+
     # Locked rev in the flake we'd activate. We deliberately compare this
     # to upstream (not the activated rev) because it's self-limiting: on a
     # broken upstream rev, we attempt one switch, nix flake update writes
     # the new rev into the lock, and the next tick sees "up to date" —
     # no retry storm, no wasted CPU / SD on a doomed build.
-    CURRENT_REV=$(${pkgs.nix}/bin/nix flake metadata "$FLAKE_DIR" --json 2>/dev/null \
+    CURRENT_REV=$(${pkgs.coreutils}/bin/printf '%s' "$FLAKE_META" \
       | ${pkgs.jq}/bin/jq -r ".locks.nodes.\"$INPUT_NAME\".locked.rev // empty")
 
     if [ -z "$CURRENT_REV" ]; then
@@ -52,7 +62,7 @@ let
     # Extract upstream coordinates from the flake metadata. Handles both
     # the structured input form (type+owner+repo+ref) and the url form
     # (github:owner/repo/ref).
-    ORIGINAL=$(${pkgs.nix}/bin/nix flake metadata "$FLAKE_DIR" --json 2>/dev/null \
+    ORIGINAL=$(${pkgs.coreutils}/bin/printf '%s' "$FLAKE_META" \
       | ${pkgs.jq}/bin/jq -c ".locks.nodes.\"$INPUT_NAME\".original")
 
     UPSTREAM_TYPE=$(echo "$ORIGINAL" | ${pkgs.jq}/bin/jq -r '.type // empty')
@@ -267,7 +277,18 @@ in
         # should freeze visibly in `systemctl --failed` and alert via
         # OnFailure below, not thrash.
       };
-      unitConfig.OnFailure = "auto-rebuild-switch-failure-notify.service";
+      # Defense-in-depth against runaway path-activation loops. If some
+      # future bug makes a trigger file reappear on its own, cap the
+      # switcher at 3 starts per 5 minutes; after that, systemd refuses
+      # further starts until the sliding window clears — no ExecStart
+      # runs, no CPU/SD burn, just a "Start request repeated too
+      # quickly" journal line every tick. Refused starts don't fire
+      # OnFailure= so we don't flood the alert queue either.
+      unitConfig = {
+        OnFailure = "auto-rebuild-switch-failure-notify.service";
+        StartLimitIntervalSec = "5min";
+        StartLimitBurst = 3;
+      };
     };
   };
 }
