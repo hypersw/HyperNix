@@ -6,6 +6,7 @@ using SixLabors.ImageSharp.Formats.Jpeg;
 using SixLabors.ImageSharp.Formats.Png;
 using SixLabors.ImageSharp.Formats.Webp;
 using SixLabors.ImageSharp.PixelFormats;
+using SixLabors.ImageSharp.Processing;
 
 namespace PrintScan.Daemon;
 
@@ -60,6 +61,22 @@ public sealed class ScanPipeline
         string FileExtension,
         bool IsLossless);
 
+    /// <summary>
+    /// One scan's worth of output: N format variants plus a small JPEG
+    /// thumbnail shared across them (same source image). Caller owns
+    /// every stream and must dispose them (or the per-session store
+    /// takes ownership on successful publish).
+    /// </summary>
+    public record ScanResult(
+        IReadOnlyList<Variant> Variants,
+        RecyclableMemoryStream Thumbnail);
+
+    // Telegram's sendDocument thumbnail spec: JPEG, ≤320×320,
+    // ≤200 KB. We aim well under the size cap — 320×320 at Q=80 is
+    // typically 15–30 KB for scanned pages.
+    private const int ThumbMaxSide = 320;
+    private const int ThumbJpegQuality = 80;
+
     // Filename convention: Scan.<ISO-date>.<ISO-time>.[Lossless.]<ext>
     // Local time (what the user reads on their phone). The "Lossless."
     // infix only appears on lossless variants so lossy and lossless
@@ -85,7 +102,7 @@ public sealed class ScanPipeline
     /// A4-page size — rough but close enough for a UI bar), and then 100
     /// when the last encode completes.
     /// </summary>
-    public async Task<IReadOnlyList<Variant>> ScanAsync(
+    public async Task<ScanResult> ScanAsync(
         ScanParams p, IProgress<int>? progress, CancellationToken ct)
     {
         // Field-test instrumentation: the whole pipeline is whole-buffer
@@ -181,6 +198,29 @@ public sealed class ScanPipeline
             image.Width, image.Height, Fmt(pixelBytes),
             decodeT.Elapsed.TotalSeconds,
             Fmt(MemRss()), Fmt(MemManaged()));
+
+        // ── Step 2b: 320×320 JPEG thumbnail for Telegram previews ──────────
+        // One thumbnail per scan, shared across all format variants (same
+        // source image anyway). Clone + Resize mode Max keeps aspect ratio
+        // and fits inside the 320×320 box Telegram mandates.
+        var thumbT = Stopwatch.StartNew();
+        var thumbStream = Pool.GetStream("scan-thumb");
+        using (var thumb = image.Clone(ctx => ctx.Resize(new ResizeOptions
+        {
+            Mode = ResizeMode.Max,
+            Size = new Size(ThumbMaxSide, ThumbMaxSide),
+        })))
+        {
+            await thumb.SaveAsJpegAsync(thumbStream, new JpegEncoder
+            {
+                Quality = ThumbJpegQuality,
+            }, ct);
+        }
+        thumbStream.Position = 0;
+        thumbT.Stop();
+        _logger.LogInformation(
+            "thumb done: {Size} in {Elapsed:F2}s",
+            Fmt(thumbStream.Length), thumbT.Elapsed.TotalSeconds);
 
         // ── Step 3: Image → N target formats (one per set bit) ─────────────
         // Flatten the bitmask into an ordered list of individual formats.
@@ -283,11 +323,12 @@ public sealed class ScanPipeline
                 encodeTotal.Elapsed.TotalSeconds);
             progress?.Report(100);
 
-            return results;
+            return new ScanResult(results, thumbStream);
         }
         catch
         {
             foreach (var v in results) v.Data.Dispose();
+            thumbStream.Dispose();
             throw;
         }
     }

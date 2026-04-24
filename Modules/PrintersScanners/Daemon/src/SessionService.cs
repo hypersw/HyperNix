@@ -22,6 +22,9 @@ public sealed class SessionService : IAsyncDisposable
 
     // per-session scan storage, keyed by sessionId + seq + variant-within-seq
     private readonly Dictionary<(string SessionId, int Seq, int Variant), CapturedImage> _images = [];
+    // one JPEG thumbnail per scan, shared across all its format variants
+    // (same source picture). Served via the /thumb sub-endpoint.
+    private readonly Dictionary<(string SessionId, int Seq), CapturedImage> _thumbs = [];
 
     // Queued-scan counter. User taps Scan while a scan is in flight →
     // this goes up → the running scan loop drains it as each scan
@@ -134,7 +137,13 @@ public sealed class SessionService : IAsyncDisposable
     {
         lock (_lock)
         {
-            // drop any held images
+            // drop any held images + their shared thumbnails
+            var thumbKeys = _thumbs.Keys.Where(k => k.SessionId == session.Id).ToList();
+            foreach (var tk in thumbKeys)
+            {
+                _thumbs[tk].Dispose();
+                _thumbs.Remove(tk);
+            }
             var keys = _images.Keys.Where(k => k.SessionId == session.Id).ToList();
             foreach (var k in keys)
             {
@@ -269,7 +278,8 @@ public sealed class SessionService : IAsyncDisposable
                         _broker.Publish(new SessionEvent(
                             SessionEventType.SessionScanProgress,
                             SessionId: sessionId, Seq: seq, PercentDone: pct)));
-                    var variants = await _pipeline.ScanAsync(session.Params, progress, ct);
+                    var scanResult = await _pipeline.ScanAsync(session.Params, progress, ct);
+                    var variants = scanResult.Variants;
                     lock (_lock)
                     {
                         for (int i = 0; i < variants.Count; i++)
@@ -278,6 +288,8 @@ public sealed class SessionService : IAsyncDisposable
                             _images[(sessionId, seq, i)] =
                                 new CapturedImage(v.Data, v.ContentType, v.FileName);
                         }
+                        _thumbs[(sessionId, seq)] = new CapturedImage(
+                            scanResult.Thumbnail, "image/jpeg", $"thumb-{seq}.jpg");
                         var extended = _store.Mutate(s => s with
                         {
                             InFlightScan = false,
@@ -355,6 +367,15 @@ public sealed class SessionService : IAsyncDisposable
         }
     }
 
+    public CapturedImage? GetThumbnail(string sessionId, int seq)
+    {
+        lock (_lock)
+        {
+            _thumbs.TryGetValue((sessionId, seq), out var img);
+            return img;
+        }
+    }
+
     // ── Shutdown ────────────────────────────────────────────────────────────
 
     public async ValueTask DisposeAsync()
@@ -372,6 +393,8 @@ public sealed class SessionService : IAsyncDisposable
         {
             foreach (var img in _images.Values) img.Dispose();
             _images.Clear();
+            foreach (var thumb in _thumbs.Values) thumb.Dispose();
+            _thumbs.Clear();
         }
         _logger.LogInformation("SessionService.DisposeAsync: done");
     }

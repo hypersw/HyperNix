@@ -194,13 +194,27 @@ app.MapPost("/sessions/{id}/scan", async (string id, SessionService svc, Cancell
 
 // Each scan may yield multiple encoded variants (one per format bit in
 // ScanParams.Format). The legacy URL `/image/{seq}` defaults to variant 0;
-// the new `/image/{seq}/{variant}` selects a specific variant.
+// `/image/{seq}/{variant}` selects a specific variant; `/image/{seq}/thumb`
+// returns the small shared JPEG thumbnail the bot passes to Telegram
+// so every variant renders a consistent preview in-chat.
 app.MapGet("/sessions/{id}/image/{seq:int}/{variant:int}",
     async (string id, int seq, int variant, SessionService svc, HttpResponse response, CancellationToken ct) =>
         await ServeImage(id, seq, variant, svc, response, ct));
 app.MapGet("/sessions/{id}/image/{seq:int}",
     async (string id, int seq, SessionService svc, HttpResponse response, CancellationToken ct) =>
         await ServeImage(id, seq, 0, svc, response, ct));
+app.MapGet("/sessions/{id}/image/{seq:int}/thumb",
+    async (string id, int seq, SessionService svc, HttpResponse response, CancellationToken ct) =>
+{
+    var thumb = svc.GetThumbnail(id, seq);
+    if (thumb is null) return Results.NotFound();
+    response.ContentType = thumb.ContentType;
+    response.Headers.ContentDisposition =
+        $"attachment; filename=\"{thumb.FileName}\"";
+    thumb.Data.Position = 0;
+    await thumb.Data.CopyToAsync(response.Body, ct);
+    return Results.Empty;
+});
 
 static async Task<IResult> ServeImage(
     string id, int seq, int variant, SessionService svc, HttpResponse response, CancellationToken ct)

@@ -832,6 +832,17 @@ async Task SendBatchAsMediaGroupAsync(
     string sessionId, int seq, List<BatchEntry> entries,
     long chatId, string caption, CancellationToken ct)
 {
+    // Fetch the per-scan thumbnail once — all variants share the same
+    // source picture — and pass a MemoryStream copy to each item so
+    // Telegram's uploader can consume them concurrently.
+    byte[] thumbBytes;
+    await using (var thumbSrc = await daemon.FetchThumbnailAsync(sessionId, seq, ct))
+    await using (var ms = new MemoryStream())
+    {
+        await thumbSrc.CopyToAsync(ms, ct);
+        thumbBytes = ms.ToArray();
+    }
+
     var streams = new List<FileStream>(entries.Count);
     try
     {
@@ -843,7 +854,7 @@ async Task SendBatchAsMediaGroupAsync(
             streams.Add(stream);
             var media = new InputMediaDocument(new InputFileStream(stream, e.FileName))
             {
-                DisableContentTypeDetection = true,
+                Thumbnail = new InputFileStream(new MemoryStream(thumbBytes), "thumb.jpg"),
                 // Only the first item's caption is shown above the album
                 // — the rest are hidden, so put the summary on slot 0.
                 Caption = i == 0 ? caption : null,
@@ -874,14 +885,17 @@ async Task UploadStagedAsync(
     try
     {
         await using var stream = File.OpenRead(path);
-        // disableContentTypeDetection=true prevents Telegram from
-        // rendering e.g. a small lossy WebP as an inline photo preview
-        // while larger files land in the document listing — we want a
-        // consistent "file attachment" look across all formats so users
-        // can compare sizes at a glance. The stored bytes are identical
-        // either way; this only affects the client's rendering choice.
+        // Attach a 320×320 thumbnail so every format renders a
+        // consistent inline preview in Telegram. Without it, clients
+        // inconsistently preview small images and list big ones as
+        // documents. `disableContentTypeDetection` intentionally
+        // left default (false) — Telegram doesn't re-encode
+        // sendDocument uploads regardless of that flag, so there's
+        // no benefit to forcing "always document" presentation.
+        await using var thumbStream = await daemon.FetchThumbnailAsync(sessionId, seq / 100, ct);
         await bot.SendDocument(chatId, new InputFileStream(stream, fileName),
-            caption: caption, disableContentTypeDetection: true,
+            caption: caption,
+            thumbnail: new InputFileStream(thumbStream, "thumb.jpg"),
             cancellationToken: ct);
         staging.Remove(sessionId, seq);
         log.LogInformation("delivered {Session}#{Seq} → {Chat}", sessionId, seq, chatId);
