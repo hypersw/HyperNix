@@ -43,6 +43,19 @@ let
     # enqueued pre-NTP sync read as "queued 35m ago" even though the
     # system has only been up 90s.
     BOOT_ID=$(${pkgs.coreutils}/bin/cat /proc/sys/kernel/random/boot_id 2>/dev/null || true)
+    # NTP-sync state at enqueue time. systemd-timesyncd drops a marker
+    # file at /run/systemd/timesync/synchronized once it's corrected
+    # wall clock against an upstream NTP source. Absent → TS is
+    # whatever the last-persisted wall clock was (could be minutes to
+    # hours in the past on an RTC-less Pi that bootlooped before
+    # completing NTP sync). We write sync:yes|sync:no so the drainer
+    # knows whether the TS can be trusted; on 'no' it renders a
+    # <no reliable clock> marker in place of the age number.
+    if [ -e /run/systemd/timesync/synchronized ]; then
+      SYNCED="yes"
+    else
+      SYNCED="no"
+    fi
     # 2>/dev/null on tr: head -c 8 closes the pipe which sends SIGPIPE to
     # tr; without stderr suppression that writes a cosmetic "tr: write
     # error: Broken pipe" to the journal even though the script works.
@@ -57,10 +70,18 @@ let
     # mktemp creates 0600; relax to 0644 — queue content is no more
     # sensitive than the journal (chat ids + event descriptions).
     ${pkgs.coreutils}/bin/chmod 0644 "$TMP"
+    # File layout (line-by-line):
+    #   1: wall-clock timestamp (epoch seconds)
+    #   2: chat id
+    #   3: boot id (UUID) — empty tolerated by drain for back-compat
+    #   4: "sync:yes" | "sync:no" — drain falls back to "synced-assumed"
+    #      if this line isn't the literal marker (i.e. older-format msgs)
+    #   5+: message body (may contain newlines)
     {
       ${pkgs.coreutils}/bin/printf '%s\n' "$TS"
       ${pkgs.coreutils}/bin/printf '%s\n' "$CHAT_ID"
       ${pkgs.coreutils}/bin/printf '%s\n' "$BOOT_ID"
+      ${pkgs.coreutils}/bin/printf '%s\n' "sync:$SYNCED"
       ${pkgs.coreutils}/bin/printf '%s' "$TEXT"
     } > "$TMP"
     ${pkgs.coreutils}/bin/mv "$TMP" "${telegramSpool}/$TS-$NONCE.msg"
@@ -140,12 +161,22 @@ let
       ts=$(${pkgs.coreutils}/bin/head -n 1 "$msg")
       chat=$(${pkgs.gnused}/bin/sed -n '2p' "$msg")
       msg_boot_id=$(${pkgs.gnused}/bin/sed -n '3p' "$msg")
-      # Backward-compat: pre-boot-id format had body starting at line 3
-      # and no boot_id line. Detect by UUID shape of line 3; if it
-      # doesn't look like a UUID, treat as old format.
+      # Three historical header layouts — determine body start line and
+      # optional flags by shape of the header fields:
+      #   (A) pre-boot-id:       line 3+ is body, no flags
+      #   (B) pre-sync-flag:     line 3 = UUID boot_id, line 4+ is body
+      #   (C) current:           line 3 = UUID, line 4 = "sync:yes|no", line 5+
+      # Back-compat is free: older messages drain correctly; only new
+      # ones carry the sync flag.
+      msg_synced="assumed"
       case "$msg_boot_id" in
         [0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]-*-*-*-*[0-9a-f])
-          text=$(${pkgs.coreutils}/bin/tail -n +4 "$msg")
+          msg_sync_line=$(${pkgs.gnused}/bin/sed -n '4p' "$msg")
+          case "$msg_sync_line" in
+            "sync:yes") msg_synced="yes"; text=$(${pkgs.coreutils}/bin/tail -n +5 "$msg") ;;
+            "sync:no")  msg_synced="no";  text=$(${pkgs.coreutils}/bin/tail -n +5 "$msg") ;;
+            *)          text=$(${pkgs.coreutils}/bin/tail -n +4 "$msg") ;;   # layout (B)
+          esac
           ;;
         *)
           msg_boot_id=""
@@ -172,7 +203,14 @@ let
           age=$current_uptime
         fi
       fi
-      if [ "$age" -gt 60 ]; then
+      # Clock wasn't synced at enqueue — TS is from whatever wall clock
+      # the RTC-less host had set (last-persisted-systemd-value or even
+      # 1970). Any computed age is nonsense; say so explicitly rather
+      # than lying with a number. &lt;/&gt; so Telegram HTML parser
+      # doesn't treat the angle-brackets as markup.
+      if [ "$msg_synced" = "no" ]; then
+        text="$text"$'\n'"<i>⏱ queued &lt;no reliable clock&gt; ago</i>"
+      elif [ "$age" -gt 60 ]; then
         if [ "$age" -ge 86400 ]; then
           dur="$((age / 86400))d $((age / 3600 % 24))h"
         elif [ "$age" -ge 3600 ]; then
