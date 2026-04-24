@@ -106,6 +106,7 @@ public enum SessionEventType
     ScannerButton,
     SessionOpened,
     SessionScanning,
+    SessionScanQueued,
     SessionScanProgress,
     SessionImageReady,
     SessionScanFailed,
@@ -141,6 +142,11 @@ public record SessionEvent(
     // scan so consumers can draw a progress bar instead of staring at a
     // stale "scanning…" state message.
     int? PercentDone = null,
+    // session.scan-queued / session.scanning: number of scans queued
+    // BEHIND the current one (i.e. additional scans the user already
+    // asked for that will run after this one finishes). Drives the
+    // "+N queued" badge on the Scan button.
+    int? QueuedCount = null,
     // session.extended
     DateTimeOffset? ExpiresAt = null,
     // session.terminated

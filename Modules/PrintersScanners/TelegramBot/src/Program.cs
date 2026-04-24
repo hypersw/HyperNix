@@ -552,8 +552,22 @@ async Task HandleEventAsync(SessionEvent ev, CancellationToken ct)
                 if (sessions.TryGetValue(ev.SessionId, out var bs))
                 {
                     bs.Scanning = true;
-                    bs.ScanProgress = 0;  // reset for new scan
+                    bs.ScanProgress = 0;
+                    // QueuedCount (if present) = scans queued BEHIND the
+                    // scan that's just starting. Sync from daemon truth;
+                    // fall back to 0 on older daemons that don't emit it.
+                    bs.QueuedScans = ev.QueuedCount ?? 0;
                 }
+            }
+            await RerenderAsync(ev.SessionId, ct);
+            break;
+        }
+        case SessionEventType.SessionScanQueued when ev.SessionId is not null:
+        {
+            lock (sessionsLock)
+            {
+                if (sessions.TryGetValue(ev.SessionId, out var bs))
+                    bs.QueuedScans = ev.QueuedCount ?? bs.QueuedScans;
             }
             await RerenderAsync(ev.SessionId, ct);
             break;

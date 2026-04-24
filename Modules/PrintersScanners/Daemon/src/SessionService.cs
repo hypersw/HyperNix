@@ -23,6 +23,12 @@ public sealed class SessionService : IAsyncDisposable
     // per-session scan storage, keyed by sessionId + seq + variant-within-seq
     private readonly Dictionary<(string SessionId, int Seq, int Variant), CapturedImage> _images = [];
 
+    // Queued-scan counter. User taps Scan while a scan is in flight →
+    // this goes up → the running scan loop drains it one-at-a-time as
+    // each scan completes. Hard cap below prevents pathological taps.
+    private int _scanQueue;
+    private const int ScanQueueMax = 10;
+
     // lock covers: the image dictionary, in-flight flag transitions, takeover
     // handshake, session replacement.
     private readonly Lock _lock = new();
@@ -173,88 +179,148 @@ public sealed class SessionService : IAsyncDisposable
 
     // ── Scan ────────────────────────────────────────────────────────────────
 
-    public async Task<int> RequestScanAsync(string sessionId, CancellationToken ct)
+    public Task<int> RequestScanAsync(string sessionId, CancellationToken ct)
     {
-        SessionRecord session;
-        int seq;
+        // Synchronous entry: either start the scan loop (fire-and-forget)
+        // or enqueue behind the currently-running one. Returns quickly
+        // in both cases so the HTTP POST /scan response is snappy even
+        // when the actual scan takes seconds.
         lock (_lock)
         {
             var current = _store.Current
                 ?? throw new InvalidOperationException("No active session");
             if (current.Id != sessionId)
                 throw new InvalidOperationException("Session ID mismatch (taken over?)");
+
             if (current.InFlightScan)
-                throw new InvalidOperationException("Scan already in flight");
+            {
+                // Already scanning — queue up one more. Hard cap at
+                // ScanQueueMax to keep tap-happy users from building
+                // runaway backlogs.
+                if (_scanQueue >= ScanQueueMax)
+                    throw new InvalidOperationException(
+                        $"Scan queue is full ({ScanQueueMax}) — wait for some to finish");
+                _scanQueue++;
+                _broker.Publish(new SessionEvent(
+                    SessionEventType.SessionScanQueued,
+                    SessionId: sessionId, QueuedCount: _scanQueue));
+                _logger.LogInformation(
+                    "scan queued for {Id}: queue depth now {N}", sessionId, _scanQueue);
+                return Task.FromResult(current.ScanCount + 1 + _scanQueue);
+            }
 
-            session = _store.Mutate(s => s with { InFlightScan = true });
-            seq = session.ScanCount + 1;
+            // Nothing in flight — start the scan loop. Tied to the
+            // service-level expiry CTS so it terminates on shutdown;
+            // not to the HTTP request ct, which would end the scan as
+            // soon as this method returns.
+            _store.Mutate(s => s with { InFlightScan = true });
             _scanIdle = new TaskCompletionSource<object?>();
+            _ = Task.Run(() => RunScanLoopAsync(sessionId, _expiryCts.Token));
+            return Task.FromResult(current.ScanCount + 1);
         }
+    }
 
-        using var gate = _gate.Begin($"scan {sessionId}#{seq}");
-        _broker.Publish(new SessionEvent(
-            SessionEventType.SessionScanning, SessionId: sessionId, Seq: seq));
-
+    /// <summary>
+    /// Runs scans back-to-back from the queue until it drains. Each
+    /// iteration processes one full scan (scanimage → decode → N encodes
+    /// → publish N image-ready events). Failures drop the queue —
+    /// operator re-taps Scan to resume.
+    /// </summary>
+    private async Task RunScanLoopAsync(string sessionId, CancellationToken ct)
+    {
         try
         {
-            // Progress bridge: IProgress<int> from the pipeline → SSE event
-            // to the bot(s). Progress<T> invokes its callback on the
-            // original SynchronizationContext (or thread-pool if none),
-            // so publishing to the broker is safe from background threads.
-            var progress = new Progress<int>(pct =>
-                _broker.Publish(new SessionEvent(
-                    SessionEventType.SessionScanProgress,
-                    SessionId: sessionId, Seq: seq, PercentDone: pct)));
-            var variants = await _pipeline.ScanAsync(session.Params, progress, ct);
-            var variantCount = variants.Count;
-            lock (_lock)
+            while (true)
             {
-                for (int i = 0; i < variants.Count; i++)
+                int queueDepth;
+                int seq;
+                SessionRecord session;
+                lock (_lock)
                 {
-                    var v = variants[i];
-                    _images[(sessionId, seq, i)] =
-                        new CapturedImage(v.Data, v.ContentType, v.FileName);
+                    var current = _store.Current;
+                    if (current is null || current.Id != sessionId)
+                    {
+                        // Session gone (closed / taken over). Bail —
+                        // queue is implicitly dropped.
+                        return;
+                    }
+                    session = _store.Mutate(s => s with { InFlightScan = true });
+                    seq = session.ScanCount + 1;
+                    queueDepth = _scanQueue;
                 }
-                var extended = _store.Mutate(s => s with
-                {
-                    InFlightScan = false,
-                    ScanCount = seq
-                });
-                // also bump the sliding window
-                ExtendWindow(extended);
-            }
-            // Fire one image-ready event per variant. Bot delivers each
-            // as it arrives, giving the user live feedback (first file
-            // appears in chat while subsequent formats still encoding).
-            for (int i = 0; i < variants.Count; i++)
-            {
-                var v = variants[i];
+
+                using var gate = _gate.Begin($"scan {sessionId}#{seq}");
                 _broker.Publish(new SessionEvent(
-                    SessionEventType.SessionImageReady,
-                    SessionId: sessionId, Seq: seq,
-                    Variant: i, VariantCount: variantCount,
-                    ContentType: v.ContentType, FileName: v.FileName,
-                    BytesLength: v.Data.Length));
+                    SessionEventType.SessionScanning,
+                    SessionId: sessionId, Seq: seq, QueuedCount: queueDepth));
+
+                try
+                {
+                    var progress = new Progress<int>(pct =>
+                        _broker.Publish(new SessionEvent(
+                            SessionEventType.SessionScanProgress,
+                            SessionId: sessionId, Seq: seq, PercentDone: pct)));
+                    var variants = await _pipeline.ScanAsync(session.Params, progress, ct);
+                    lock (_lock)
+                    {
+                        for (int i = 0; i < variants.Count; i++)
+                        {
+                            var v = variants[i];
+                            _images[(sessionId, seq, i)] =
+                                new CapturedImage(v.Data, v.ContentType, v.FileName);
+                        }
+                        var extended = _store.Mutate(s => s with
+                        {
+                            InFlightScan = false,
+                            ScanCount = seq
+                        });
+                        ExtendWindow(extended);
+                    }
+                    for (int i = 0; i < variants.Count; i++)
+                    {
+                        var v = variants[i];
+                        _broker.Publish(new SessionEvent(
+                            SessionEventType.SessionImageReady,
+                            SessionId: sessionId, Seq: seq,
+                            Variant: i, VariantCount: variants.Count,
+                            ContentType: v.ContentType, FileName: v.FileName,
+                            BytesLength: v.Data.Length));
+                    }
+                }
+                catch (Exception ex)
+                {
+                    lock (_lock)
+                    {
+                        if (_store.Current is not null && _store.Current.Id == sessionId)
+                            _store.Mutate(s => s with { InFlightScan = false });
+                        // Drop queue on failure. User can re-tap to resume.
+                        _scanQueue = 0;
+                    }
+                    _broker.Publish(new SessionEvent(
+                        SessionEventType.SessionScanFailed,
+                        SessionId: sessionId, Seq: seq, Error: ex.Message));
+                    _logger.LogError(ex, "scan failed for session {Id}#{Seq}", sessionId, seq);
+                    return;  // exit loop on failure
+                }
+
+                // Drain one queue slot or exit.
+                lock (_lock)
+                {
+                    if (_scanQueue > 0)
+                    {
+                        _scanQueue--;
+                        continue;
+                    }
+                    return;  // queue empty, scan loop done
+                }
             }
-            return seq;
-        }
-        catch (Exception ex)
-        {
-            lock (_lock)
-            {
-                if (_store.Current is not null && _store.Current.Id == sessionId)
-                    _store.Mutate(s => s with { InFlightScan = false });
-            }
-            _broker.Publish(new SessionEvent(
-                SessionEventType.SessionScanFailed,
-                SessionId: sessionId, Seq: seq, Error: ex.Message));
-            _logger.LogError(ex, "scan failed for session {Id}#{Seq}", sessionId, seq);
-            throw;
         }
         finally
         {
             lock (_lock)
             {
+                if (_store.Current is not null && _store.Current.Id == sessionId)
+                    _store.Mutate(s => s with { InFlightScan = false });
                 _scanIdle?.TrySetResult(null);
                 _scanIdle = null;
             }

@@ -21,6 +21,10 @@ public sealed class BotSession
     // SessionScanProgress SSE events from the daemon; rendered as an
     // emoji bar next to the "scanning…" line in the status message.
     public int ScanProgress { get; set; }
+    // Scans queued BEHIND the current in-flight one. User taps
+    // Scan while scanning → increments. Decrements as each queued
+    // scan starts. Drives the "+N queued" badge on the Scan button.
+    public int QueuedScans { get; set; }
     public int LastUploadedSeq { get; set; }
 }
 
@@ -126,18 +130,23 @@ public static class StatusMessage
             InlineKeyboardButton.WithCallbackData($"📄 Format: {fmt}",              $"pick:fmt:{sid}"),
             InlineKeyboardButton.WithCallbackData($"📏 Resolution: {s.Params.Dpi} dpi", $"pick:dpi:{sid}"),
         });
-        // Row 2: the primary-action button. Always present (was previously
-        // omitted during scans, which made the keyboard reshape every time
-        // a scan started/finished — jarring). Idle vs scanning differ only
-        // in label and callback target:
-        //   idle     → "📷 SCAN NOW!" (ALL CAPS stands in for bold — Telegram
-        //              inline-button labels are plain text only, no HTML)
-        //   scanning → "⏳ Scanning…" with callback data "noop". HandleCallback
-        //              answers the query up-front then falls through on any
-        //              unknown prefix, so a tap does nothing silently.
-        rows.Add(s.Scanning
-            ? new[] { InlineKeyboardButton.WithCallbackData("⏳ Scanning…", "noop") }
-            : new[] { InlineKeyboardButton.WithCallbackData("📷 SCAN NOW!", $"scan:{sid}") });
+        // Row 2: primary-action button. Always present (was previously
+        // omitted during scans, which made the keyboard reshape every
+        // time a scan started/finished — jarring). Three states:
+        //   idle              → "📷 SCAN NOW!"            tap: start new
+        //   scanning, queue=0 → "⏳ Scanning… ⏭ queue next"  tap: enqueue next
+        //   scanning, queue=N → "⏳ Scanning… ⏭ +N queued"   tap: enqueue another
+        // All three use the same "scan:{sid}" callback — daemon decides
+        // start-vs-enqueue based on its own in-flight state. Daemon also
+        // caps the queue; beyond the cap it returns an error that the
+        // bot surfaces as a "queue full" message.
+        var scanLabel = (s.Scanning, s.QueuedScans) switch
+        {
+            (false, _)    => "📷 SCAN NOW!",
+            (true, 0)     => "⏳ Scanning… ⏭ queue next",
+            (true, var n) => $"⏳ Scanning… ⏭ +{n} queued",
+        };
+        rows.Add(new[] { InlineKeyboardButton.WithCallbackData(scanLabel, $"scan:{sid}") });
         return new InlineKeyboardMarkup(rows);
     }
 
