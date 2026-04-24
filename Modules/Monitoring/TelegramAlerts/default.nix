@@ -226,16 +226,39 @@ let
           break
           ;;
         4*)
-          # Permanent 4xx: 400 (too long / bad HTML), 401/403 (token/ACL),
-          # 404 (chat gone). The message will NEVER succeed on retry — drop
-          # it with a loud log, but carry on draining the rest of the queue
-          # (a single poison message shouldn't block unrelated messages
-          # behind it). rc stays 0: the drain is doing its job of clearing
-          # the queue; the operator sees the problem in this log line.
+          # Permanent-ish 4xx. Always try once more as stripped plain text
+          # (strip HTML tags, unescape the three meta entities, re-cap to
+          # 4080 bytes, POST without parse_mode). Rescues "too long" and
+          # "can't parse entities" with a single round-trip; harmless for
+          # other 4xx (chat-gone, bot-blocked, text-empty) — they 4xx
+          # again, we drop. Sleep first to not burn our per-chat rate
+          # budget on the retry.
           desc=$(${pkgs.jq}/bin/jq -r '.description // "(no description)"' < "$BODY" 2>/dev/null \
               || ${pkgs.coreutils}/bin/cat "$BODY")
-          echo "drain: dropping $msgname — permanent HTTP $code: $desc" >&2
-          ${pkgs.coreutils}/bin/rm -f "$msg" "$BODY"
+          ${pkgs.coreutils}/bin/sleep 1.1
+          plain=$(${pkgs.coreutils}/bin/printf '%s' "$text" \
+              | ${pkgs.gnused}/bin/sed 's|<[^>]*>||g; s|&amp;|\&|g; s|&lt;|<|g; s|&gt;|>|g' \
+              | ${pkgs.coreutils}/bin/head -c 4080)
+          BODY2=$(${pkgs.coreutils}/bin/mktemp)
+          retry_code=$(${pkgs.curl}/bin/curl -sS --max-time 10 -o "$BODY2" \
+              -w "%{http_code}" -X POST \
+              "https://api.telegram.org/bot$TOKEN/sendMessage" \
+              --data-urlencode "chat_id=$chat" \
+              --data-urlencode "text=$plain" 2>&1) || retry_code="000"
+          case "$retry_code" in ""|*[!0-9]*) retry_code="000" ;; esac
+          case "$retry_code" in
+            2*)
+              echo "drain: $msgname: initial HTTP $code ($desc) — delivered as plain text" >&2
+              ${pkgs.coreutils}/bin/rm -f "$msg" "$BODY" "$BODY2"
+              ${pkgs.coreutils}/bin/sleep 1.1
+              ;;
+            *)
+              retry_desc=$(${pkgs.jq}/bin/jq -r '.description // "(no description)"' < "$BODY2" 2>/dev/null \
+                  || ${pkgs.coreutils}/bin/cat "$BODY2" 2>/dev/null || echo "(no body)")
+              echo "drain: dropping $msgname — HTML: $code $desc; plain retry: $retry_code $retry_desc" >&2
+              ${pkgs.coreutils}/bin/rm -f "$msg" "$BODY" "$BODY2"
+              ;;
+          esac
           ;;
         000)
           # curl itself failed: DNS, timeout, no route, TLS error. Transient.
