@@ -197,7 +197,15 @@ public sealed class SessionService : IAsyncDisposable
 
         try
         {
-            var result = await _pipeline.ScanAsync(session.Params, ct);
+            // Progress bridge: IProgress<int> from the pipeline → SSE event
+            // to the bot(s). Progress<T> invokes its callback on the
+            // original SynchronizationContext (or thread-pool if none),
+            // so publishing to the broker is safe from background threads.
+            var progress = new Progress<int>(pct =>
+                _broker.Publish(new SessionEvent(
+                    SessionEventType.SessionScanProgress,
+                    SessionId: sessionId, Seq: seq, PercentDone: pct)));
+            var result = await _pipeline.ScanAsync(session.Params, progress, ct);
             var captured = new CapturedImage(result.Data, result.ContentType,
                 $"scan-{sessionId}-{seq}.{result.FileExtension}");
             lock (_lock)

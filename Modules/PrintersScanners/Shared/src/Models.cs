@@ -16,13 +16,13 @@ public record PrinterStatus(
 
 // ── Scan params ─────────────────────────────────────────────────────────────
 
-public enum ScanFormat { Jpeg, Png, Tiff }
+public enum ScanFormat { Jpeg, Png, Tiff, Webp }
 
 /// <summary>
 /// Parameters for one scan. Applies to every scan within a session.
 /// JpegQuality kept for wire-compat / future use; the daemon currently
 /// bakes in Q=85 regardless (see ScanPipeline). Users who need higher
-/// quality pick PNG or TIFF instead of tuning a knob.
+/// quality pick PNG, WEBP (lossless) or TIFF instead of tuning a knob.
 /// </summary>
 public record ScanParams(
     int Dpi = 200,
@@ -91,6 +91,7 @@ public enum SessionEventType
     ScannerButton,
     SessionOpened,
     SessionScanning,
+    SessionScanProgress,
     SessionImageReady,
     SessionScanFailed,
     SessionExtended,
@@ -116,6 +117,10 @@ public record SessionEvent(
     string? FileName = null,
     long? BytesLength = null,
     string? Error = null,
+    // session.scan-progress (0..100). Fired periodically during an in-flight
+    // scan so consumers can draw a progress bar instead of staring at a
+    // stale "scanning…" state message.
+    int? PercentDone = null,
     // session.extended
     DateTimeOffset? ExpiresAt = null,
     // session.terminated

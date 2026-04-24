@@ -523,8 +523,23 @@ async Task HandleEventAsync(SessionEvent ev, CancellationToken ct)
             lock (sessionsLock)
             {
                 if (sessions.TryGetValue(ev.SessionId, out var bs))
+                {
                     bs.Scanning = true;
+                    bs.ScanProgress = 0;  // reset for new scan
+                }
             }
+            await RerenderAsync(ev.SessionId, ct);
+            break;
+        }
+        case SessionEventType.SessionScanProgress when ev.SessionId is not null && ev.PercentDone is int pct:
+        {
+            lock (sessionsLock)
+            {
+                if (sessions.TryGetValue(ev.SessionId, out var bs))
+                    bs.ScanProgress = pct;
+            }
+            // Every 5% tick is ~20 edits per scan, ~2-4 edits/sec —
+            // comfortably under Telegram's per-chat rate limit.
             await RerenderAsync(ev.SessionId, ct);
             break;
         }

@@ -6,6 +6,7 @@ using SixLabors.ImageSharp.Formats.Jpeg;
 using SixLabors.ImageSharp.Formats.Png;
 using SixLabors.ImageSharp.Formats.Tiff;
 using SixLabors.ImageSharp.Formats.Tiff.Constants;
+using SixLabors.ImageSharp.Formats.Webp;
 using SixLabors.ImageSharp.PixelFormats;
 
 namespace PrintScan.Daemon;
@@ -59,9 +60,13 @@ public sealed class ScanPipeline
     /// <summary>
     /// Scan synchronously, decode, re-encode, return the encoded stream.
     /// Caller owns the stream and must dispose it. Throws on non-zero
-    /// exit or spawn failure.
+    /// exit or spawn failure. Optional <paramref name="progress"/> is
+    /// reported 0..100 while scanimage is streaming bytes (estimated
+    /// from expected A4-page size — rough but close enough for a UI
+    /// progress bar), and then 100 when encoding completes.
     /// </summary>
-    public async Task<Result> ScanAsync(ScanParams p, CancellationToken ct)
+    public async Task<Result> ScanAsync(
+        ScanParams p, IProgress<int>? progress, CancellationToken ct)
     {
         // Field-test instrumentation: the whole pipeline is whole-buffer
         // (scanimage → TIFF blob → Image<Rgb24> decode → encoded blob),
@@ -93,10 +98,35 @@ public sealed class ScanPipeline
         using var proc = Process.Start(psi)
             ?? throw new InvalidOperationException("Failed to start scanimage");
 
+        // Expected raw-pixel bytes for an A4-ish page at this dpi. We
+        // overestimate slightly (8.5 × 11.7 in) so progress doesn't hit
+        // 100% mid-scan and stall visibly; final "done" jump to 100 comes
+        // from the encode-complete report at the bottom.
+        long expectedBytes = (long)(8.5 * 11.7 * p.Dpi * p.Dpi * 3);
+
         using var tiffStream = Pool.GetStream("scan-tiff");
-        var copyTask = proc.StandardOutput.BaseStream.CopyToAsync(tiffStream, ct);
         var stderrTask = proc.StandardError.ReadToEndAsync(ct);
-        await copyTask;
+        var buffer = new byte[64 * 1024];
+        long totalRead = 0;
+        int lastReportedPct = -5;  // ensures the first real report fires
+        while (true)
+        {
+            var n = await proc.StandardOutput.BaseStream.ReadAsync(buffer, ct);
+            if (n <= 0) break;
+            await tiffStream.WriteAsync(buffer.AsMemory(0, n), ct);
+            totalRead += n;
+            if (progress is not null && expectedBytes > 0)
+            {
+                // Cap at 99% — 100% belongs to "encode complete", so the
+                // UI never says 100% while the daemon is still working.
+                var pct = (int)Math.Min(99, totalRead * 100 / expectedBytes);
+                if (pct - lastReportedPct >= 5)
+                {
+                    progress.Report(pct);
+                    lastReportedPct = pct;
+                }
+            }
+        }
         await proc.WaitForExitAsync(ct);
         var stderr = await stderrTask;
         scanT.Stop();
@@ -137,6 +167,7 @@ public sealed class ScanPipeline
         {
             ScanFormat.Png => ("image/png", "png"),
             ScanFormat.Tiff => ("image/tiff", "tiff"),
+            ScanFormat.Webp => ("image/webp", "webp"),
             _ => ("image/jpeg", "jpg"),
         };
         var outStream = Pool.GetStream("scan-encoded");
@@ -165,6 +196,22 @@ public sealed class ScanPipeline
                     await image.SaveAsTiffAsync(outStream, new TiffEncoder
                     {
                         Compression = TiffCompression.Deflate,
+                    }, ct);
+                    break;
+
+                case ScanFormat.Webp:
+                    // Lossless WebP — typically ~55-65% the size of a
+                    // level-9 PNG on document scans, zero quality loss,
+                    // and Telegram renders inline previews for WebP
+                    // attachments. FileFormat=Lossless plus a middle-of-
+                    // road encode method (4/6) balances compression vs
+                    // encode-time on the A72. Method 6 would squeeze
+                    // another ~5% but triples encode time — not worth
+                    // it at scanner feed rates.
+                    await image.SaveAsWebpAsync(outStream, new WebpEncoder
+                    {
+                        FileFormat = WebpFileFormatType.Lossless,
+                        Method = WebpEncodingMethod.Default,
                     }, ct);
                     break;
 
@@ -203,6 +250,8 @@ public sealed class ScanPipeline
                 scanT.Elapsed.TotalSeconds,
                 decodeT.Elapsed.TotalSeconds,
                 encodeT.Elapsed.TotalSeconds);
+            // Final 100% belongs here — everything above it is "not done yet".
+            progress?.Report(100);
 
             return new Result(outStream, contentType, ext);
         }

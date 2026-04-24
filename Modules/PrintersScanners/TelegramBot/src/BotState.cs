@@ -17,6 +17,10 @@ public sealed class BotSession
     public int ScanCount { get; set; }
     public bool ScannerOnline { get; set; }
     public bool Scanning { get; set; }
+    // 0..100 while a scan is in flight; null / 0 otherwise. Fed by
+    // SessionScanProgress SSE events from the daemon; rendered as an
+    // emoji bar next to the "scanning…" line in the status message.
+    public int ScanProgress { get; set; }
     public int LastUploadedSeq { get; set; }
 }
 
@@ -78,7 +82,7 @@ public static class StatusMessage
 
         var scannerLine = (s.Scanning, s.ScannerOnline) switch
         {
-            (true, _)      => "📡 Scanner: 📷 <i>scanning…</i>",
+            (true, _)      => $"📡 Scanner: 📷 <i>scanning… {ProgressBar(s.ScanProgress)} {s.ScanProgress}%</i>",
             (false, true)  => "📡 Scanner: ✅ ready — tap Scan (or press scanner button)",
             (false, false) => "📡 Scanner: ⏳ <i>waiting — power on or press scanner button</i>",
         };
@@ -127,6 +131,16 @@ public static class StatusMessage
         return new InlineKeyboardMarkup(rows);
     }
 
+    // Progress bar for the in-flight scan status line. 10 segments,
+    // ▰ filled / ▱ empty — monospaced in Telegram, reads cleanly
+    // across desktop and mobile clients. Caps at 10/10 even if the
+    // daemon's estimate reports >100 (shouldn't, but be defensive).
+    private static string ProgressBar(int pct)
+    {
+        var filled = Math.Clamp(pct / 10, 0, 10);
+        return new string('▰', filled) + new string('▱', 10 - filled);
+    }
+
     // Radio-button emojis for current-selection indication in the
     // format / DPI pickers. The previous " ✓" suffix got lost next
     // to the emoji-heavy labels; filled-circle vs open-circle is
@@ -139,12 +153,18 @@ public static class StatusMessage
         var sid = s.DaemonSessionId;
         var cur = s.Params.Format;
         string mark(ScanFormat f) => f == cur ? SelectedMark : UnselectedMark;
+        // Four format choices split 2+2 so a single row doesn't get
+        // too cramped on narrow mobile widths.
         return new InlineKeyboardMarkup(new[]
         {
             new[]
             {
                 InlineKeyboardButton.WithCallbackData($"{mark(ScanFormat.Jpeg)}JPG",  $"set:fmt:{sid}:jpeg"),
                 InlineKeyboardButton.WithCallbackData($"{mark(ScanFormat.Png)}PNG",   $"set:fmt:{sid}:png"),
+            },
+            new[]
+            {
+                InlineKeyboardButton.WithCallbackData($"{mark(ScanFormat.Webp)}WEBP", $"set:fmt:{sid}:webp"),
                 InlineKeyboardButton.WithCallbackData($"{mark(ScanFormat.Tiff)}TIFF", $"set:fmt:{sid}:tiff"),
             },
             new[] { InlineKeyboardButton.WithCallbackData("↩ back", $"cancel:{sid}") },
