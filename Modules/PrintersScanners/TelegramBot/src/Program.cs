@@ -54,22 +54,34 @@ var sessionsLock = new Lock();
 var inFlight = 0;
 var inFlightDrained = new SemaphoreSlim(1, 1);
 
+// ── Cancellation / shutdown ─────────────────────────────────────────────────
+
+using var cts = new CancellationTokenSource();
+Console.CancelKeyPress += (_, e) => { e.Cancel = true; cts.Cancel(); };
+AppDomain.CurrentDomain.ProcessExit += (_, _) => cts.Cancel();
+
 // ── Bot identity + commands ─────────────────────────────────────────────────
 
-// Fetch the bot's own username once at startup. Used to build deep-link
-// URLs inside status messages (e.g. the "end" hyperlink points at
-// https://t.me/<username>?start=end_<sid>, which triggers /start on
-// this bot when tapped — see HandleMessageAsync).
-var me = await bot.GetMe();
+// The bot runs on a box that can see network dark periods at any time —
+// from "systemd started us before resolved is live" at boot to "Wi-Fi
+// dropped for 30s" during the day. A single HttpRequestException from
+// the Telegram client must never crash the process. Wrap any TG call we
+// make before the main poll loop (which has its own catch+sleep) in a
+// retry with capped exponential back-off.
+var me = await RetryTransient(
+    () => bot.GetMe(), "bot.GetMe()", log, cts.Token);
 var botUsername = me.Username
     ?? throw new Exception("bot.GetMe() returned no username — token may be wrong");
 log.LogInformation("bot identity: @{Username} (id={Id})", botUsername, me.Id);
 
-await bot.SetMyCommands([
-    new() { Command = "scanner", Description = "📷 Open scanner session" },
-    new() { Command = "status", Description = "📊 Printer & scanner status" },
-    new() { Command = "help",   Description = "❓ How to use this bot" },
-]);
+await RetryTransient(
+    () => bot.SetMyCommands([
+        new() { Command = "scanner", Description = "📷 Open scanner session" },
+        new() { Command = "status", Description = "📊 Printer & scanner status" },
+        new() { Command = "help",   Description = "❓ How to use this bot" },
+    ]),
+    "bot.SetMyCommands()", log, cts.Token);
+
 var mainKeyboard = new ReplyKeyboardMarkup(
     new[] { new KeyboardButton[] { "📷 Scanner", "📊 Status" } })
 { ResizeKeyboard = true, IsPersistent = true };
@@ -77,12 +89,6 @@ var mainKeyboard = new ReplyKeyboardMarkup(
 log.LogInformation("bot starting, allowed users: {Users}, socket: {Sock}, staging: {Stg}",
     string.Join(", ", allowedUsers.Select(u => $"{u.Value}({u.Key})")),
     socketPath, runtimeDir);
-
-// ── Cancellation / shutdown ─────────────────────────────────────────────────
-
-using var cts = new CancellationTokenSource();
-Console.CancelKeyPress += (_, e) => { e.Cancel = true; cts.Cancel(); };
-AppDomain.CurrentDomain.ProcessExit += (_, _) => cts.Cancel();
 
 // ── Background loops ────────────────────────────────────────────────────────
 
@@ -703,4 +709,45 @@ async Task SweepStagingAsync(CancellationToken ct)
 }
 
 // ────────────────────────────────────────────────────────────────────────────
+// Resilience helper: re-run a TG call on transient network failures with
+// capped exponential back-off. Used only for startup-critical calls
+// (GetMe, SetMyCommands) — the main long-poll loop has its own catch +
+// 5s-delay retry path. We loop forever (until the passed CancellationToken
+// is tripped); if the box has no connectivity at all, the service just
+// sits here instead of crashing and being marked failed.
+static async Task<T> RetryTransient<T>(
+    Func<Task<T>> op, string what, ILogger log, CancellationToken ct)
+{
+    var attempt = 0;
+    while (true)
+    {
+        try { return await op(); }
+        catch (Exception ex) when (!ct.IsCancellationRequested && IsTransient(ex))
+        {
+            attempt++;
+            var delay = TimeSpan.FromSeconds(Math.Min(30, 1 << Math.Min(attempt, 5)));
+            log.LogWarning(
+                "{What} attempt #{N} transient error: {Msg} — retry in {Sec}s",
+                what, attempt, ex.Message, (int)delay.TotalSeconds);
+            try { await Task.Delay(delay, ct); }
+            catch (OperationCanceledException) { throw; }
+        }
+    }
+}
+
+static async Task RetryTransient(
+    Func<Task> op, string what, ILogger log, CancellationToken ct) =>
+    await RetryTransient<object?>(async () => { await op(); return null; }, what, log, ct);
+
+// Any network-adjacent failure counts as transient. DNS name-not-known
+// and socket errors bubble up via TG's RequestException (inner is
+// HttpRequestException/SocketException). TaskCanceledException also
+// appears on HTTP timeouts. Operator-signal cancellations are handled
+// by the ct.IsCancellationRequested check in the outer `when` clause.
+static bool IsTransient(Exception ex) =>
+    ex is System.Net.Http.HttpRequestException ||
+    ex is System.Net.Sockets.SocketException ||
+    ex is TaskCanceledException ||
+    (ex.InnerException is Exception inner && IsTransient(inner));
+
 record AllowedUser(long Id, string Name);

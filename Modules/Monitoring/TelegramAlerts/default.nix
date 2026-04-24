@@ -662,8 +662,13 @@ in
 
     systemd.services.alert-telegram-outbox-drain = {
       description = "Deliver pending Telegram alerts from the outbox";
-      # No After=network-online.target — drain tolerates network-down by
-      # failing (systemd re-runs per timer). Boot never waits for this.
+      # Wait for the network stack AND DNS to be ready. Without this, the
+      # first post-boot drain tick fires before systemd-resolved is up and
+      # fails on "Name or service not known (api.telegram.org:443)",
+      # landing the unit in failed state until later timer firings manage
+      # to succeed.
+      after = [ "network-online.target" "nss-lookup.target" ];
+      wants = [ "network-online.target" "nss-lookup.target" ];
       serviceConfig = {
         WorkingDirectory = "/var/empty";  # safe CWD — see Modules/PrintersScanners/Daemon/default.nix
         Type = "oneshot";
@@ -951,11 +956,11 @@ Uptime: $UPTIME"
           if [ "$STREAK" -ge 2 ]; then
             ${sendAlert} "💥 <b>$HOST</b>: previous boot ended abruptly (no shutdown marker). Streak of $STREAK unclean boots back — suspect power / USB-peripheral / hardware.
 Last failing boot ended with:
-<blockquote expandable>$LAST_UNCLEAN_TAIL</blockquote>"
+<blockquote expandable><pre>$LAST_UNCLEAN_TAIL</pre></blockquote>"
           else
             ${sendAlert} "⚠️ <b>$HOST</b>: previous boot ended abruptly (no shutdown marker). Isolated event — worth noting only if it recurs.
 Last failing boot ended with:
-<blockquote expandable>$LAST_UNCLEAN_TAIL</blockquote>"
+<blockquote expandable><pre>$LAST_UNCLEAN_TAIL</pre></blockquote>"
           fi
 
           # Separately: genuine kernel panics in the immediately previous
@@ -966,7 +971,7 @@ Last failing boot ended with:
             | ${tgEscape})
           if [ -n "$PANIC" ]; then
             ${sendAlert} "☠️ <b>$HOST</b>: kernel panic/oops in previous boot:
-<blockquote expandable>$PANIC</blockquote>"
+<blockquote expandable><pre>$PANIC</pre></blockquote>"
           fi
         '';
       };
@@ -999,7 +1004,7 @@ Last failing boot ended with:
           HOST=$(${pkgs.hostname}/bin/hostname)
           LOG=$(${pkgs.systemd}/bin/journalctl -u nixos-upgrade --no-pager -n 15 -q 2>/dev/null | ${tgEscape})
           ${sendAlert} "❌ <b>$HOST</b>: NixOS upgrade FAILED
-<blockquote expandable>$LOG</blockquote>"
+<blockquote expandable><pre>$LOG</pre></blockquote>"
         '';
       };
     };
@@ -1020,7 +1025,7 @@ Last failing boot ended with:
           HOST=$(${pkgs.hostname}/bin/hostname)
           LOG=$(${pkgs.systemd}/bin/journalctl -u auto-rebuild-switch --no-pager -n 30 -q 2>/dev/null | ${tgEscape})
           ${sendAlert} "❌ <b>$HOST</b>: auto-rebuild switch FAILED
-<blockquote expandable>$LOG</blockquote>"
+<blockquote expandable><pre>$LOG</pre></blockquote>"
         '';
       };
     };
@@ -1034,7 +1039,7 @@ Last failing boot ended with:
           HOST=$(${pkgs.hostname}/bin/hostname)
           LOG=$(${pkgs.systemd}/bin/journalctl -u auto-rebuild-github-checker --no-pager -n 30 -q 2>/dev/null | ${tgEscape})
           ${sendLog} "⚠️ <b>$HOST</b>: auto-rebuild checker hard-failed (not transient)
-<blockquote expandable>$LOG</blockquote>"
+<blockquote expandable><pre>$LOG</pre></blockquote>"
         '';
       };
     };

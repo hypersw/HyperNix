@@ -181,6 +181,13 @@ in
     # ── Checker: unprivileged, hardened, internet-facing ────────────
     systemd.services.auto-rebuild-github-checker = {
       description = "Check upstream flake for changes; queue a switch if any";
+      # Wait for the network stack AND DNS resolution to be ready before we
+      # attempt `git ls-remote` to github. Without this we race early-boot
+      # ticks before systemd-resolved is up and get "Name or service not
+      # known" — the script soft-exits on that, but the first tick is
+      # wasted and shows up as transient failures in the journal.
+      after = [ "network-online.target" "nss-lookup.target" ];
+      wants = [ "network-online.target" "nss-lookup.target" ];
       # HOME defaults to /var/empty for isSystemUser (which is 0555 immutable),
       # but `nix flake metadata` wants to mkdir $HOME/.cache/nix for its eval
       # cache. Point HOME at the writable runtime directory instead. Cleared
@@ -262,6 +269,16 @@ in
     # gets "trigger a rebuild now" (DoS) and nothing more.
     systemd.services.auto-rebuild-switch = {
       description = "Update flake lock and activate new NixOS configuration";
+      # Don't let nixos-rebuild restart this service mid-self-switch.
+      # The unit file for auto-rebuild-switch.service ~always changes
+      # whenever we update anything in this module; with the default
+      # restartIfChanged=true, switch-to-configuration stops the
+      # currently-running switcher as part of activation — which
+      # SIGTERMs the nixos-rebuild child mid-flight. Setting this to
+      # false means: the running switcher finishes with the OLD unit
+      # definition intact; the NEW definition only takes effect on the
+      # NEXT path-triggered switch. Exactly what we want for oneshot.
+      restartIfChanged = false;
       serviceConfig = {
         Type = "oneshot";
         WorkingDirectory = "/var/empty";
