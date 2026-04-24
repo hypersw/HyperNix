@@ -1,4 +1,10 @@
-{ pkgs, closefrom3, timeout ? 3600, perTokenPin ? false }:
+{ pkgs, closefrom3 }:
+let
+  flakeName = import ../../flake-name.nix;
+  envPrefix = "${pkgs.lib.toUpper flakeName}_SSH_ASKPASS";
+  timeoutVar      = "${envPrefix}_TIMEOUT";
+  perTokenPinVar  = "${envPrefix}_PER_TOKEN_PIN";
+in
 pkgs.writeShellScriptBin "ssh-askpass-credential-helper" ''
   # SSH_ASKPASS helper that caches prompts via git credential-cache.
   #
@@ -6,30 +12,33 @@ pkgs.writeShellScriptBin "ssh-askpass-credential-helper" ''
   # All other prompts (passphrases, passwords) are also cached, each
   # under its own full prompt string as cache key.
   #
-  # PIN cache key behavior (compile-time choice):
-  #   per-token-pin=false (default): all PIN prompts share one cache slot
-  #   per-token-pin=true: each token gets its own cached PIN
-  #
   # Cache miss prompts via zenity (GUI dialog) since SSH runs askpass
   # detached from the terminal.
   #
   # Uses closefrom3 to prevent git credential-cache's daemon from inheriting
   # the SSH pipe fd (which would keep the pipe open and hang SSH).
   #
+  # Config is read from env vars, which the NixOS module sets locally via
+  # `makeWrapper --set` on this binary (so no global env pollution, and the
+  # names are namespaced to this flake):
+  #   ${timeoutVar}         Cache timeout in seconds (default: 3600)
+  #   ${perTokenPinVar}     Non-empty → each PIN prompt is its own cache
+  #                         slot; empty → all PIN prompts share "pkcs11-pin"
+  #
   # See: TpmSshSetup.md in this repo for context.
 
   prompt="''${1:-}"
+  timeout="''${${timeoutVar}:-3600}"
+  per_token_pin="''${${perTokenPinVar}:-}"
 
   # Determine cache key
   case "$prompt" in
     "Enter PIN for '"*)
-      ${if perTokenPin then ''
-      # Per-token mode: each PIN prompt is a separate cache key
-      cache_key="$prompt"
-      '' else ''
-      # Unified mode: all PIN prompts share one cache slot
-      cache_key="pkcs11-pin"
-      ''}
+      if [ -n "$per_token_pin" ]; then
+        cache_key="$prompt"
+      else
+        cache_key="pkcs11-pin"
+      fi
       ;;
     *)
       # Non-PIN prompts: always keyed by full prompt
@@ -58,6 +67,6 @@ pkgs.writeShellScriptBin "ssh-askpass-credential-helper" ''
   # inheriting the SSH pipe fd
   printf 'protocol=pkcs11\nhost=%s\nusername=tpm\npassword=%s\n' "$cache_key" "$value" \
     | ${closefrom3}/bin/closefrom3 \
-      ${pkgs.git}/bin/git credential-cache --timeout=${toString timeout} store \
+      ${pkgs.git}/bin/git credential-cache --timeout="$timeout" store \
       >/dev/null 2>/dev/null
 ''
