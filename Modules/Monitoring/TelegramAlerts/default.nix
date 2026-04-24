@@ -49,13 +49,18 @@ let
     # whatever the last-persisted wall clock was (could be minutes to
     # hours in the past on an RTC-less Pi that bootlooped before
     # completing NTP sync). We write sync:yes|sync:no so the drainer
-    # knows whether the TS can be trusted; on 'no' it renders a
-    # <no reliable clock> marker in place of the age number.
+    # knows whether the wall TS can be trusted.
     if [ -e /run/systemd/timesync/synchronized ]; then
       SYNCED="yes"
     else
       SYNCED="no"
     fi
+    # Monotonic seconds since boot. Always reliable (doesn't depend on
+    # NTP), but only meaningful within the same boot — which is what
+    # boot_id identifies. Drainer uses this for same-boot messages
+    # enqueued while unsynced, where wall clock is garbage but the
+    # monotonic delta gives an accurate age.
+    MONO=$(${pkgs.gawk}/bin/awk '{print int($1)}' /proc/uptime)
     # 2>/dev/null on tr: head -c 8 closes the pipe which sends SIGPIPE to
     # tr; without stderr suppression that writes a cosmetic "tr: write
     # error: Broken pipe" to the journal even though the script works.
@@ -75,13 +80,18 @@ let
     #   2: chat id
     #   3: boot id (UUID) — empty tolerated by drain for back-compat
     #   4: "sync:yes" | "sync:no" — drain falls back to "synced-assumed"
-    #      if this line isn't the literal marker (i.e. older-format msgs)
-    #   5+: message body (may contain newlines)
+    #      if this line isn't the literal marker (older-format msgs)
+    #   5: "mono:N" — monotonic seconds since boot at enqueue time;
+    #      drain uses this for same-boot sync:no messages where the
+    #      wall clock is garbage. Older msgs: drain falls back to
+    #      "no reliable clock" text if mono isn't present.
+    #   6+: message body (may contain newlines)
     {
       ${pkgs.coreutils}/bin/printf '%s\n' "$TS"
       ${pkgs.coreutils}/bin/printf '%s\n' "$CHAT_ID"
       ${pkgs.coreutils}/bin/printf '%s\n' "$BOOT_ID"
       ${pkgs.coreutils}/bin/printf '%s\n' "sync:$SYNCED"
+      ${pkgs.coreutils}/bin/printf '%s\n' "mono:$MONO"
       ${pkgs.coreutils}/bin/printf '%s' "$TEXT"
     } > "$TMP"
     ${pkgs.coreutils}/bin/mv "$TMP" "${telegramSpool}/$TS-$NONCE.msg"
@@ -161,26 +171,39 @@ let
       ts=$(${pkgs.coreutils}/bin/head -n 1 "$msg")
       chat=$(${pkgs.gnused}/bin/sed -n '2p' "$msg")
       msg_boot_id=$(${pkgs.gnused}/bin/sed -n '3p' "$msg")
-      # Three historical header layouts — determine body start line and
+      # Four historical header layouts — determine body start line and
       # optional flags by shape of the header fields:
-      #   (A) pre-boot-id:       line 3+ is body, no flags
-      #   (B) pre-sync-flag:     line 3 = UUID boot_id, line 4+ is body
-      #   (C) current:           line 3 = UUID, line 4 = "sync:yes|no", line 5+
+      #   (A) pre-boot-id:    line 3+ is body, no flags
+      #   (B) pre-sync-flag:  line 3 = UUID boot_id, line 4+ is body
+      #   (C) pre-mono:       line 3 = UUID, line 4 = "sync:*", line 5+
+      #   (D) current:        line 3 = UUID, line 4 = "sync:*",
+      #                       line 5 = "mono:N", line 6+
       # Back-compat is free: older messages drain correctly; only new
-      # ones carry the sync flag.
+      # ones carry the full header.
       msg_synced="assumed"
+      msg_mono=""
       case "$msg_boot_id" in
         [0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]-*-*-*-*[0-9a-f])
           msg_sync_line=$(${pkgs.gnused}/bin/sed -n '4p' "$msg")
           case "$msg_sync_line" in
-            "sync:yes") msg_synced="yes"; text=$(${pkgs.coreutils}/bin/tail -n +5 "$msg") ;;
-            "sync:no")  msg_synced="no";  text=$(${pkgs.coreutils}/bin/tail -n +5 "$msg") ;;
-            *)          text=$(${pkgs.coreutils}/bin/tail -n +4 "$msg") ;;   # layout (B)
+            "sync:yes"|"sync:no")
+              [ "$msg_sync_line" = "sync:yes" ] && msg_synced="yes" || msg_synced="no"
+              msg_mono_line=$(${pkgs.gnused}/bin/sed -n '5p' "$msg")
+              case "$msg_mono_line" in
+                "mono:"*)
+                  msg_mono="''${msg_mono_line#mono:}"
+                  text=$(${pkgs.coreutils}/bin/tail -n +6 "$msg") ;;     # layout (D)
+                *)
+                  text=$(${pkgs.coreutils}/bin/tail -n +5 "$msg") ;;     # layout (C)
+              esac
+              ;;
+            *)
+              text=$(${pkgs.coreutils}/bin/tail -n +4 "$msg") ;;         # layout (B)
           esac
           ;;
         *)
           msg_boot_id=""
-          text=$(${pkgs.coreutils}/bin/tail -n +3 "$msg")
+          text=$(${pkgs.coreutils}/bin/tail -n +3 "$msg")                # layout (A)
           ;;
       esac
 
@@ -198,19 +221,32 @@ let
       # current monotonic uptime — the msg can't be older than the boot.
       now=$(${pkgs.coreutils}/bin/date +%s)
       age=$((now - ts))
+      same_boot="no"
       if [ -n "$msg_boot_id" ] && [ "$msg_boot_id" = "$current_boot_id" ]; then
+        same_boot="yes"
         if [ "$age" -gt "$current_uptime" ]; then
           age=$current_uptime
         fi
       fi
-      # Clock wasn't synced at enqueue — TS is from whatever wall clock
-      # the RTC-less host had set (last-persisted-systemd-value or even
-      # 1970). Any computed age is nonsense; say so explicitly rather
-      # than lying with a number. &lt;/&gt; so Telegram HTML parser
-      # doesn't treat the angle-brackets as markup.
+      # Clock-wasn't-synced branch. Three sub-cases:
+      #   (a) same boot + monotonic stamp present → we can compute the
+      #       exact age from monotonic delta (uptime math is reliable
+      #       regardless of NTP). Normal "queued N ago" rendering.
+      #   (b) same boot, no mono stamp (old-format msg) → say so.
+      #   (c) different boot → say so (we never had the data to recover).
+      # For cases (b) and (c) we keep the shape "queued X ago" but
+      # substitute &lt;no reliable clock&gt; in place of a duration.
       if [ "$msg_synced" = "no" ]; then
-        text="$text"$'\n'"<i>⏱ queued &lt;no reliable clock&gt; ago</i>"
-      elif [ "$age" -gt 60 ]; then
+        if [ "$same_boot" = "yes" ] && [ -n "$msg_mono" ]; then
+          age=$((current_uptime - msg_mono))
+          [ "$age" -lt 0 ] && age=0
+        else
+          text="$text"$'\n'"<i>⏱ queued &lt;no reliable clock&gt; ago</i>"
+          # skip the age-based branch below
+          age=-1
+        fi
+      fi
+      if [ "$age" -gt 60 ]; then
         if [ "$age" -ge 86400 ]; then
           dur="$((age / 86400))d $((age / 3600 % 24))h"
         elif [ "$age" -ge 3600 ]; then
