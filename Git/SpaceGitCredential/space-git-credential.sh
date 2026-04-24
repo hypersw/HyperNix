@@ -21,7 +21,11 @@ if [[ "${input[host]:-}" != *"jetbrains.team"* ]]; then
   exit 0
 fi
 
-# Step 1: Get a Space OAuth access token via browser
+# Step 1: Get a Space OAuth access token via browser.
+# --silent makes oauth2c emit only the final JSON on stdout (without it,
+# stdout is mixed prose + JSON, which breaks jq).
+oauth2c_stderr=$(mktemp)
+trap 'rm -f "$oauth2c_stderr"' EXIT
 oauth_response=$(oauth2c https://jetbrains.team \
   --client-id "space-idea-app" \
   --client-secret "space-idea-app-secret" \
@@ -34,12 +38,17 @@ oauth_response=$(oauth2c https://jetbrains.team \
   --redirect-url "http://localhost:8080/api/space/oauth/authorization_code" \
   --authorization-endpoint "https://jetbrains.team/oauth/auth" \
   --token-endpoint "https://jetbrains.team/oauth/token" \
-  --no-prompt 2>/dev/null) || true
+  --silent \
+  --no-prompt 2>"$oauth2c_stderr") || true
 
-access_token=$(echo "$oauth_response" | jq -r '.access_token // empty')
+access_token=$(printf '%s' "$oauth_response" | jq -r '.access_token // empty' 2>/dev/null || true)
 
 if [[ -z "$access_token" ]]; then
   echo "space-git-credential: failed to obtain OAuth token" >&2
+  echo "space-git-credential: oauth2c stdout was:" >&2
+  printf '%s\n' "$oauth_response" >&2
+  echo "space-git-credential: oauth2c stderr was:" >&2
+  cat "$oauth2c_stderr" >&2
   exit 1
 fi
 

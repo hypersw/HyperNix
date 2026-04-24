@@ -112,14 +112,18 @@ public static class StatusMessage
             InlineKeyboardButton.WithCallbackData($"📄 Format: {fmt}",              $"pick:fmt:{sid}"),
             InlineKeyboardButton.WithCallbackData($"📏 Resolution: {s.Params.Dpi} dpi", $"pick:dpi:{sid}"),
         });
-        // Row 2: Scan alone — full-width, primary action. "end" lives
-        // as a hyperlink in the body text (see RenderHtml). During an
-        // in-flight scan, row 2 is omitted entirely; end-link in the
-        // body remains clickable.
-        if (!s.Scanning)
-        {
-            rows.Add(new[] { InlineKeyboardButton.WithCallbackData("📷 Scan", $"scan:{sid}") });
-        }
+        // Row 2: the primary-action button. Always present (was previously
+        // omitted during scans, which made the keyboard reshape every time
+        // a scan started/finished — jarring). Idle vs scanning differ only
+        // in label and callback target:
+        //   idle     → "📷 SCAN NOW!" (ALL CAPS stands in for bold — Telegram
+        //              inline-button labels are plain text only, no HTML)
+        //   scanning → "⏳ Scanning…" with callback data "noop". HandleCallback
+        //              answers the query up-front then falls through on any
+        //              unknown prefix, so a tap does nothing silently.
+        rows.Add(s.Scanning
+            ? new[] { InlineKeyboardButton.WithCallbackData("⏳ Scanning…", "noop") }
+            : new[] { InlineKeyboardButton.WithCallbackData("📷 SCAN NOW!", $"scan:{sid}") });
         return new InlineKeyboardMarkup(rows);
     }
 

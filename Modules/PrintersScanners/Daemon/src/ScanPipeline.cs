@@ -47,7 +47,13 @@ public sealed class ScanPipeline
         };
 
         var args = $"--resolution {p.Dpi} --format {formatArg}";
-        if (p.Format == ScanFormat.Jpeg) args += $" --jpeg-quality {p.JpegQuality}";
+        // NOTE: sane-backends 1.4.0's scanimage rejects --jpeg-quality as
+        // an unrecognized option (it's a backend-specific option and our
+        // epkowa backend doesn't expose it). Accept scanimage's built-in
+        // default JPEG quality (~75) for now. If we ever need finer
+        // control, pipe the PNM/TIFF output through cjpeg or ImageMagick
+        // rather than relying on scanimage's --jpeg-quality path.
+        // p.JpegQuality is kept in the config model for future use.
         // --output-file omitted → scanimage writes to stdout
         _logger.LogInformation("scanimage {Args}", args);
 
