@@ -440,10 +440,16 @@ async Task HandlePrintPhotoAsync(long chatId, PhotoSize photo, CancellationToken
 
 async Task ShowStatusAsync(long chatId, CancellationToken ct)
 {
+    // Every user-visible top-level reply re-asserts mainKeyboard. Not
+    // passing replyMarkup doesn't *remove* a persistent reply keyboard,
+    // but some Telegram clients stop showing it after a stretch of
+    // replies without one. Cheapest reliable way to keep the keyboard
+    // pinned is just to include it on every non-inline reply.
     var st = await daemon.GetStatusAsync(ct);
     if (st is null)
     {
-        await bot.SendMessage(chatId, "📊 Daemon unreachable", cancellationToken: ct);
+        await bot.SendMessage(chatId, "📊 Daemon unreachable",
+            replyMarkup: mainKeyboard, cancellationToken: ct);
         return;
     }
     await bot.SendMessage(chatId, $"""
@@ -451,7 +457,7 @@ async Task ShowStatusAsync(long chatId, CancellationToken ct)
 
         🖨️ Printer: {(st.Printer.Online ? "✅ online" : "⚠️ offline")}
         📷 Scanner: {(st.Scanner.Online ? "✅ online" : "⚠️ offline")}
-        """, parseMode: ParseMode.Html, cancellationToken: ct);
+        """, parseMode: ParseMode.Html, replyMarkup: mainKeyboard, cancellationToken: ct);
 }
 
 // ────────────────────────────────────────────────────────────────────────────
