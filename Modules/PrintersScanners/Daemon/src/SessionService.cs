@@ -24,10 +24,12 @@ public sealed class SessionService : IAsyncDisposable
     private readonly Dictionary<(string SessionId, int Seq, int Variant), CapturedImage> _images = [];
 
     // Queued-scan counter. User taps Scan while a scan is in flight →
-    // this goes up → the running scan loop drains it one-at-a-time as
-    // each scan completes. Hard cap below prevents pathological taps.
+    // this goes up → the running scan loop drains it as each scan
+    // completes. Capped at 1 — "queue one more after the current one"
+    // covers the serial-scan workflow; there's no realistic user need
+    // to queue further ahead than that.
     private int _scanQueue;
-    private const int ScanQueueMax = 10;
+    private const int ScanQueueMax = 1;
 
     // lock covers: the image dictionary, in-flight flag transitions, takeover
     // handshake, session replacement.
@@ -194,12 +196,19 @@ public sealed class SessionService : IAsyncDisposable
 
             if (current.InFlightScan)
             {
-                // Already scanning — queue up one more. Hard cap at
-                // ScanQueueMax to keep tap-happy users from building
-                // runaway backlogs.
+                // Already scanning — queue one up (but only one ever:
+                // ScanQueueMax=1). If there's already one queued, treat
+                // the tap as a silent no-op. No error thrown because the
+                // UI already shows "+1 queued" and a second tap just
+                // means "yes I know, still one queued" — any error
+                // popup would confuse more than inform.
                 if (_scanQueue >= ScanQueueMax)
-                    throw new InvalidOperationException(
-                        $"Scan queue is full ({ScanQueueMax}) — wait for some to finish");
+                {
+                    _logger.LogDebug(
+                        "scan queue already at max ({Max}) — ignoring duplicate tap",
+                        ScanQueueMax);
+                    return Task.FromResult(current.ScanCount + 1 + _scanQueue);
+                }
                 _scanQueue++;
                 _broker.Publish(new SessionEvent(
                     SessionEventType.SessionScanQueued,

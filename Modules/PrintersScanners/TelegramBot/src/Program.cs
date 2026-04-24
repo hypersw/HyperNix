@@ -600,9 +600,14 @@ async Task HandleEventAsync(SessionEvent ev, CancellationToken ct)
             {
                 if (sessions.TryGetValue(ev.SessionId, out var bs) && isLastVariant)
                 {
-                    bs.Scanning = false;
                     bs.ScanCount = seq;
                     bs.LastUploadedSeq = seq;
+                    // If there's a queued scan about to start, keep
+                    // Scanning=true so the button doesn't flicker to
+                    // idle between SessionImageReady(last-variant) and
+                    // the upcoming SessionScanning(next-seq). Progress
+                    // gets reset when that next SessionScanning fires.
+                    if (bs.QueuedScans == 0) bs.Scanning = false;
                 }
             }
             await RerenderAsync(ev.SessionId, ct);
@@ -757,8 +762,15 @@ async Task UploadStagedAsync(
     try
     {
         await using var stream = File.OpenRead(path);
+        // disableContentTypeDetection=true prevents Telegram from
+        // rendering e.g. a small lossy WebP as an inline photo preview
+        // while larger files land in the document listing — we want a
+        // consistent "file attachment" look across all formats so users
+        // can compare sizes at a glance. The stored bytes are identical
+        // either way; this only affects the client's rendering choice.
         await bot.SendDocument(chatId, new InputFileStream(stream, fileName),
-            caption: caption, cancellationToken: ct);
+            caption: caption, disableContentTypeDetection: true,
+            cancellationToken: ct);
         staging.Remove(sessionId, seq);
         log.LogInformation("delivered {Session}#{Seq} → {Chat}", sessionId, seq, chatId);
     }

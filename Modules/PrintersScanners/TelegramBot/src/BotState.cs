@@ -84,9 +84,11 @@ public static class StatusMessage
         var remain = s.ExpiresAt - DateTimeOffset.UtcNow;
         var mins = remain.TotalSeconds < 0 ? 0 : (int)Math.Ceiling(remain.TotalMinutes);
 
+        // Scanner-status line stays plain: progress lives on the Scan
+        // button itself (see RenderMain), so this doesn't duplicate it.
         var scannerLine = (s.Scanning, s.ScannerOnline) switch
         {
-            (true, _)      => $"📡 Scanner: 📷 <i>scanning… {ProgressBar(s.ScanProgress)} {s.ScanProgress}%</i>",
+            (true, _)      => "📡 Scanner: 📷 <i>scanning…</i>",
             (false, true)  => "📡 Scanner: ✅ ready — tap Scan (or press scanner button)",
             (false, false) => "📡 Scanner: ⏳ <i>waiting — power on or press scanner button</i>",
         };
@@ -130,22 +132,26 @@ public static class StatusMessage
             InlineKeyboardButton.WithCallbackData($"📄 Format: {fmt}",              $"pick:fmt:{sid}"),
             InlineKeyboardButton.WithCallbackData($"📏 Resolution: {s.Params.Dpi} dpi", $"pick:dpi:{sid}"),
         });
-        // Row 2: primary-action button. Always present (was previously
-        // omitted during scans, which made the keyboard reshape every
-        // time a scan started/finished — jarring). Three states:
-        //   idle              → "📷 SCAN NOW!"            tap: start new
-        //   scanning, queue=0 → "⏳ Scanning… ⏭ queue next"  tap: enqueue next
-        //   scanning, queue=N → "⏳ Scanning… ⏭ +N queued"   tap: enqueue another
-        // All three use the same "scan:{sid}" callback — daemon decides
-        // start-vs-enqueue based on its own in-flight state. Daemon also
-        // caps the queue; beyond the cap it returns an error that the
-        // bot surfaces as a "queue full" message.
-        var scanLabel = (s.Scanning, s.QueuedScans) switch
+        // Row 2: primary-action button. Always present, always using
+        // the "scan:{sid}" callback — daemon handles start-vs-enqueue
+        // based on its own state. Label encodes current state:
+        //   idle              → "📷 SCAN NOW!"
+        //   scanning          → "⏳ ▰▰▱▱▱▱▱▱▱▱ 23%"      (progress bar)
+        //   scanning +queued  → "⏳ ▰▰▱▱▱▱▱▱▱▱ 23% +1"   (queue badge)
+        // No hint text like "tap to queue" — user discovers the
+        // behavior by tapping; the "+1" badge confirms their input
+        // was accepted. Queue caps at 1 server-side; extra taps are
+        // silently ignored.
+        string scanLabel;
+        if (!s.Scanning)
         {
-            (false, _)    => "📷 SCAN NOW!",
-            (true, 0)     => "⏳ Scanning… ⏭ queue next",
-            (true, var n) => $"⏳ Scanning… ⏭ +{n} queued",
-        };
+            scanLabel = "📷 SCAN NOW!";
+        }
+        else
+        {
+            var bar = $"⏳ {ProgressBar(s.ScanProgress)} {s.ScanProgress}%";
+            scanLabel = s.QueuedScans > 0 ? $"{bar} +{s.QueuedScans}" : bar;
+        }
         rows.Add(new[] { InlineKeyboardButton.WithCallbackData(scanLabel, $"scan:{sid}") });
         return new InlineKeyboardMarkup(rows);
     }
