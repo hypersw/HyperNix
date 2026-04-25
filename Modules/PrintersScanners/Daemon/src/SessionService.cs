@@ -20,11 +20,10 @@ public sealed class SessionService : IAsyncDisposable
     private readonly ShutdownGate _gate;
     private readonly ILogger<SessionService> _logger;
 
-    // per-session scan storage, keyed by sessionId + seq + variant-within-seq
+    // per-session scan storage, keyed by sessionId + seq + variant-within-seq.
+    // Each CapturedImage owns its encoded bytes AND a per-variant JPEG
+    // thumbnail (with overlay label) generated alongside the encode.
     private readonly Dictionary<(string SessionId, int Seq, int Variant), CapturedImage> _images = [];
-    // one JPEG thumbnail per scan, shared across all its format variants
-    // (same source picture). Served via the /thumb sub-endpoint.
-    private readonly Dictionary<(string SessionId, int Seq), CapturedImage> _thumbs = [];
 
     // Queued-scan counter. User taps Scan while a scan is in flight →
     // this goes up → the running scan loop drains it as each scan
@@ -137,13 +136,7 @@ public sealed class SessionService : IAsyncDisposable
     {
         lock (_lock)
         {
-            // drop any held images + their shared thumbnails
-            var thumbKeys = _thumbs.Keys.Where(k => k.SessionId == session.Id).ToList();
-            foreach (var tk in thumbKeys)
-            {
-                _thumbs[tk].Dispose();
-                _thumbs.Remove(tk);
-            }
+            // drop any held images (each owns its encoded bytes + overlay thumbnail)
             var keys = _images.Keys.Where(k => k.SessionId == session.Id).ToList();
             foreach (var k in keys)
             {
@@ -278,18 +271,16 @@ public sealed class SessionService : IAsyncDisposable
                         _broker.Publish(new SessionEvent(
                             SessionEventType.SessionScanProgress,
                             SessionId: sessionId, Seq: seq, PercentDone: pct)));
-                    var scanResult = await _pipeline.ScanAsync(session.Params, progress, ct);
-                    var variants = scanResult.Variants;
+                    var variants = await _pipeline.ScanAsync(session.Params, seq, progress, ct);
                     lock (_lock)
                     {
                         for (int i = 0; i < variants.Count; i++)
                         {
                             var v = variants[i];
                             _images[(sessionId, seq, i)] =
-                                new CapturedImage(v.Data, v.ContentType, v.FileName);
+                                new CapturedImage(v.Data, v.Thumbnail,
+                                    v.ContentType, v.FileName);
                         }
-                        _thumbs[(sessionId, seq)] = new CapturedImage(
-                            scanResult.Thumbnail, "image/jpeg", $"thumb-{seq}.jpg");
                         var extended = _store.Mutate(s => s with
                         {
                             InFlightScan = false,
@@ -367,12 +358,20 @@ public sealed class SessionService : IAsyncDisposable
         }
     }
 
-    public CapturedImage? GetThumbnail(string sessionId, int seq)
+    /// <summary>
+    /// Returns the thumbnail stream for the given captured image, or null
+    /// if that seq+variant isn't held. The underlying stream is owned by
+    /// the CapturedImage — callers must not dispose it; ReadAsync it and
+    /// leave it for the next fetch (we rewind on each call).
+    /// </summary>
+    public RecyclableMemoryStream? GetThumbnail(string sessionId, int seq, int variant)
     {
         lock (_lock)
         {
-            _thumbs.TryGetValue((sessionId, seq), out var img);
-            return img;
+            if (!_images.TryGetValue((sessionId, seq, variant), out var img))
+                return null;
+            img.Thumbnail.Position = 0;
+            return img.Thumbnail;
         }
     }
 
@@ -393,27 +392,31 @@ public sealed class SessionService : IAsyncDisposable
         {
             foreach (var img in _images.Values) img.Dispose();
             _images.Clear();
-            foreach (var thumb in _thumbs.Values) thumb.Dispose();
-            _thumbs.Clear();
         }
         _logger.LogInformation("SessionService.DisposeAsync: done");
     }
 }
 
 /// <summary>
-/// One captured image. Owns a RecyclableMemoryStream; disposed when the
-/// session that produced it terminates.
+/// One captured image. Owns two RecyclableMemoryStreams — the encoded
+/// full-size bytes and a small (≤320 px, JPEG Q=80) inline preview with
+/// an overlay strip (dpi + scan # + optional format label). Both streams
+/// are disposed when the owning session terminates.
 /// </summary>
 public sealed class CapturedImage : IDisposable
 {
     public RecyclableMemoryStream Data { get; }
+    public RecyclableMemoryStream Thumbnail { get; }
     public string ContentType { get; }
     public string FileName { get; }
 
-    public CapturedImage(RecyclableMemoryStream data, string contentType, string fileName)
+    public CapturedImage(
+        RecyclableMemoryStream data, RecyclableMemoryStream thumbnail,
+        string contentType, string fileName)
     {
-        Data = data; ContentType = contentType; FileName = fileName;
+        Data = data; Thumbnail = thumbnail;
+        ContentType = contentType; FileName = fileName;
     }
 
-    public void Dispose() => Data.Dispose();
+    public void Dispose() { Data.Dispose(); Thumbnail.Dispose(); }
 }

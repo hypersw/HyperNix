@@ -1,7 +1,10 @@
 using System.Diagnostics;
 using Microsoft.IO;
 using PrintScan.Shared;
+using SixLabors.Fonts;
 using SixLabors.ImageSharp;
+using SixLabors.ImageSharp.Drawing;
+using SixLabors.ImageSharp.Drawing.Processing;
 using SixLabors.ImageSharp.Formats.Jpeg;
 using SixLabors.ImageSharp.Formats.Png;
 using SixLabors.ImageSharp.Formats.Webp;
@@ -56,26 +59,39 @@ public sealed class ScanPipeline
 
     public record Variant(
         RecyclableMemoryStream Data,
+        RecyclableMemoryStream Thumbnail,
         string ContentType,
         string FileName,
         string FileExtension,
         bool IsLossless);
 
-    /// <summary>
-    /// One scan's worth of output: N format variants plus a small JPEG
-    /// thumbnail shared across them (same source image). Caller owns
-    /// every stream and must dispose them (or the per-session store
-    /// takes ownership on successful publish).
-    /// </summary>
-    public record ScanResult(
-        IReadOnlyList<Variant> Variants,
-        RecyclableMemoryStream Thumbnail);
-
-    // Telegram's sendDocument thumbnail spec: JPEG, ≤320×320,
-    // ≤200 KB. We aim well under the size cap — 320×320 at Q=80 is
-    // typically 15–30 KB for scanned pages.
+    // Telegram's sendDocument thumbnail spec: JPEG, ≤320×320, ≤200 KB.
+    // 320×320 at Q=80 is typically 15–30 KB for scanned pages, well under
+    // the cap. Overlay strip adds a few KB for the black bar + text glyphs.
     private const int ThumbMaxSide = 320;
     private const int ThumbJpegQuality = 80;
+    private const float OverlayFontSize = 14f;
+    private const float OverlayBarHeight = 22f;
+
+    // Lazily-loaded overlay font. ToolPaths.OverlayFont points at a
+    // DejaVu Sans TTF in the nix store (injected at build time by
+    // package.nix — see ToolPaths.g.cs). Pure managed, no fontconfig
+    // lookup at runtime.
+    private static readonly Lazy<Font> _overlayFont = new(() =>
+    {
+        var fonts = new FontCollection();
+        var family = fonts.Add(ToolPaths.OverlayFont);
+        return family.CreateFont(OverlayFontSize, FontStyle.Regular);
+    });
+
+    private static string FormatLabel(ScanFormat f) => f switch
+    {
+        ScanFormat.Jpeg         => "JPG",
+        ScanFormat.Png          => "PNG",
+        ScanFormat.WebpLossless => "WEBP-LL",
+        ScanFormat.WebpLossy    => "WEBP",
+        _ => f.ToString(),
+    };
 
     // Filename convention: Scan.<ISO-date>.<ISO-time>.[Lossless.]<ext>
     // Local time (what the user reads on their phone). The "Lossless."
@@ -102,8 +118,8 @@ public sealed class ScanPipeline
     /// A4-page size — rough but close enough for a UI bar), and then 100
     /// when the last encode completes.
     /// </summary>
-    public async Task<ScanResult> ScanAsync(
-        ScanParams p, IProgress<int>? progress, CancellationToken ct)
+    public async Task<IReadOnlyList<Variant>> ScanAsync(
+        ScanParams p, int seq, IProgress<int>? progress, CancellationToken ct)
     {
         // Field-test instrumentation: the whole pipeline is whole-buffer
         // (scanimage → TIFF blob → Image<Rgb24> decode → encoded blob),
@@ -199,29 +215,6 @@ public sealed class ScanPipeline
             decodeT.Elapsed.TotalSeconds,
             Fmt(MemRss()), Fmt(MemManaged()));
 
-        // ── Step 2b: 320×320 JPEG thumbnail for Telegram previews ──────────
-        // One thumbnail per scan, shared across all format variants (same
-        // source image anyway). Clone + Resize mode Max keeps aspect ratio
-        // and fits inside the 320×320 box Telegram mandates.
-        var thumbT = Stopwatch.StartNew();
-        var thumbStream = Pool.GetStream("scan-thumb");
-        using (var thumb = image.Clone(ctx => ctx.Resize(new ResizeOptions
-        {
-            Mode = ResizeMode.Max,
-            Size = new Size(ThumbMaxSide, ThumbMaxSide),
-        })))
-        {
-            await thumb.SaveAsJpegAsync(thumbStream, new JpegEncoder
-            {
-                Quality = ThumbJpegQuality,
-            }, ct);
-        }
-        thumbStream.Position = 0;
-        thumbT.Stop();
-        _logger.LogInformation(
-            "thumb done: {Size} in {Elapsed:F2}s",
-            Fmt(thumbStream.Length), thumbT.Elapsed.TotalSeconds);
-
         // ── Step 3: Image → N target formats (one per set bit) ─────────────
         // Flatten the bitmask into an ordered list of individual formats.
         // Fallback to Jpeg if caller somehow sent None (defensive; the
@@ -233,6 +226,11 @@ public sealed class ScanPipeline
         if ((p.Format & ScanFormat.WebpLossy)    != 0) formats.Add(ScanFormat.WebpLossy);
         if (formats.Count == 0) formats.Add(ScanFormat.Jpeg);
 
+        // Only label format in overlays when the user selected >1 format
+        // (otherwise the label is redundant — the filename extension
+        // already tells you which format this is).
+        var labelFormat = formats.Count > 1;
+
         var stamp = DateTime.Now;
         var results = new List<Variant>(formats.Count);
         var encodeTotal = Stopwatch.StartNew();
@@ -242,6 +240,7 @@ public sealed class ScanPipeline
             {
                 var (contentType, ext, lossless) = FormatMeta(fmt);
                 var outStream = Pool.GetStream("scan-encoded");
+                RecyclableMemoryStream? thumbStream = null;
                 var encodeT = Stopwatch.StartNew();
                 try
                 {
@@ -294,20 +293,29 @@ public sealed class ScanPipeline
                     encodeT.Stop();
                     outStream.Position = 0;
 
+                    // Per-variant thumbnail with bottom-bar overlay.
+                    // Text "dpi · scan #N" (+ " · WEBP-LL"/etc when multi-
+                    // format). DejaVu Sans at 14pt on a 22px black strip.
+                    thumbStream = await MakeThumbnailAsync(
+                        image, p.Dpi, seq, fmt, labelFormat, ct);
+
                     var fileName = BuildFileName(ext, lossless, stamp);
-                    results.Add(new Variant(outStream, contentType, fileName, ext, lossless));
+                    results.Add(new Variant(
+                        outStream, thumbStream, contentType, fileName, ext, lossless));
 
                     _logger.LogInformation(
-                        "encode {Fmt}: {Out} ({Pct}% of raw) in {Elapsed:F2}s " +
-                        "rss={Rss} heap={Heap}",
+                        "encode {Fmt}: {Out} ({Pct}% of raw) + {ThumbKb}KB thumb " +
+                        "in {Elapsed:F2}s rss={Rss} heap={Heap}",
                         fmt, Fmt(outStream.Length),
                         tiffBytes > 0 ? 100L * outStream.Length / tiffBytes : 0,
+                        thumbStream.Length / 1024,
                         encodeT.Elapsed.TotalSeconds,
                         Fmt(MemRss()), Fmt(MemManaged()));
                 }
                 catch
                 {
                     outStream.Dispose();
+                    thumbStream?.Dispose();
                     throw;
                 }
             }
@@ -323,13 +331,49 @@ public sealed class ScanPipeline
                 encodeTotal.Elapsed.TotalSeconds);
             progress?.Report(100);
 
-            return new ScanResult(results, thumbStream);
+            return results;
         }
         catch
         {
-            foreach (var v in results) v.Data.Dispose();
-            thumbStream.Dispose();
+            foreach (var v in results)
+            {
+                v.Data.Dispose();
+                v.Thumbnail.Dispose();
+            }
             throw;
         }
+    }
+
+    /// <summary>
+    /// Clone → resize to 320×320 max → draw black bottom-strip with
+    /// white label → encode JPEG. Returns a stream rewound for reading.
+    /// </summary>
+    private async Task<RecyclableMemoryStream> MakeThumbnailAsync(
+        Image<Rgb24> source, int dpi, int seq, ScanFormat fmt, bool labelFormat,
+        CancellationToken ct)
+    {
+        using var thumb = source.Clone(ctx => ctx.Resize(new ResizeOptions
+        {
+            Mode = ResizeMode.Max,
+            Size = new Size(ThumbMaxSide, ThumbMaxSide),
+        }));
+
+        var label = labelFormat
+            ? $"{dpi} dpi · scan #{seq} · {FormatLabel(fmt)}"
+            : $"{dpi} dpi · scan #{seq}";
+
+        thumb.Mutate(ctx =>
+        {
+            var barY = thumb.Height - OverlayBarHeight;
+            ctx.Fill(Color.Black,
+                new RectangularPolygon(0, barY, thumb.Width, OverlayBarHeight));
+            ctx.DrawText(label, _overlayFont.Value, Color.White,
+                new PointF(8, barY + 3));
+        });
+
+        var stream = Pool.GetStream("scan-thumb");
+        await thumb.SaveAsJpegAsync(stream, new JpegEncoder { Quality = ThumbJpegQuality }, ct);
+        stream.Position = 0;
+        return stream;
     }
 }

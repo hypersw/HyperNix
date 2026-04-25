@@ -95,10 +95,10 @@ public sealed class DaemonClient : IDisposable
     }
 
     public async Task<Stream> FetchThumbnailAsync(
-        string sessionId, int seq, CancellationToken ct)
+        string sessionId, int seq, int variant, CancellationToken ct)
     {
         var resp = await _http.GetAsync(
-            $"/sessions/{sessionId}/image/{seq}/thumb",
+            $"/sessions/{sessionId}/image/{seq}/{variant}/thumb",
             HttpCompletionOption.ResponseHeadersRead, ct);
         resp.EnsureSuccessStatusCode();
         return await resp.Content.ReadAsStreamAsync(ct);

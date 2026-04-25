@@ -15,8 +15,18 @@
     "hash": "sha256-UatEoMVfTZGdiG9MvIE8WxVPUQe+DN4ngo+LLQuhmYc="
   },
   {
+    "pname": "SixLabors.Fonts",
+    "version": "2.0.4",
+    "hash": "sha256-fIxKz0fbw7sv2A12KBxu9h/XTcayL8OWbJg5wJM/2qs="
+  },
+  {
     "pname": "SixLabors.ImageSharp",
     "version": "3.1.5",
     "hash": "sha256-3UehX9T+I81nfgv2dTHlpoPgYzXFk7kHr1mmlQOCBfw="
+  },
+  {
+    "pname": "SixLabors.ImageSharp.Drawing",
+    "version": "2.1.4",
+    "hash": "sha256-tV7U8iKcAU9gvF2e0P/6dnslKoRWc+XrSqCYbqpl/rs="
   }
 ]

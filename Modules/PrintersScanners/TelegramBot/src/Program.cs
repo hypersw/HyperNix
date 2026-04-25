@@ -832,15 +832,23 @@ async Task SendBatchAsMediaGroupAsync(
     string sessionId, int seq, List<BatchEntry> entries,
     long chatId, string caption, CancellationToken ct)
 {
-    // Fetch the per-scan thumbnail once — all variants share the same
-    // source picture — and pass a MemoryStream copy to each item so
-    // Telegram's uploader can consume them concurrently.
-    byte[] thumbBytes;
-    await using (var thumbSrc = await daemon.FetchThumbnailAsync(sessionId, seq, ct))
-    await using (var ms = new MemoryStream())
+    // Fetch each variant's overlay thumbnail up front — they all share
+    // one source picture but carry their own format label in the
+    // bottom strip, so we can't reuse one blob. Crucial correctness
+    // note: Telegram.Bot derives the multipart `attach://` reference
+    // from the InputFileStream's FileName. Two thumbnails named
+    // "thumb.jpg" in the same media group collide → one gets uploaded
+    // and the rest point at missing parts, surfacing as
+    // "Wrong file identifier" on every item past the first. We give
+    // each thumbnail a unique name (variant index) to avoid that.
+    var thumbs = new byte[entries.Count][];
+    for (int i = 0; i < entries.Count; i++)
     {
-        await thumbSrc.CopyToAsync(ms, ct);
-        thumbBytes = ms.ToArray();
+        await using var src = await daemon.FetchThumbnailAsync(
+            sessionId, seq, entries[i].Variant, ct);
+        await using var ms = new MemoryStream();
+        await src.CopyToAsync(ms, ct);
+        thumbs[i] = ms.ToArray();
     }
 
     var streams = new List<FileStream>(entries.Count);
@@ -854,7 +862,8 @@ async Task SendBatchAsMediaGroupAsync(
             streams.Add(stream);
             var media = new InputMediaDocument(new InputFileStream(stream, e.FileName))
             {
-                Thumbnail = new InputFileStream(new MemoryStream(thumbBytes), "thumb.jpg"),
+                Thumbnail = new InputFileStream(
+                    new MemoryStream(thumbs[i]), $"thumb-{e.Variant}.jpg"),
                 // Only the first item's caption is shown above the album
                 // — the rest are hidden, so put the summary on slot 0.
                 Caption = i == 0 ? caption : null,
@@ -885,14 +894,15 @@ async Task UploadStagedAsync(
     try
     {
         await using var stream = File.OpenRead(path);
-        // Attach a 320×320 thumbnail so every format renders a
-        // consistent inline preview in Telegram. Without it, clients
-        // inconsistently preview small images and list big ones as
-        // documents. `disableContentTypeDetection` intentionally
-        // left default (false) — Telegram doesn't re-encode
-        // sendDocument uploads regardless of that flag, so there's
-        // no benefit to forcing "always document" presentation.
-        await using var thumbStream = await daemon.FetchThumbnailAsync(sessionId, seq / 100, ct);
+        // Attach the per-variant 320×320 JPEG thumbnail so every format
+        // renders a consistent inline preview in-chat (and carries the
+        // dpi/scan-# overlay). The composite staging key packs the real
+        // seq in the high slot and the variant index in the low two
+        // digits, so we need to unpack both here.
+        int realSeq = seq / 100;
+        int variant = seq % 100;
+        await using var thumbStream = await daemon.FetchThumbnailAsync(
+            sessionId, realSeq, variant, ct);
         await bot.SendDocument(chatId, new InputFileStream(stream, fileName),
             caption: caption,
             thumbnail: new InputFileStream(thumbStream, "thumb.jpg"),

@@ -14,6 +14,8 @@
          scanimage's uncompressed TIFF into the user's chosen format
          with sensible quality defaults. Pure managed, no native deps. -->
     <PackageReference Include="SixLabors.ImageSharp" Version="3.1.5" />
+    <!-- Drawing + text rendering on thumbnails (labels overlay). -->
+    <PackageReference Include="SixLabors.ImageSharp.Drawing" Version="2.1.4" />
   </ItemGroup>
 
   <ItemGroup>
