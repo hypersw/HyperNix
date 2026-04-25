@@ -15,10 +15,6 @@ let
         public static readonly string LpStat = "${pkgs.cups}/bin/lpstat";
         public static readonly string Lp = "${pkgs.cups}/bin/lp";
         public static readonly string ScanImage = "${pkgs.sane-backends}/bin/scanimage";
-        // TTF used by ScanPipeline to overlay labels on thumbnails.
-        // DejaVu Sans is public-domain, ~750 KB on disk, rendered via
-        // SixLabors.ImageSharp.Drawing.
-        public static readonly string OverlayFont = "${pkgs.dejavu_fonts}/share/fonts/truetype/DejaVuSans.ttf";
     }
   '';
 in

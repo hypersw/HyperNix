@@ -17,32 +17,14 @@ public record PrinterStatus(
 // ── Scan params ─────────────────────────────────────────────────────────────
 
 /// <summary>
-/// Output format bitmask — multiple can be selected for the same scan,
-/// and the daemon emits one encoded variant per set bit (same decoded
-/// pixel buffer, N encodes). TIFF dropped (larger than PNG, no Telegram
-/// inline preview). WebP split into lossless and lossy — the lossy
-/// encoder at default settings is typically ~30% smaller than JPG
-/// at visually equivalent quality on documents.
-/// </summary>
-[Flags]
-public enum ScanFormat
-{
-    None = 0,
-    Jpeg = 1 << 0,
-    Png = 1 << 1,
-    WebpLossless = 1 << 2,
-    WebpLossy = 1 << 3,
-}
-
-/// <summary>
-/// Parameters for one scan. Format is a bitmask — see ScanFormat.
-/// JpegQuality kept for wire-compat / future use; the daemon currently
-/// bakes in Q=85 regardless. Users who want knobs pick a lossless format.
+/// Parameters for one scan that the daemon actually acts on. Today
+/// that's just dpi (passed through to scanimage). Anything client-
+/// specific — format selection, encoder quality, output naming —
+/// lives in the session's <see cref="SessionRecord.Metadata"/> bag
+/// instead, so adding a new client never requires changing this type.
 /// </summary>
 public record ScanParams(
-    int Dpi = 200,
-    ScanFormat Format = ScanFormat.Jpeg,
-    int JpegQuality = 85
+    int Dpi = 200
 );
 
 public record ScannerStatus(
@@ -58,14 +40,20 @@ public record DeviceStatus(
 // ── Session model ───────────────────────────────────────────────────────────
 
 /// <summary>
-/// Request body for <c>POST /sessions</c>. Bots send this to open a scan session.
+/// Request body for <c>POST /sessions</c>. Bots send this to open a scan
+/// session. <paramref name="Metadata"/> is an opaque key-value bag the
+/// daemon stores and replays back via SSE without ever interpreting it
+/// — clients use it for their own settings (e.g. the Telegram bot
+/// stashes its format-selection bitmask there so the choice survives
+/// a bot restart).
 /// </summary>
 public record OpenSessionRequest(
     string OwnerBot,            // "telegram", "whatsapp", "web", …
     long OwnerChatId,            // bot-specific; for TG this is the chat id
     int OwnerStatusMessageId,    // bot-side id of the status message to edit
     string OwnerDisplayName,     // free-form, for takeover notifications
-    ScanParams Params
+    ScanParams Params,
+    Dictionary<string, string>? Metadata = null
 );
 
 /// <summary>
@@ -82,7 +70,8 @@ public record SessionRecord(
     DateTimeOffset Opened,
     DateTimeOffset ExpiresAt,
     int ScanCount = 0,
-    bool InFlightScan = false
+    bool InFlightScan = false,
+    Dictionary<string, string>? Metadata = null
 );
 
 /// <summary>
@@ -129,13 +118,10 @@ public record SessionEvent(
     string? SessionId = null,
     // session.scanning / session.image-ready / session.scan-failed
     int? Seq = null,
-    // session.image-ready: which variant within this scan this event
-    // refers to (0-based), and how many total variants to expect. Fires
-    // once per variant. Consumers deliver each file as it arrives.
-    int? Variant = null,
-    int? VariantCount = null,
-    string? ContentType = null,
-    string? FileName = null,
+    // session.image-ready: size of the captured TIFF blob the bot is
+    // about to fetch from /sessions/{id}/image/{seq}. Informational
+    // only — the bot owns format selection, re-encoding, and any
+    // thumbnailing once it has the raw bytes.
     long? BytesLength = null,
     string? Error = null,
     // session.scan-progress (0..100). Fired periodically during an in-flight

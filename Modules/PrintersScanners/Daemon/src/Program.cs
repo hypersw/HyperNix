@@ -57,11 +57,11 @@ _runtimeListener.Summarize();
 builder.Host.UseSystemd();
 BootLog(_bootSw, "UseSystemd done");
 
-// Bot and daemon both use System.Text.Json but the bot opts into
-// JsonStringEnumConverter (ScanFormat serialized as "Jpeg"/"Png"/"Tiff").
-// Minimal-APIs' default serializer expects enums as integers, so without
-// this bot requests get 400 Bad Request on the enum field. Register the
-// string-enum converter on the daemon side so both sides agree.
+// Bot and daemon both use System.Text.Json with JsonStringEnumConverter
+// for SessionEventType / SessionTerminationReason etc. Without this
+// option Minimal-APIs serializes enums as integers and the bot's
+// string-enum deserializer rejects them with 400. Register on the
+// daemon side so both sides agree.
 builder.Services.ConfigureHttpJsonOptions(options =>
 {
     options.SerializerOptions.Converters.Add(
@@ -169,6 +169,23 @@ app.MapPatch("/sessions/{id}", (string id, ScanParams newParams, SessionService 
     }
 });
 
+// Opaque metadata bag — clients store their own per-session state here
+// (e.g. the Telegram bot stashes its format-selection bitmask). PUT
+// replaces the entire dict; the daemon never reads or interprets it.
+app.MapPut("/sessions/{id}/metadata",
+    (string id, Dictionary<string, string> metadata, SessionService svc) =>
+{
+    try
+    {
+        var updated = svc.UpdateMetadata(id, metadata);
+        return Results.Ok(updated);
+    }
+    catch (InvalidOperationException ex)
+    {
+        return Results.BadRequest(ex.Message);
+    }
+});
+
 app.MapDelete("/sessions/{id}", (string id, SessionService svc) =>
 {
     var ok = svc.Close(id, SessionTerminationReason.Closed);
@@ -192,40 +209,26 @@ app.MapPost("/sessions/{id}/scan", async (string id, SessionService svc, Cancell
     }
 });
 
-// Each scan may yield multiple encoded variants (one per format bit in
-// ScanParams.Format). The URL `/image/{seq}` defaults to variant 0;
-// `/image/{seq}/{variant}` selects a specific variant;
-// `/image/{seq}/{variant}/thumb` returns that variant's 320×320 JPEG
-// thumbnail (overlay-labelled with dpi + scan # + optional format tag)
-// so Telegram renders a consistent inline preview across all formats.
-app.MapGet("/sessions/{id}/image/{seq:int}/{variant:int}",
-    async (string id, int seq, int variant, SessionService svc, HttpResponse response, CancellationToken ct) =>
-        await ServeImage(id, seq, variant, svc, response, ct));
+// Hand the captured TIFF blob to the client and drop it from memory.
+// First fetch wins; subsequent calls 404. The client is expected to
+// re-encode/thumbnail/upload entirely on its side — the daemon just
+// brokers the raw scan and never persists imagery between scans.
 app.MapGet("/sessions/{id}/image/{seq:int}",
     async (string id, int seq, SessionService svc, HttpResponse response, CancellationToken ct) =>
-        await ServeImage(id, seq, 0, svc, response, ct));
-app.MapGet("/sessions/{id}/image/{seq:int}/{variant:int}/thumb",
-    async (string id, int seq, int variant, SessionService svc, HttpResponse response, CancellationToken ct) =>
 {
-    var thumb = svc.GetThumbnail(id, seq, variant);
-    if (thumb is null) return Results.NotFound();
-    response.ContentType = "image/jpeg";
-    await thumb.CopyToAsync(response.Body, ct);
+    var tiff = svc.TakeScan(id, seq);
+    if (tiff is null) return Results.NotFound();
+    try
+    {
+        response.ContentType = "image/tiff";
+        await tiff.CopyToAsync(response.Body, ct);
+    }
+    finally
+    {
+        tiff.Dispose();
+    }
     return Results.Empty;
 });
-
-static async Task<IResult> ServeImage(
-    string id, int seq, int variant, SessionService svc, HttpResponse response, CancellationToken ct)
-{
-    var img = svc.GetImage(id, seq, variant);
-    if (img is null) return Results.NotFound();
-    response.ContentType = img.ContentType;
-    response.Headers.ContentDisposition =
-        $"attachment; filename=\"{img.FileName}\"";
-    img.Data.Position = 0;
-    await img.Data.CopyToAsync(response.Body, ct);
-    return Results.Empty;
-}
 
 // ── Debug / test hooks ──────────────────────────────────────────────────────
 

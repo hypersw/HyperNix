@@ -20,10 +20,12 @@ public sealed class SessionService : IAsyncDisposable
     private readonly ShutdownGate _gate;
     private readonly ILogger<SessionService> _logger;
 
-    // per-session scan storage, keyed by sessionId + seq + variant-within-seq.
-    // Each CapturedImage owns its encoded bytes AND a per-variant JPEG
-    // thumbnail (with overlay label) generated alongside the encode.
-    private readonly Dictionary<(string SessionId, int Seq, int Variant), CapturedImage> _images = [];
+    // Per-session captured TIFF blobs keyed by (sessionId, seq). One
+    // blob per scan; the daemon never re-encodes or thumbnails — that's
+    // the client's job. Entries are dropped on first successful fetch
+    // (so memory doesn't pile up across many scans within a session)
+    // and any survivors are disposed when the session terminates.
+    private readonly Dictionary<(string SessionId, int Seq), RecyclableMemoryStream> _scans = [];
 
     // Queued-scan counter. User taps Scan while a scan is in flight →
     // this goes up → the running scan loop drains it as each scan
@@ -117,8 +119,34 @@ public sealed class SessionService : IAsyncDisposable
             _broker.Publish(new SessionEvent(
                 SessionEventType.SessionOpened,
                 SessionId: updated.Id, Session: updated));
-            _logger.LogInformation("session {Id} params updated: dpi={Dpi} fmt={Fmt}",
-                updated.Id, newParams.Dpi, newParams.Format);
+            _logger.LogInformation("session {Id} params updated: dpi={Dpi}",
+                updated.Id, newParams.Dpi);
+            return updated;
+        }
+    }
+
+    /// <summary>
+    /// Replace the session's client metadata bag wholesale. The daemon
+    /// never inspects the contents — this is opaque storage so clients
+    /// (the Telegram bot today) can persist their own per-session state
+    /// without us having to add a new typed field for every concern.
+    /// Emits a <c>SessionOpened</c> event so the writing client (or
+    /// any other subscriber) re-renders.
+    /// </summary>
+    public SessionRecord UpdateMetadata(string sessionId, Dictionary<string, string> metadata)
+    {
+        lock (_lock)
+        {
+            var current = _store.Current
+                ?? throw new InvalidOperationException("No active session");
+            if (current.Id != sessionId)
+                throw new InvalidOperationException("Session ID mismatch");
+            var updated = _store.Mutate(s => s with { Metadata = metadata });
+            _broker.Publish(new SessionEvent(
+                SessionEventType.SessionOpened,
+                SessionId: updated.Id, Session: updated));
+            _logger.LogInformation("session {Id} metadata updated: {Keys}",
+                updated.Id, string.Join(",", metadata.Keys));
             return updated;
         }
     }
@@ -136,12 +164,12 @@ public sealed class SessionService : IAsyncDisposable
     {
         lock (_lock)
         {
-            // drop any held images (each owns its encoded bytes + overlay thumbnail)
-            var keys = _images.Keys.Where(k => k.SessionId == session.Id).ToList();
+            // dispose any TIFFs not yet fetched by the bot
+            var keys = _scans.Keys.Where(k => k.SessionId == session.Id).ToList();
             foreach (var k in keys)
             {
-                _images[k].Dispose();
-                _images.Remove(k);
+                _scans[k].Dispose();
+                _scans.Remove(k);
             }
             _store.Set(null);
         }
@@ -271,16 +299,12 @@ public sealed class SessionService : IAsyncDisposable
                         _broker.Publish(new SessionEvent(
                             SessionEventType.SessionScanProgress,
                             SessionId: sessionId, Seq: seq, PercentDone: pct)));
-                    var variants = await _pipeline.ScanAsync(session.Params, seq, progress, ct);
+                    var tiff = await _pipeline.ScanAsync(session.Params, progress, ct);
+                    long bytes;
                     lock (_lock)
                     {
-                        for (int i = 0; i < variants.Count; i++)
-                        {
-                            var v = variants[i];
-                            _images[(sessionId, seq, i)] =
-                                new CapturedImage(v.Data, v.Thumbnail,
-                                    v.ContentType, v.FileName);
-                        }
+                        _scans[(sessionId, seq)] = tiff;
+                        bytes = tiff.Length;
                         var extended = _store.Mutate(s => s with
                         {
                             InFlightScan = false,
@@ -288,16 +312,9 @@ public sealed class SessionService : IAsyncDisposable
                         });
                         ExtendWindow(extended);
                     }
-                    for (int i = 0; i < variants.Count; i++)
-                    {
-                        var v = variants[i];
-                        _broker.Publish(new SessionEvent(
-                            SessionEventType.SessionImageReady,
-                            SessionId: sessionId, Seq: seq,
-                            Variant: i, VariantCount: variants.Count,
-                            ContentType: v.ContentType, FileName: v.FileName,
-                            BytesLength: v.Data.Length));
-                    }
+                    _broker.Publish(new SessionEvent(
+                        SessionEventType.SessionImageReady,
+                        SessionId: sessionId, Seq: seq, BytesLength: bytes));
                 }
                 catch (Exception ex)
                 {
@@ -349,29 +366,22 @@ public sealed class SessionService : IAsyncDisposable
 
     // ── Image fetch ─────────────────────────────────────────────────────────
 
-    public CapturedImage? GetImage(string sessionId, int seq, int variant = 0)
-    {
-        lock (_lock)
-        {
-            _images.TryGetValue((sessionId, seq, variant), out var img);
-            return img;
-        }
-    }
-
     /// <summary>
-    /// Returns the thumbnail stream for the given captured image, or null
-    /// if that seq+variant isn't held. The underlying stream is owned by
-    /// the CapturedImage — callers must not dispose it; ReadAsync it and
-    /// leave it for the next fetch (we rewind on each call).
+    /// Atomically removes and returns the captured TIFF for this scan.
+    /// First (and only successful) fetch wins — subsequent calls return
+    /// null. Caller takes ownership of the stream and must dispose it.
+    /// This drop-on-fetch policy is the whole point of the new memory
+    /// model: the daemon doesn't accumulate scan blobs across a session.
     /// </summary>
-    public RecyclableMemoryStream? GetThumbnail(string sessionId, int seq, int variant)
+    public RecyclableMemoryStream? TakeScan(string sessionId, int seq)
     {
         lock (_lock)
         {
-            if (!_images.TryGetValue((sessionId, seq, variant), out var img))
+            var key = (sessionId, seq);
+            if (!_scans.Remove(key, out var stream))
                 return null;
-            img.Thumbnail.Position = 0;
-            return img.Thumbnail;
+            stream.Position = 0;
+            return stream;
         }
     }
 
@@ -390,33 +400,10 @@ public sealed class SessionService : IAsyncDisposable
         _logger.LogInformation("SessionService.DisposeAsync: expiry task joined");
         lock (_lock)
         {
-            foreach (var img in _images.Values) img.Dispose();
-            _images.Clear();
+            foreach (var s in _scans.Values) s.Dispose();
+            _scans.Clear();
         }
         _logger.LogInformation("SessionService.DisposeAsync: done");
     }
 }
 
-/// <summary>
-/// One captured image. Owns two RecyclableMemoryStreams — the encoded
-/// full-size bytes and a small (≤320 px, JPEG Q=80) inline preview with
-/// an overlay strip (dpi + scan # + optional format label). Both streams
-/// are disposed when the owning session terminates.
-/// </summary>
-public sealed class CapturedImage : IDisposable
-{
-    public RecyclableMemoryStream Data { get; }
-    public RecyclableMemoryStream Thumbnail { get; }
-    public string ContentType { get; }
-    public string FileName { get; }
-
-    public CapturedImage(
-        RecyclableMemoryStream data, RecyclableMemoryStream thumbnail,
-        string contentType, string fileName)
-    {
-        Data = data; Thumbnail = thumbnail;
-        ContentType = contentType; FileName = fileName;
-    }
-
-    public void Dispose() { Data.Dispose(); Thumbnail.Dispose(); }
-}
