@@ -1,72 +1,41 @@
-using System.Diagnostics;
 using PrintScan.Shared;
 
 namespace PrintScan.Daemon;
 
 /// <summary>
-/// Shells out to <c>lp</c> for printing and <c>lpstat</c> for status.
-/// Unchanged from the original daemon — the session refactor is scan-only.
+/// Stub printer — for end-to-end testing of the bot's print UX without
+/// burning paper or toner. Reports the printer as online, accepts every
+/// job, simulates a short processing delay, and logs what would have
+/// gone to <c>lp</c>. Drop-in replacement for the future real
+/// implementation: the public surface (<see cref="GetStatus"/>,
+/// <see cref="PrintAsync"/>) and the request/response shapes are the
+/// same, so swapping in a CUPS-backed version later doesn't ripple.
 /// </summary>
 public sealed class PrintService
 {
     private readonly ILogger<PrintService> _logger;
     public PrintService(ILogger<PrintService> logger) { _logger = logger; }
 
-    public PrinterStatus GetStatus()
-    {
-        try
-        {
-            var result = RunCommand(ToolPaths.LpStat, "-p");
-            var online = result.ExitCode == 0 && !result.Output.Contains("disabled");
-            return new PrinterStatus(online, result.Output.Trim());
-        }
-        catch (Exception ex)
-        {
-            _logger.LogError(ex, "Failed to get printer status");
-            return new PrinterStatus(false, ex.Message);
-        }
-    }
+    public PrinterStatus GetStatus() =>
+        new(Online: true,
+            StatusText: "stub printer (no physical device wired up)");
 
     public async Task<bool> PrintAsync(PrintRequest request, CancellationToken ct)
     {
-        var tempFile = Path.Combine(Path.GetTempPath(),
-            $"printscan-{Guid.NewGuid()}{Path.GetExtension(request.FileName)}");
-        try
-        {
-            await File.WriteAllBytesAsync(tempFile, request.FileData, ct);
-            var args = new List<string> { tempFile };
-            if (request.Copies > 1) args.AddRange(["-n", request.Copies.ToString()]);
-            if (!string.IsNullOrEmpty(request.PageRange))
-                args.AddRange(["-o", $"page-ranges={request.PageRange}"]);
-            var result = RunCommand(ToolPaths.Lp, string.Join(" ", args));
-            if (result.ExitCode != 0)
-            {
-                _logger.LogError("lp failed: {Error}", result.Error);
-                return false;
-            }
-            _logger.LogInformation("Printed {File} ({Copies} copies, pages: {Pages})",
-                request.FileName, request.Copies, request.PageRange ?? "all");
-            return true;
-        }
-        finally
-        {
-            try { File.Delete(tempFile); } catch { }
-        }
-    }
+        _logger.LogInformation(
+            "STUB PRINT: {File} ({Bytes} bytes), copies={Copies}, " +
+            "pages={Pages}, scale={Scale}, orient={Orient}",
+            request.FileName, request.FileData.Length, request.Copies,
+            request.PageRange ?? "all", request.Scale, request.Orientation);
 
-    private static CommandResult RunCommand(string command, string args)
-    {
-        using var process = Process.Start(new ProcessStartInfo(command, args)
-        {
-            RedirectStandardOutput = true,
-            RedirectStandardError = true,
-            UseShellExecute = false,
-        })!;
-        var output = process.StandardOutput.ReadToEnd();
-        var error = process.StandardError.ReadToEnd();
-        process.WaitForExit();
-        return new CommandResult(process.ExitCode, output, error);
-    }
+        // Simulated processing time. A real Pi-attached HP LaserJet at
+        // 100-150 ms per page is typical, but for a stub we just want
+        // the bot's "🖨 printing…" intermediate state to be visible
+        // briefly before we flip to "✅ done", not instantaneously.
+        try { await Task.Delay(TimeSpan.FromSeconds(2), ct); }
+        catch (OperationCanceledException) { return false; }
 
-    private record CommandResult(int ExitCode, string Output, string Error);
+        _logger.LogInformation("STUB PRINT done: {File}", request.FileName);
+        return true;
+    }
 }

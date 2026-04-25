@@ -46,6 +46,13 @@ var pipeline = new ImagePipeline(loggerFactory.CreateLogger<ImagePipeline>());
 var sessions = new Dictionary<string, BotSession>();
 var sessionsLock = new Lock();
 
+// Per-chat printer-session state. Lives entirely on the bot (printing
+// has no exclusive-resource model the way scanning does — multiple
+// users can submit jobs to CUPS in parallel) so there's no daemon-side
+// session lifecycle to mirror. Lost on bot restart; user re-sends.
+var printSessions = new Dictionary<long, BotPrintSession>();
+var printSessionsLock = new Lock();
+
 // In-flight scan-delivery counter. We don't gate concurrency on it
 // (Telegram tolerates parallel uploads to different chats fine) — it
 // only exists so graceful shutdown can wait until pending scans have
@@ -75,13 +82,14 @@ log.LogInformation("bot identity: @{Username} (id={Id})", botUsername, me.Id);
 await Retry.Transient(
     () => bot.SetMyCommands([
         new() { Command = "scanner", Description = "📷 Open scanner session" },
-        new() { Command = "status", Description = "📊 Printer & scanner status" },
-        new() { Command = "help",   Description = "❓ How to use this bot" },
+        new() { Command = "printer", Description = "🖨 Open printer session" },
+        new() { Command = "status",  Description = "📊 Printer & scanner status" },
+        new() { Command = "help",    Description = "❓ How to use this bot" },
     ]),
     "bot.SetMyCommands()", log, cts.Token);
 
 var mainKeyboard = new ReplyKeyboardMarkup(
-    new[] { new KeyboardButton[] { "📷 Scanner", "📊 Status" } })
+    new[] { new KeyboardButton[] { "📷 Scanner", "🖨 Printer", "📊 Status" } })
 { ResizeKeyboard = true, IsPersistent = true };
 
 log.LogInformation("bot starting, allowed users: {Users}, socket: {Sock}",
@@ -156,8 +164,20 @@ async Task HandleUpdateAsync(Update update, CancellationToken ct)
 
 async Task HandleMessageAsync(string userName, Message msg, CancellationToken ct)
 {
-    if (msg.Document is { } doc) { await HandlePrintDocumentAsync(msg.Chat.Id, doc, ct); return; }
-    if (msg.Photo is { Length: > 0 } ph) { await HandlePrintPhotoAsync(msg.Chat.Id, ph.Last(), ct); return; }
+    // File arrivals route into the printer session for confirmation
+    // — we never start a print job from an incoming file alone.
+    // Auth has already been checked by HandleUpdateAsync above; if
+    // we're here at all the user is allowed.
+    if (msg.Document is { } doc)
+    {
+        await StageDocumentForPrintAsync(msg.Chat.Id, doc, ct);
+        return;
+    }
+    if (msg.Photo is { Length: > 0 } ph)
+    {
+        await StagePhotoForPrintAsync(msg.Chat.Id, ph.Last(), ct);
+        return;
+    }
 
     var text = (msg.Text ?? "").Trim();
     var slash = text.Split(' ', '@')[0].ToLower();
@@ -188,21 +208,36 @@ async Task HandleMessageAsync(string userName, Message msg, CancellationToken ct
             }
             return;
         }
+        if (payload == "printend")
+        {
+            await ClosePrinterSessionAsync(msg.Chat.Id, ct);
+            try { await bot.DeleteMessage(msg.Chat.Id, msg.Id, ct); }
+            catch (Exception ex) { log.LogDebug("delete of /start printend msg failed: {Err}", ex.Message); }
+            return;
+        }
         // fall through to standard /start help below
     }
 
     if (text.Equals("📷 Scanner", StringComparison.OrdinalIgnoreCase)
         || slash is "/scanner" or "/scan")
         await OpenScannerSessionAsync(msg.Chat.Id, userName, ct);
+    else if (text.Equals("🖨 Printer", StringComparison.OrdinalIgnoreCase)
+             || text.Equals("🖨️ Printer", StringComparison.OrdinalIgnoreCase)
+             || slash is "/printer" or "/print")
+        await OpenPrinterSessionAsync(msg.Chat.Id, ct);
     else if (text.Equals("📊 Status", StringComparison.OrdinalIgnoreCase) || slash == "/status")
         await ShowStatusAsync(msg.Chat.Id, ct);
     else if (slash is "/help" or "/start")
         await bot.SendMessage(msg.Chat.Id, """
             🖨️ <b>PrintScan Bot</b>
 
-            📄 Send a PDF or image to print it
             📷 /scanner — open scanner session
+            🖨 /printer — open printer session, then send a file to print
             📊 /status — printer &amp; scanner
+
+            Files (PDF, PostScript, images) you send while a printer
+            session is open get staged for confirmation before
+            printing — nothing prints unless you tap ✅ Print.
             """, parseMode: ParseMode.Html, replyMarkup: mainKeyboard, cancellationToken: ct);
     else
         await bot.SendMessage(msg.Chat.Id, "Send a file to print, or tap 📷 Scanner.",
@@ -215,6 +250,14 @@ async Task HandleCallbackAsync(string userName, CallbackQuery cb, CancellationTo
     var msgId = cb.Message.Id;
     var data = cb.Data ?? "";
     await bot.AnswerCallbackQuery(cb.Id, cancellationToken: ct);
+
+    // Printer-session callbacks have their own "print:" prefix so
+    // they don't collide with scanner pick:/set:/cancel:/scan:/end:.
+    if (data.StartsWith("print:"))
+    {
+        await HandlePrintCallbackAsync(chatId, data, ct);
+        return;
+    }
 
     // Format: pick:<fmt|dpi>:<sessionId>  — open a picker view
     //         set:<fmt|dpi>:<sessionId>:<value>  — apply change + back to main
@@ -473,20 +516,352 @@ static ScanFormat ParseFormatFromMetadata(Dictionary<string, string>? meta)
 // Print path (as before)
 // ────────────────────────────────────────────────────────────────────────────
 
-async Task HandlePrintDocumentAsync(long chatId, Document doc, CancellationToken ct)
+// ────────────────────────────────────────────────────────────────────────────
+// Printer session: per-chat in-bot state. Files arrive → staged →
+// confirmation UI → daemon /print (currently a stub). Auth has already
+// been enforced upstream by HandleUpdateAsync's allowedUsers check, so
+// every entry point here can trust msg.From was authorised.
+// ────────────────────────────────────────────────────────────────────────────
+
+async Task OpenPrinterSessionAsync(long chatId, CancellationToken ct)
 {
-    var status = await bot.SendMessage(chatId,
-        $"🖨️ Printing <code>{doc.FileName}</code>…",
-        parseMode: ParseMode.Html, cancellationToken: ct);
+    BotPrintSession? existing;
+    lock (printSessionsLock) { printSessions.TryGetValue(chatId, out existing); }
+    if (existing is not null)
+    {
+        // Already-open session for this chat — point the user at the
+        // existing status message via Telegram's reply-chip rather
+        // than spawning a second session message that'd just clutter.
+        try
+        {
+            await bot.SendMessage(chatId,
+                "🖨 You already have an open printer session — tap the reply above to jump to it.",
+                replyParameters: new() { MessageId = existing.StatusMessageId },
+                cancellationToken: ct);
+        }
+        catch (Exception ex)
+        {
+            log.LogDebug("printer self-jump reply failed: {Err}", ex.Message);
+            await bot.SendMessage(chatId, "🖨 Printer session is already open.",
+                cancellationToken: ct);
+        }
+        return;
+    }
+
+    var st = await daemon.GetStatusAsync(ct);
+    var online = st?.Printer.Online ?? true;
+    var placeholder = await bot.SendMessage(chatId, "🖨 Opening printer session…",
+        cancellationToken: ct);
+
+    var session = new BotPrintSession
+    {
+        ChatId = chatId,
+        StatusMessageId = placeholder.Id,
+        PrinterOnline = online,
+    };
+    lock (printSessionsLock) { printSessions[chatId] = session; }
+    await RenderPrintSessionAsync(chatId, ct);
+}
+
+async Task ClosePrinterSessionAsync(long chatId, CancellationToken ct)
+{
+    BotPrintSession? s;
+    lock (printSessionsLock)
+    {
+        printSessions.TryGetValue(chatId, out s);
+        if (s is not null) printSessions.Remove(chatId);
+    }
+    if (s is null) return;
     try
     {
-        using var ms = new MemoryStream();
-        await bot.GetInfoAndDownloadFile(doc.FileId, ms, ct);
-        ms.Position = 0;
+        await bot.EditMessageText(chatId, s.StatusMessageId,
+            PrintMessage.RenderTerminated(s),
+            parseMode: ParseMode.Html, replyMarkup: null,
+            cancellationToken: ct);
+    }
+    catch (Exception ex) { log.LogDebug("close-render failed: {Err}", ex.Message); }
+}
+
+async Task RenderPrintSessionAsync(long chatId, CancellationToken ct)
+{
+    BotPrintSession? s;
+    lock (printSessionsLock) { printSessions.TryGetValue(chatId, out s); }
+    if (s is null) return;
+    var (html, kb) = PrintMessage.Render(s, botUsername);
+    try
+    {
+        await bot.EditMessageText(chatId, s.StatusMessageId, html,
+            parseMode: ParseMode.Html, replyMarkup: kb,
+            linkPreviewOptions: new() { IsDisabled = true },
+            cancellationToken: ct);
+    }
+    catch (Exception ex)
+    {
+        if (!ex.Message.Contains("not modified", StringComparison.OrdinalIgnoreCase))
+            log.LogDebug("printer render failed: {Err}", ex.Message);
+    }
+}
+
+async Task StageDocumentForPrintAsync(long chatId, Document doc, CancellationToken ct)
+{
+    var (kind, contentType) = ClassifyForPrint(doc.MimeType, doc.FileName);
+    if (kind is null)
+    {
+        var nameForMsg = (doc.FileName ?? doc.MimeType ?? "this file")
+            .Replace("&", "&amp;").Replace("<", "&lt;").Replace(">", "&gt;");
+        await bot.SendMessage(chatId,
+            $"❌ <code>{nameForMsg}</code> isn't a supported print format. " +
+            "Send a PDF, PostScript, or image instead.",
+            parseMode: ParseMode.Html, cancellationToken: ct);
+        return;
+    }
+    using var ms = new MemoryStream();
+    await bot.GetInfoAndDownloadFile(doc.FileId, ms, ct);
+    var bytes = ms.ToArray();
+    await StageBytesForPrintAsync(chatId, doc.FileName ?? "document", contentType,
+        kind.Value, bytes, ct);
+}
+
+async Task StagePhotoForPrintAsync(long chatId, PhotoSize photo, CancellationToken ct)
+{
+    using var ms = new MemoryStream();
+    await bot.GetInfoAndDownloadFile(photo.FileId, ms, ct);
+    var bytes = ms.ToArray();
+    // Telegram delivers Photo as JPEG and strips dpi metadata, so
+    // always images-flow with no useful 1:1 hint.
+    await StageBytesForPrintAsync(chatId, "photo.jpg", "image/jpeg",
+        PendingPrintKind.Image, bytes, ct);
+}
+
+async Task StageBytesForPrintAsync(
+    long chatId, string fileName, string contentType,
+    PendingPrintKind kind, byte[] bytes, CancellationToken ct)
+{
+    BotPrintSession? s;
+    lock (printSessionsLock) { printSessions.TryGetValue(chatId, out s); }
+    if (s is null)
+    {
+        // No open session — auto-open one. Same effect as the user
+        // tapping 🖨 Printer first, then sending the file.
+        await OpenPrinterSessionAsync(chatId, ct);
+        lock (printSessionsLock) { printSessions.TryGetValue(chatId, out s); }
+        if (s is null) return;
+    }
+
+    int? w = null, h = null, dpi = null;
+    if (kind == PendingPrintKind.Image)
+    {
+        try
+        {
+            using var imgStream = new MemoryStream(bytes, writable: false);
+            var info = await SixLabors.ImageSharp.Image.IdentifyAsync(imgStream, ct);
+            w = info.Width;
+            h = info.Height;
+            // ImageSharp surfaces resolution in the Metadata. Most
+            // formats record it in pixels-per-inch via PixelResolutionUnit
+            // — when the unit is anything else (cm) we'd need to
+            // convert; for the printable-direct path here all the
+            // formats we accept use PixelsPerInch.
+            var hRes = info.Metadata.HorizontalResolution;
+            var vRes = info.Metadata.VerticalResolution;
+            if (hRes > 0 && vRes > 0)
+            {
+                dpi = (int)Math.Round(Math.Min(hRes, vRes));
+                if (dpi < PendingPrint.MinReasonableDpi) dpi = null;
+            }
+        }
+        catch (Exception ex)
+        {
+            log.LogDebug("image metadata extract failed for {File}: {Err}", fileName, ex.Message);
+        }
+    }
+
+    var pending = new PendingPrint
+    {
+        Id = Guid.NewGuid().ToString("N")[..8],
+        Data = bytes,
+        FileName = fileName,
+        ContentType = contentType,
+        Kind = kind,
+        PixelWidth = w,
+        PixelHeight = h,
+        Dpi = dpi,
+    };
+    if (pending.Fits1to1) pending.Scale = PrintScaleMode.OneToOne;
+
+    lock (printSessionsLock)
+    {
+        if (printSessions.TryGetValue(chatId, out var bs))
+        {
+            bs.Pending = pending;
+            bs.View = PrintPickerView.Main;
+        }
+    }
+    await RenderPrintSessionAsync(chatId, ct);
+}
+
+/// <summary>
+/// Classify an incoming document by MIME type / extension. Returns
+/// (Pageable | Image, content-type). Null kind = "we don't accept this
+/// in this build" — the bot replies to the user with a short hint
+/// instead of staging it.
+/// </summary>
+static (PendingPrintKind? Kind, string ContentType) ClassifyForPrint(string? mime, string? fileName)
+{
+    var mimeLower = (mime ?? "").ToLowerInvariant();
+    var ext = Path.GetExtension(fileName ?? "").ToLowerInvariant();
+
+    if (mimeLower == "application/pdf" || ext == ".pdf")
+        return (PendingPrintKind.Pageable, "application/pdf");
+    if (mimeLower == "application/postscript" || mimeLower == "application/x-postscript"
+        || ext is ".ps" or ".eps")
+        return (PendingPrintKind.Pageable, "application/postscript");
+
+    if (mimeLower.StartsWith("image/") || ext is ".jpg" or ".jpeg" or ".png"
+        or ".webp" or ".gif" or ".bmp" or ".tif" or ".tiff")
+    {
+        var ct = mimeLower.StartsWith("image/") ? mimeLower : ext switch
+        {
+            ".jpg" or ".jpeg" => "image/jpeg",
+            ".png"  => "image/png",
+            ".webp" => "image/webp",
+            ".gif"  => "image/gif",
+            ".bmp"  => "image/bmp",
+            ".tif" or ".tiff" => "image/tiff",
+            _ => "application/octet-stream",
+        };
+        return (PendingPrintKind.Image, ct);
+    }
+
+    return (null, "application/octet-stream");
+}
+
+async Task HandlePrintCallbackAsync(long chatId, string data, CancellationToken ct)
+{
+    // Verbs:
+    //   print:pick:<scale|orient|main>:<pendingId>   — switch picker view
+    //   print:set:<scale|orient>:<pendingId>:<value> — apply value, back to main
+    //   print:confirm:<pendingId>                    — kick off the print
+    //   print:cancel:<pendingId>                     — drop the pending
+    var parts = data.Split(':');
+    if (parts.Length < 3) return;
+    var verb = parts[1];
+
+    BotPrintSession? s;
+    lock (printSessionsLock) { printSessions.TryGetValue(chatId, out s); }
+    if (s is null) return;
+
+    // For verbs that carry a pendingId, ignore the tap if the pending
+    // has changed under us (stale callback from a prior file upload).
+    bool MatchesCurrent(string id) => s.Pending is { } cur && cur.Id == id;
+
+    switch (verb)
+    {
+        case "pick":
+        {
+            if (parts.Length < 4) return;
+            var what = parts[2];
+            var pid = parts[3];
+            if (pid != "_" && !MatchesCurrent(pid)) return;
+            lock (printSessionsLock)
+            {
+                if (printSessions.TryGetValue(chatId, out var bs))
+                    bs.View = what switch
+                    {
+                        "scale"  => PrintPickerView.Scale,
+                        "orient" => PrintPickerView.Orientation,
+                        _ => PrintPickerView.Main,
+                    };
+            }
+            await RenderPrintSessionAsync(chatId, ct);
+            break;
+        }
+        case "set":
+        {
+            if (parts.Length < 5) return;
+            var what  = parts[2];
+            var pid   = parts[3];
+            var value = parts[4];
+            if (!MatchesCurrent(pid)) return;
+            lock (printSessionsLock)
+            {
+                if (!printSessions.TryGetValue(chatId, out var bs) || bs.Pending is null) break;
+                if (what == "scale")
+                {
+                    bs.Pending.Scale = value switch
+                    {
+                        "onetoone" => PrintScaleMode.OneToOne,
+                        "fit"      => PrintScaleMode.Fit,
+                        "fill"     => PrintScaleMode.Fill,
+                        _ => bs.Pending.Scale,
+                    };
+                }
+                else if (what == "orient")
+                {
+                    bs.Pending.Orientation = value switch
+                    {
+                        "auto"      => PrintOrientation.Auto,
+                        "portrait"  => PrintOrientation.Portrait,
+                        "landscape" => PrintOrientation.Landscape,
+                        _ => bs.Pending.Orientation,
+                    };
+                }
+                bs.View = PrintPickerView.Main;
+            }
+            await RenderPrintSessionAsync(chatId, ct);
+            break;
+        }
+        case "cancel":
+        {
+            var pid = parts[2];
+            if (!MatchesCurrent(pid)) return;
+            lock (printSessionsLock)
+            {
+                if (printSessions.TryGetValue(chatId, out var bs))
+                {
+                    bs.Pending = null;
+                    bs.View = PrintPickerView.Main;
+                }
+            }
+            await RenderPrintSessionAsync(chatId, ct);
+            break;
+        }
+        case "confirm":
+        {
+            var pid = parts[2];
+            if (!MatchesCurrent(pid)) return;
+            await ExecutePrintAsync(chatId, pid, ct);
+            break;
+        }
+    }
+}
+
+async Task ExecutePrintAsync(long chatId, string pendingId, CancellationToken ct)
+{
+    PendingPrint? p;
+    lock (printSessionsLock)
+    {
+        if (!printSessions.TryGetValue(chatId, out var bs)) return;
+        if (bs.Pending is null || bs.Pending.Id != pendingId) return;
+        if (bs.Printing) return;          // re-entry guard
+        bs.Printing = true;
+        p = bs.Pending;
+    }
+    await RenderPrintSessionAsync(chatId, ct);
+
+    bool ok = false;
+    string? error = null;
+    try
+    {
         using var content = new MultipartFormDataContent();
-        var file = new StreamContent(ms);
-        file.Headers.ContentType = new MediaTypeHeaderValue("application/octet-stream");
-        content.Add(file, "file", doc.FileName ?? "document");
+        var fileContent = new ByteArrayContent(p!.Data);
+        fileContent.Headers.ContentType = new MediaTypeHeaderValue(p.ContentType);
+        content.Add(fileContent, "file", p.FileName);
+        content.Add(new StringContent(p.Scale.ToString()), "scale");
+        content.Add(new StringContent(p.Orientation.ToString()), "orientation");
+
+        // Daemon talks unix socket; one-shot HttpClient with the same
+        // ConnectCallback shape DaemonClient uses internally.
         using var http = new HttpClient(new SocketsHttpHandler
         {
             ConnectCallback = async (_, innerCt) =>
@@ -495,31 +870,38 @@ async Task HandlePrintDocumentAsync(long chatId, Document doc, CancellationToken
                     System.Net.Sockets.AddressFamily.Unix,
                     System.Net.Sockets.SocketType.Stream,
                     System.Net.Sockets.ProtocolType.Unspecified);
-                await sock.ConnectAsync(new System.Net.Sockets.UnixDomainSocketEndPoint(socketPath), innerCt);
+                await sock.ConnectAsync(
+                    new System.Net.Sockets.UnixDomainSocketEndPoint(socketPath), innerCt);
                 return new System.Net.Sockets.NetworkStream(sock, ownsSocket: true);
             }
         }) { BaseAddress = new Uri("http://localhost") };
         var resp = await http.PostAsync("/print", content, ct);
-        await bot.EditMessageText(chatId, status.Id,
-            resp.IsSuccessStatusCode ? $"✅ Printed <code>{doc.FileName}</code>"
-                                     : $"❌ Print failed: {resp.StatusCode}",
-            parseMode: ParseMode.Html, cancellationToken: ct);
+        ok = resp.IsSuccessStatusCode;
+        if (!ok) error = $"HTTP {(int)resp.StatusCode}";
     }
     catch (Exception ex)
     {
-        await bot.EditMessageText(chatId, status.Id, $"❌ Print error: {ex.Message}", cancellationToken: ct);
+        error = ex.Message;
+        log.LogError(ex, "print of {File} failed", p?.FileName);
     }
-}
 
-async Task HandlePrintPhotoAsync(long chatId, PhotoSize photo, CancellationToken ct)
-{
-    // Same pipeline as document path with a fixed filename/content-type.
-    var fake = new Document
+    lock (printSessionsLock)
     {
-        FileId = photo.FileId,
-        FileName = "photo.jpg"
-    };
-    await HandlePrintDocumentAsync(chatId, fake, ct);
+        if (printSessions.TryGetValue(chatId, out var bs))
+        {
+            bs.Printing = false;
+            bs.History.Insert(0, new PrintHistoryEntry(
+                DateTimeOffset.Now, p?.FileName ?? "?", ok, error));
+            if (bs.History.Count > BotPrintSession.HistoryCap)
+                bs.History.RemoveRange(BotPrintSession.HistoryCap,
+                    bs.History.Count - BotPrintSession.HistoryCap);
+            // Drop the pending whether print succeeded or failed —
+            // user re-sends to retry; matches the scan flow's "no
+            // automatic retry" stance.
+            bs.Pending = null;
+        }
+    }
+    await RenderPrintSessionAsync(chatId, ct);
 }
 
 async Task ShowStatusAsync(long chatId, CancellationToken ct)

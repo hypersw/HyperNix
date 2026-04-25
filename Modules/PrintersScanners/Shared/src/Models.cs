@@ -1,12 +1,41 @@
 namespace PrintScan.Shared;
 
-// ── Print (unchanged shape) ─────────────────────────────────────────────────
+// ── Print ───────────────────────────────────────────────────────────────────
+
+/// <summary>
+/// How an image (or any rasterizable input) should be sized on the
+/// physical page. Ignored for pre-paginated formats (PDF, PostScript)
+/// where the document already encodes its own page geometry.
+/// </summary>
+public enum PrintScaleMode
+{
+    /// Print at native resolution (image px ÷ image dpi → physical
+    /// inches). Only sensible when the dpi metadata is realistic and
+    /// the resulting dimensions fit on the paper.
+    OneToOne,
+    /// Scale uniformly so the whole image fits within the printable
+    /// area (no cropping; may leave margins).
+    Fit,
+    /// Scale uniformly so the image covers the printable area
+    /// (no margins; crops the overflowing dimension).
+    Fill,
+}
+
+public enum PrintOrientation
+{
+    /// Bot picks based on image aspect (longer side → page's longer side).
+    Auto,
+    Portrait,
+    Landscape,
+}
 
 public record PrintRequest(
     string FileName,
     byte[] FileData,
     string? PageRange = null,
-    int Copies = 1
+    int Copies = 1,
+    PrintScaleMode Scale = PrintScaleMode.Fit,
+    PrintOrientation Orientation = PrintOrientation.Auto
 );
 
 public record PrinterStatus(

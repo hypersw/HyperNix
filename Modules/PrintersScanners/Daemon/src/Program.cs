@@ -123,12 +123,23 @@ app.MapPost("/print", async (HttpRequest request, PrintService print, ShutdownGa
 
     var pageRange = form["pageRange"].FirstOrDefault();
     var copies = int.TryParse(form["copies"].FirstOrDefault(), out var c) ? c : 1;
+    // Scale + orientation are optional; missing or unparseable values
+    // fall back to the defaults baked into PrintRequest. Threaded
+    // through to the daemon so the eventual real-printer path can
+    // translate them into lp options (-o fit-to-page / -o landscape /
+    // -o scaling=100 etc.) without a protocol change.
+    var scale = Enum.TryParse<PrintScaleMode>(
+        form["scale"].FirstOrDefault(), ignoreCase: true, out var sc)
+        ? sc : PrintScaleMode.Fit;
+    var orient = Enum.TryParse<PrintOrientation>(
+        form["orientation"].FirstOrDefault(), ignoreCase: true, out var o)
+        ? o : PrintOrientation.Auto;
     using var ms = new MemoryStream();
     await file.CopyToAsync(ms, ct);
 
     using var _ = gate.Begin("print");
     var ok = await print.PrintAsync(
-        new PrintRequest(file.FileName, ms.ToArray(), pageRange, copies), ct);
+        new PrintRequest(file.FileName, ms.ToArray(), pageRange, copies, scale, orient), ct);
     return ok ? Results.Ok("Printed") : Results.StatusCode(500);
 });
 
