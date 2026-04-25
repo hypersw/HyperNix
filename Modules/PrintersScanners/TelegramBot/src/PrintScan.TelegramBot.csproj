@@ -9,7 +9,15 @@
 
   <ItemGroup>
     <PackageReference Include="Microsoft.Extensions.Logging.Console" Version="10.0.5" />
+    <PackageReference Include="Microsoft.IO.RecyclableMemoryStream" Version="3.0.1" />
     <PackageReference Include="Telegram.Bot" Version="22.9.6" />
+    <!-- Image decode/re-encode pipeline. The bot owns all imagery work
+         end-to-end: fetch raw TIFF from the daemon, decode once, encode
+         each user-selected format, draw overlay thumbnails, upload to
+         Telegram. Pure managed, no native deps. -->
+    <PackageReference Include="SixLabors.ImageSharp" Version="3.1.5" />
+    <!-- Drawing + text rendering on thumbnails (label overlay). -->
+    <PackageReference Include="SixLabors.ImageSharp.Drawing" Version="2.1.4" />
   </ItemGroup>
 
   <ItemGroup>

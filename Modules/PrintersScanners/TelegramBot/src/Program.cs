@@ -22,10 +22,6 @@ if (string.IsNullOrEmpty(tokenFile))
 if (string.IsNullOrEmpty(tokenFile) || !File.Exists(tokenFile))
     throw new Exception($"Bot token file not found (tried {tokenFile})");
 
-// systemd sets RUNTIME_DIRECTORY when RuntimeDirectory= is configured.
-var runtimeDir = Environment.GetEnvironmentVariable("RUNTIME_DIRECTORY")?.Split(':')[0]
-    ?? "/run/printscan-bot";
-
 var allowedUsersJson = Environment.GetEnvironmentVariable("PRINTSCAN_ALLOWED_USERS") ?? "[]";
 var allowedUsers = (System.Text.Json.JsonSerializer.Deserialize<List<AllowedUser>>(
     allowedUsersJson,
@@ -44,24 +40,17 @@ var log = loggerFactory.CreateLogger("bot");
 var token = (await File.ReadAllTextAsync(tokenFile)).Trim();
 var bot = new TelegramBotClient(token);
 using var daemon = new DaemonClient(socketPath, loggerFactory.CreateLogger<DaemonClient>());
-var staging = new Staging(runtimeDir, loggerFactory.CreateLogger<Staging>());
+var pipeline = new ImagePipeline(loggerFactory.CreateLogger<ImagePipeline>());
 
 // in-memory bot-side session state, keyed by daemon's session id
 var sessions = new Dictionary<string, BotSession>();
 var sessionsLock = new Lock();
 
-// gate: refuse to exit while an upload is in flight
-var inFlight = 0;
-var inFlightDrained = new SemaphoreSlim(1, 1);
-
-// multi-variant accumulator. Keyed by (sessionId, seq); each entry
-// holds one variant's staged path while we wait for its siblings.
-// Cleared on send-complete (or lost on session terminate, which wipes
-// staging too). Kept at outer scope so DeliverImageAsync (a local async
-// function later in the file) can close over it — C# top-level-statement
-// scoping requires the lexical declaration to precede the function.
-var pendingBatches = new Dictionary<(string sessionId, int seq), List<BatchEntry>>();
-var batchesLock = new Lock();
+// In-flight scan-delivery counter. We don't gate concurrency on it
+// (Telegram tolerates parallel uploads to different chats fine) — it
+// only exists so graceful shutdown can wait until pending scans have
+// finished re-encoding and uploading before the process exits.
+var inFlightCount = 0;
 
 // ── Cancellation / shutdown ─────────────────────────────────────────────────
 
@@ -95,14 +84,13 @@ var mainKeyboard = new ReplyKeyboardMarkup(
     new[] { new KeyboardButton[] { "📷 Scanner", "📊 Status" } })
 { ResizeKeyboard = true, IsPersistent = true };
 
-log.LogInformation("bot starting, allowed users: {Users}, socket: {Sock}, staging: {Stg}",
+log.LogInformation("bot starting, allowed users: {Users}, socket: {Sock}",
     string.Join(", ", allowedUsers.Select(u => $"{u.Value}({u.Key})")),
-    socketPath, runtimeDir);
+    socketPath);
 
 // ── Background loops ────────────────────────────────────────────────────────
 
 var sseLoop = Task.Run(() => RunSseLoopAsync(cts.Token));
-var retryLoop = Task.Run(() => SweepStagingAsync(cts.Token));
 var pollOffset = 0;
 
 try
@@ -129,10 +117,13 @@ try
 finally
 {
     log.LogInformation("draining in-flight uploads before exit");
-    await inFlightDrained.WaitAsync();
-    inFlightDrained.Release();
+    var drainStart = DateTime.UtcNow;
+    while (Volatile.Read(ref inFlightCount) > 0 &&
+           DateTime.UtcNow - drainStart < TimeSpan.FromSeconds(30))
+    {
+        try { await Task.Delay(100); } catch { break; }
+    }
     try { await sseLoop; } catch { }
-    try { await retryLoop; } catch { }
     log.LogInformation("clean exit");
 }
 
@@ -272,42 +263,57 @@ async Task HandleCallbackAsync(string userName, CallbackQuery cb, CancellationTo
         };
 
         // Toggle with a "never leave zero formats selected" guard —
-        // daemon falls back to Jpeg on empty mask but we prefer the
-        // UI to make refusals explicit rather than silently force a
-        // format the user had just unchecked.
+        // we prefer the UI to make refusals explicit rather than
+        // silently fall back to a format the user had just unchecked.
         static ScanFormat Toggle(ScanFormat cur, ScanFormat bit) =>
             ((cur ^ bit) == ScanFormat.None) ? cur : (cur ^ bit);
 
-        var newParams = (verb, what) switch
+        // Format selection is a bot-only concern — daemon doesn't
+        // operate on formats. We persist it via the daemon's opaque
+        // session-metadata bag so the choice survives bot restarts;
+        // dpi flows through ScanParams as before because the daemon
+        // does need it to pass to scanimage.
+        if (verb == "toggle" && what == "fmt" && ParseFormat(value) is ScanFormat f)
         {
-            ("toggle", "fmt") when ParseFormat(value) is ScanFormat f =>
-                s.Params with { Format = Toggle(s.Params.Format, f) },
-            ("set", "dpi") when int.TryParse(value, out var d) =>
-                s.Params with { Dpi = d },
-            _ => s.Params,
-        };
-        try
-        {
-            await daemon.PatchSessionParamsAsync(sid, newParams, ct);
+            var newFormat = Toggle(s.Format, f);
+            lock (sessionsLock)
+            {
+                if (sessions.TryGetValue(sid, out var bs)) bs.Format = newFormat;
+            }
+            try
+            {
+                await daemon.PutMetadataAsync(sid,
+                    new() { [MetadataKeys.Format] = ((int)newFormat).ToString() }, ct);
+            }
+            catch (Exception ex)
+            {
+                log.LogWarning("PUT metadata failed: {Err}", ex.Message);
+            }
+            // Stay on the format picker so users can flip multiple
+            // boxes in a row without leaving the picker view.
+            await RerenderAsync(sid, ct, PickerView.Format);
         }
-        catch (Exception ex)
+        else if (verb == "set" && what == "dpi" && int.TryParse(value, out var d))
         {
-            log.LogWarning("PATCH session params failed: {Err}", ex.Message);
+            var newParams = s.Params with { Dpi = d };
+            lock (sessionsLock)
+            {
+                if (sessions.TryGetValue(sid, out var bs)) bs.Params = newParams;
+            }
+            try
+            {
+                await daemon.PatchSessionParamsAsync(sid, newParams, ct);
+            }
+            catch (Exception ex)
+            {
+                log.LogWarning("PATCH session params failed: {Err}", ex.Message);
+            }
+            await RerenderAsync(sid, ct);
         }
-        // SessionOpened event from daemon will pick up new params and
-        // re-render; render now too so the UI doesn't lag the SSE roundtrip.
-        lock (sessionsLock)
+        else
         {
-            if (sessions.TryGetValue(sid, out var bs)) bs.Params = newParams;
+            await RerenderAsync(sid, ct);
         }
-        // Stay on the format picker when toggling so users can flip
-        // multiple boxes in a row without leaving the picker view.
-        var stayView = (verb, what) switch
-        {
-            ("toggle", "fmt") => PickerView.Format,
-            _ => PickerView.Main,
-        };
-        await RerenderAsync(sid, ct, stayView);
     }
     else if (data.StartsWith("cancel:"))
     {
@@ -367,7 +373,8 @@ async Task OpenScannerSessionAsync(
         OwnerChatId: chatId,
         OwnerStatusMessageId: msgId,
         OwnerDisplayName: "@" + userName,
-        Params: StatusMessage.Defaults());
+        Params: StatusMessage.DefaultParams(),
+        Metadata: new() { [MetadataKeys.Format] = ((int)StatusMessage.DefaultFormat).ToString() });
 
     DaemonClient.OpenResult outcome;
     SessionRecord? session;
@@ -442,11 +449,24 @@ async Task OpenScannerSessionAsync(
             ChatId = chatId,
             StatusMessageId = msgId,
             Params = session.Params,
+            Format = ParseFormatFromMetadata(session.Metadata),
             ExpiresAt = session.ExpiresAt,
             ScanCount = session.ScanCount,
         };
     }
     await RerenderAsync(session.Id, ct);
+}
+
+// Decode the bot's format selection out of the daemon's opaque metadata
+// bag. Falls back to the default if the key is missing (fresh session
+// from another client) or unparseable.
+static ScanFormat ParseFormatFromMetadata(Dictionary<string, string>? meta)
+{
+    if (meta is null || !meta.TryGetValue(MetadataKeys.Format, out var s))
+        return StatusMessage.DefaultFormat;
+    if (int.TryParse(s, out var n) && Enum.IsDefined(typeof(ScanFormat), n))
+        return (ScanFormat)n;
+    return StatusMessage.DefaultFormat;
 }
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -549,13 +569,16 @@ async Task HandleEventAsync(SessionEvent ev, CancellationToken ct)
                 if (!sessions.ContainsKey(s.Id) && s.OwnerBot == "telegram")
                 {
                     // Reconstruct from primer (daemon restart) — we don't
-                    // own this in memory, rebuild it.
+                    // own this in memory, rebuild it. Format selection
+                    // travels in the daemon's opaque metadata bag, so we
+                    // recover it from there.
                     sessions[s.Id] = new BotSession
                     {
                         DaemonSessionId = s.Id,
                         ChatId = s.OwnerChatId,
                         StatusMessageId = s.OwnerStatusMessageId,
                         Params = s.Params,
+                        Format = ParseFormatFromMetadata(s.Metadata),
                         ExpiresAt = s.ExpiresAt,
                         ScanCount = s.ScanCount,
                     };
@@ -563,10 +586,11 @@ async Task HandleEventAsync(SessionEvent ev, CancellationToken ct)
                 else if (sessions.TryGetValue(s.Id, out var bs))
                 {
                     // SessionOpened is also re-emitted on PATCH-params
-                    // so pick up param changes here.
+                    // and metadata updates — pick up changes here.
                     bs.ExpiresAt = s.ExpiresAt;
                     bs.ScanCount = s.ScanCount;
                     bs.Params    = s.Params;
+                    bs.Format    = ParseFormatFromMetadata(s.Metadata);
                 }
             }
             await RerenderAsync(s.Id, ct);
@@ -623,29 +647,38 @@ async Task HandleEventAsync(SessionEvent ev, CancellationToken ct)
         }
         case SessionEventType.SessionImageReady when ev.SessionId is not null && ev.Seq is int seq:
         {
-            // Daemon fires one image-ready event per variant (one per
-            // selected format bit). Deliver this specific variant now;
-            // flip Scanning=false and bump ScanCount only once the LAST
-            // variant has delivered, so the status bar keeps showing
-            // "scanning…" while additional formats are still streaming.
-            var variant = ev.Variant ?? 0;
-            var variantCount = ev.VariantCount ?? 1;
-            var isLastVariant = variant == variantCount - 1;
-            await DeliverImageAsync(ev.SessionId, seq, variant, variantCount,
-                ev.ContentType ?? "image/jpeg",
-                ev.FileName ?? $"scan-{seq}.jpg", ct);
+            // Daemon fires exactly one event per scan now — it carries
+            // the raw TIFF blob, the bot decodes once and produces all
+            // variants on its side. Run delivery on a worker so the SSE
+            // event loop doesn't block on decode/encode (a 600 dpi scan
+            // can take several seconds of CPU).
+            BotSession? bs;
+            lock (sessionsLock) { sessions.TryGetValue(ev.SessionId, out bs); }
+            var sessionId = ev.SessionId;
+            if (bs is not null)
+            {
+                Interlocked.Increment(ref inFlightCount);
+                _ = Task.Run(async () =>
+                {
+                    try { await DeliverScanAsync(sessionId, seq, bs, ct); }
+                    catch (Exception ex)
+                    {
+                        log.LogError(ex, "deliver scan {Session}#{Seq} failed", sessionId, seq);
+                    }
+                    finally { Interlocked.Decrement(ref inFlightCount); }
+                });
+            }
             lock (sessionsLock)
             {
-                if (sessions.TryGetValue(ev.SessionId, out var bs) && isLastVariant)
+                if (sessions.TryGetValue(ev.SessionId, out var bs2))
                 {
-                    bs.ScanCount = seq;
-                    bs.LastUploadedSeq = seq;
+                    bs2.ScanCount = seq;
+                    bs2.LastUploadedSeq = seq;
                     // If there's a queued scan about to start, keep
                     // Scanning=true so the button doesn't flicker to
-                    // idle between SessionImageReady(last-variant) and
-                    // the upcoming SessionScanning(next-seq). Progress
-                    // gets reset when that next SessionScanning fires.
-                    if (bs.QueuedScans == 0) bs.Scanning = false;
+                    // idle between SessionImageReady and the upcoming
+                    // SessionScanning(next-seq).
+                    if (bs2.QueuedScans == 0) bs2.Scanning = false;
                 }
             }
             await RerenderAsync(ev.SessionId, ct);
@@ -723,7 +756,6 @@ async Task HandleEventAsync(SessionEvent ev, CancellationToken ct)
                         cancellationToken: ct);
                 }
                 catch { /* message may have been deleted */ }
-                staging.WipeSession(ev.SessionId);
             }
             break;
         }
@@ -755,178 +787,76 @@ async Task RerenderAsync(string sessionId, CancellationToken ct,
 }
 
 // ────────────────────────────────────────────────────────────────────────────
-// Image delivery: fetch from daemon, stage to disk, upload to TG, unstage.
+// Scan delivery: fetch raw TIFF, decode + encode + thumbnail, upload to TG.
+// All bytes are in-memory and released as soon as Telegram accepts the
+// album — no on-disk staging, no daemon-side accumulation.
 // ────────────────────────────────────────────────────────────────────────────
 
-async Task DeliverImageAsync(string sessionId, int seq, int variant, int variantCount,
-    string contentType, string fileName, CancellationToken ct)
+async Task DeliverScanAsync(string sessionId, int seq, BotSession bs, CancellationToken ct)
 {
-    Interlocked.Increment(ref inFlight);
-    try { await inFlightDrained.WaitAsync(ct); } catch { }
+    // 1. Fetch raw TIFF from the daemon. The daemon hands the blob over
+    //    once and drops its copy as soon as the response completes —
+    //    "drop on first fetch" is the whole point of the new memory
+    //    model. There's no second-fetch retry possible.
+    using var tiffMs = new MemoryStream();
+    using (var tiffStream = await daemon.FetchScanAsync(sessionId, seq, ct))
+    {
+        await tiffStream.CopyToAsync(tiffMs, ct);
+    }
+    tiffMs.Position = 0;
+
+    // 2. Decode once, encode each requested format, build per-variant
+    //    overlay thumbnails. ImagePipeline owns the disposal contract:
+    //    each EncodedVariant holds two streams; the using-scope below
+    //    disposes them all when we leave.
+    var variants = await pipeline.ProcessAsync(
+        tiffMs, bs.Params.Dpi, seq, bs.Format, ct);
     try
     {
-        BotSession? bs;
-        lock (sessionsLock) { sessions.TryGetValue(sessionId, out bs); }
-        if (bs is null) return;
-
-        var ext = Path.GetExtension(fileName).TrimStart('.');
-        // Stage key uses seq AND variant so distinct formats of the same
-        // scan don't collide (a WebP-lossy and JPG of scan #3 are both
-        // legitimately "scan 3, variant N").
-        var stageSeq = seq * 100 + variant;
-        string path;
-        await using (var stream = await daemon.FetchImageAsync(sessionId, seq, variant, ct))
-        {
-            path = await staging.StageAsync(sessionId, stageSeq, ext, stream, ct);
-        }
         var caption = $"📷 {bs.Params.Dpi} dpi · scan #{seq}";
-        staging.RecordManifest(sessionId, stageSeq, new StagedEntry(
-            ChatId: bs.ChatId, FileName: fileName, ContentType: contentType,
-            Caption: caption));
 
-        if (variantCount <= 1)
+        if (variants.Count == 1)
         {
-            // Single-variant scan: direct upload, no batching needed.
-            await UploadStagedAsync(sessionId, stageSeq, path, bs.ChatId,
-                fileName, caption, ct);
-            return;
+            // Single format → SendDocument. Thumbnail name doesn't need
+            // to be unique here because there's only one attach.
+            var v = variants[0];
+            await bot.SendDocument(bs.ChatId,
+                new InputFileStream(v.Data, v.FileName),
+                caption: caption,
+                thumbnail: new InputFileStream(v.Thumbnail, "thumb.jpg"),
+                cancellationToken: ct);
         }
-
-        // Multi-variant: accumulate until the full set arrives, then
-        // send as a Telegram media group. That presents the N formats
-        // of one scan as a single album in the chat (much tidier than
-        // N loose file messages).
-        List<BatchEntry>? completeBatch = null;
-        long chatId = bs.ChatId;
-        lock (batchesLock)
+        else
         {
-            var key = (sessionId, seq);
-            if (!pendingBatches.TryGetValue(key, out var list))
+            // Multi-format → media group (album). Crucial correctness
+            // note: Telegram.Bot derives the multipart `attach://`
+            // reference from each InputFileStream's FileName, so two
+            // streams named "thumb.jpg" collide and the API surfaces
+            // "Wrong file identifier" on every item past the first.
+            // Variant-suffixed thumbnail names avoid that.
+            var medias = new List<IAlbumInputMedia>(variants.Count);
+            for (int i = 0; i < variants.Count; i++)
             {
-                pendingBatches[key] = list = new List<BatchEntry>();
+                var v = variants[i];
+                medias.Add(new InputMediaDocument(
+                    new InputFileStream(v.Data, v.FileName))
+                {
+                    Thumbnail = new InputFileStream(
+                        v.Thumbnail, $"thumb-{i}.jpg"),
+                    // Only the first item's caption is shown above the
+                    // album — the rest are hidden, so put the summary
+                    // on slot 0.
+                    Caption = i == 0 ? caption : null,
+                });
             }
-            list.Add(new BatchEntry(variant, path, fileName, contentType));
-            if (list.Count >= variantCount)
-            {
-                completeBatch = list;
-                pendingBatches.Remove(key);
-            }
+            await bot.SendMediaGroup(bs.ChatId, medias, cancellationToken: ct);
         }
-        if (completeBatch is not null)
-        {
-            // Deterministic album order (variant index == format-flag
-            // order: Jpeg, Png, WebpLossless, WebpLossy).
-            completeBatch.Sort((a, b) => a.Variant.CompareTo(b.Variant));
-            await SendBatchAsMediaGroupAsync(sessionId, seq, completeBatch,
-                chatId, caption, ct);
-        }
+        log.LogInformation("delivered {Session}#{Seq} ({N} formats)",
+            sessionId, seq, variants.Count);
     }
     finally
     {
-        if (Interlocked.Decrement(ref inFlight) == 0)
-            inFlightDrained.Release();
-    }
-}
-
-async Task SendBatchAsMediaGroupAsync(
-    string sessionId, int seq, List<BatchEntry> entries,
-    long chatId, string caption, CancellationToken ct)
-{
-    // Fetch each variant's overlay thumbnail up front — they all share
-    // one source picture but carry their own format label in the
-    // bottom strip, so we can't reuse one blob. Crucial correctness
-    // note: Telegram.Bot derives the multipart `attach://` reference
-    // from the InputFileStream's FileName. Two thumbnails named
-    // "thumb.jpg" in the same media group collide → one gets uploaded
-    // and the rest point at missing parts, surfacing as
-    // "Wrong file identifier" on every item past the first. We give
-    // each thumbnail a unique name (variant index) to avoid that.
-    var thumbs = new byte[entries.Count][];
-    for (int i = 0; i < entries.Count; i++)
-    {
-        await using var src = await daemon.FetchThumbnailAsync(
-            sessionId, seq, entries[i].Variant, ct);
-        await using var ms = new MemoryStream();
-        await src.CopyToAsync(ms, ct);
-        thumbs[i] = ms.ToArray();
-    }
-
-    var streams = new List<FileStream>(entries.Count);
-    try
-    {
-        var medias = new List<IAlbumInputMedia>(entries.Count);
-        for (int i = 0; i < entries.Count; i++)
-        {
-            var e = entries[i];
-            var stream = File.OpenRead(e.Path);
-            streams.Add(stream);
-            var media = new InputMediaDocument(new InputFileStream(stream, e.FileName))
-            {
-                Thumbnail = new InputFileStream(
-                    new MemoryStream(thumbs[i]), $"thumb-{e.Variant}.jpg"),
-                // Only the first item's caption is shown above the album
-                // — the rest are hidden, so put the summary on slot 0.
-                Caption = i == 0 ? caption : null,
-            };
-            medias.Add(media);
-        }
-        await bot.SendMediaGroup(chatId, medias, cancellationToken: ct);
-        foreach (var e in entries) staging.Remove(sessionId, seq * 100 + e.Variant);
-        log.LogInformation("delivered {Session}#{Seq} as album of {N}",
-            sessionId, seq, entries.Count);
-    }
-    catch (Exception ex)
-    {
-        log.LogError(ex,
-            "media group upload of {Session}#{Seq} failed, staging kept for retry",
-            sessionId, seq);
-    }
-    finally
-    {
-        foreach (var s in streams) await s.DisposeAsync();
-    }
-}
-
-async Task UploadStagedAsync(
-    string sessionId, int seq, string path, long chatId,
-    string fileName, string caption, CancellationToken ct)
-{
-    try
-    {
-        await using var stream = File.OpenRead(path);
-        // Attach the per-variant 320×320 JPEG thumbnail so every format
-        // renders a consistent inline preview in-chat (and carries the
-        // dpi/scan-# overlay). The composite staging key packs the real
-        // seq in the high slot and the variant index in the low two
-        // digits, so we need to unpack both here.
-        int realSeq = seq / 100;
-        int variant = seq % 100;
-        await using var thumbStream = await daemon.FetchThumbnailAsync(
-            sessionId, realSeq, variant, ct);
-        await bot.SendDocument(chatId, new InputFileStream(stream, fileName),
-            caption: caption,
-            thumbnail: new InputFileStream(thumbStream, "thumb.jpg"),
-            cancellationToken: ct);
-        staging.Remove(sessionId, seq);
-        log.LogInformation("delivered {Session}#{Seq} → {Chat}", sessionId, seq, chatId);
-    }
-    catch (Exception ex)
-    {
-        log.LogError(ex, "upload of {Session}#{Seq} failed, staging kept for retry", sessionId, seq);
-    }
-}
-
-async Task SweepStagingAsync(CancellationToken ct)
-{
-    // Called once at startup: any scans in the staging dir are unfinished
-    // uploads from a previous bot process. Retry them in order.
-    try { await Task.Delay(2000, ct); } catch { return; }
-    foreach (var (sessionId, seq, entry, path) in staging.EnumeratePending())
-    {
-        if (ct.IsCancellationRequested) return;
-        log.LogInformation("retry upload {Session}#{Seq} from staging", sessionId, seq);
-        await UploadStagedAsync(sessionId, seq, path, entry.ChatId,
-            entry.FileName, entry.Caption, ct);
+        foreach (var v in variants) v.Dispose();
     }
 }
 
@@ -979,6 +909,3 @@ static class Retry
 }
 
 record AllowedUser(long Id, string Name);
-
-// One staged variant awaiting its siblings before a media-group send.
-record BatchEntry(int Variant, string Path, string FileName, string ContentType);

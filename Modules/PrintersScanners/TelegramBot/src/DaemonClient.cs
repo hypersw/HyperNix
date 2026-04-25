@@ -71,6 +71,21 @@ public sealed class DaemonClient : IDisposable
         return await resp.Content.ReadFromJsonAsync<SessionRecord>(Json, ct);
     }
 
+    /// <summary>
+    /// Replace the session's opaque metadata bag wholesale. The daemon
+    /// stores it untouched and replays it on every <c>SessionOpened</c>
+    /// SSE frame; the bot uses it to persist its own per-session state
+    /// (format selection today) across bot restarts.
+    /// </summary>
+    public async Task<SessionRecord?> PutMetadataAsync(
+        string sessionId, Dictionary<string, string> metadata, CancellationToken ct)
+    {
+        using var resp = await _http.PutAsJsonAsync(
+            $"/sessions/{sessionId}/metadata", metadata, Json, ct);
+        resp.EnsureSuccessStatusCode();
+        return await resp.Content.ReadFromJsonAsync<SessionRecord>(Json, ct);
+    }
+
     public async Task CloseSessionAsync(string sessionId, CancellationToken ct)
     {
         using var resp = await _http.DeleteAsync($"/sessions/{sessionId}", ct);
@@ -84,21 +99,17 @@ public sealed class DaemonClient : IDisposable
         resp.EnsureSuccessStatusCode();
     }
 
-    public async Task<Stream> FetchImageAsync(
-        string sessionId, int seq, int variant, CancellationToken ct)
+    /// <summary>
+    /// Fetch the captured raw TIFF for this scan. The daemon serves the
+    /// blob exactly once and drops it from memory after the response
+    /// completes — there is no second-fetch retry. Caller takes
+    /// ownership of the returned stream and must dispose it.
+    /// </summary>
+    public async Task<Stream> FetchScanAsync(
+        string sessionId, int seq, CancellationToken ct)
     {
         var resp = await _http.GetAsync(
-            $"/sessions/{sessionId}/image/{seq}/{variant}",
-            HttpCompletionOption.ResponseHeadersRead, ct);
-        resp.EnsureSuccessStatusCode();
-        return await resp.Content.ReadAsStreamAsync(ct);
-    }
-
-    public async Task<Stream> FetchThumbnailAsync(
-        string sessionId, int seq, int variant, CancellationToken ct)
-    {
-        var resp = await _http.GetAsync(
-            $"/sessions/{sessionId}/image/{seq}/{variant}/thumb",
+            $"/sessions/{sessionId}/image/{seq}",
             HttpCompletionOption.ResponseHeadersRead, ct);
         resp.EnsureSuccessStatusCode();
         return await resp.Content.ReadAsStreamAsync(ct);

@@ -4,6 +4,36 @@ using Telegram.Bot.Types.ReplyMarkups;
 namespace PrintScan.TelegramBot;
 
 /// <summary>
+/// Output format bitmask — multiple may be selected for the same scan.
+/// Lives bot-side only: the daemon never operates on formats, it just
+/// hands raw TIFF to the client. The bot persists the user's selection
+/// across restarts via the daemon's opaque session metadata bag (see
+/// <see cref="MetadataKeys.Format"/>). WebP split into lossless and
+/// lossy — lossy at default settings is typically ~30 % smaller than
+/// JPG at visually equivalent quality on documents.
+/// </summary>
+[Flags]
+public enum ScanFormat
+{
+    None = 0,
+    Jpeg = 1 << 0,
+    Png = 1 << 1,
+    WebpLossless = 1 << 2,
+    WebpLossy = 1 << 3,
+}
+
+/// <summary>
+/// Keys the bot writes into the session's metadata dict on the daemon.
+/// Centralised here so both the writer (callback handler) and reader
+/// (SessionOpened event handler that primes BotSession) use the same
+/// names, and accidental typos turn into compile errors.
+/// </summary>
+public static class MetadataKeys
+{
+    public const string Format = "tg.format";
+}
+
+/// <summary>
 /// Per-session state owned by this bot process. Reconstructed from the
 /// daemon's SSE replay (<c>session.opened</c> primer) on startup.
 /// </summary>
@@ -13,6 +43,7 @@ public sealed class BotSession
     public required long ChatId { get; init; }
     public required int StatusMessageId { get; init; }
     public required ScanParams Params { get; set; }   // mutable: PATCH updates
+    public ScanFormat Format { get; set; }            // bot-only; persisted via metadata
     public DateTimeOffset ExpiresAt { get; set; }
     public int ScanCount { get; set; }
     public bool ScannerOnline { get; set; }
@@ -46,10 +77,7 @@ public static class StatusMessage
     public const int DefaultDpi = 200;
     public const ScanFormat DefaultFormat = ScanFormat.Jpeg;
 
-    public static ScanParams Defaults() => new(
-        Dpi: DefaultDpi,
-        Format: DefaultFormat,
-        JpegQuality: 90);
+    public static ScanParams DefaultParams() => new(Dpi: DefaultDpi);
 
     public static (string Html, InlineKeyboardMarkup Keyboard) Render(
         BotSession s, string botUsername, PickerView view = PickerView.Main)
@@ -123,7 +151,7 @@ public static class StatusMessage
     private static InlineKeyboardMarkup RenderMain(BotSession s)
     {
         var sid = s.DaemonSessionId;
-        var fmt = FormatsLabel(s.Params.Format);
+        var fmt = FormatsLabel(s.Format);
         var rows = new List<InlineKeyboardButton[]>();
         // Row 1: tap-to-change parameter buttons; button labels carry
         // what was previously duplicated in the body text.
@@ -184,13 +212,14 @@ public static class StatusMessage
     private static InlineKeyboardMarkup RenderFormatPicker(BotSession s)
     {
         var sid = s.DaemonSessionId;
-        var cur = s.Params.Format;
+        var cur = s.Format;
         string mark(ScanFormat f) => (cur & f) != 0 ? CheckedMark : UncheckedMark;
-        // Checkbox semantics: tap toggles the bit. Daemon then produces
-        // one encoded variant per set bit from the same decoded pixel
-        // buffer (cheap — one scan, N encodes). "toggle:fmt:<sid>:<name>"
-        // carries the single format being flipped; bot XOR-applies it
-        // onto the current mask, guarding against zero-selected state.
+        // Checkbox semantics: tap toggles the bit. The bot's image
+        // pipeline produces one encoded variant per set bit from the
+        // single decoded pixel buffer (cheap — one decode, N encodes).
+        // "toggle:fmt:<sid>:<name>" carries the single format being
+        // flipped; bot XOR-applies it onto the current mask, guarding
+        // against zero-selected state.
         // Two rows of two so the widest label ("WEBP-LL") stays readable
         // on narrow mobile.
         return new InlineKeyboardMarkup(new[]

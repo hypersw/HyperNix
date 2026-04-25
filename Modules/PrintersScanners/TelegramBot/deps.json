@@ -90,6 +90,26 @@
     "hash": "sha256-FU8qj3DR8bDdc1c+WeGZx/PCZeqqndweZM9epcpXjSo="
   },
   {
+    "pname": "Microsoft.IO.RecyclableMemoryStream",
+    "version": "3.0.1",
+    "hash": "sha256-unFg/5EcU/XKJbob4GtQC43Ydgi5VjeBGs7hfhj4EYo="
+  },
+  {
+    "pname": "SixLabors.Fonts",
+    "version": "2.0.4",
+    "hash": "sha256-fIxKz0fbw7sv2A12KBxu9h/XTcayL8OWbJg5wJM/2qs="
+  },
+  {
+    "pname": "SixLabors.ImageSharp",
+    "version": "3.1.5",
+    "hash": "sha256-3UehX9T+I81nfgv2dTHlpoPgYzXFk7kHr1mmlQOCBfw="
+  },
+  {
+    "pname": "SixLabors.ImageSharp.Drawing",
+    "version": "2.1.4",
+    "hash": "sha256-tV7U8iKcAU9gvF2e0P/6dnslKoRWc+XrSqCYbqpl/rs="
+  },
+  {
     "pname": "Telegram.Bot",
     "version": "22.9.6",
     "hash": "sha256-bfv04qn1doLgmhdDpG2n9//Jfpv9zDzoxLDdS4tHptw="
