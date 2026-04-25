@@ -2,6 +2,7 @@
 let
   cfg = config.services.printscan-telegram-bot;
   daemonCfg = config.services.printscan-daemon;
+  rendererCfg = config.services.printscan-renderer;
   sharedPackage = import ../Shared/package.nix { inherit pkgs; };
   botPackage = import ./package.nix { inherit pkgs sharedPackage; };
 in
@@ -54,6 +55,8 @@ in
       environment = {
         PRINTSCAN_SOCKET = daemonCfg.socketPath;
         PRINTSCAN_ALLOWED_USERS = builtins.toJSON (map (u: { inherit (u) id name; }) cfg.allowedUsers);
+      } // lib.optionalAttrs rendererCfg.enable {
+        PRINTSCAN_RENDERER_SOCKET = rendererCfg.socketPath;
       };
 
       serviceConfig = {
@@ -82,6 +85,10 @@ in
 
         User = "printscan-bot";
         Group = daemonCfg.group;  # access to daemon's socket
+        # Supplementary group for the renderer's socket (when enabled).
+        # The bot needs write access to /run/printscan-renderer/api.sock
+        # to POST documents for soffice→PDF conversion.
+        SupplementaryGroups = lib.optional rendererCfg.enable rendererCfg.group;
 
         # Hardening.
         #

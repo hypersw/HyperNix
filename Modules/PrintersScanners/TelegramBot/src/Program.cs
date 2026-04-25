@@ -42,6 +42,13 @@ var bot = new TelegramBotClient(token);
 using var daemon = new DaemonClient(socketPath, loggerFactory.CreateLogger<DaemonClient>());
 var pipeline = new ImagePipeline(loggerFactory.CreateLogger<ImagePipeline>());
 
+// Renderer is optional. When the env var is unset we run without it
+// and the bot's classifier rejects doc/docx/odt with a "send a PDF"
+// hint instead of trying to convert.
+var rendererSocket = Environment.GetEnvironmentVariable("PRINTSCAN_RENDERER_SOCKET");
+using var renderer = new RendererClient(
+    rendererSocket, loggerFactory.CreateLogger<RendererClient>());
+
 // in-memory bot-side session state, keyed by daemon's session id
 var sessions = new Dictionary<string, BotSession>();
 var sessionsLock = new Lock();
@@ -614,8 +621,9 @@ async Task RenderPrintSessionAsync(long chatId, CancellationToken ct)
 
 async Task StageDocumentForPrintAsync(long chatId, Document doc, CancellationToken ct)
 {
-    var (kind, contentType) = ClassifyForPrint(doc.MimeType, doc.FileName);
-    if (kind is null)
+    var classified = ClassifyForPrint(doc.MimeType, doc.FileName);
+
+    if (classified.Kind == IncomingFileKind.Unsupported)
     {
         var nameForMsg = (doc.FileName ?? doc.MimeType ?? "this file")
             .Replace("&", "&amp;").Replace("<", "&lt;").Replace(">", "&gt;");
@@ -625,11 +633,65 @@ async Task StageDocumentForPrintAsync(long chatId, Document doc, CancellationTok
             parseMode: ParseMode.Html, cancellationToken: ct);
         return;
     }
+
     using var ms = new MemoryStream();
     await bot.GetInfoAndDownloadFile(doc.FileId, ms, ct);
     var bytes = ms.ToArray();
-    await StageBytesForPrintAsync(chatId, doc.FileName ?? "document", contentType,
-        kind.Value, bytes, ct);
+    var fileName = doc.FileName ?? "document";
+
+    if (classified.Kind == IncomingFileKind.Renderable)
+    {
+        if (!renderer.Enabled)
+        {
+            await bot.SendMessage(chatId,
+                "❌ The doc-rendering service isn't enabled on this server. " +
+                "Convert to PDF on your device first and resend.",
+                cancellationToken: ct);
+            return;
+        }
+        // Tell the user we're working on it — soffice cold-start can
+        // take 5–10 s and the user shouldn't think the bot ignored
+        // the upload.
+        var notice = await bot.SendMessage(chatId,
+            $"🔄 Rendering <code>{System.Net.WebUtility.HtmlEncode(fileName)}</code> to PDF…",
+            parseMode: ParseMode.Html, cancellationToken: ct);
+        byte[] pdfBytes;
+        try
+        {
+            pdfBytes = await renderer.RenderAsync(bytes, fileName,
+                classified.ContentType, ct);
+        }
+        catch (Exception ex)
+        {
+            log.LogWarning(ex, "render failed for {File}", fileName);
+            try
+            {
+                await bot.EditMessageText(chatId, notice.Id,
+                    $"❌ Rendering failed: <code>{System.Net.WebUtility.HtmlEncode(ex.Message)}</code>\n" +
+                    "Try printing from the source app to a PDF first — " +
+                    "the result will be more reliable.",
+                    parseMode: ParseMode.Html, cancellationToken: ct);
+            }
+            catch { /* notice may be gone */ }
+            return;
+        }
+        try { await bot.DeleteMessage(chatId, notice.Id, ct); }
+        catch (Exception ex) { log.LogDebug("notice delete: {Err}", ex.Message); }
+
+        // Substitute the rendered PDF in. Keep the user's filename
+        // (with .pdf swapped in) so they recognise it in the
+        // confirmation block.
+        var pdfName = Path.ChangeExtension(fileName, ".pdf");
+        await StageBytesForPrintAsync(chatId, pdfName, "application/pdf",
+            PendingPrintKind.Pageable, pdfBytes, ct);
+        return;
+    }
+
+    var pendingKind = classified.Kind == IncomingFileKind.Image
+        ? PendingPrintKind.Image
+        : PendingPrintKind.Pageable;
+    await StageBytesForPrintAsync(chatId, fileName, classified.ContentType,
+        pendingKind, bytes, ct);
 }
 
 async Task StagePhotoForPrintAsync(long chatId, PhotoSize photo, CancellationToken ct)
@@ -714,21 +776,21 @@ async Task StageBytesForPrintAsync(
 }
 
 /// <summary>
-/// Classify an incoming document by MIME type / extension. Returns
-/// (Pageable | Image, content-type). Null kind = "we don't accept this
-/// in this build" — the bot replies to the user with a short hint
-/// instead of staging it.
+/// Classify an incoming document by MIME type / extension. Pageable
+/// goes straight to the print queue, Image opens the scale/orient
+/// flow, Renderable bounces through the renderer daemon
+/// (libreoffice → PDF) before becoming Pageable.
 /// </summary>
-static (PendingPrintKind? Kind, string ContentType) ClassifyForPrint(string? mime, string? fileName)
+static (IncomingFileKind Kind, string ContentType) ClassifyForPrint(string? mime, string? fileName)
 {
     var mimeLower = (mime ?? "").ToLowerInvariant();
     var ext = Path.GetExtension(fileName ?? "").ToLowerInvariant();
 
     if (mimeLower == "application/pdf" || ext == ".pdf")
-        return (PendingPrintKind.Pageable, "application/pdf");
+        return (IncomingFileKind.Pageable, "application/pdf");
     if (mimeLower == "application/postscript" || mimeLower == "application/x-postscript"
         || ext is ".ps" or ".eps")
-        return (PendingPrintKind.Pageable, "application/postscript");
+        return (IncomingFileKind.Pageable, "application/postscript");
 
     if (mimeLower.StartsWith("image/") || ext is ".jpg" or ".jpeg" or ".png"
         or ".webp" or ".gif" or ".bmp" or ".tif" or ".tiff")
@@ -743,10 +805,52 @@ static (PendingPrintKind? Kind, string ContentType) ClassifyForPrint(string? mim
             ".tif" or ".tiff" => "image/tiff",
             _ => "application/octet-stream",
         };
-        return (PendingPrintKind.Image, ct);
+        return (IncomingFileKind.Image, ct);
     }
 
-    return (null, "application/octet-stream");
+    // Office formats — bounce through the renderer daemon. We list
+    // the common MIMEs explicitly because Telegram clients tend to
+    // tag user uploads with a generic "application/octet-stream"
+    // and we'd rather match on filename extension as a fallback than
+    // miss a docx upload entirely.
+    if (mimeLower
+        is "application/msword"
+        or "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+        or "application/vnd.oasis.opendocument.text"
+        or "application/rtf"
+        or "text/rtf"
+        or "text/plain"
+        or "application/vnd.ms-excel"
+        or "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        or "application/vnd.oasis.opendocument.spreadsheet"
+        or "application/vnd.ms-powerpoint"
+        or "application/vnd.openxmlformats-officedocument.presentationml.presentation"
+        or "application/vnd.oasis.opendocument.presentation"
+        || ext is ".doc" or ".docx" or ".odt" or ".rtf" or ".txt"
+              or ".xls" or ".xlsx" or ".ods"
+              or ".ppt" or ".pptx" or ".odp")
+    {
+        var ct = mimeLower.StartsWith("application/") || mimeLower.StartsWith("text/")
+            ? mimeLower
+            : ext switch
+            {
+                ".doc"  => "application/msword",
+                ".docx" => "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                ".odt"  => "application/vnd.oasis.opendocument.text",
+                ".rtf"  => "application/rtf",
+                ".txt"  => "text/plain",
+                ".xls"  => "application/vnd.ms-excel",
+                ".xlsx" => "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                ".ods"  => "application/vnd.oasis.opendocument.spreadsheet",
+                ".ppt"  => "application/vnd.ms-powerpoint",
+                ".pptx" => "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+                ".odp"  => "application/vnd.oasis.opendocument.presentation",
+                _ => "application/octet-stream",
+            };
+        return (IncomingFileKind.Renderable, ct);
+    }
+
+    return (IncomingFileKind.Unsupported, "application/octet-stream");
 }
 
 async Task HandlePrintCallbackAsync(long chatId, string data, CancellationToken ct)

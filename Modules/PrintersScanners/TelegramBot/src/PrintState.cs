@@ -99,6 +99,20 @@ public enum PendingPrintKind
     Image,
 }
 
+/// <summary>
+/// Classifier output for an incoming file. Image and Pageable are
+/// directly stageable; Renderable means we have to bounce it through
+/// the rendering daemon (libreoffice → PDF) before it becomes a
+/// Pageable PendingPrint.
+/// </summary>
+public enum IncomingFileKind
+{
+    Pageable,
+    Image,
+    Renderable,
+    Unsupported,
+}
+
 public enum PrintPickerView
 {
     Main,

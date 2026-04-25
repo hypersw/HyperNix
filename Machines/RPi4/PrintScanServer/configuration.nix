@@ -4,6 +4,7 @@
     ../../../Modules/PrintersScanners/LaserJetPrinter
     ../../../Modules/PrintersScanners/EpkowaScanner
     ../../../Modules/PrintersScanners/Daemon
+    ../../../Modules/PrintersScanners/Renderer
     ../../../Modules/PrintersScanners/TelegramBot
     ../../../Modules/Monitoring/TelegramAlerts
     ../../../Modules/System/AutoRebuildOnPush
@@ -557,6 +558,7 @@ FLAKE
   services.laserjet-printer.enable = true;
   services.epkowa-scanner.enable = true;
   services.printscan-daemon.enable = true;
+  services.printscan-renderer.enable = true;
 
   services.printscan-telegram-bot = {
     enable = true;

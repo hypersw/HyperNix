@@ -30,6 +30,7 @@
           printScanShared = import ./Modules/PrintersScanners/Shared/package.nix { inherit pkgs; };
           printScanDaemon = import ./Modules/PrintersScanners/Daemon/package.nix { inherit pkgs; sharedPackage = printScanShared; };
           printScanBot = import ./Modules/PrintersScanners/TelegramBot/package.nix { inherit pkgs; sharedPackage = printScanShared; };
+          printScanRenderer = import ./Modules/PrintersScanners/Renderer/package.nix { inherit pkgs; };
         in {
           Util-CloseFrom3 = closefrom3;
           Git-SshAskpassCredentialHelper = import ./Git/SshAskpassCredentialHelper/package.nix { inherit pkgs closefrom3; };
@@ -37,6 +38,7 @@
           Modules-PrintersScanners-Shared = printScanShared;
           Modules-PrintersScanners-Daemon = printScanDaemon;
           Modules-PrintersScanners-TelegramBot = printScanBot;
+          Modules-PrintersScanners-Renderer = printScanRenderer;
           # Machine runner packages
           Machines-MicroVM-VmSshFront =
             self.nixosConfigurations.VmSshFront.config.microvm.declaredRunner or null;
@@ -51,6 +53,7 @@
         Modules-PrintersScanners-EpkowaScanner = import ./Modules/PrintersScanners/EpkowaScanner;
         Modules-PrintersScanners-Daemon = import ./Modules/PrintersScanners/Daemon;
         Modules-PrintersScanners-TelegramBot = import ./Modules/PrintersScanners/TelegramBot;
+        Modules-PrintersScanners-Renderer = import ./Modules/PrintersScanners/Renderer;
         Modules-Monitoring-TelegramAlerts = import ./Modules/Monitoring/TelegramAlerts;
         Modules-System-AutoRebuildOnPush = import ./Modules/System/AutoRebuildOnPush;
         Modules-System-AvahiPerInterfaceNames = import ./Modules/System/AvahiPerInterfaceNames;
