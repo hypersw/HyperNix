@@ -44,6 +44,12 @@ public sealed class BotSession
     public required int StatusMessageId { get; init; }
     public required ScanParams Params { get; set; }   // mutable: PATCH updates
     public ScanFormat Format { get; set; }            // bot-only; persisted via metadata
+    /// Currently-shown picker. Lives on the session so SSE-triggered
+    /// re-renders preserve the view the user is interacting with —
+    /// without this, every SessionOpened reply (including the one
+    /// echoed back from a metadata PUT) would snap the keyboard back
+    /// to Main and steal the picker out from under repeated taps.
+    public PickerView View { get; set; } = PickerView.Main;
     public DateTimeOffset ExpiresAt { get; set; }
     public int ScanCount { get; set; }
     public bool ScannerOnline { get; set; }

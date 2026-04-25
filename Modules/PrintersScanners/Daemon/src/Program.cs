@@ -91,7 +91,10 @@ var stateDir = Environment.GetEnvironmentVariable("STATE_DIRECTORY")?.Split(':')
 builder.Services.AddSingleton(new SessionStore(stateDir));
 builder.Services.AddSingleton<EventBroker>();
 builder.Services.AddSingleton<ScanPipeline>();
-builder.Services.AddSingleton<PrintService>();
+builder.Services.AddSingleton<PrintService>(sp =>
+    new PrintService(
+        sp.GetRequiredService<ILogger<PrintService>>(),
+        Environment.GetEnvironmentVariable("PRINTSCAN_MEDIA_SIZE") ?? "A4"));
 builder.Services.AddSingleton<SessionService>();
 
 // ShutdownGate and ScannerMonitor need to be both injectable and hosted.
@@ -134,12 +137,15 @@ app.MapPost("/print", async (HttpRequest request, PrintService print, ShutdownGa
     var orient = Enum.TryParse<PrintOrientation>(
         form["orientation"].FirstOrDefault(), ignoreCase: true, out var o)
         ? o : PrintOrientation.Auto;
+    var pageSet = Enum.TryParse<PageSelection>(
+        form["pageSelection"].FirstOrDefault(), ignoreCase: true, out var ps)
+        ? ps : PageSelection.All;
     using var ms = new MemoryStream();
     await file.CopyToAsync(ms, ct);
 
     using var _ = gate.Begin("print");
     var ok = await print.PrintAsync(
-        new PrintRequest(file.FileName, ms.ToArray(), pageRange, copies, scale, orient), ct);
+        new PrintRequest(file.FileName, ms.ToArray(), pageRange, copies, scale, orient, pageSet), ct);
     return ok ? Results.Ok("Printed") : Results.StatusCode(500);
 });
 

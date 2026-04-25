@@ -14,19 +14,26 @@ namespace PrintScan.Daemon;
 public sealed class PrintService
 {
     private readonly ILogger<PrintService> _logger;
-    public PrintService(ILogger<PrintService> logger) { _logger = logger; }
+    private readonly string _mediaSize;
+    public PrintService(ILogger<PrintService> logger, string mediaSize)
+    {
+        _logger = logger;
+        _mediaSize = mediaSize;
+    }
 
     public PrinterStatus GetStatus() =>
         new(Online: true,
-            StatusText: "stub printer (no physical device wired up)");
+            StatusText: $"stub printer ({_mediaSize}, no physical device wired up)",
+            MediaSize: _mediaSize);
 
     public async Task<bool> PrintAsync(PrintRequest request, CancellationToken ct)
     {
         _logger.LogInformation(
             "STUB PRINT: {File} ({Bytes} bytes), copies={Copies}, " +
-            "pages={Pages}, scale={Scale}, orient={Orient}",
+            "pages={Pages}, set={Set}, scale={Scale}, orient={Orient}",
             request.FileName, request.FileData.Length, request.Copies,
-            request.PageRange ?? "all", request.Scale, request.Orientation);
+            request.PageRange ?? "all", request.PageSelection,
+            request.Scale, request.Orientation);
 
         // Simulated processing time. A real Pi-attached HP LaserJet at
         // 100-150 ms per page is typical, but for a stub we just want

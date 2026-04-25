@@ -29,18 +29,37 @@ public enum PrintOrientation
     Landscape,
 }
 
+/// <summary>
+/// Page-set filter — maps to CUPS' <c>-o page-set=&lt;all|odd|even&gt;</c>
+/// option. Used both as a quick "skip empty trailing pages" preset
+/// and as half of a manual duplex sequence (print Odd, flip stack,
+/// print Even).
+/// </summary>
+public enum PageSelection
+{
+    All,
+    Odd,
+    Even,
+}
+
 public record PrintRequest(
     string FileName,
     byte[] FileData,
     string? PageRange = null,
     int Copies = 1,
     PrintScaleMode Scale = PrintScaleMode.Fit,
-    PrintOrientation Orientation = PrintOrientation.Auto
+    PrintOrientation Orientation = PrintOrientation.Auto,
+    PageSelection PageSelection = PageSelection.All
 );
 
 public record PrinterStatus(
     bool Online,
-    string? StatusText = null
+    string? StatusText = null,
+    /// Configured paper size (e.g. "A4", "Letter"). Set in the nix
+    /// module. The daemon doesn't act on this beyond reporting it —
+    /// clients read it to know what physical-size assumptions to
+    /// bake into their previews and "fits 1:1?" decisions.
+    string? MediaSize = null
 );
 
 // ── Scan params ─────────────────────────────────────────────────────────────

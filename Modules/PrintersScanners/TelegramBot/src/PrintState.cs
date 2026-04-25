@@ -15,6 +15,10 @@ public sealed class BotPrintSession
     public required long ChatId { get; init; }
     public required int StatusMessageId { get; init; }
     public bool PrinterOnline { get; set; } = true;
+    /// Paper size as reported by the daemon at session open. Drives
+    /// "1:1 fits?" logic and (eventually) preview rendering geometry.
+    /// Falls back to A4 when the daemon doesn't know.
+    public string MediaSize { get; set; } = "A4";
 
     /// The file the user has staged but not yet confirmed (or null
     /// when the session is idle). Holding the bytes in memory bounds
@@ -56,21 +60,25 @@ public sealed class PendingPrint
     public int? Dpi { get; init; }
     public PrintScaleMode Scale { get; set; } = PrintScaleMode.Fit;
     public PrintOrientation Orientation { get; set; } = PrintOrientation.Auto;
+    public PageSelection PageSelection { get; set; } = PageSelection.All;
 
     public const int MinReasonableDpi = 100;
-    /// A4 dimensions in inches — used to decide whether 1:1 fits.
-    public const double A4ShortInches = 8.27;
-    public const double A4LongInches = 11.69;
+
+    /// Paper short side in inches — set at staging time from the
+    /// session's <see cref="BotPrintSession.MediaSize"/>. Drives the
+    /// "1:1 fits?" check and (eventually) preview rendering.
+    public required double PaperShortInches { get; init; }
+    public required double PaperLongInches  { get; init; }
 
     /// True when the image's native dimensions, at its declared dpi,
-    /// fit on an A4 sheet in either orientation. Drives whether 1:1
-    /// is offered as a scale option.
+    /// fit on the configured paper size in either orientation. Drives
+    /// whether 1:1 is offered as a scale option.
     public bool Fits1to1 =>
         Kind == PendingPrintKind.Image &&
         Dpi is int d && d >= MinReasonableDpi &&
         PixelWidth is int w && PixelHeight is int h &&
-        Math.Min(w, h) / (double)d <= A4ShortInches &&
-        Math.Max(w, h) / (double)d <= A4LongInches;
+        Math.Min(w, h) / (double)d <= PaperShortInches &&
+        Math.Max(w, h) / (double)d <= PaperLongInches;
 
     /// Pick the orientation we'd like to default to when the user
     /// hasn't picked one explicitly — the longer image dimension
@@ -96,6 +104,32 @@ public enum PrintPickerView
     Main,
     Scale,
     Orientation,
+    Pages,
+}
+
+/// <summary>
+/// Lookup of common paper sizes → physical short/long sides in inches.
+/// Lives bot-side because the daemon is content-dumb (it only knows
+/// the size's name) and it's the bot that needs to act on the geometry
+/// for 1:1-fits and (later) preview rendering.
+/// </summary>
+public static class PaperSizes
+{
+    public static (double Short, double Long) Inches(string? name)
+    {
+        // Names come from the daemon's nix-module config, so casing
+        // can vary; canonicalise.
+        var key = (name ?? "A4").Trim().ToUpperInvariant();
+        return key switch
+        {
+            "A4"     => (8.27, 11.69),
+            "LETTER" => (8.5,  11.0),
+            "LEGAL"  => (8.5,  14.0),
+            "A3"     => (11.69, 16.54),
+            "A5"     => (5.83,  8.27),
+            _ => (8.27, 11.69), // unknown → assume A4
+        };
+    }
 }
 
 public record PrintHistoryEntry(
@@ -120,6 +154,7 @@ public static class PrintMessage
         {
             PrintPickerView.Scale       => RenderScalePicker(s),
             PrintPickerView.Orientation => RenderOrientPicker(s),
+            PrintPickerView.Pages       => RenderPagesPicker(s),
             _ => RenderMain(s),
         };
         return (html, kb);
@@ -209,8 +244,17 @@ public static class PrintMessage
             $"{head} · {dims}{dpi}\n" +
             $"Scale: <b>{ScaleLabel(p.Scale)}</b>" +
             (p.Kind == PendingPrintKind.Image ? $" · Orientation: <b>{orientText}</b>" : "") +
+            $" · Pages: <b>{PagesLabel(p.PageSelection)}</b>" +
             "\nReady to print?";
     }
+
+    private static string PagesLabel(PageSelection sel) => sel switch
+    {
+        PageSelection.All  => "all",
+        PageSelection.Odd  => "odd only",
+        PageSelection.Even => "even only",
+        _ => sel.ToString(),
+    };
 
     private static InlineKeyboardMarkup? RenderMain(BotPrintSession s)
     {
@@ -234,6 +278,17 @@ public static class PrintMessage
                     $"print:pick:orient:{p.Id}"),
             });
         }
+
+        // Pages selector applies to both Pageable and Image inputs —
+        // odd/even is occasionally useful even on a one-image scan
+        // when chained into a manual duplex sequence with a second
+        // sheet, though the common use is "skip blank trailing pages
+        // on a multi-page PDF".
+        rows.Add(new[]
+        {
+            InlineKeyboardButton.WithCallbackData($"📑 Pages: {PagesLabel(p.PageSelection)}",
+                $"print:pick:pages:{p.Id}"),
+        });
 
         rows.Add(new[]
         {
@@ -293,6 +348,30 @@ public static class PrintMessage
                     $"{mark(PrintOrientation.Portrait)}Portrait",  $"print:set:orient:{p.Id}:portrait"),
                 InlineKeyboardButton.WithCallbackData(
                     $"{mark(PrintOrientation.Landscape)}Landscape", $"print:set:orient:{p.Id}:landscape"),
+            },
+            new[] { InlineKeyboardButton.WithCallbackData("↩ back", $"print:pick:main:{p.Id}") },
+        });
+    }
+
+    private static InlineKeyboardMarkup RenderPagesPicker(BotPrintSession s)
+    {
+        if (s.Pending is null)
+            return new InlineKeyboardMarkup(new[] {
+                new[] { InlineKeyboardButton.WithCallbackData("↩ back", "print:pick:main:_") }
+            });
+
+        var p = s.Pending;
+        string mark(PageSelection sel) => p.PageSelection == sel ? SelectedMark : UnselectedMark;
+        return new InlineKeyboardMarkup(new[]
+        {
+            new[]
+            {
+                InlineKeyboardButton.WithCallbackData($"{mark(PageSelection.All)}All",
+                    $"print:set:pages:{p.Id}:all"),
+                InlineKeyboardButton.WithCallbackData($"{mark(PageSelection.Odd)}Odd",
+                    $"print:set:pages:{p.Id}:odd"),
+                InlineKeyboardButton.WithCallbackData($"{mark(PageSelection.Even)}Even",
+                    $"print:set:pages:{p.Id}:even"),
             },
             new[] { InlineKeyboardButton.WithCallbackData("↩ back", $"print:pick:main:{p.Id}") },
         });

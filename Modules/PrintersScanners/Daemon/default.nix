@@ -19,6 +19,20 @@ in
       default = "printscan";
       description = "Group that can connect to the daemon socket";
     };
+
+    mediaSize = lib.mkOption {
+      type = lib.types.str;
+      default = "A4";
+      description = ''
+        Default paper size the printer is loaded with. Reported via
+        the daemon's /status endpoint and consumed by clients (the
+        Telegram bot today) to decide whether an image fits 1:1
+        and to render the print preview at correct aspect. The
+        daemon itself is content-dumb and does not act on this
+        value beyond reporting it. Common values: "A4", "Letter",
+        "A3", "Legal".
+      '';
+    };
   };
 
   config = lib.mkIf cfg.enable {
@@ -65,6 +79,7 @@ in
 
       environment = {
         PRINTSCAN_SOCKET = cfg.socketPath;
+        PRINTSCAN_MEDIA_SIZE = cfg.mediaSize;
         # ASPNETCORE_URLS deliberately unset. Kestrel picks up fd 3 from
         # systemd (UseSystemd + ConfigureKestrel.ListenHandle in code).
         # If LISTEN_FDS is missing the daemon now fails fast rather than

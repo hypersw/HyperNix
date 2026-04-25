@@ -88,8 +88,12 @@ await Retry.Transient(
     ]),
     "bot.SetMyCommands()", log, cts.Token);
 
+// "…" suffix on Scanner/Printer to convey "this opens a UI" — same
+// connotation as the Windows menu-item ellipsis. Status doesn't get
+// one because it's a one-shot status read with nothing to interact
+// with after.
 var mainKeyboard = new ReplyKeyboardMarkup(
-    new[] { new KeyboardButton[] { "📷 Scanner", "🖨 Printer", "📊 Status" } })
+    new[] { new KeyboardButton[] { "📷 Scanner…", "🖨 Printer…", "📊 Status" } })
 { ResizeKeyboard = true, IsPersistent = true };
 
 log.LogInformation("bot starting, allowed users: {Users}, socket: {Sock}",
@@ -99,6 +103,7 @@ log.LogInformation("bot starting, allowed users: {Users}, socket: {Sock}",
 // ── Background loops ────────────────────────────────────────────────────────
 
 var sseLoop = Task.Run(() => RunSseLoopAsync(cts.Token));
+var printerPollLoop = Task.Run(() => PollPrinterStatusAsync(cts.Token));
 var pollOffset = 0;
 
 try
@@ -132,6 +137,7 @@ finally
         try { await Task.Delay(100); } catch { break; }
     }
     try { await sseLoop; } catch { }
+    try { await printerPollLoop; } catch { }
     log.LogInformation("clean exit");
 }
 
@@ -218,14 +224,16 @@ async Task HandleMessageAsync(string userName, Message msg, CancellationToken ct
         // fall through to standard /start help below
     }
 
-    if (text.Equals("📷 Scanner", StringComparison.OrdinalIgnoreCase)
+    // Accept both old and new label spellings (with/without the "…")
+    // so users with stale persistent reply keyboards keep working.
+    if (text is "📷 Scanner" or "📷 Scanner…"
         || slash is "/scanner" or "/scan")
         await OpenScannerSessionAsync(msg.Chat.Id, userName, ct);
-    else if (text.Equals("🖨 Printer", StringComparison.OrdinalIgnoreCase)
-             || text.Equals("🖨️ Printer", StringComparison.OrdinalIgnoreCase)
+    else if (text is "🖨 Printer" or "🖨 Printer…"
+                  or "🖨️ Printer" or "🖨️ Printer…"
              || slash is "/printer" or "/print")
         await OpenPrinterSessionAsync(msg.Chat.Id, ct);
-    else if (text.Equals("📊 Status", StringComparison.OrdinalIgnoreCase) || slash == "/status")
+    else if (text == "📊 Status" || slash == "/status")
         await ShowStatusAsync(msg.Chat.Id, ct);
     else if (slash is "/help" or "/start")
         await bot.SendMessage(msg.Chat.Id, """
@@ -351,11 +359,11 @@ async Task HandleCallbackAsync(string userName, CallbackQuery cb, CancellationTo
             {
                 log.LogWarning("PATCH session params failed: {Err}", ex.Message);
             }
-            await RerenderAsync(sid, ct);
+            await RerenderAsync(sid, ct, PickerView.Main);
         }
         else
         {
-            await RerenderAsync(sid, ct);
+            await RerenderAsync(sid, ct, PickerView.Main);
         }
     }
     else if (data.StartsWith("cancel:"))
@@ -549,7 +557,8 @@ async Task OpenPrinterSessionAsync(long chatId, CancellationToken ct)
     }
 
     var st = await daemon.GetStatusAsync(ct);
-    var online = st?.Printer.Online ?? true;
+    var online    = st?.Printer.Online ?? true;
+    var mediaSize = st?.Printer.MediaSize ?? "A4";
     var placeholder = await bot.SendMessage(chatId, "🖨 Opening printer session…",
         cancellationToken: ct);
 
@@ -558,6 +567,7 @@ async Task OpenPrinterSessionAsync(long chatId, CancellationToken ct)
         ChatId = chatId,
         StatusMessageId = placeholder.Id,
         PrinterOnline = online,
+        MediaSize = mediaSize,
     };
     lock (printSessionsLock) { printSessions[chatId] = session; }
     await RenderPrintSessionAsync(chatId, ct);
@@ -676,6 +686,7 @@ async Task StageBytesForPrintAsync(
         }
     }
 
+    var paper = PaperSizes.Inches(s.MediaSize);
     var pending = new PendingPrint
     {
         Id = Guid.NewGuid().ToString("N")[..8],
@@ -686,6 +697,8 @@ async Task StageBytesForPrintAsync(
         PixelWidth = w,
         PixelHeight = h,
         Dpi = dpi,
+        PaperShortInches = paper.Short,
+        PaperLongInches  = paper.Long,
     };
     if (pending.Fits1to1) pending.Scale = PrintScaleMode.OneToOne;
 
@@ -770,6 +783,7 @@ async Task HandlePrintCallbackAsync(long chatId, string data, CancellationToken 
                     {
                         "scale"  => PrintPickerView.Scale,
                         "orient" => PrintPickerView.Orientation,
+                        "pages"  => PrintPickerView.Pages,
                         _ => PrintPickerView.Main,
                     };
             }
@@ -804,6 +818,16 @@ async Task HandlePrintCallbackAsync(long chatId, string data, CancellationToken 
                         "portrait"  => PrintOrientation.Portrait,
                         "landscape" => PrintOrientation.Landscape,
                         _ => bs.Pending.Orientation,
+                    };
+                }
+                else if (what == "pages")
+                {
+                    bs.Pending.PageSelection = value switch
+                    {
+                        "all"  => PageSelection.All,
+                        "odd"  => PageSelection.Odd,
+                        "even" => PageSelection.Even,
+                        _ => bs.Pending.PageSelection,
                     };
                 }
                 bs.View = PrintPickerView.Main;
@@ -859,6 +883,7 @@ async Task ExecutePrintAsync(long chatId, string pendingId, CancellationToken ct
         content.Add(fileContent, "file", p.FileName);
         content.Add(new StringContent(p.Scale.ToString()), "scale");
         content.Add(new StringContent(p.Orientation.ToString()), "orientation");
+        content.Add(new StringContent(p.PageSelection.ToString()), "pageSelection");
 
         // Daemon talks unix socket; one-shot HttpClient with the same
         // ConnectCallback shape DaemonClient uses internally.
@@ -969,10 +994,16 @@ async Task HandleEventAsync(SessionEvent ev, CancellationToken ct)
                 {
                     // SessionOpened is also re-emitted on PATCH-params
                     // and metadata updates — pick up changes here.
+                    // Format is intentionally NOT re-read from metadata:
+                    // the bot is the only writer to that key, so every
+                    // SessionOpened we receive after reconstruction is
+                    // an echo of a value we just wrote. Re-applying it
+                    // would race with rapid user toggles — a stale echo
+                    // arriving between two fast taps would overwrite
+                    // the newer local value before its own echo lands.
                     bs.ExpiresAt = s.ExpiresAt;
                     bs.ScanCount = s.ScanCount;
                     bs.Params    = s.Params;
-                    bs.Format    = ParseFormatFromMetadata(s.Metadata);
                 }
             }
             await RerenderAsync(s.Id, ct);
@@ -1145,12 +1176,16 @@ async Task HandleEventAsync(SessionEvent ev, CancellationToken ct)
 }
 
 async Task RerenderAsync(string sessionId, CancellationToken ct,
-    PickerView view = PickerView.Main)
+    PickerView? viewOverride = null)
 {
     BotSession? s;
-    lock (sessionsLock) { sessions.TryGetValue(sessionId, out s); }
+    lock (sessionsLock)
+    {
+        if (sessions.TryGetValue(sessionId, out s) && viewOverride is { } v)
+            s.View = v;
+    }
     if (s is null) return;
-    var (html, kb) = StatusMessage.Render(s, botUsername, view);
+    var (html, kb) = StatusMessage.Render(s, botUsername, s.View);
     try
     {
         await bot.EditMessageText(s.ChatId, s.StatusMessageId, html,
@@ -1255,6 +1290,51 @@ async Task DeliverScanAsync(string sessionId, int seq, BotSession bs, Cancellati
     finally
     {
         foreach (var v in variants) v.Dispose();
+    }
+}
+
+// Light-weight printer-status sync. The scanner has a full SSE feed
+// (online/offline transitions) on the daemon side; printers don't —
+// for now the bot just polls /status periodically and refreshes any
+// open print sessions whose cached online flag has drifted. Cheap,
+// no daemon-side changes needed, can be replaced with proper SSE
+// once a real printer is wired up and lpstat polling lives on the
+// daemon side.
+async Task PollPrinterStatusAsync(CancellationToken ct)
+{
+    var period = TimeSpan.FromSeconds(30);
+    while (!ct.IsCancellationRequested)
+    {
+        try { await Task.Delay(period, ct); } catch { return; }
+        DeviceStatus? st;
+        try { st = await daemon.GetStatusAsync(ct); }
+        catch { continue; }
+        if (st is null) continue;
+
+        List<long> changedChats = [];
+        lock (printSessionsLock)
+        {
+            foreach (var (chatId, ps) in printSessions)
+            {
+                bool changed = false;
+                if (ps.PrinterOnline != st.Printer.Online)
+                {
+                    ps.PrinterOnline = st.Printer.Online;
+                    changed = true;
+                }
+                var ms = st.Printer.MediaSize ?? "A4";
+                if (!string.Equals(ps.MediaSize, ms, StringComparison.OrdinalIgnoreCase))
+                {
+                    ps.MediaSize = ms;
+                    changed = true;
+                }
+                if (changed) changedChats.Add(chatId);
+            }
+        }
+        foreach (var chatId in changedChats)
+        {
+            try { await RenderPrintSessionAsync(chatId, ct); } catch { }
+        }
     }
 }
 
