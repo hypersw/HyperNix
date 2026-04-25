@@ -15,16 +15,22 @@ public sealed class PrintService
 {
     private readonly ILogger<PrintService> _logger;
     private readonly string _mediaSize;
-    public PrintService(ILogger<PrintService> logger, string mediaSize)
+    private readonly PrintableMargins _margins;
+    public PrintService(
+        ILogger<PrintService> logger,
+        string mediaSize,
+        PrintableMargins margins)
     {
         _logger = logger;
         _mediaSize = mediaSize;
+        _margins = margins;
     }
 
     public PrinterStatus GetStatus() =>
         new(Online: true,
             StatusText: $"stub printer ({_mediaSize}, no physical device wired up)",
-            MediaSize: _mediaSize);
+            MediaSize: _mediaSize,
+            Margins: _margins);
 
     public async Task<bool> PrintAsync(PrintRequest request, CancellationToken ct)
     {

@@ -91,10 +91,27 @@ var stateDir = Environment.GetEnvironmentVariable("STATE_DIRECTORY")?.Split(':')
 builder.Services.AddSingleton(new SessionStore(stateDir));
 builder.Services.AddSingleton<EventBroker>();
 builder.Services.AddSingleton<ScanPipeline>();
+// Margins flow through the env as four PRINTSCAN_MARGIN_* variables in
+// millimetres so the systemd unit can drive them from the nix module
+// without us having to define a new config-file format. Anything
+// missing or unparseable falls back to the HP LaserJet P2015n's
+// spec'd 4.23 mm all-sides (the default in PrintableMargins).
+double ReadMm(string envVar, double fallback) =>
+    double.TryParse(
+        Environment.GetEnvironmentVariable(envVar),
+        System.Globalization.CultureInfo.InvariantCulture,
+        out var v) ? v : fallback;
+var margins = new PrintableMargins(
+    TopMm:    ReadMm("PRINTSCAN_MARGIN_TOP_MM",    4.23),
+    BottomMm: ReadMm("PRINTSCAN_MARGIN_BOTTOM_MM", 4.23),
+    LeftMm:   ReadMm("PRINTSCAN_MARGIN_LEFT_MM",   4.23),
+    RightMm:  ReadMm("PRINTSCAN_MARGIN_RIGHT_MM",  4.23));
+
 builder.Services.AddSingleton<PrintService>(sp =>
     new PrintService(
         sp.GetRequiredService<ILogger<PrintService>>(),
-        Environment.GetEnvironmentVariable("PRINTSCAN_MEDIA_SIZE") ?? "A4"));
+        Environment.GetEnvironmentVariable("PRINTSCAN_MEDIA_SIZE") ?? "A4",
+        margins));
 builder.Services.AddSingleton<SessionService>();
 
 // ShutdownGate and ScannerMonitor need to be both injectable and hosted.

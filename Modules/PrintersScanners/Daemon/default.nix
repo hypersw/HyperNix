@@ -33,6 +33,28 @@ in
         "A3", "Legal".
       '';
     };
+
+    nonPrintableMarginsMm = lib.mkOption {
+      type = lib.types.submodule {
+        options = {
+          top    = lib.mkOption { type = lib.types.float; default = 4.23; };
+          bottom = lib.mkOption { type = lib.types.float; default = 4.23; };
+          left   = lib.mkOption { type = lib.types.float; default = 4.23; };
+          right  = lib.mkOption { type = lib.types.float; default = 4.23; };
+        };
+      };
+      default = {};
+      description = ''
+        Non-printable margins of the loaded paper, in millimetres.
+        Reported via /status as advisory metadata for clients (the
+        bot uses them to compute the safe-printable rectangle and to
+        warn when an image at 1:1 would land outside it).
+        The default 4.23 mm all-sides matches the HP LaserJet P2015n
+        spec for plain A4. Different printer / paper / driver combos
+        report different values; check `lpoptions -p <q> -l` for
+        media-source-specific output once a real printer is wired.
+      '';
+    };
   };
 
   config = lib.mkIf cfg.enable {
@@ -80,6 +102,10 @@ in
       environment = {
         PRINTSCAN_SOCKET = cfg.socketPath;
         PRINTSCAN_MEDIA_SIZE = cfg.mediaSize;
+        PRINTSCAN_MARGIN_TOP_MM    = toString cfg.nonPrintableMarginsMm.top;
+        PRINTSCAN_MARGIN_BOTTOM_MM = toString cfg.nonPrintableMarginsMm.bottom;
+        PRINTSCAN_MARGIN_LEFT_MM   = toString cfg.nonPrintableMarginsMm.left;
+        PRINTSCAN_MARGIN_RIGHT_MM  = toString cfg.nonPrintableMarginsMm.right;
         # ASPNETCORE_URLS deliberately unset. Kestrel picks up fd 3 from
         # systemd (UseSystemd + ConfigureKestrel.ListenHandle in code).
         # If LISTEN_FDS is missing the daemon now fails fast rather than

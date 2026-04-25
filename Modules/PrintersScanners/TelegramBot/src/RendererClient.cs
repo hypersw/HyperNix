@@ -67,9 +67,31 @@ public sealed class RendererClient : IDisposable
         sw.Stop();
         if (!resp.IsSuccessStatusCode)
         {
-            var detail = await resp.Content.ReadAsStringAsync(ct);
-            throw new InvalidOperationException(
-                $"renderer returned {(int)resp.StatusCode}: {detail.Trim()}");
+            // The renderer returns ProblemDetails (RFC 7807) JSON for
+            // tool failures, with title=friendly summary and
+            // detail=raw stderr. Parse it back so the bot's UI can
+            // show the friendly summary inline and tuck the raw
+            // text into a <pre> block. Falls back to plaintext for
+            // any non-JSON error body.
+            var bodyStr = await resp.Content.ReadAsStringAsync(ct);
+            string? title = null, detail = bodyStr;
+            try
+            {
+                using var doc = System.Text.Json.JsonDocument.Parse(bodyStr);
+                if (doc.RootElement.TryGetProperty("title", out var t))
+                    title = t.GetString();
+                if (doc.RootElement.TryGetProperty("detail", out var d))
+                    detail = d.GetString() ?? bodyStr;
+            }
+            catch (System.Text.Json.JsonException)
+            {
+                // Plain text body — keep both fields equal so the
+                // caller still has *something* to show.
+            }
+            throw new RenderFailedRemotely(
+                (int)resp.StatusCode,
+                title ?? $"renderer returned HTTP {(int)resp.StatusCode}",
+                detail ?? "");
         }
         var bytes = await resp.Content.ReadAsByteArrayAsync(ct);
         _logger.LogInformation(
@@ -78,5 +100,60 @@ public sealed class RendererClient : IDisposable
         return bytes;
     }
 
+    /// <summary>
+    /// Ask the renderer how many pages are in this PDF. Best-effort:
+    /// returns null if the daemon's disabled, the call errors, or
+    /// pdfinfo couldn't read the file. Used to decide whether to
+    /// show the bot's per-page checkbox UI vs the digit-keyboard
+    /// custom-range picker.
+    /// </summary>
+    public async Task<int?> GetPdfPageCountAsync(
+        byte[] pdfBytes, string fileName, CancellationToken ct)
+    {
+        if (!Enabled) return null;
+        try
+        {
+            using var content = new System.Net.Http.MultipartFormDataContent();
+            var fileContent = new System.Net.Http.ByteArrayContent(pdfBytes);
+            fileContent.Headers.ContentType =
+                new System.Net.Http.Headers.MediaTypeHeaderValue("application/pdf");
+            content.Add(fileContent, "file", fileName);
+            using var resp = await _http.PostAsync("/pdf-info", content, ct);
+            if (!resp.IsSuccessStatusCode) return null;
+            var doc = await System.Text.Json.JsonDocument.ParseAsync(
+                await resp.Content.ReadAsStreamAsync(ct), cancellationToken: ct);
+            if (doc.RootElement.TryGetProperty("pageCount", out var pc) &&
+                pc.TryGetInt32(out var n))
+                return n;
+            return null;
+        }
+        catch (Exception ex)
+        {
+            _logger.LogDebug("pdf-info failed for {File}: {Err}", fileName, ex.Message);
+            return null;
+        }
+    }
+
     public void Dispose() => _http.Dispose();
+}
+
+/// <summary>
+/// Thrown by <see cref="RendererClient.RenderAsync"/> when the
+/// renderer returned a structured failure. The caller surfaces
+/// <see cref="Friendly"/> as a one-liner banner to the user and
+/// (optionally) tucks <see cref="RawDetail"/> into an expander or
+/// monospace block for diagnosis.
+/// </summary>
+public sealed class RenderFailedRemotely : Exception
+{
+    public int HttpStatus { get; }
+    public string Friendly { get; }
+    public string RawDetail { get; }
+    public RenderFailedRemotely(int httpStatus, string friendly, string rawDetail)
+        : base(friendly)
+    {
+        HttpStatus = httpStatus;
+        Friendly = friendly;
+        RawDetail = rawDetail;
+    }
 }

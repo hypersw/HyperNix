@@ -19,6 +19,10 @@ public sealed class BotPrintSession
     /// "1:1 fits?" logic and (eventually) preview rendering geometry.
     /// Falls back to A4 when the daemon doesn't know.
     public string MediaSize { get; set; } = "A4";
+    /// Non-printable margins as reported by the daemon. Used together
+    /// with MediaSize to compute the safe printable rectangle for
+    /// the "1:1 fits?" check.
+    public PrintableMargins Margins { get; set; } = new();
 
     /// The file the user has staged but not yet confirmed (or null
     /// when the session is idle). Holding the bytes in memory bounds
@@ -62,23 +66,58 @@ public sealed class PendingPrint
     public PrintOrientation Orientation { get; set; } = PrintOrientation.Auto;
     public PageSelection PageSelection { get; set; } = PageSelection.All;
 
+    /// Total page count for pageables (PDFs and rendered docs);
+    /// null when unknown (not yet queried, not a PDF, or pdfinfo
+    /// failed). Drives the per-page checkbox UI for short PDFs.
+    public int? PageCount { get; set; }
+
+    /// Custom page-range expression in CUPS notation
+    /// (e.g. "1-3,5,7-9"). Empty string means "no custom range
+    /// active". Constructed via the digit-keyboard picker; takes
+    /// precedence over <see cref="PageSelection"/> when non-empty.
+    public string PageRange { get; set; } = "";
+
     public const int MinReasonableDpi = 100;
+    /// Tolerance for the "1:1 fits?" check. A 1 mm slop catches
+    /// rounding-error overflows on otherwise page-sized scans
+    /// without classifying them as "won't fit".
+    public const double FitSlopMm = 1.0;
+    private const double InchesPerMm = 1.0 / 25.4;
 
     /// Paper short side in inches — set at staging time from the
     /// session's <see cref="BotPrintSession.MediaSize"/>. Drives the
     /// "1:1 fits?" check and (eventually) preview rendering.
     public required double PaperShortInches { get; init; }
     public required double PaperLongInches  { get; init; }
+    /// Printer's safe printable rectangle (paper minus non-printable
+    /// margins) in inches. Set at staging time from the session's
+    /// margins config.
+    public required double PrintableShortInches { get; init; }
+    public required double PrintableLongInches  { get; init; }
 
-    /// True when the image's native dimensions, at its declared dpi,
-    /// fit on the configured paper size in either orientation. Drives
-    /// whether 1:1 is offered as a scale option.
-    public bool Fits1to1 =>
-        Kind == PendingPrintKind.Image &&
-        Dpi is int d && d >= MinReasonableDpi &&
-        PixelWidth is int w && PixelHeight is int h &&
-        Math.Min(w, h) / (double)d <= PaperShortInches &&
-        Math.Max(w, h) / (double)d <= PaperLongInches;
+    /// Three-state classification of how 1:1 printing would land
+    /// on the page — drives the badge on the 1:1 scale button so
+    /// the user can pick it knowingly even when the image overflows.
+    public OneToOneFit Fits1to1
+    {
+        get
+        {
+            if (Kind != PendingPrintKind.Image) return OneToOneFit.NotApplicable;
+            if (Dpi is not int d || d < MinReasonableDpi) return OneToOneFit.NotApplicable;
+            if (PixelWidth is not int w || PixelHeight is not int h)
+                return OneToOneFit.NotApplicable;
+            var shortIn = Math.Min(w, h) / (double)d;
+            var longIn  = Math.Max(w, h) / (double)d;
+            var slopIn = FitSlopMm * InchesPerMm;
+            if (shortIn <= PrintableShortInches + slopIn &&
+                longIn  <= PrintableLongInches  + slopIn)
+                return OneToOneFit.Printable;
+            if (shortIn <= PaperShortInches + slopIn &&
+                longIn  <= PaperLongInches  + slopIn)
+                return OneToOneFit.PaperFitsMarginsClipped;
+            return OneToOneFit.Overflows;
+        }
+    }
 
     /// Pick the orientation we'd like to default to when the user
     /// hasn't picked one explicitly — the longer image dimension
@@ -87,6 +126,22 @@ public sealed class PendingPrint
         PixelWidth is int w && PixelHeight is int h && w > h
             ? PrintOrientation.Landscape
             : PrintOrientation.Portrait;
+}
+
+/// <summary>
+/// Outcome of comparing an image's 1:1 physical size against the
+/// printable area. <see cref="Printable"/> means the image fits
+/// inside the printer's safe area (with a small slop tolerance);
+/// <see cref="PaperFitsMarginsClipped"/> means it fits the paper
+/// but would have edges chopped by the non-printable margin;
+/// <see cref="Overflows"/> means it exceeds the paper itself.
+/// </summary>
+public enum OneToOneFit
+{
+    NotApplicable,
+    Printable,
+    PaperFitsMarginsClipped,
+    Overflows,
 }
 
 public enum PendingPrintKind
@@ -119,6 +174,64 @@ public enum PrintPickerView
     Scale,
     Orientation,
     Pages,
+    PageRangeKeyboard,
+}
+
+/// <summary>
+/// Parser/serializer for CUPS page-range notation
+/// (e.g. "1-3,5,7-9"). Used both by the per-page checkbox UI
+/// (toggle ↔ string conversion) and by the digit-keyboard custom-
+/// range picker (display only, no structural parsing).
+/// </summary>
+public static class PageRangeNotation
+{
+    public static HashSet<int> Parse(string range, int maxPage)
+    {
+        var pages = new HashSet<int>();
+        if (string.IsNullOrWhiteSpace(range)) return pages;
+        foreach (var raw in range.Split(','))
+        {
+            var part = raw.Trim();
+            if (part.Length == 0) continue;
+            var dashIdx = part.IndexOf('-');
+            if (dashIdx < 0)
+            {
+                if (int.TryParse(part, out var p) && p >= 1 && p <= maxPage)
+                    pages.Add(p);
+            }
+            else
+            {
+                var lo = part[..dashIdx].Trim();
+                var hi = part[(dashIdx + 1)..].Trim();
+                int from = int.TryParse(lo, out var lv) ? lv : 1;
+                int to   = int.TryParse(hi, out var rv) ? rv : maxPage;
+                for (int i = Math.Max(1, from); i <= Math.Min(maxPage, to); i++)
+                    pages.Add(i);
+            }
+        }
+        return pages;
+    }
+
+    public static string Serialize(IEnumerable<int> pages)
+    {
+        var sorted = pages.Where(p => p > 0).Distinct().OrderBy(p => p).ToList();
+        if (sorted.Count == 0) return "";
+        var parts = new List<string>();
+        int start = sorted[0], prev = sorted[0];
+        for (int i = 1; i <= sorted.Count; i++)
+        {
+            if (i == sorted.Count || sorted[i] != prev + 1)
+            {
+                parts.Add(start == prev ? start.ToString() : $"{start}-{prev}");
+                if (i < sorted.Count) { start = sorted[i]; prev = sorted[i]; }
+            }
+            else
+            {
+                prev = sorted[i];
+            }
+        }
+        return string.Join(",", parts);
+    }
 }
 
 /// <summary>
@@ -166,9 +279,10 @@ public static class PrintMessage
         var html = RenderHtml(s, botUsername);
         var kb = s.View switch
         {
-            PrintPickerView.Scale       => RenderScalePicker(s),
-            PrintPickerView.Orientation => RenderOrientPicker(s),
-            PrintPickerView.Pages       => RenderPagesPicker(s),
+            PrintPickerView.Scale             => RenderScalePicker(s),
+            PrintPickerView.Orientation       => RenderOrientPicker(s),
+            PrintPickerView.Pages             => RenderPagesPicker(s),
+            PrintPickerView.PageRangeKeyboard => RenderPageRangeKeyboard(s),
             _ => RenderMain(s),
         };
         return (html, kb);
@@ -214,11 +328,19 @@ public static class PrintMessage
         {
             lines.Add("");
             lines.Add(RenderPendingBlock(p));
+            // Echo the current page-range buffer above the digit
+            // keyboard so the user sees what they're typing.
+            if (s.View == PrintPickerView.PageRangeKeyboard)
+            {
+                var buf = string.IsNullOrEmpty(p.PageRange) ? "(empty)" : p.PageRange;
+                lines.Add("");
+                lines.Add($"<b>Range:</b> <code>{EscapeHtml(buf)}</code>");
+            }
         }
         else
         {
             lines.Add("");
-            lines.Add("Send a PDF / PostScript / image to print " +
+            lines.Add("Send a PDF / PostScript / image / Markdown / Office doc to print " +
                 "(tap 📎 in the chat composer below).");
         }
 
@@ -229,12 +351,20 @@ public static class PrintMessage
     {
         var icon = p.Kind == PendingPrintKind.Image ? "🖼" : "📄";
         var sizeKb = p.Data.Length / 1024;
-        var head = sizeKb < 1024
-            ? $"{icon} <b>{EscapeHtml(p.FileName)}</b> · {sizeKb} KB"
-            : $"{icon} <b>{EscapeHtml(p.FileName)}</b> · {sizeKb / 1024.0:F1} MB";
+        var sizeText = sizeKb < 1024
+            ? $"{sizeKb} KB"
+            : $"{sizeKb / 1024.0:F1} MB";
+        var head = $"{icon} <b>{EscapeHtml(p.FileName)}</b> · {sizeText}";
 
         if (p.Kind != PendingPrintKind.Image)
-            return $"{head}\nReady to print?";
+        {
+            // Pageable: show page count if we know it.
+            var pageInfo = p.PageCount is int pc ? $" · {pc} page{(pc == 1 ? "" : "s")}" : "";
+            return
+                $"{head}{pageInfo}\n" +
+                $"Pages: <b>{PagesEffectiveLabel(p)}</b>\n" +
+                "Ready to print?";
+        }
 
         var dims = (p.PixelWidth, p.PixelHeight) switch
         {
@@ -243,10 +373,6 @@ public static class PrintMessage
         };
         var dpi = p.Dpi is int d ? $" @ {d} dpi" : "";
 
-        // The auto orientation gets resolved here purely for display
-        // — the wire value we send the daemon stays "Auto" so the
-        // suggestion doesn't get baked in, but the user sees what
-        // we'd actually do.
         var effectiveOrient = p.Orientation == PrintOrientation.Auto
             ? p.AutoSuggestedOrientation
             : p.Orientation;
@@ -254,13 +380,34 @@ public static class PrintMessage
             ? $"auto ({effectiveOrient.ToString().ToLower()})"
             : effectiveOrient.ToString().ToLower();
 
+        // Render the 1:1-fit caveat when the user has picked it
+        // explicitly and it would clip or overflow — they should know
+        // before tapping ✅.
+        var scaleText = ScaleLabel(p.Scale);
+        if (p.Scale == PrintScaleMode.OneToOne)
+        {
+            scaleText += p.Fits1to1 switch
+            {
+                OneToOneFit.PaperFitsMarginsClipped =>
+                    " <i>(edges into non-printable margin)</i>",
+                OneToOneFit.Overflows =>
+                    " <i>(exceeds page — will be cropped)</i>",
+                _ => "",
+            };
+        }
+
         return
             $"{head} · {dims}{dpi}\n" +
-            $"Scale: <b>{ScaleLabel(p.Scale)}</b>" +
-            (p.Kind == PendingPrintKind.Image ? $" · Orientation: <b>{orientText}</b>" : "") +
-            $" · Pages: <b>{PagesLabel(p.PageSelection)}</b>" +
+            $"Scale: <b>{scaleText}</b>" +
+            $" · Orientation: <b>{orientText}</b>" +
+            $" · Pages: <b>{PagesEffectiveLabel(p)}</b>" +
             "\nReady to print?";
     }
+
+    private static string PagesEffectiveLabel(PendingPrint p) =>
+        string.IsNullOrEmpty(p.PageRange)
+            ? PagesLabel(p.PageSelection)
+            : p.PageRange;
 
     private static string PagesLabel(PageSelection sel) => sel switch
     {
@@ -314,12 +461,11 @@ public static class PrintMessage
 
     private const string SelectedMark   = "🔘 ";
     private const string UnselectedMark = "⚪ ";
+    private const string CheckedMark    = "☑ ";
+    private const string UncheckedMark  = "☐ ";
 
     private static InlineKeyboardMarkup RenderScalePicker(BotPrintSession s)
     {
-        // Defensive: if user toggles into the picker but the pending
-        // got dropped (e.g., session timed out), fall back to a back
-        // button so the UI doesn't hang.
         if (s.Pending is null)
             return new InlineKeyboardMarkup(new[] {
                 new[] { InlineKeyboardButton.WithCallbackData("↩ back", "print:pick:main:_") }
@@ -327,15 +473,27 @@ public static class PrintMessage
 
         var p = s.Pending;
         string mark(PrintScaleMode m) => p.Scale == m ? SelectedMark : UnselectedMark;
+        // 1:1 is always offered now — even when the image overflows
+        // the printable area or the page itself, the user may know
+        // something we don't (paper they actually loaded, willingness
+        // to crop). The badge tells them what'll happen.
+        var oneOneLabel = "1:1" + p.Fits1to1 switch
+        {
+            OneToOneFit.PaperFitsMarginsClipped => " ⚠ margins",
+            OneToOneFit.Overflows               => " ⚠ won't fit",
+            _ => "",
+        };
         var rows = new List<InlineKeyboardButton[]>();
-        var row = new List<InlineKeyboardButton>();
-        if (p.Fits1to1)
-            row.Add(InlineKeyboardButton.WithCallbackData(
-                $"{mark(PrintScaleMode.OneToOne)}1:1", $"print:set:scale:{p.Id}:onetoone"));
-        row.Add(InlineKeyboardButton.WithCallbackData(
-            $"{mark(PrintScaleMode.Fit)}Fit", $"print:set:scale:{p.Id}:fit"));
-        row.Add(InlineKeyboardButton.WithCallbackData(
-            $"{mark(PrintScaleMode.Fill)}Fill", $"print:set:scale:{p.Id}:fill"));
+        var row = new List<InlineKeyboardButton>
+        {
+            InlineKeyboardButton.WithCallbackData(
+                $"{mark(PrintScaleMode.OneToOne)}{oneOneLabel}",
+                $"print:set:scale:{p.Id}:onetoone"),
+            InlineKeyboardButton.WithCallbackData(
+                $"{mark(PrintScaleMode.Fit)}Fit",  $"print:set:scale:{p.Id}:fit"),
+            InlineKeyboardButton.WithCallbackData(
+                $"{mark(PrintScaleMode.Fill)}Fill", $"print:set:scale:{p.Id}:fill"),
+        };
         rows.Add(row.ToArray());
         rows.Add(new[] {
             InlineKeyboardButton.WithCallbackData("↩ back", $"print:pick:main:{p.Id}")
@@ -367,6 +525,12 @@ public static class PrintMessage
         });
     }
 
+    /// Soft cap for the per-page checkbox UI: we display individual
+    /// per-page checkboxes when the document has at most this many
+    /// pages. Above this, fall back to the digit-keyboard custom
+    /// range view (no chat-text-input flow needed).
+    public const int PerPageCheckboxCap = 10;
+
     private static InlineKeyboardMarkup RenderPagesPicker(BotPrintSession s)
     {
         if (s.Pending is null)
@@ -375,19 +539,94 @@ public static class PrintMessage
             });
 
         var p = s.Pending;
-        string mark(PageSelection sel) => p.PageSelection == sel ? SelectedMark : UnselectedMark;
+        string radio(PageSelection sel) =>
+            (string.IsNullOrEmpty(p.PageRange) && p.PageSelection == sel)
+                ? SelectedMark : UnselectedMark;
+
+        var rows = new List<InlineKeyboardButton[]>();
+
+        // Top row: All / Odd / Even radio (zeros out PageRange).
+        rows.Add(new[]
+        {
+            InlineKeyboardButton.WithCallbackData($"{radio(PageSelection.All)}All",
+                $"print:set:pages:{p.Id}:all"),
+            InlineKeyboardButton.WithCallbackData($"{radio(PageSelection.Odd)}Odd",
+                $"print:set:pages:{p.Id}:odd"),
+            InlineKeyboardButton.WithCallbackData($"{radio(PageSelection.Even)}Even",
+                $"print:set:pages:{p.Id}:even"),
+        });
+
+        // Per-page checkboxes when we know the count and it's small
+        // enough to fit two rows of five buttons. Tapping a page
+        // toggles it in PageRange (overrides the All/Odd/Even radio
+        // — non-empty PageRange wins).
+        if (p.PageCount is int pc && pc > 0 && pc <= PerPageCheckboxCap)
+        {
+            var selected = PageRangeNotation.Parse(p.PageRange, pc);
+            // If PageRange is empty, derive selection from the
+            // radio so the checkboxes mirror what would actually
+            // print today.
+            if (selected.Count == 0 && string.IsNullOrEmpty(p.PageRange))
+            {
+                for (int i = 1; i <= pc; i++)
+                {
+                    var include = p.PageSelection switch
+                    {
+                        PageSelection.Odd  => i % 2 == 1,
+                        PageSelection.Even => i % 2 == 0,
+                        _ => true,
+                    };
+                    if (include) selected.Add(i);
+                }
+            }
+            for (int rowStart = 1; rowStart <= pc; rowStart += 5)
+            {
+                var row = new List<InlineKeyboardButton>();
+                for (int i = rowStart; i < rowStart + 5 && i <= pc; i++)
+                {
+                    var glyph = selected.Contains(i) ? CheckedMark : UncheckedMark;
+                    row.Add(InlineKeyboardButton.WithCallbackData(
+                        $"{glyph}{i}", $"print:togglepage:{p.Id}:{i}"));
+                }
+                rows.Add(row.ToArray());
+            }
+        }
+
+        // Custom-range entry — opens the digit keyboard.
+        rows.Add(new[]
+        {
+            InlineKeyboardButton.WithCallbackData(
+                "✏ Custom range" + (string.IsNullOrEmpty(p.PageRange) ? "" : ": " + p.PageRange),
+                $"print:pick:rangekb:{p.Id}"),
+        });
+
+        rows.Add(new[] { InlineKeyboardButton.WithCallbackData("↩ back", $"print:pick:main:{p.Id}") });
+        return new InlineKeyboardMarkup(rows);
+    }
+
+    /// <summary>
+    /// Per-button "type" UI for entering a custom page-range
+    /// expression, since Telegram bot inline keyboards don't have a
+    /// native text-input affordance. Each digit/comma/dash button
+    /// appends one character to PendingPrint.PageRange; ⌫ pops one;
+    /// ↺ clears; ✓ applies and returns to the main view.
+    /// </summary>
+    private static InlineKeyboardMarkup RenderPageRangeKeyboard(BotPrintSession s)
+    {
+        if (s.Pending is null)
+            return new InlineKeyboardMarkup(new[] {
+                new[] { InlineKeyboardButton.WithCallbackData("↩ back", "print:pick:main:_") }
+            });
+        var p = s.Pending;
+        InlineKeyboardButton key(string label, string value) =>
+            InlineKeyboardButton.WithCallbackData(label, $"print:rangekey:{p.Id}:{value}");
+
         return new InlineKeyboardMarkup(new[]
         {
-            new[]
-            {
-                InlineKeyboardButton.WithCallbackData($"{mark(PageSelection.All)}All",
-                    $"print:set:pages:{p.Id}:all"),
-                InlineKeyboardButton.WithCallbackData($"{mark(PageSelection.Odd)}Odd",
-                    $"print:set:pages:{p.Id}:odd"),
-                InlineKeyboardButton.WithCallbackData($"{mark(PageSelection.Even)}Even",
-                    $"print:set:pages:{p.Id}:even"),
-            },
-            new[] { InlineKeyboardButton.WithCallbackData("↩ back", $"print:pick:main:{p.Id}") },
+            new[] { key("1", "1"), key("2", "2"), key("3", "3"), key("4", "4"), key("5", "5") },
+            new[] { key("6", "6"), key("7", "7"), key("8", "8"), key("9", "9"), key("0", "0") },
+            new[] { key("-", "-"), key(",", ","), key("⌫", "BS"), key("↺", "CLR"), key("✓", "OK") },
+            new[] { InlineKeyboardButton.WithCallbackData("↩ back", $"print:pick:pages:{p.Id}") },
         });
     }
 

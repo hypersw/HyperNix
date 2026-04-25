@@ -973,3 +973,157 @@ nothing on the failure path.
 
 Current focus when the rig comes back up: **9 → 10**, everything before is
 complete and building clean.
+
+## Print Flow — 2026-04-25
+
+The print path was redesigned in line with the scanner's separation
+of concerns: daemon stays content-dumb, all imagery / format /
+preview decisions live in the bot, untrusted file conversion runs
+in a separately-hardened sidecar.
+
+### Components
+
+  - **PrintScan.Daemon** — owns the HTTP/Unix-socket interface and
+    drives `lp` (when a real printer is wired) or the stub. Reports
+    paper geometry and non-printable margins via `/status`. Never
+    inspects file contents.
+  - **PrintScan.Renderer** — hardened sidecar at
+    `Modules/PrintersScanners/Renderer`. Drops privileges to
+    DynamicUser, runs in `PrivateNetwork` namespace with
+    `RestrictAddressFamilies=AF_UNIX`, `IPAddressDeny=any`, full
+    `Protect*` bundle, empty `CapabilityBoundingSet`,
+    `NoNewPrivileges`. Spawns one fresh subprocess per render
+    request — soffice / pandoc / xpstopdf / pdfinfo — so a parser
+    crash takes the child down, not the daemon. Endpoints:
+      - `POST /render` — `multipart file` → `application/pdf`.
+        Routes by extension: XPS/OXPS via libgxps's xpstopdf,
+        Markdown via pandoc → docx → soffice, everything else
+        via soffice (DOC/DOCX/ODT/RTF/HTML/TXT/XLS/PPT/…).
+        Math in Markdown survives the round-trip via OMML in
+        the docx intermediate.
+      - `POST /pdf-info` — `multipart file` → JSON
+        `{pageCount, raw}`. Used by the bot for the per-page
+        checkbox UI.
+    Failure responses are RFC 7807 ProblemDetails — `title` is
+    the human summary, `detail` is the raw stderr (truncated).
+  - **PrintScan.TelegramBot** — owns all UX. Per-chat
+    `BotPrintSession` with a single `PendingPrint` awaiting
+    confirmation. Image analysis (dimensions / dpi / aspect /
+    fit verdict) via SixLabors.ImageSharp on the bot side.
+    Routes Office uploads through the renderer transparently.
+
+### UX shape
+
+  - Reply keyboard is `📷 Scanner…` `🖨 Printer…` `📊 Status`. Both
+    `/scanner` and `/scan`, both `/printer` and `/print`, and
+    `/status` are accepted. Old labels without the ellipsis are
+    matched too so stale persistent keyboards keep working.
+  - Confirm-before-print is invariant. Files from the chat are
+    staged into `BotPrintSession.Pending`; nothing prints unless
+    the user taps ✅.
+  - Pickers, all inline keyboards on the same status message:
+      - **Scale** (images only): 1:1 / Fit / Fill. 1:1 is always
+        offered and gets a badge — `1:1 ⚠ margins` when the image
+        fits the paper but extends into the non-printable strip,
+        `1:1 ⚠ won't fit` when it exceeds the paper. Default is
+        1:1 only when `OneToOneFit.Printable` (fits printable
+        rectangle within a 1 mm slop tolerance for rounding-error
+        overflows).
+      - **Orientation** (images only): Auto / Portrait / Landscape.
+        Auto picks based on aspect.
+      - **Pages**: All / Odd / Even radio. When the document is a
+        Pageable with ≤ 10 pages (page count from renderer's
+        `/pdf-info`), each page also gets a checkbox row (5 per
+        row). A custom-range button opens a small inline-keyboard
+        digit pad for entering the classical CUPS expression
+        (`1-3,5,7-9`) without needing a chat-text-input flow.
+      - The 1:1 caveat is also rendered into the pending block's
+        text so users who don't open the picker still see it.
+  - **History**: per-chat in-memory list of last 5 print jobs,
+    top 3 surfaced as `📑 Recent: ✅ a.pdf · ❌ b.png · …`.
+    Cleared on bot restart (no persistence).
+
+### Hardware-specific defaults (HP LaserJet P2015n)
+
+  - Paper: A4. `services.printscan-daemon.mediaSize = "A4"`.
+  - Non-printable margins: 4.23 mm all sides per HP's plain-A4
+    spec. `services.printscan-daemon.nonPrintableMarginsMm = {
+      top = 4.23; bottom = 4.23; left = 4.23; right = 4.23;
+    }`.
+  - **No hardware duplex** on this model (P2015dn would have it).
+    Manual duplex is a planned UX layer (Pages=Odd → flip → Pages=Even)
+    that's deferred until a real printer is wired and we can
+    test the actual stack-flip ordering.
+
+### Wire format
+
+`POST /print` accepts these form fields:
+  - `file` — required, the document
+  - `copies` (int, default 1)
+  - `pageRange` — CUPS expression like `1-3,5,7-9`. When non-empty,
+    overrides `pageSelection`.
+  - `pageSelection` — `All` / `Odd` / `Even`. Used only when
+    `pageRange` is empty.
+  - `scale` — `OneToOne` / `Fit` / `Fill`
+  - `orientation` — `Auto` / `Portrait` / `Landscape`
+
+The renderer is invoked transparently: bot classifies the file,
+sends Office-family inputs through `POST /render` first, takes
+the resulting PDF as the new pending document. Direct PDF / PS /
+image uploads skip the renderer. PDF page count is then queried
+via `POST /pdf-info` and fed into the picker UI.
+
+### Done
+
+  - Confirm-before-print across all formats.
+  - Format-toggle scanner picker glitch fixed (view persistence
+    on `BotSession`; `Format` is bot-only-source-of-truth).
+  - Three-button reply keyboard with disambig ellipsis.
+  - Daemon paper-size + non-printable margins config.
+  - Bot polls `/status` every 30 s to refresh printer state in
+    open print sessions (`PrinterOnline`, `MediaSize`, `Margins`).
+  - Pages: All / Odd / Even / per-page checkbox (≤ 10 pages) /
+    digit-keyboard custom range.
+  - Renderer: DOCX / ODT / RTF / TXT / HTML / Markdown (with
+    LaTeX math) / XPS / OXPS / spreadsheets / presentations
+    via soffice + pandoc + xpstopdf.
+  - PDF page-count query via renderer's pdfinfo wrapper.
+  - Friendly failure surfacing — bot shows the renderer's
+    ProblemDetails `title` as a one-liner banner and tucks the
+    raw stderr into a `<pre><code>` block (truncated to 1 KB)
+    so investigation is straightforward.
+
+### Deferred / open
+
+  1. **Print preview as an image.** User asked for a render of how
+     the page will look (image placement, margins shown), updated
+     as toggles change. The Telegram side is non-trivial because
+     converting a text status message into a media one needs
+     delete + resend (no `editMessageMedia` from text), and we'd
+     have to track multiple message ids on the bot side. Per the
+     last round, the chosen approach is to abandon the previous
+     status message (replace its text with `→ Continued ↓` and
+     drop its keyboard) and continue the session in a new media
+     message. Not yet implemented. Doc preview (first page of
+     the rendered PDF via `pdftoppm`) lands in the same flight.
+  2. **Manual duplex sequence.** Two-step flow:
+     "Print Odd → flip pages → Print Even", with per-printer
+     stacking-order hint. Deferred until a real P2015n is on the
+     wire so we can verify the page ordering empirically.
+  3. **Real printer.** Currently a stub — `PrintService.PrintAsync`
+     just logs and sleeps. The wire format and bot UX are in
+     final-ish shape; swapping in a CUPS-driven implementation is
+     a single class-body change.
+  4. **Doc-renderer test coverage.** Renderer is integration-tested
+     by hand only. A test corpus of small DOCX / MD / XPS /
+     malformed inputs against `/render` would catch regressions.
+  5. **Format coverage gaps.** Renderer doesn't currently accept:
+     EPUB (would need pandoc with EPUB→docx → soffice; trivial to
+     add), HEIC images (libheif → soffice/imagemagick; bot side),
+     CSV (soffice handles via its calc importer but we don't list
+     it). Add as needed; broad-by-default to avoid the "send a
+     PDF instead" hint where avoidable.
+  6. **Scanner reply-keyboard icon.** Currently `📷` (camera) which
+     is what's at hand but visually ambiguous. No native
+     "scanner" emoji; alternatives discussed but no change yet
+     (📠 fax, 🔍 magnifier, 📑 bookmark tabs, 🖼 framed picture).

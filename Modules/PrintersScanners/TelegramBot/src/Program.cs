@@ -566,6 +566,7 @@ async Task OpenPrinterSessionAsync(long chatId, CancellationToken ct)
     var st = await daemon.GetStatusAsync(ct);
     var online    = st?.Printer.Online ?? true;
     var mediaSize = st?.Printer.MediaSize ?? "A4";
+    var margins   = st?.Printer.Margins ?? new PrintableMargins();
     var placeholder = await bot.SendMessage(chatId, "🖨 Opening printer session…",
         cancellationToken: ct);
 
@@ -575,6 +576,7 @@ async Task OpenPrinterSessionAsync(long chatId, CancellationToken ct)
         StatusMessageId = placeholder.Id,
         PrinterOnline = online,
         MediaSize = mediaSize,
+        Margins = margins,
     };
     lock (printSessionsLock) { printSessions[chatId] = session; }
     await RenderPrintSessionAsync(chatId, ct);
@@ -666,10 +668,31 @@ async Task StageDocumentForPrintAsync(long chatId, Document doc, CancellationTok
             log.LogWarning(ex, "render failed for {File}", fileName);
             try
             {
-                await bot.EditMessageText(chatId, notice.Id,
-                    $"❌ Rendering failed: <code>{System.Net.WebUtility.HtmlEncode(ex.Message)}</code>\n" +
-                    "Try printing from the source app to a PDF first — " +
-                    "the result will be more reliable.",
+                // Friendly summary on its own line, raw tool output
+                // in a monospace expander-style <pre><code> block —
+                // keeps the failure debuggable without burying the
+                // useful summary in a wall of stderr.
+                string body;
+                if (ex is RenderFailedRemotely rf)
+                {
+                    var friendlyEsc = System.Net.WebUtility.HtmlEncode(rf.Friendly);
+                    var raw = rf.RawDetail.Trim();
+                    if (raw.Length > 1000) raw = raw[..1000] + "…";
+                    var rawEsc = System.Net.WebUtility.HtmlEncode(raw);
+                    body =
+                        $"❌ Rendering failed: <b>{friendlyEsc}</b>\n" +
+                        (raw.Length > 0 ? $"<pre><code>{rawEsc}</code></pre>\n" : "") +
+                        "💡 Tip: printing from the source app to a PDF on " +
+                        "your device first usually gives more reliable output.";
+                }
+                else
+                {
+                    body =
+                        $"❌ Rendering failed: <b>{System.Net.WebUtility.HtmlEncode(ex.Message)}</b>\n" +
+                        "💡 Tip: printing from the source app to a PDF on " +
+                        "your device first usually gives more reliable output.";
+                }
+                await bot.EditMessageText(chatId, notice.Id, body,
                     parseMode: ParseMode.Html, cancellationToken: ct);
             }
             catch { /* notice may be gone */ }
@@ -749,6 +772,14 @@ async Task StageBytesForPrintAsync(
     }
 
     var paper = PaperSizes.Inches(s.MediaSize);
+    // Convert margins (mm) to inches and subtract from paper to get
+    // the safe printable rectangle. Long-axis margin is top + bottom
+    // since the long axis of the paper is the vertical one in
+    // portrait; the picker uses Math.Min/Max so flipping orientation
+    // doesn't change the verdict.
+    const double InchesPerMm = 1.0 / 25.4;
+    var marginShortIn = (s.Margins.LeftMm + s.Margins.RightMm)  * InchesPerMm;
+    var marginLongIn  = (s.Margins.TopMm  + s.Margins.BottomMm) * InchesPerMm;
     var pending = new PendingPrint
     {
         Id = Guid.NewGuid().ToString("N")[..8],
@@ -761,8 +792,11 @@ async Task StageBytesForPrintAsync(
         Dpi = dpi,
         PaperShortInches = paper.Short,
         PaperLongInches  = paper.Long,
+        PrintableShortInches = Math.Max(0.1, paper.Short - marginShortIn),
+        PrintableLongInches  = Math.Max(0.1, paper.Long  - marginLongIn),
     };
-    if (pending.Fits1to1) pending.Scale = PrintScaleMode.OneToOne;
+    if (pending.Fits1to1 == OneToOneFit.Printable)
+        pending.Scale = PrintScaleMode.OneToOne;
 
     lock (printSessionsLock)
     {
@@ -773,6 +807,28 @@ async Task StageBytesForPrintAsync(
         }
     }
     await RenderPrintSessionAsync(chatId, ct);
+
+    // For Pageable inputs (direct PDFs or rendered docs), ask the
+    // renderer how many pages there are. This drives the per-page
+    // checkbox UI for short PDFs (≤10 pages) and the page-count
+    // info shown next to the filename. Best-effort — null on any
+    // failure, no UI impact beyond the lack of a count.
+    if (kind == PendingPrintKind.Pageable && renderer.Enabled)
+    {
+        var n = await renderer.GetPdfPageCountAsync(bytes, fileName, ct);
+        if (n is int count)
+        {
+            lock (printSessionsLock)
+            {
+                if (printSessions.TryGetValue(chatId, out var bs2) &&
+                    bs2.Pending is { } cur && cur.Id == pending.Id)
+                {
+                    cur.PageCount = count;
+                }
+            }
+            await RenderPrintSessionAsync(chatId, ct);
+        }
+    }
 }
 
 /// <summary>
@@ -885,9 +941,10 @@ async Task HandlePrintCallbackAsync(long chatId, string data, CancellationToken 
                 if (printSessions.TryGetValue(chatId, out var bs))
                     bs.View = what switch
                     {
-                        "scale"  => PrintPickerView.Scale,
-                        "orient" => PrintPickerView.Orientation,
-                        "pages"  => PrintPickerView.Pages,
+                        "scale"   => PrintPickerView.Scale,
+                        "orient"  => PrintPickerView.Orientation,
+                        "pages"   => PrintPickerView.Pages,
+                        "rangekb" => PrintPickerView.PageRangeKeyboard,
                         _ => PrintPickerView.Main,
                     };
             }
@@ -933,8 +990,13 @@ async Task HandlePrintCallbackAsync(long chatId, string data, CancellationToken 
                         "even" => PageSelection.Even,
                         _ => bs.Pending.PageSelection,
                     };
+                    // Picking a preset clears any prior custom range —
+                    // PageRange-non-empty wins over the preset, so
+                    // leaving stale custom data would silently override
+                    // the user's just-now choice.
+                    bs.Pending.PageRange = "";
                 }
-                bs.View = PrintPickerView.Main;
+                bs.View = what == "pages" ? PrintPickerView.Pages : PrintPickerView.Main;
             }
             await RenderPrintSessionAsync(chatId, ct);
             break;
@@ -959,6 +1021,84 @@ async Task HandlePrintCallbackAsync(long chatId, string data, CancellationToken 
             var pid = parts[2];
             if (!MatchesCurrent(pid)) return;
             await ExecutePrintAsync(chatId, pid, ct);
+            break;
+        }
+        case "togglepage":
+        {
+            // print:togglepage:<pid>:<pageNumber> — flip page N's
+            // membership in PageRange. Used by the per-page
+            // checkbox row in the Pages picker.
+            if (parts.Length < 4) return;
+            var pid = parts[2];
+            if (!MatchesCurrent(pid)) return;
+            if (!int.TryParse(parts[3], out var pageNum)) return;
+            lock (printSessionsLock)
+            {
+                if (!printSessions.TryGetValue(chatId, out var bs2) ||
+                    bs2.Pending is null) break;
+                if (bs2.Pending.PageCount is not int pc || pc <= 0) break;
+                var current = PageRangeNotation.Parse(bs2.Pending.PageRange, pc);
+                // First click against an empty PageRange while a
+                // preset is active: seed the set from the preset so
+                // the toggle reads as "remove from current
+                // selection" rather than "include only this page".
+                if (current.Count == 0 && string.IsNullOrEmpty(bs2.Pending.PageRange))
+                {
+                    for (int i = 1; i <= pc; i++)
+                    {
+                        var include = bs2.Pending.PageSelection switch
+                        {
+                            PageSelection.Odd  => i % 2 == 1,
+                            PageSelection.Even => i % 2 == 0,
+                            _ => true,
+                        };
+                        if (include) current.Add(i);
+                    }
+                }
+                if (!current.Add(pageNum)) current.Remove(pageNum);
+                bs2.Pending.PageRange = PageRangeNotation.Serialize(current);
+                bs2.View = PrintPickerView.Pages;
+            }
+            await RenderPrintSessionAsync(chatId, ct);
+            break;
+        }
+        case "rangekey":
+        {
+            // print:rangekey:<pid>:<value> — append/erase/clear/commit
+            // a character to the page-range buffer. Acts like a tiny
+            // numeric keyboard.
+            if (parts.Length < 4) return;
+            var pid = parts[2];
+            if (!MatchesCurrent(pid)) return;
+            var value = parts[3];
+            lock (printSessionsLock)
+            {
+                if (!printSessions.TryGetValue(chatId, out var bs2) ||
+                    bs2.Pending is null) break;
+                var buf = bs2.Pending.PageRange ?? "";
+                switch (value)
+                {
+                    case "BS":
+                        if (buf.Length > 0) buf = buf[..^1];
+                        break;
+                    case "CLR":
+                        buf = "";
+                        break;
+                    case "OK":
+                        bs2.View = PrintPickerView.Main;
+                        break;
+                    default:
+                        // Digit / "-" / "," — just append. The string
+                        // is validated implicitly by the daemon's
+                        // page-range parser; if the user types
+                        // "1-2-3,," CUPS will reject the job, which
+                        // is fine.
+                        if (value.Length == 1) buf += value;
+                        break;
+                }
+                bs2.Pending.PageRange = buf;
+            }
+            await RenderPrintSessionAsync(chatId, ct);
             break;
         }
     }
@@ -987,7 +1127,14 @@ async Task ExecutePrintAsync(long chatId, string pendingId, CancellationToken ct
         content.Add(fileContent, "file", p.FileName);
         content.Add(new StringContent(p.Scale.ToString()), "scale");
         content.Add(new StringContent(p.Orientation.ToString()), "orientation");
-        content.Add(new StringContent(p.PageSelection.ToString()), "pageSelection");
+        // Custom range wins over the preset when non-empty — see
+        // the comment on PendingPrint.PageRange. Daemon's /print
+        // form parser reads pageRange first and falls back to
+        // pageSelection only if pageRange is missing.
+        if (!string.IsNullOrEmpty(p.PageRange))
+            content.Add(new StringContent(p.PageRange), "pageRange");
+        else
+            content.Add(new StringContent(p.PageSelection.ToString()), "pageSelection");
 
         // Daemon talks unix socket; one-shot HttpClient with the same
         // ConnectCallback shape DaemonClient uses internally.

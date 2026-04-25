@@ -52,6 +52,19 @@ public record PrintRequest(
     PageSelection PageSelection = PageSelection.All
 );
 
+/// <summary>
+/// Non-printable margins of the loaded paper, in millimetres. The
+/// daemon doesn't enforce these — they're advisory metadata for
+/// clients that need to compose previews or warn when an image
+/// would land outside the printer's reachable area.
+/// </summary>
+public record PrintableMargins(
+    double TopMm = 4.23,
+    double BottomMm = 4.23,
+    double LeftMm = 4.23,
+    double RightMm = 4.23
+);
+
 public record PrinterStatus(
     bool Online,
     string? StatusText = null,
@@ -59,7 +72,13 @@ public record PrinterStatus(
     /// module. The daemon doesn't act on this beyond reporting it —
     /// clients read it to know what physical-size assumptions to
     /// bake into their previews and "fits 1:1?" decisions.
-    string? MediaSize = null
+    string? MediaSize = null,
+    /// Per-printer non-printable margins. Configured in the nix
+    /// module (defaults to the HP LaserJet P2015n's 4.23 mm all-
+    /// sides spec). Bot uses these to compute the safe printable
+    /// rectangle and to warn the user when an image at 1:1 would
+    /// extend into the non-printable strip.
+    PrintableMargins? Margins = null
 );
 
 // ── Scan params ─────────────────────────────────────────────────────────────
