@@ -209,26 +209,27 @@ app.MapPost("/sessions/{id}/scan", async (string id, SessionService svc, Cancell
     }
 });
 
-// Hand the captured TIFF blob to the client and drop it from memory.
-// First fetch wins; subsequent calls 404. The client is expected to
-// re-encode/thumbnail/upload entirely on its side — the daemon just
-// brokers the raw scan and never persists imagery between scans.
+// Hand the captured TIFF blob to the client. The daemon keeps its
+// copy until the client explicitly DELETEs the resource (or until
+// the session terminates — the 10-minute idle window is the TTL
+// backstop). Idempotent GET: clients can re-fetch on transient
+// failure within that window. The client is expected to re-encode,
+// thumbnail, and upload entirely on its side; the daemon just
+// brokers the raw scan and never persists imagery beyond session
+// lifetime.
 app.MapGet("/sessions/{id}/image/{seq:int}",
     async (string id, int seq, SessionService svc, HttpResponse response, CancellationToken ct) =>
 {
-    var tiff = svc.TakeScan(id, seq);
+    var tiff = svc.GetScan(id, seq);
     if (tiff is null) return Results.NotFound();
-    try
-    {
-        response.ContentType = "image/tiff";
-        await tiff.CopyToAsync(response.Body, ct);
-    }
-    finally
-    {
-        tiff.Dispose();
-    }
+    response.ContentType = "image/tiff";
+    await tiff.CopyToAsync(response.Body, ct);
     return Results.Empty;
 });
+
+app.MapDelete("/sessions/{id}/image/{seq:int}",
+    (string id, int seq, SessionService svc) =>
+        svc.RemoveScan(id, seq) ? Results.NoContent() : Results.NotFound());
 
 // ── Debug / test hooks ──────────────────────────────────────────────────────
 

@@ -100,10 +100,10 @@ public sealed class DaemonClient : IDisposable
     }
 
     /// <summary>
-    /// Fetch the captured raw TIFF for this scan. The daemon serves the
-    /// blob exactly once and drops it from memory after the response
-    /// completes — there is no second-fetch retry. Caller takes
-    /// ownership of the returned stream and must dispose it.
+    /// Fetch the captured raw TIFF for this scan. The daemon retains
+    /// its copy until <see cref="DeleteScanAsync"/> is called (or the
+    /// session terminates), so transient upload failures can be
+    /// retried with a re-fetch. Caller owns the returned stream.
     /// </summary>
     public async Task<Stream> FetchScanAsync(
         string sessionId, int seq, CancellationToken ct)
@@ -113,6 +113,22 @@ public sealed class DaemonClient : IDisposable
             HttpCompletionOption.ResponseHeadersRead, ct);
         resp.EnsureSuccessStatusCode();
         return await resp.Content.ReadAsStreamAsync(ct);
+    }
+
+    /// <summary>
+    /// Tell the daemon to drop its copy of the scan. Idempotent —
+    /// 404 (already deleted or never existed) is treated as success
+    /// so retries don't spuriously surface as errors. Best called
+    /// after a successful upload to Telegram so the daemon doesn't
+    /// hold the bytes for the full session-idle window.
+    /// </summary>
+    public async Task DeleteScanAsync(
+        string sessionId, int seq, CancellationToken ct)
+    {
+        using var resp = await _http.DeleteAsync(
+            $"/sessions/{sessionId}/image/{seq}", ct);
+        if (resp.StatusCode == System.Net.HttpStatusCode.NotFound) return;
+        resp.EnsureSuccessStatusCode();
     }
 
     public async Task<DeviceStatus?> GetStatusAsync(CancellationToken ct)

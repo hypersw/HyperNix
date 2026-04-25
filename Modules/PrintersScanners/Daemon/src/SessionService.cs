@@ -367,21 +367,40 @@ public sealed class SessionService : IAsyncDisposable
     // ── Image fetch ─────────────────────────────────────────────────────────
 
     /// <summary>
-    /// Atomically removes and returns the captured TIFF for this scan.
-    /// First (and only successful) fetch wins — subsequent calls return
-    /// null. Caller takes ownership of the stream and must dispose it.
-    /// This drop-on-fetch policy is the whole point of the new memory
-    /// model: the daemon doesn't accumulate scan blobs across a session.
+    /// Returns the captured TIFF for this scan as a read-only stream
+    /// view, rewound to the start. The daemon retains ownership — it's
+    /// the caller's job to send <see cref="RemoveScan"/> once they've
+    /// finished consuming it (typically: bot fetches, uploads, then
+    /// deletes). If the caller never deletes, the stream is bounded
+    /// instead by session lifetime: <see cref="TerminateInternal"/>
+    /// disposes any survivors at session end (idle timeout / explicit
+    /// close / takeover).
     /// </summary>
-    public RecyclableMemoryStream? TakeScan(string sessionId, int seq)
+    public RecyclableMemoryStream? GetScan(string sessionId, int seq)
     {
         lock (_lock)
         {
-            var key = (sessionId, seq);
-            if (!_scans.Remove(key, out var stream))
+            if (!_scans.TryGetValue((sessionId, seq), out var stream))
                 return null;
             stream.Position = 0;
             return stream;
+        }
+    }
+
+    /// <summary>
+    /// Drop the captured TIFF for this scan and dispose its stream.
+    /// Returns true if the entry existed, false if it had already been
+    /// removed (or was never created). Idempotent — calling twice is
+    /// safe.
+    /// </summary>
+    public bool RemoveScan(string sessionId, int seq)
+    {
+        lock (_lock)
+        {
+            if (!_scans.Remove((sessionId, seq), out var stream))
+                return false;
+            stream.Dispose();
+            return true;
         }
     }
 

@@ -794,10 +794,11 @@ async Task RerenderAsync(string sessionId, CancellationToken ct,
 
 async Task DeliverScanAsync(string sessionId, int seq, BotSession bs, CancellationToken ct)
 {
-    // 1. Fetch raw TIFF from the daemon. The daemon hands the blob over
-    //    once and drops its copy as soon as the response completes —
-    //    "drop on first fetch" is the whole point of the new memory
-    //    model. There's no second-fetch retry possible.
+    // 1. Fetch the raw TIFF from the daemon. The daemon keeps its
+    //    copy until we DELETE (step 4) — the 10-min session-idle
+    //    window is the TTL backstop if we never get there. That
+    //    means transient TG upload failures here can simply re-run
+    //    DeliverScanAsync without re-scanning.
     using var tiffMs = new MemoryStream();
     using (var tiffStream = await daemon.FetchScanAsync(sessionId, seq, ct))
     {
@@ -853,6 +854,21 @@ async Task DeliverScanAsync(string sessionId, int seq, BotSession bs, Cancellati
         }
         log.LogInformation("delivered {Session}#{Seq} ({N} formats)",
             sessionId, seq, variants.Count);
+
+        // 4. Tell the daemon to drop its TIFF copy. Done last so that
+        //    a Telegram-upload failure leaves the daemon's blob intact
+        //    for a retry. Idempotent — best-effort, doesn't fail the
+        //    delivery if the daemon round-trip glitches.
+        try
+        {
+            await daemon.DeleteScanAsync(sessionId, seq, ct);
+        }
+        catch (Exception ex)
+        {
+            log.LogDebug(
+                "DELETE scan {Session}#{Seq} failed (will be reaped at session-end): {Err}",
+                sessionId, seq, ex.Message);
+        }
     }
     finally
     {

@@ -91,8 +91,20 @@ public sealed class ImagePipeline
     /// <summary>
     /// Decode the TIFF, encode every requested format (one per bit in
     /// <paramref name="formats"/>), and produce a per-variant overlay
-    /// thumbnail. Returned variants are in flag order (Jpeg, Png,
-    /// WebpLossless, WebpLossy). Throws if the TIFF can't be decoded.
+    /// thumbnail. Per-format work runs in parallel via Task.Run — the
+    /// Pi 4 has 4 A72 cores and these encodes are CPU-bound, so a
+    /// 4-format scan completes in roughly the time of the slowest
+    /// single encode rather than the sum of all four. Returned
+    /// variants are in flag order (Jpeg, Png, WebpLossless, WebpLossy).
+    ///
+    /// Thread-safety note: SixLabors.ImageSharp's
+    /// <see cref="Image{TPixel}"/> is not documented as thread-safe
+    /// in the general case, but the <c>Save</c> path and
+    /// <c>Clone</c> only read the pixel buffer (no mutation of
+    /// shared state), so concurrent reads of one source image from
+    /// multiple Save/Clone calls are fine in practice. The
+    /// thumbnail's <see cref="Image.Mutate"/> runs on the cloned
+    /// image, not the source.
     /// </summary>
     public async Task<IReadOnlyList<EncodedVariant>> ProcessAsync(
         Stream tiff, int dpi, int seq, ScanFormat formats, CancellationToken ct)
@@ -113,81 +125,94 @@ public sealed class ImagePipeline
             seq, image.Width, image.Height,
             (long)image.Width * image.Height * 3 / 1024.0 / 1024.0);
 
-        var results = new List<EncodedVariant>(formatList.Count);
+        var totalSw = System.Diagnostics.Stopwatch.StartNew();
+        var tasks = new Task<EncodedVariant>[formatList.Count];
+        for (int i = 0; i < formatList.Count; i++)
+        {
+            var fmt = formatList[i];
+            tasks[i] = Task.Run(
+                () => ProcessOneAsync(image, dpi, seq, fmt, labelFormat, stamp, ct),
+                ct);
+        }
         try
         {
-            foreach (var fmt in formatList)
-            {
-                var (contentType, ext, lossless) = FormatMeta(fmt);
-                var fileName = BuildFileName(ext, lossless, stamp);
-
-                // Encode body
-                var data = Pool.GetStream("scan-encoded");
-                try
-                {
-                    switch (fmt)
-                    {
-                        case ScanFormat.Png:
-                            await image.SaveAsPngAsync(data, new PngEncoder
-                            {
-                                CompressionLevel = PngCompressionLevel.BestCompression,
-                            }, ct);
-                            break;
-                        case ScanFormat.WebpLossless:
-                            await image.SaveAsWebpAsync(data, new WebpEncoder
-                            {
-                                FileFormat = WebpFileFormatType.Lossless,
-                                Method = WebpEncodingMethod.Default,
-                            }, ct);
-                            break;
-                        case ScanFormat.WebpLossy:
-                            await image.SaveAsWebpAsync(data, new WebpEncoder
-                            {
-                                FileFormat = WebpFileFormatType.Lossy,
-                                Quality = JpegQuality,
-                                Method = WebpEncodingMethod.Default,
-                            }, ct);
-                            break;
-                        default: // Jpeg
-                            await image.SaveAsJpegAsync(data, new JpegEncoder
-                            {
-                                Quality = JpegQuality,
-                                ColorType = JpegEncodingColor.YCbCrRatio444,
-                            }, ct);
-                            break;
-                    }
-                    data.Position = 0;
-                }
-                catch
-                {
-                    data.Dispose();
-                    throw;
-                }
-
-                // Per-variant thumbnail
-                RecyclableMemoryStream thumb;
-                try
-                {
-                    thumb = await MakeThumbnailAsync(image, dpi, seq, fmt, labelFormat, ct);
-                }
-                catch
-                {
-                    data.Dispose();
-                    throw;
-                }
-
-                results.Add(new EncodedVariant(data, thumb, contentType, fileName));
-                _logger.LogInformation(
-                    "encoded scan #{Seq} {Fmt}: {Bytes} KB + {Thumb} KB thumb",
-                    seq, fmt, data.Length / 1024, thumb.Length / 1024);
-            }
+            var results = await Task.WhenAll(tasks);
+            totalSw.Stop();
+            _logger.LogInformation(
+                "encoded scan #{Seq} ({N} formats parallel) in {Elapsed:F2}s",
+                seq, formatList.Count, totalSw.Elapsed.TotalSeconds);
             return results;
         }
         catch
         {
-            foreach (var v in results) v.Dispose();
+            // One task threw, but others may have completed — dispose
+            // their streams so we don't leak pool-backed buffers on the
+            // failure path.
+            foreach (var t in tasks)
+                if (t.IsCompletedSuccessfully) t.Result.Dispose();
             throw;
         }
+    }
+
+    private async Task<EncodedVariant> ProcessOneAsync(
+        Image<Rgb24> image, int dpi, int seq, ScanFormat fmt, bool labelFormat,
+        DateTime stamp, CancellationToken ct)
+    {
+        var (contentType, ext, lossless) = FormatMeta(fmt);
+        var fileName = BuildFileName(ext, lossless, stamp);
+        var sw = System.Diagnostics.Stopwatch.StartNew();
+
+        var data = Pool.GetStream("scan-encoded");
+        try
+        {
+            switch (fmt)
+            {
+                case ScanFormat.Png:
+                    await image.SaveAsPngAsync(data, new PngEncoder
+                    {
+                        CompressionLevel = PngCompressionLevel.BestCompression,
+                    }, ct);
+                    break;
+                case ScanFormat.WebpLossless:
+                    await image.SaveAsWebpAsync(data, new WebpEncoder
+                    {
+                        FileFormat = WebpFileFormatType.Lossless,
+                        Method = WebpEncodingMethod.Default,
+                    }, ct);
+                    break;
+                case ScanFormat.WebpLossy:
+                    await image.SaveAsWebpAsync(data, new WebpEncoder
+                    {
+                        FileFormat = WebpFileFormatType.Lossy,
+                        Quality = JpegQuality,
+                        Method = WebpEncodingMethod.Default,
+                    }, ct);
+                    break;
+                default: // Jpeg
+                    await image.SaveAsJpegAsync(data, new JpegEncoder
+                    {
+                        Quality = JpegQuality,
+                        ColorType = JpegEncodingColor.YCbCrRatio444,
+                    }, ct);
+                    break;
+            }
+            data.Position = 0;
+        }
+        catch
+        {
+            data.Dispose();
+            throw;
+        }
+
+        RecyclableMemoryStream thumb;
+        try { thumb = await MakeThumbnailAsync(image, dpi, seq, fmt, labelFormat, ct); }
+        catch { data.Dispose(); throw; }
+
+        sw.Stop();
+        _logger.LogInformation(
+            "encoded scan #{Seq} {Fmt}: {Bytes} KB + {Thumb} KB thumb in {Elapsed:F2}s",
+            seq, fmt, data.Length / 1024, thumb.Length / 1024, sw.Elapsed.TotalSeconds);
+        return new EncodedVariant(data, thumb, contentType, fileName);
     }
 
     private static async Task<RecyclableMemoryStream> MakeThumbnailAsync(
