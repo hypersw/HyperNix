@@ -99,9 +99,15 @@ public sealed class PendingPrint
     /// True when the user uploaded this as a Telegram Photo (compressed
     /// in transit) rather than as a Document. The bot doesn't *block*
     /// the upload — sometimes you legitimately want to forward a
-    /// channel post — but the UI annotates it so the user has a chance
-    /// to back out and resend as a file.
+    /// channel post — but it gates the Print action behind an explicit
+    /// acknowledgement (see <see cref="CompressedAcknowledged"/>) so
+    /// the lossy quality can't slip through unnoticed and waste paper.
     public bool TelegramCompressed { get; set; }
+    /// User has explicitly tapped through the "I accept compressed
+    /// quality" gate. Print stays disabled until this flips true.
+    /// Reset on every new pending — each upload requires its own
+    /// fresh acknowledgement.
+    public bool CompressedAcknowledged { get; set; }
 
     public const int MinReasonableDpi = 100;
     /// Tolerance for the "1:1 fits?" check. A 1 mm slop catches
@@ -206,12 +212,16 @@ public enum LiveMessageKind
 /// Classifier output for an incoming file. Image and Pageable are
 /// directly stageable; Renderable means we have to bounce it through
 /// the rendering daemon (libreoffice → PDF) before it becomes a
-/// Pageable PendingPrint.
+/// Pageable PendingPrint; ConvertibleImage means it's an image
+/// in a container ImageSharp can't read (HEIC, AVIF) and must
+/// be converted to PNG via the renderer first, then treated as
+/// a normal Image.
 /// </summary>
 public enum IncomingFileKind
 {
     Pageable,
     Image,
+    ConvertibleImage,
     Renderable,
     Unsupported,
 }
@@ -451,11 +461,14 @@ public static class PrintMessage
             ? $" · fills <b>{fp:F0}%</b> of page"
             : "";
         // Telegram-compressed warning: user uploaded as a Photo
-        // (which TG transcodes) rather than as a Document. Print
-        // anyway — they may have meant to forward a chat photo —
-        // but make the trade-off visible.
+        // (which TG transcodes) rather than as a Document. Once
+        // they've ticked the consent box the warning shrinks to
+        // an "(acknowledged)" hint so the surface area stays small
+        // but the trade-off remains visible.
         var compressedWarn = p.TelegramCompressed
-            ? "\n⚠ <i>Sent as Telegram media (compressed). Resend as a file for full quality.</i>"
+            ? p.CompressedAcknowledged
+                ? "\n<i>⚠ compressed (acknowledged) — resend as a file for full quality</i>"
+                : "\n⚠ <b>Sent as Telegram media (compressed).</b> Tick the box below or resend as a file for full quality."
             : "";
 
         return
@@ -488,6 +501,31 @@ public static class PrintMessage
         if (s.Pending is null || s.Printing) return null;
 
         var p = s.Pending;
+
+        // Compressed-photo consent gate: when the user uploaded as a
+        // Telegram Photo (TG-recompressed in transit), hide all the
+        // print machinery until they explicitly tap through the
+        // checkbox. Wasted paper from "oh I didn't realise it'd
+        // print pixelated" is a real failure mode — passive warnings
+        // are too easy to skip.
+        if (p.TelegramCompressed && !p.CompressedAcknowledged)
+        {
+            return new InlineKeyboardMarkup(new[]
+            {
+                new[]
+                {
+                    InlineKeyboardButton.WithCallbackData(
+                        "☐ I accept compressed quality",
+                        $"print:ackcomp:{p.Id}"),
+                },
+                new[]
+                {
+                    InlineKeyboardButton.WithCallbackData("❌ Cancel",
+                        $"print:cancel:{p.Id}"),
+                },
+            });
+        }
+
         var rows = new List<InlineKeyboardButton[]>();
 
         // Image-only: scale + orientation pickers above the action row.

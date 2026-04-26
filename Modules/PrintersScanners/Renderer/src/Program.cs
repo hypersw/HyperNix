@@ -125,6 +125,88 @@ app.MapPost("/render", async (HttpRequest request, CancellationToken ct) =>
     }
 });
 
+// Decode device-specific image containers (HEIC from iPhones, AVIF
+// from modern web pipelines) into a vanilla PNG the bot's image
+// path can then read with SixLabors.ImageSharp. Each tool runs in
+// its own subprocess inside the renderer's existing systemd jail,
+// so a CVE in libheif's HEVC decoder takes the child down rather
+// than the parent.
+app.MapPost("/image-convert", async (HttpRequest request, CancellationToken ct) =>
+{
+    var form = await request.ReadFormAsync(ct);
+    var file = form.Files.FirstOrDefault();
+    if (file is null) return Results.BadRequest("No file provided");
+    if (file.Length <= 0) return Results.BadRequest("Empty file");
+
+    var jobId = Guid.NewGuid().ToString("N")[..12];
+    var stateRoot = Environment.GetEnvironmentVariable("STATE_DIRECTORY")
+        ?? "/var/lib/printscan-renderer";
+    var jobDir = Path.Combine(stateRoot, "jobs", jobId);
+    Directory.CreateDirectory(jobDir);
+    log.LogInformation("image-convert {Job}: {File} ({Bytes} bytes, type={Type})",
+        jobId, file.FileName, file.Length, file.ContentType ?? "?");
+
+    try
+    {
+        var safeName = MakeSafeFilename(file.FileName ?? "input");
+        var inputPath = Path.Combine(jobDir, safeName);
+        await using (var fs = File.Create(inputPath))
+            await file.CopyToAsync(fs, ct);
+
+        var ext = Path.GetExtension(safeName).ToLowerInvariant();
+        var outputPath = Path.Combine(jobDir,
+            Path.GetFileNameWithoutExtension(safeName) + ".png");
+
+        // Try heif-convert first — it handles both HEIC and modern
+        // AVIF, and libheif's build in nixpkgs typically includes
+        // the AV1 decoders needed for the latter. Fall back to
+        // avifdec on AVIF-specific failures.
+        try
+        {
+            await RunToolAsync(
+                ToolPaths.HeifConvert, [inputPath, outputPath],
+                jobDir, jobId, "heif-convert", log, ct, TimeSpan.FromMinutes(1));
+        }
+        catch (RenderFailedException) when (ext is ".avif")
+        {
+            log.LogInformation(
+                "image-convert {Job}: heif-convert failed on AVIF, retrying with avifdec",
+                jobId);
+            await RunToolAsync(
+                ToolPaths.AvifDec, [inputPath, outputPath],
+                jobDir, jobId, "avifdec", log, ct, TimeSpan.FromMinutes(1));
+        }
+
+        if (!File.Exists(outputPath))
+            throw new RenderFailedException("image-convert",
+                "image conversion produced no output",
+                "decoder reported success but no output at " + outputPath);
+
+        var pngBytes = await File.ReadAllBytesAsync(outputPath, ct);
+        return Results.File(pngBytes,
+            contentType: "image/png",
+            fileDownloadName: Path.GetFileNameWithoutExtension(safeName) + ".png");
+    }
+    catch (RenderFailedException ex)
+    {
+        log.LogWarning("image-convert {Job}: {Tool} failed: {Err}",
+            jobId, ex.Tool, Trunc(ex.Details));
+        return Results.Problem(
+            title: ex.Friendly, detail: ex.Details, statusCode: 502);
+    }
+    catch (Exception ex)
+    {
+        log.LogError(ex, "image-convert {Job} failed", jobId);
+        return Results.Problem(
+            title: "image converter crashed",
+            detail: ex.Message, statusCode: 500);
+    }
+    finally
+    {
+        try { Directory.Delete(jobDir, recursive: true); } catch { }
+    }
+});
+
 app.MapPost("/pdf-info", async (HttpRequest request, CancellationToken ct) =>
 {
     var form = await request.ReadFormAsync(ct);
@@ -190,6 +272,12 @@ static async Task<byte[]?> ConvertAsync(
         ".md" or ".markdown" =>
             await MarkdownToPdfAsync(inputPath, jobDir, log, jobId, ct),
 
+        // EPUB — zipped HTML+CSS+assets. soffice's import is
+        // unreliable; pandoc handles EPUB natively. Same docx →
+        // soffice tail as Markdown.
+        ".epub" =>
+            await PandocToPdfAsync(inputPath, jobDir, "epub", log, jobId, ct),
+
         // Office formats (incl. plain text and HTML which soffice
         // imports natively) — the catch-all soffice path.
         _ => await SofficeToPdfAsync(inputPath, jobDir, log, jobId, ct),
@@ -214,24 +302,30 @@ static async Task<byte[]> XpsToPdfAsync(
 }
 
 static async Task<byte[]> MarkdownToPdfAsync(
-    string inputPath, string jobDir, ILogger log, string jobId, CancellationToken ct)
+    string inputPath, string jobDir, ILogger log, string jobId, CancellationToken ct) =>
+    await PandocToPdfAsync(inputPath, jobDir, "markdown", log, jobId, ct);
+
+/// <summary>
+/// Generic pandoc-to-soffice path. Pandoc converts the source
+/// format to DOCX (its built-in writer, no PDF engine needed),
+/// then soffice converts the DOCX to PDF. Works the same way
+/// for any of pandoc's input formats — Markdown, EPUB, etc.
+/// </summary>
+static async Task<byte[]> PandocToPdfAsync(
+    string inputPath, string jobDir, string fromFormat,
+    ILogger log, string jobId, CancellationToken ct)
 {
     var docxPath = Path.Combine(jobDir,
         Path.GetFileNameWithoutExtension(inputPath) + ".docx");
-    // Markdown → DOCX. --standalone for a complete document,
-    // --mathml not used here since the docx writer emits OMML
-    // natively for inline LaTeX math (`$x^2$`) and display math
-    // blocks (`$$ … $$`).
     await RunToolAsync(
         ToolPaths.Pandoc,
-        ["--from=markdown", "--to=docx", "--standalone",
+        [$"--from={fromFormat}", "--to=docx", "--standalone",
          "--output=" + docxPath, inputPath],
         jobDir, jobId, "pandoc", log, ct, TimeSpan.FromMinutes(1));
     if (!File.Exists(docxPath))
         throw new RenderFailedException("pandoc",
-            "markdown → docx produced no output",
+            $"{fromFormat} → docx produced no output",
             "pandoc reported success but no output at " + docxPath);
-    // Then docx → PDF via the regular soffice path.
     return await SofficeToPdfAsync(docxPath, jobDir, log, jobId, ct);
 }
 

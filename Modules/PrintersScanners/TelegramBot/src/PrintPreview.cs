@@ -2,6 +2,7 @@ using PrintScan.Shared;
 using SixLabors.ImageSharp;
 using SixLabors.ImageSharp.Drawing;
 using SixLabors.ImageSharp.Drawing.Processing;
+using SixLabors.ImageSharp.Formats.Webp;
 using SixLabors.ImageSharp.PixelFormats;
 using SixLabors.ImageSharp.Processing;
 
@@ -35,7 +36,13 @@ public static class PrintPreview
 
     private const double InchesPerMm = 1.0 / 25.4;
 
-    public sealed record Result(byte[] PngBytes, double FillPercent);
+    /// Container for the composed preview. Bytes are encoded as
+    /// lossy WebP at Q=80 — substantially smaller than PNG, which
+    /// matters when we re-send on every toggle. The printer is mono
+    /// so we grayscale the source as part of composition; the
+    /// preview is then both quicker to ship and accurately reflects
+    /// what'll actually print (post-grayscale-conversion).
+    public sealed record Result(byte[] WebpBytes, double FillPercent);
 
     /// <summary>
     /// Synthesise a preview PNG showing how <paramref name="sourceBytes"/>
@@ -154,21 +161,23 @@ public static class PrintPreview
             }
         }
 
-        // Resize source to the target canvas size up front so we can
-        // stamp it onto the page canvas with one DrawImage. ImageSharp's
-        // resampler choice matters here — Lanczos3 is the right default
-        // for downscaling photo content. For tiny upscales (1:1 of a
-        // very high-dpi image at small physical size on a small canvas)
-        // it's also fine.
+        // Resize-and-grayscale the source up front so the preview
+        // reflects what the printer will actually receive (P2015n is
+        // mono — there is no colour print, ever, so showing the user
+        // the colour version of their image is a lie). Lanczos3 is
+        // the right resampler default for both photo and screen
+        // content downscale; the Grayscale() pass uses BT.709 luma
+        // weights which is what most printer drivers do too.
         var targetW = Math.Max(1, (int)Math.Round(drawW));
         var targetH = Math.Max(1, (int)Math.Round(drawH));
-        using var scaledSource = source.Clone(ctx => ctx.Resize(
-            new ResizeOptions
+        using var scaledSource = source.Clone(ctx => ctx
+            .Resize(new ResizeOptions
             {
                 Mode = ResizeMode.Stretch,
                 Size = new Size(targetW, targetH),
                 Sampler = KnownResamplers.Lanczos3,
-            }));
+            })
+            .Grayscale());
 
         using var canvas = new Image<Rgb24>(canvasW, canvasH);
         canvas.Mutate(ctx =>
@@ -218,7 +227,12 @@ public static class PrintPreview
         var fillPct = (visW * visH) / (double)(canvasW * canvasH) * 100.0;
 
         using var ms = new MemoryStream();
-        canvas.SaveAsPng(ms);
+        canvas.SaveAsWebp(ms, new WebpEncoder
+        {
+            FileFormat = WebpFileFormatType.Lossy,
+            Quality = 80,
+            Method = WebpEncodingMethod.Default,
+        });
         return new Result(ms.ToArray(), fillPct);
     }
 }

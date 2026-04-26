@@ -37,6 +37,19 @@ let
             "${pkgs.poppler-utils}/bin/pdfinfo";
         public static readonly string PdfToPpm =
             "${pkgs.poppler-utils}/bin/pdftoppm";
+        // libheif's heif-convert decodes HEIC / HEIF (Apple devices)
+        // and recent libheif builds also handle AVIF (AV1-encoded HEIF
+        // container). Outputs JPEG / PNG / Y4M; we use PNG for
+        // lossless transitional bytes the bot then re-reads via
+        // ImageSharp.
+        public static readonly string HeifConvert =
+            "${pkgs.libheif}/bin/heif-convert";
+        // libavif's avifdec — AVIF-specific decoder, used as a
+        // fallback when heif-convert reports an unsupported AV1
+        // codec configuration or build of libheif without the AOM
+        // backend.
+        public static readonly string AvifDec =
+            "${pkgs.libavif}/bin/avifdec";
     }
   '';
 in

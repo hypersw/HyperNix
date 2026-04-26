@@ -101,6 +101,47 @@ public sealed class RendererClient : IDisposable
     }
 
     /// <summary>
+    /// Convert a device-specific image container (HEIC, AVIF) into
+    /// a vanilla PNG that ImageSharp can decode. Throws on failure
+    /// — the bot caller surfaces a friendly message.
+    /// </summary>
+    public async Task<byte[]> ConvertImageAsync(
+        byte[] sourceBytes, string fileName, string contentType,
+        CancellationToken ct)
+    {
+        if (!Enabled)
+            throw new InvalidOperationException(
+                "Renderer disabled (PRINTSCAN_RENDERER_SOCKET not set)");
+
+        using var content = new System.Net.Http.MultipartFormDataContent();
+        var fileContent = new System.Net.Http.ByteArrayContent(sourceBytes);
+        fileContent.Headers.ContentType =
+            new System.Net.Http.Headers.MediaTypeHeaderValue(contentType);
+        content.Add(fileContent, "file", fileName);
+
+        using var resp = await _http.PostAsync("/image-convert", content, ct);
+        if (!resp.IsSuccessStatusCode)
+        {
+            var bodyStr = await resp.Content.ReadAsStringAsync(ct);
+            string? title = null, detail = bodyStr;
+            try
+            {
+                using var doc = System.Text.Json.JsonDocument.Parse(bodyStr);
+                if (doc.RootElement.TryGetProperty("title", out var t))
+                    title = t.GetString();
+                if (doc.RootElement.TryGetProperty("detail", out var d))
+                    detail = d.GetString() ?? bodyStr;
+            }
+            catch (System.Text.Json.JsonException) { }
+            throw new RenderFailedRemotely(
+                (int)resp.StatusCode,
+                title ?? $"image converter returned HTTP {(int)resp.StatusCode}",
+                detail ?? "");
+        }
+        return await resp.Content.ReadAsByteArrayAsync(ct);
+    }
+
+    /// <summary>
     /// Ask the renderer how many pages are in this PDF. Best-effort:
     /// returns null if the daemon's disabled, the call errors, or
     /// pdfinfo couldn't read the file. Used to decide whether to

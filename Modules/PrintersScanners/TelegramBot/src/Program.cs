@@ -642,8 +642,8 @@ async Task RenderPrintSessionAsync(long chatId, CancellationToken ct)
                 if (s2 is null) return;
                 (html, kb) = PrintMessage.Render(s2, botUsername);
 
-                using var mediaStream = new MemoryStream(preview.PngBytes);
-                var media = new InputMediaPhoto(new InputFileStream(mediaStream, "preview.png"))
+                using var mediaStream = new MemoryStream(preview.WebpBytes);
+                var media = new InputMediaPhoto(new InputFileStream(mediaStream, "preview.webp"))
                 {
                     Caption = html,
                     ParseMode = ParseMode.Html,
@@ -728,9 +728,9 @@ async Task HandoverPrintSessionAsync(long chatId, CancellationToken ct)
         lock (printSessionsLock) { printSessions.TryGetValue(chatId, out s2); }
         if (s2 is not null) (html, kb) = PrintMessage.Render(s2, botUsername);
 
-        using var ms = new MemoryStream(preview.PngBytes);
+        using var ms = new MemoryStream(preview.WebpBytes);
         sent = await bot.SendPhoto(chatId,
-            photo: new InputFileStream(ms, "preview.png"),
+            photo: new InputFileStream(ms, "preview.webp"),
             caption: html, parseMode: ParseMode.Html,
             replyMarkup: kb, cancellationToken: ct);
         lock (printSessionsLock)
@@ -800,6 +800,60 @@ async Task StageDocumentForPrintAsync(long chatId, Document doc, CancellationTok
     await bot.GetInfoAndDownloadFile(doc.FileId, ms, ct);
     var bytes = ms.ToArray();
     var fileName = doc.FileName ?? "document";
+
+    // HEIC / AVIF: ImageSharp can't read these, so we bounce through
+    // the renderer's image-convert endpoint to get a vanilla PNG
+    // first, then proceed down the normal Image-staging path.
+    if (classified.Kind == IncomingFileKind.ConvertibleImage)
+    {
+        if (!renderer.Enabled)
+        {
+            await bot.SendMessage(chatId,
+                "❌ HEIC/AVIF support needs the renderer service, which isn't enabled. " +
+                "Convert to JPEG/PNG on your device first.",
+                cancellationToken: ct);
+            return;
+        }
+        var notice = await bot.SendMessage(chatId,
+            $"🔄 Decoding <code>{System.Net.WebUtility.HtmlEncode(fileName)}</code>…",
+            parseMode: ParseMode.Html, cancellationToken: ct);
+        byte[] pngBytes;
+        try
+        {
+            pngBytes = await renderer.ConvertImageAsync(
+                bytes, fileName, classified.ContentType, ct);
+        }
+        catch (Exception ex)
+        {
+            log.LogWarning(ex, "image-convert failed for {File}", fileName);
+            string body;
+            if (ex is RenderFailedRemotely rf)
+            {
+                var raw = rf.RawDetail.Trim();
+                if (raw.Length > 1000) raw = raw[..1000] + "…";
+                body = $"❌ Decoding failed: <b>{System.Net.WebUtility.HtmlEncode(rf.Friendly)}</b>" +
+                    (raw.Length > 0 ? $"\n<pre><code>{System.Net.WebUtility.HtmlEncode(raw)}</code></pre>" : "");
+            }
+            else
+            {
+                body = $"❌ Decoding failed: <b>{System.Net.WebUtility.HtmlEncode(ex.Message)}</b>";
+            }
+            try { await bot.EditMessageText(chatId, notice.Id, body,
+                parseMode: ParseMode.Html, cancellationToken: ct); }
+            catch { }
+            return;
+        }
+        try { await bot.DeleteMessage(chatId, notice.Id, ct); }
+        catch (Exception ex) { log.LogDebug("notice delete: {Err}", ex.Message); }
+
+        // Drop the original file extension and any HEIC magic in
+        // the name; the staged file is genuinely a PNG now.
+        var pngName = Path.ChangeExtension(fileName, ".png");
+        await StageBytesForPrintAsync(chatId, pngName, "image/png",
+            PendingPrintKind.Image, pngBytes,
+            telegramCompressed: false, ct);
+        return;
+    }
 
     if (classified.Kind == IncomingFileKind.Renderable)
     {
@@ -1016,6 +1070,23 @@ static (IncomingFileKind Kind, string ContentType) ClassifyForPrint(string? mime
         || ext is ".ps" or ".eps")
         return (IncomingFileKind.Pageable, "application/postscript");
 
+    // HEIC / AVIF — image, but ImageSharp can't decode them
+    // directly (no managed decoder available on .NET 10). Route
+    // through the renderer's /image-convert which drops to
+    // libheif's heif-convert / libavif's avifdec to produce a
+    // PNG the bot can then handle as a normal Image.
+    if (mimeLower is "image/heic" or "image/heif" or "image/avif"
+        || ext is ".heic" or ".heif" or ".avif")
+    {
+        var ct = mimeLower.StartsWith("image/") ? mimeLower : ext switch
+        {
+            ".heic" or ".heif" => "image/heic",
+            ".avif" => "image/avif",
+            _ => "application/octet-stream",
+        };
+        return (IncomingFileKind.ConvertibleImage, ct);
+    }
+
     if (mimeLower.StartsWith("image/") || ext is ".jpg" or ".jpeg" or ".png"
         or ".webp" or ".gif" or ".bmp" or ".tif" or ".tiff")
     {
@@ -1032,11 +1103,17 @@ static (IncomingFileKind Kind, string ContentType) ClassifyForPrint(string? mime
         return (IncomingFileKind.Image, ct);
     }
 
-    // Office formats — bounce through the renderer daemon. We list
-    // the common MIMEs explicitly because Telegram clients tend to
-    // tag user uploads with a generic "application/octet-stream"
-    // and we'd rather match on filename extension as a fallback than
-    // miss a docx upload entirely.
+    // Office formats + EPUB + Markdown — bounce through the
+    // renderer daemon. We list the common MIMEs explicitly because
+    // Telegram clients tend to tag user uploads with a generic
+    // "application/octet-stream" and we'd rather match on filename
+    // extension as a fallback than miss a docx upload entirely.
+    //
+    // CSV is intentionally NOT listed: soffice's CSV importer needs
+    // the column-separator/quote-char wizard to fire, and we don't
+    // expose those as toggles; the result for any non-defaults file
+    // is silently wrong. Users can convert their CSVs to ODS/XLSX
+    // first if they want a printable spreadsheet.
     if (mimeLower
         is "application/msword"
         or "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
@@ -1044,6 +1121,8 @@ static (IncomingFileKind Kind, string ContentType) ClassifyForPrint(string? mime
         or "application/rtf"
         or "text/rtf"
         or "text/plain"
+        or "text/markdown"
+        or "application/epub+zip"
         or "application/vnd.ms-excel"
         or "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
         or "application/vnd.oasis.opendocument.spreadsheet"
@@ -1051,6 +1130,7 @@ static (IncomingFileKind Kind, string ContentType) ClassifyForPrint(string? mime
         or "application/vnd.openxmlformats-officedocument.presentationml.presentation"
         or "application/vnd.oasis.opendocument.presentation"
         || ext is ".doc" or ".docx" or ".odt" or ".rtf" or ".txt"
+              or ".md"  or ".markdown" or ".epub"
               or ".xls" or ".xlsx" or ".ods"
               or ".ppt" or ".pptx" or ".odp")
     {
@@ -1063,6 +1143,8 @@ static (IncomingFileKind Kind, string ContentType) ClassifyForPrint(string? mime
                 ".odt"  => "application/vnd.oasis.opendocument.text",
                 ".rtf"  => "application/rtf",
                 ".txt"  => "text/plain",
+                ".md" or ".markdown" => "text/markdown",
+                ".epub" => "application/epub+zip",
                 ".xls"  => "application/vnd.ms-excel",
                 ".xlsx" => "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                 ".ods"  => "application/vnd.oasis.opendocument.spreadsheet",
@@ -1226,6 +1308,22 @@ async Task HandlePrintCallbackAsync(long chatId, string data, CancellationToken 
                 if (!current.Add(pageNum)) current.Remove(pageNum);
                 bs2.Pending.PageRange = PageRangeNotation.Serialize(current);
                 bs2.View = PrintPickerView.Pages;
+            }
+            await RenderPrintSessionAsync(chatId, ct);
+            break;
+        }
+        case "ackcomp":
+        {
+            // print:ackcomp:<pid> — user clicked "I accept compressed
+            // quality"; flip the gate so the rest of the print UI
+            // becomes available.
+            var pid = parts[2];
+            if (!MatchesCurrent(pid)) return;
+            lock (printSessionsLock)
+            {
+                if (printSessions.TryGetValue(chatId, out var bs2) &&
+                    bs2.Pending is { } cur)
+                    cur.CompressedAcknowledged = true;
             }
             await RenderPrintSessionAsync(chatId, ct);
             break;
