@@ -41,6 +41,30 @@ public sealed class PrintService
             request.PageRange ?? "all", request.PageSelection,
             request.Scale, request.Orientation);
 
+        // End-to-end test path: write whatever the bot handed us
+        // verbatim into <STATE_DIRECTORY>/printed/. Lets the user
+        // inspect what would have hit CUPS without burning paper.
+        // When the real lp-driven implementation lands this will
+        // be replaced by a CUPS subprocess; the file output stays
+        // as an audit trail (the lp invocation's tee).
+        try
+        {
+            var stateRoot = Environment.GetEnvironmentVariable("STATE_DIRECTORY")
+                ?? "/var/lib/printscan-daemon";
+            var outDir = Path.Combine(stateRoot, "printed");
+            Directory.CreateDirectory(outDir);
+            var stamp = DateTimeOffset.Now.ToString("yyyyMMdd-HHmmss-fff");
+            var safeName = string.Concat((request.FileName ?? "job")
+                .Select(c => char.IsAsciiLetterOrDigit(c) || c is '-' or '_' or '.' ? c : '_'));
+            var path = Path.Combine(outDir, $"{stamp}-{safeName}");
+            await File.WriteAllBytesAsync(path, request.FileData, ct);
+            _logger.LogInformation("STUB PRINT wrote: {Path}", path);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "STUB PRINT failed to write output file");
+        }
+
         // Simulated processing time. A real Pi-attached HP LaserJet at
         // 100-150 ms per page is typical, but for a stub we just want
         // the bot's "🖨 printing…" intermediate state to be visible

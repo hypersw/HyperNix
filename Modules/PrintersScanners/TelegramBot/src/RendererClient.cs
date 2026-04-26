@@ -101,6 +101,39 @@ public sealed class RendererClient : IDisposable
     }
 
     /// <summary>
+    /// Rasterise the first <paramref name="maxPages"/> pages of a
+    /// PDF into a single grayscale WebP, stacked vertically. Used
+    /// by the bot's preview path — a multi-page document gets its
+    /// first few pages composited into one image and shipped as a
+    /// Telegram Document so the user sees what'll print without
+    /// the platform recompressing the bytes. Returns null on any
+    /// failure so the caller can fall back to the bare-PDF send.
+    /// </summary>
+    public async Task<byte[]?> GetPdfPreviewAsync(
+        byte[] pdfBytes, string fileName, int maxPages, CancellationToken ct)
+    {
+        if (!Enabled) return null;
+        try
+        {
+            using var content = new System.Net.Http.MultipartFormDataContent();
+            var fileContent = new System.Net.Http.ByteArrayContent(pdfBytes);
+            fileContent.Headers.ContentType =
+                new System.Net.Http.Headers.MediaTypeHeaderValue("application/pdf");
+            content.Add(fileContent, "file", fileName);
+            content.Add(new System.Net.Http.StringContent(maxPages.ToString()), "maxPages");
+
+            using var resp = await _http.PostAsync("/pdf-preview", content, ct);
+            if (!resp.IsSuccessStatusCode) return null;
+            return await resp.Content.ReadAsByteArrayAsync(ct);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogDebug("pdf-preview failed for {File}: {Err}", fileName, ex.Message);
+            return null;
+        }
+    }
+
+    /// <summary>
     /// Convert a device-specific image container (HEIC, AVIF) into
     /// a vanilla PNG that ImageSharp can decode. Throws on failure
     /// — the bot caller surfaces a friendly message.

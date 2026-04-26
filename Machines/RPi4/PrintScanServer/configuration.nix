@@ -23,6 +23,25 @@
   networking.hostName = "printscan";
   system.stateVersion = "25.05";
 
+  # Broad font set for the rendering daemon's fallback path on PDFs
+  # whose creator forgot to embed everything. Ghostscript / soffice
+  # / pandoc all consult fontconfig, which reads
+  # /run/current-system/sw/share/fonts populated from this list.
+  # The renderer service inherits access via its read-only system
+  # paths; no per-service binding needed.
+  fonts.packages = with pkgs; [
+    dejavu_fonts          # neutral sans/serif/mono, public domain
+    liberation_ttf        # metric-compatible with Arial / Times / Courier
+    corefonts             # actual MS Arial / Times / Courier (binary, license-OK for personal use)
+    noto-fonts            # huge Unicode coverage (Latin / Cyrillic / CJK / emoji-less)
+    noto-fonts-cjk-sans   # Chinese / Japanese / Korean fallback
+    freefont_ttf          # GNU FreeFont — additional metric-compat
+    cantarell-fonts       # GNOME default sans
+    source-sans
+    source-serif
+    source-code-pro
+  ];
+
   # Required for RPi4 WiFi (brcmfmac) and Bluetooth firmware blobs.
   hardware.enableRedistributableFirmware = true;
 

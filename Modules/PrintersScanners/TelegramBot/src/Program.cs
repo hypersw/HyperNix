@@ -744,16 +744,33 @@ async Task HandoverPrintSessionAsync(long chatId, CancellationToken ct)
     }
     else if (s.Pending is { } pd && pd.Kind == PendingPrintKind.Pageable)
     {
-        // Send the pageable as a Document so the user can verify
-        // contents. This works even for many-page PDFs that don't
-        // have a per-page preview yet — Telegram renders document
-        // messages with a faint inline thumbnail and the file name,
-        // and tap-to-view shows the full PDF.
-        using var ms = new MemoryStream(pd.Data);
-        sent = await bot.SendDocument(chatId,
-            document: new InputFileStream(ms, pd.FileName),
-            caption: html, parseMode: ParseMode.Html,
-            replyMarkup: kb, cancellationToken: ct);
+        // Try the renderer's /pdf-preview path first — a grayscale
+        // WebP composite of the first 3 pages, sent as a Document
+        // so Telegram doesn't recompress. Falls back to the original
+        // PDF as a Document if the preview fetch fails (network, the
+        // file isn't actually parseable as PDF, etc.) so the user
+        // still sees something.
+        byte[]? webp = null;
+        if (renderer.Enabled)
+            webp = await renderer.GetPdfPreviewAsync(pd.Data, pd.FileName, maxPages: 3, ct);
+
+        if (webp is not null)
+        {
+            using var ms = new MemoryStream(webp);
+            var previewName = Path.GetFileNameWithoutExtension(pd.FileName) + ".preview.webp";
+            sent = await bot.SendDocument(chatId,
+                document: new InputFileStream(ms, previewName),
+                caption: html, parseMode: ParseMode.Html,
+                replyMarkup: kb, cancellationToken: ct);
+        }
+        else
+        {
+            using var ms = new MemoryStream(pd.Data);
+            sent = await bot.SendDocument(chatId,
+                document: new InputFileStream(ms, pd.FileName),
+                caption: html, parseMode: ParseMode.Html,
+                replyMarkup: kb, cancellationToken: ct);
+        }
         lock (printSessionsLock)
         {
             if (printSessions.TryGetValue(chatId, out var bs3))
@@ -1387,10 +1404,47 @@ async Task ExecutePrintAsync(long chatId, string pendingId, CancellationToken ct
     string? error = null;
     try
     {
+        // Image preprocessing pipeline: Lanczos3 upscale (only when
+        // it'd materially improve crispness — typically Telegram-
+        // compressed photos and small web images) + grayscale
+        // conversion. Output is PNG so CUPS' filter chain decodes
+        // it once and downstream rasterization is the only resample
+        // step. PDF / PS uploads pass through untouched — vector
+        // content is rasterized directly by Ghostscript at the
+        // printer's native resolution, no benefit to bot-side
+        // pixel-level pre-processing.
+        byte[] payloadBytes = p!.Data;
+        string payloadName = p.FileName;
+        string payloadCt   = p.ContentType;
+        if (p.Kind == PendingPrintKind.Image)
+        {
+            try
+            {
+                var processed = await PrintPreprocess.ProcessForPrintAsync(
+                    p.Data, p.PaperShortInches, p.PaperLongInches, ct);
+                payloadBytes = processed.PngBytes;
+                payloadName  = Path.ChangeExtension(p.FileName, ".png");
+                payloadCt    = "image/png";
+                log.LogInformation(
+                    "preprocessed {File}: {W}x{H} @ {Dpi} dpi → {Bytes} byte PNG",
+                    p.FileName, processed.Width, processed.Height,
+                    processed.Dpi, payloadBytes.Length);
+            }
+            catch (Exception ex)
+            {
+                // Fail-open: ship the original bytes if pre-processing
+                // throws. Rather have the user's print arrive at a
+                // lower quality than have the print job fail.
+                log.LogWarning(ex,
+                    "image preprocess failed for {File}, sending raw",
+                    p.FileName);
+            }
+        }
+
         using var content = new MultipartFormDataContent();
-        var fileContent = new ByteArrayContent(p!.Data);
-        fileContent.Headers.ContentType = new MediaTypeHeaderValue(p.ContentType);
-        content.Add(fileContent, "file", p.FileName);
+        var fileContent = new ByteArrayContent(payloadBytes);
+        fileContent.Headers.ContentType = new MediaTypeHeaderValue(payloadCt);
+        content.Add(fileContent, "file", payloadName);
         content.Add(new StringContent(p.Scale.ToString()), "scale");
         content.Add(new StringContent(p.Orientation.ToString()), "orientation");
         // Custom range wins over the preset when non-empty — see

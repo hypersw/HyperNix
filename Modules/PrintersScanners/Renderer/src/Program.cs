@@ -207,6 +207,93 @@ app.MapPost("/image-convert", async (HttpRequest request, CancellationToken ct) 
     }
 });
 
+// Multi-page PDF preview as a single grayscale WebP. The bot uses
+// this for Pageables: rasterize the first N pages, stack them
+// vertically with a thin separator, ship as a Document so Telegram
+// doesn't recompress. Single ImageMagick invocation under the hood
+// — IM rasterizes the PDF (via Ghostscript), grayscales, stacks,
+// encodes WebP; we don't need to coordinate pdftoppm + montage
+// ourselves.
+app.MapPost("/pdf-preview", async (HttpRequest request, CancellationToken ct) =>
+{
+    var form = await request.ReadFormAsync(ct);
+    var file = form.Files.FirstOrDefault();
+    if (file is null) return Results.BadRequest("No file provided");
+    if (file.Length <= 0) return Results.BadRequest("Empty file");
+
+    // maxPages and density both have query/form fallbacks. 3 pages
+    // at 120 dpi keeps the WebP under ~150 KB for typical content.
+    var maxPagesStr = form["maxPages"].FirstOrDefault() ?? "3";
+    if (!int.TryParse(maxPagesStr, out var maxPages) || maxPages < 1)
+        maxPages = 3;
+    if (maxPages > 10) maxPages = 10;
+    var densityStr = form["density"].FirstOrDefault() ?? "120";
+    if (!int.TryParse(densityStr, out var density) || density < 50)
+        density = 120;
+    if (density > 300) density = 300;
+
+    var jobId = Guid.NewGuid().ToString("N")[..12];
+    var stateRoot = Environment.GetEnvironmentVariable("STATE_DIRECTORY")
+        ?? "/var/lib/printscan-renderer";
+    var jobDir = Path.Combine(stateRoot, "jobs", jobId);
+    Directory.CreateDirectory(jobDir);
+    log.LogInformation("pdf-preview {Job}: {File} maxPages={MaxPages} density={Density}",
+        jobId, file.FileName, maxPages, density);
+    try
+    {
+        var inputPath = Path.Combine(jobDir, MakeSafeFilename(file.FileName ?? "input.pdf"));
+        await using (var fs = File.Create(inputPath))
+            await file.CopyToAsync(fs, ct);
+
+        var outputPath = Path.Combine(jobDir, "preview.webp");
+        // ImageMagick page-range is "[start-end]" 0-indexed.
+        // Density first means it controls input rasterization.
+        // -append stacks vertically; -alpha remove + -background white
+        // flatten any transparency (otherwise WebP encodes alpha
+        // that doesn't help us). -colorspace gray + -type Grayscale
+        // commits to grayscale before encode.
+        await RunToolAsync(
+            ToolPaths.Magick,
+            ["-density", density.ToString(),
+             $"{inputPath}[0-{Math.Max(0, maxPages - 1)}]",
+             "-alpha", "remove",
+             "-background", "white",
+             "-colorspace", "gray",
+             "-type", "Grayscale",
+             "-quality", "80",
+             "-append",
+             outputPath],
+            jobDir, jobId, "magick", log, ct, TimeSpan.FromMinutes(2));
+        if (!File.Exists(outputPath))
+            throw new RenderFailedException("magick",
+                "PDF preview produced no output",
+                "magick reported success but no output at " + outputPath);
+        var bytes = await File.ReadAllBytesAsync(outputPath, ct);
+        log.LogInformation("pdf-preview {Job}: produced {Bytes} byte WebP",
+            jobId, bytes.Length);
+        return Results.File(bytes, contentType: "image/webp",
+            fileDownloadName: "preview.webp");
+    }
+    catch (RenderFailedException ex)
+    {
+        log.LogWarning("pdf-preview {Job}: {Tool} failed: {Err}",
+            jobId, ex.Tool, Trunc(ex.Details));
+        return Results.Problem(
+            title: ex.Friendly, detail: ex.Details, statusCode: 502);
+    }
+    catch (Exception ex)
+    {
+        log.LogError(ex, "pdf-preview {Job} failed", jobId);
+        return Results.Problem(
+            title: "pdf preview crashed",
+            detail: ex.Message, statusCode: 500);
+    }
+    finally
+    {
+        try { Directory.Delete(jobDir, recursive: true); } catch { }
+    }
+});
+
 app.MapPost("/pdf-info", async (HttpRequest request, CancellationToken ct) =>
 {
     var form = await request.ReadFormAsync(ct);

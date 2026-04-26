@@ -50,6 +50,14 @@ let
         // backend.
         public static readonly string AvifDec =
             "${pkgs.libavif}/bin/avifdec";
+        // ImageMagick for compositing — used by /pdf-preview to
+        // rasterize the first N pages of a PDF (via Ghostscript
+        // under the hood) and stack them vertically into one
+        // grayscale WebP. One subprocess invocation does the
+        // whole pipeline, so we don't pull a managed image
+        // library into the renderer.
+        public static readonly string Magick =
+            "${pkgs.imagemagick}/bin/magick";
     }
   '';
 in
