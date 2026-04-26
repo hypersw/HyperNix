@@ -13,7 +13,19 @@ namespace PrintScan.TelegramBot;
 public sealed class BotPrintSession
 {
     public required long ChatId { get; init; }
-    public required int StatusMessageId { get; init; }
+    /// Message id of the *current* live session message. Mutable
+    /// on purpose: every time the user posts a new file the bot
+    /// abandons the previous live message (replacing its body
+    /// with "→ continued below ↓", removing the keyboard) and
+    /// sends a fresh one positioned right under the user's
+    /// upload, so the active session UI stays in view instead
+    /// of scrolling away.
+    public int StatusMessageId { get; set; }
+    /// Type of the current live message. Toggle/confirm/cancel
+    /// edits use editMessageMedia / editMessageCaption / editMessageText
+    /// depending on this — Telegram's edit verbs don't transparently
+    /// span message types. Set on every message-handover.
+    public LiveMessageKind StatusKind { get; set; } = LiveMessageKind.Text;
     public bool PrinterOnline { get; set; } = true;
     /// Paper size as reported by the daemon at session open. Drives
     /// "1:1 fits?" logic and (eventually) preview rendering geometry.
@@ -76,6 +88,20 @@ public sealed class PendingPrint
     /// active". Constructed via the digit-keyboard picker; takes
     /// precedence over <see cref="PageSelection"/> when non-empty.
     public string PageRange { get; set; } = "";
+
+    /// Percent of the physical page area the source image's content
+    /// would occupy, computed by <see cref="PrintPreview"/> when the
+    /// preview is rendered. Surfaces the "is this going to print
+    /// postmark-sized?" answer in the caption — populated for
+    /// images, null otherwise.
+    public double? PreviewFillPercent { get; set; }
+
+    /// True when the user uploaded this as a Telegram Photo (compressed
+    /// in transit) rather than as a Document. The bot doesn't *block*
+    /// the upload — sometimes you legitimately want to forward a
+    /// channel post — but the UI annotates it so the user has a chance
+    /// to back out and resend as a file.
+    public bool TelegramCompressed { get; set; }
 
     public const int MinReasonableDpi = 100;
     /// Tolerance for the "1:1 fits?" check. A 1 mm slop catches
@@ -152,6 +178,28 @@ public enum PendingPrintKind
     Pageable,
     /// Raster image — bot offers scale (1:1/Fit/Fill) and orientation.
     Image,
+}
+
+/// <summary>
+/// Type of the current live-session Telegram message — drives the
+/// edit verb the bot uses on the next refresh.
+/// </summary>
+public enum LiveMessageKind
+{
+    /// Plain text — used at session open before any file lands.
+    /// Subsequent edits go through editMessageText.
+    Text,
+    /// Photo (used for image previews and short-pageable previews).
+    /// Edits go through editMessageMedia (for the preview image)
+    /// or editMessageCaption (for caption-only updates like
+    /// "Printing…" / "Done").
+    Photo,
+    /// Document — used when we send a Pageable (PDF) for the user
+    /// to verify before printing. Edits go through editMessageCaption.
+    /// editMessageMedia on a Document also works but we don't
+    /// need it because the document itself doesn't change with
+    /// scale/orient/range toggles.
+    Document,
 }
 
 /// <summary>
@@ -358,12 +406,13 @@ public static class PrintMessage
 
         if (p.Kind != PendingPrintKind.Image)
         {
-            // Pageable: show page count if we know it.
             var pageInfo = p.PageCount is int pc ? $" · {pc} page{(pc == 1 ? "" : "s")}" : "";
-            return
-                $"{head}{pageInfo}\n" +
-                $"Pages: <b>{PagesEffectiveLabel(p)}</b>\n" +
-                "Ready to print?";
+            // Hide the Pages line entirely for single-page docs —
+            // there's only one option, no need to mention it.
+            var pagesLine = (p.PageCount is int pc2 && pc2 == 1)
+                ? ""
+                : $"\nPages: <b>{PagesEffectiveLabel(p)}</b>";
+            return $"{head}{pageInfo}{pagesLine}\nReady to print?";
         }
 
         var dims = (p.PixelWidth, p.PixelHeight) switch
@@ -396,11 +445,24 @@ public static class PrintMessage
             };
         }
 
+        // Page-fill % from the preview compositor — answers the
+        // "would it land postmark-sized?" question quantitatively.
+        var fillSuffix = p.PreviewFillPercent is double fp
+            ? $" · fills <b>{fp:F0}%</b> of page"
+            : "";
+        // Telegram-compressed warning: user uploaded as a Photo
+        // (which TG transcodes) rather than as a Document. Print
+        // anyway — they may have meant to forward a chat photo —
+        // but make the trade-off visible.
+        var compressedWarn = p.TelegramCompressed
+            ? "\n⚠ <i>Sent as Telegram media (compressed). Resend as a file for full quality.</i>"
+            : "";
+
         return
-            $"{head} · {dims}{dpi}\n" +
+            $"{head} · {dims}{dpi}{fillSuffix}\n" +
             $"Scale: <b>{scaleText}</b>" +
             $" · Orientation: <b>{orientText}</b>" +
-            $" · Pages: <b>{PagesEffectiveLabel(p)}</b>" +
+            compressedWarn +
             "\nReady to print?";
     }
 
@@ -440,16 +502,21 @@ public static class PrintMessage
             });
         }
 
-        // Pages selector applies to both Pageable and Image inputs —
-        // odd/even is occasionally useful even on a one-image scan
-        // when chained into a manual duplex sequence with a second
-        // sheet, though the common use is "skip blank trailing pages
-        // on a multi-page PDF".
-        rows.Add(new[]
+        // Pages selector — only meaningful for documents with more
+        // than one page. Hide it for images (always single-page) and
+        // for single-page PDFs so the UI doesn't offer "Odd / Even"
+        // as if there were multiple sheets to choose from.
+        bool showPages =
+            p.Kind == PendingPrintKind.Pageable &&
+            (p.PageCount is null || p.PageCount.Value > 1);
+        if (showPages)
         {
-            InlineKeyboardButton.WithCallbackData($"📑 Pages: {PagesLabel(p.PageSelection)}",
-                $"print:pick:pages:{p.Id}"),
-        });
+            rows.Add(new[]
+            {
+                InlineKeyboardButton.WithCallbackData($"📑 Pages: {PagesEffectiveLabel(p)}",
+                    $"print:pick:pages:{p.Id}"),
+            });
+        }
 
         rows.Add(new[]
         {
@@ -476,9 +543,13 @@ public static class PrintMessage
         // 1:1 is always offered now — even when the image overflows
         // the printable area or the page itself, the user may know
         // something we don't (paper they actually loaded, willingness
-        // to crop). The badge tells them what'll happen.
+        // to crop). The badge tells them what'll happen, including
+        // an explicit positive ✓ when 1:1 fits — the previous "no
+        // badge" rendering was ambiguous (does silence mean "fits"
+        // or "no info"?).
         var oneOneLabel = "1:1" + p.Fits1to1 switch
         {
+            OneToOneFit.Printable               => " ✓",
             OneToOneFit.PaperFitsMarginsClipped => " ⚠ margins",
             OneToOneFit.Overflows               => " ⚠ won't fit",
             _ => "",

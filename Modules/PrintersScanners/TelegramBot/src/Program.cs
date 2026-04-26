@@ -574,6 +574,7 @@ async Task OpenPrinterSessionAsync(long chatId, CancellationToken ct)
     {
         ChatId = chatId,
         StatusMessageId = placeholder.Id,
+        StatusKind = LiveMessageKind.Text,
         PrinterOnline = online,
         MediaSize = mediaSize,
         Margins = margins,
@@ -606,18 +607,177 @@ async Task RenderPrintSessionAsync(long chatId, CancellationToken ct)
     BotPrintSession? s;
     lock (printSessionsLock) { printSessions.TryGetValue(chatId, out s); }
     if (s is null) return;
+
     var (html, kb) = PrintMessage.Render(s, botUsername);
     try
     {
-        await bot.EditMessageText(chatId, s.StatusMessageId, html,
-            parseMode: ParseMode.Html, replyMarkup: kb,
-            linkPreviewOptions: new() { IsDisabled = true },
-            cancellationToken: ct);
+        switch (s.StatusKind)
+        {
+            case LiveMessageKind.Text:
+                await bot.EditMessageText(chatId, s.StatusMessageId, html,
+                    parseMode: ParseMode.Html, replyMarkup: kb,
+                    linkPreviewOptions: new() { IsDisabled = true },
+                    cancellationToken: ct);
+                break;
+
+            case LiveMessageKind.Photo when s.Pending?.Kind == PendingPrintKind.Image:
+            {
+                // Image preview goes through editMessageMedia so the
+                // image visualisation tracks Scale / Orientation
+                // toggles in real time. Compose first, then send —
+                // a tiny CPU cost per toggle but the UX win is
+                // huge (the user sees the layout change as they
+                // pick options, not after).
+                var preview = await PrintPreview.ComposeImageAsync(
+                    s.Pending.Data, s.Pending, s, ct);
+                lock (printSessionsLock)
+                {
+                    if (printSessions.TryGetValue(chatId, out var bs2) &&
+                        bs2.Pending?.Id == s.Pending.Id)
+                        bs2.Pending.PreviewFillPercent = preview.FillPercent;
+                }
+                // Re-render html now that fill % is on the pending.
+                BotPrintSession? s2;
+                lock (printSessionsLock) { printSessions.TryGetValue(chatId, out s2); }
+                if (s2 is null) return;
+                (html, kb) = PrintMessage.Render(s2, botUsername);
+
+                using var mediaStream = new MemoryStream(preview.PngBytes);
+                var media = new InputMediaPhoto(new InputFileStream(mediaStream, "preview.png"))
+                {
+                    Caption = html,
+                    ParseMode = ParseMode.Html,
+                };
+                await bot.EditMessageMedia(chatId, s.StatusMessageId, media,
+                    replyMarkup: kb, cancellationToken: ct);
+                break;
+            }
+
+            case LiveMessageKind.Photo:
+            case LiveMessageKind.Document:
+                // Caption-only update — used when the state changed
+                // but the underlying media doesn't (e.g., toggling
+                // Pages on a Pageable, or transitioning to "Printing"
+                // / "Done" terminal text).
+                await bot.EditMessageCaption(chatId, s.StatusMessageId,
+                    caption: html, parseMode: ParseMode.Html,
+                    replyMarkup: kb as InlineKeyboardMarkup,
+                    cancellationToken: ct);
+                break;
+        }
     }
     catch (Exception ex)
     {
         if (!ex.Message.Contains("not modified", StringComparison.OrdinalIgnoreCase))
             log.LogDebug("printer render failed: {Err}", ex.Message);
+    }
+}
+
+// Hand session UI off to a freshly-sent message, abandoning the old
+// one in place. Called every time the user posts a file: their
+// upload pushes the chat down past the previous session message,
+// so we send a new one right after their upload. The old message
+// gets a "→ moved below ↓" stub and loses its keyboard.
+async Task HandoverPrintSessionAsync(long chatId, CancellationToken ct)
+{
+    BotPrintSession? s;
+    lock (printSessionsLock) { printSessions.TryGetValue(chatId, out s); }
+    if (s is null) return;
+
+    // Annotate the old message — best-effort, message may have
+    // been deleted by the user.
+    try
+    {
+        var movedNote = "🖨 <i>→ session continued below ↓</i>";
+        switch (s.StatusKind)
+        {
+            case LiveMessageKind.Text:
+                await bot.EditMessageText(chatId, s.StatusMessageId, movedNote,
+                    parseMode: ParseMode.Html, replyMarkup: null,
+                    cancellationToken: ct);
+                break;
+            case LiveMessageKind.Photo:
+            case LiveMessageKind.Document:
+                await bot.EditMessageCaption(chatId, s.StatusMessageId,
+                    caption: movedNote, parseMode: ParseMode.Html,
+                    replyMarkup: null, cancellationToken: ct);
+                break;
+        }
+    }
+    catch (Exception ex)
+    {
+        log.LogDebug("handover annotate-old failed: {Err}", ex.Message);
+    }
+
+    // Compose the new live message — preview-as-photo for images,
+    // PDF-as-document for pageables, plain text when there's no
+    // pending yet.
+    var (html, kb) = PrintMessage.Render(s, botUsername);
+    Message sent;
+    if (s.Pending is { } p && p.Kind == PendingPrintKind.Image)
+    {
+        var preview = await PrintPreview.ComposeImageAsync(p.Data, p, s, ct);
+        lock (printSessionsLock)
+        {
+            if (printSessions.TryGetValue(chatId, out var bs2) &&
+                bs2.Pending?.Id == p.Id)
+                bs2.Pending.PreviewFillPercent = preview.FillPercent;
+        }
+        // Re-render with fill % populated.
+        BotPrintSession? s2;
+        lock (printSessionsLock) { printSessions.TryGetValue(chatId, out s2); }
+        if (s2 is not null) (html, kb) = PrintMessage.Render(s2, botUsername);
+
+        using var ms = new MemoryStream(preview.PngBytes);
+        sent = await bot.SendPhoto(chatId,
+            photo: new InputFileStream(ms, "preview.png"),
+            caption: html, parseMode: ParseMode.Html,
+            replyMarkup: kb, cancellationToken: ct);
+        lock (printSessionsLock)
+        {
+            if (printSessions.TryGetValue(chatId, out var bs3))
+            {
+                bs3.StatusMessageId = sent.Id;
+                bs3.StatusKind = LiveMessageKind.Photo;
+            }
+        }
+    }
+    else if (s.Pending is { } pd && pd.Kind == PendingPrintKind.Pageable)
+    {
+        // Send the pageable as a Document so the user can verify
+        // contents. This works even for many-page PDFs that don't
+        // have a per-page preview yet — Telegram renders document
+        // messages with a faint inline thumbnail and the file name,
+        // and tap-to-view shows the full PDF.
+        using var ms = new MemoryStream(pd.Data);
+        sent = await bot.SendDocument(chatId,
+            document: new InputFileStream(ms, pd.FileName),
+            caption: html, parseMode: ParseMode.Html,
+            replyMarkup: kb, cancellationToken: ct);
+        lock (printSessionsLock)
+        {
+            if (printSessions.TryGetValue(chatId, out var bs3))
+            {
+                bs3.StatusMessageId = sent.Id;
+                bs3.StatusKind = LiveMessageKind.Document;
+            }
+        }
+    }
+    else
+    {
+        // No pending — plain text (e.g., session opening with no file yet).
+        sent = await bot.SendMessage(chatId, html,
+            parseMode: ParseMode.Html, replyMarkup: kb,
+            linkPreviewOptions: new() { IsDisabled = true },
+            cancellationToken: ct);
+        lock (printSessionsLock)
+        {
+            if (printSessions.TryGetValue(chatId, out var bs3))
+            {
+                bs3.StatusMessageId = sent.Id;
+                bs3.StatusKind = LiveMessageKind.Text;
+            }
+        }
     }
 }
 
@@ -706,7 +866,8 @@ async Task StageDocumentForPrintAsync(long chatId, Document doc, CancellationTok
         // confirmation block.
         var pdfName = Path.ChangeExtension(fileName, ".pdf");
         await StageBytesForPrintAsync(chatId, pdfName, "application/pdf",
-            PendingPrintKind.Pageable, pdfBytes, ct);
+            PendingPrintKind.Pageable, pdfBytes,
+            telegramCompressed: false, ct);
         return;
     }
 
@@ -714,7 +875,7 @@ async Task StageDocumentForPrintAsync(long chatId, Document doc, CancellationTok
         ? PendingPrintKind.Image
         : PendingPrintKind.Pageable;
     await StageBytesForPrintAsync(chatId, fileName, classified.ContentType,
-        pendingKind, bytes, ct);
+        pendingKind, bytes, telegramCompressed: false, ct);
 }
 
 async Task StagePhotoForPrintAsync(long chatId, PhotoSize photo, CancellationToken ct)
@@ -723,14 +884,17 @@ async Task StagePhotoForPrintAsync(long chatId, PhotoSize photo, CancellationTok
     await bot.GetInfoAndDownloadFile(photo.FileId, ms, ct);
     var bytes = ms.ToArray();
     // Telegram delivers Photo as JPEG and strips dpi metadata, so
-    // always images-flow with no useful 1:1 hint.
+    // always images-flow with no useful 1:1 hint. The compressed=true
+    // flag surfaces a UI warning so the user notices (and can resend
+    // as a Document for full quality if they have the original).
     await StageBytesForPrintAsync(chatId, "photo.jpg", "image/jpeg",
-        PendingPrintKind.Image, bytes, ct);
+        PendingPrintKind.Image, bytes, telegramCompressed: true, ct);
 }
 
 async Task StageBytesForPrintAsync(
     long chatId, string fileName, string contentType,
-    PendingPrintKind kind, byte[] bytes, CancellationToken ct)
+    PendingPrintKind kind, byte[] bytes, bool telegramCompressed,
+    CancellationToken ct)
 {
     BotPrintSession? s;
     lock (printSessionsLock) { printSessions.TryGetValue(chatId, out s); }
@@ -790,6 +954,7 @@ async Task StageBytesForPrintAsync(
         PixelWidth = w,
         PixelHeight = h,
         Dpi = dpi,
+        TelegramCompressed = telegramCompressed,
         PaperShortInches = paper.Short,
         PaperLongInches  = paper.Long,
         PrintableShortInches = Math.Max(0.1, paper.Short - marginShortIn),
@@ -806,13 +971,11 @@ async Task StageBytesForPrintAsync(
             bs.View = PrintPickerView.Main;
         }
     }
-    await RenderPrintSessionAsync(chatId, ct);
 
-    // For Pageable inputs (direct PDFs or rendered docs), ask the
-    // renderer how many pages there are. This drives the per-page
-    // checkbox UI for short PDFs (≤10 pages) and the page-count
-    // info shown next to the filename. Best-effort — null on any
-    // failure, no UI impact beyond the lack of a count.
+    // For Pageable inputs, query the page count up front (before the
+    // handover send) so the very first message we put in the chat
+    // already has the right Pages-picker visibility (hidden on
+    // single-page PDFs) and the right page-count line.
     if (kind == PendingPrintKind.Pageable && renderer.Enabled)
     {
         var n = await renderer.GetPdfPageCountAsync(bytes, fileName, ct);
@@ -826,9 +989,14 @@ async Task StageBytesForPrintAsync(
                     cur.PageCount = count;
                 }
             }
-            await RenderPrintSessionAsync(chatId, ct);
         }
     }
+
+    // Hand the session UI off to a fresh message right after the
+    // user's upload. The previous live message gets a "→ continued
+    // below ↓" stub. This keeps the active session in view even if
+    // they upload several files in a row.
+    await HandoverPrintSessionAsync(chatId, ct);
 }
 
 /// <summary>
