@@ -22,6 +22,24 @@ if [[ "${input[host]:-}" != *"jetbrains.team"* ]]; then
 fi
 
 # Step 1: Get a Space OAuth access token via browser.
+#
+# Pick a free localhost port for the OAuth callback — the IntelliJ Space
+# plugin uses dynamic ports, and Space accepts any localhost:<port>
+# redirect for the space-idea-app client (RFC 8252). A hardcoded 8080
+# was prone to collisions with other services on the user's machine.
+oauth_port=
+for _ in $(seq 1 50); do
+  candidate=$((RANDOM % 16384 + 49152))  # IANA ephemeral range
+  if ! (echo > /dev/tcp/127.0.0.1/$candidate) 2>/dev/null; then
+    oauth_port=$candidate
+    break
+  fi
+done
+if [[ -z "$oauth_port" ]]; then
+  echo "space-git-credential: failed to find a free localhost port for OAuth callback" >&2
+  exit 1
+fi
+
 # --silent makes oauth2c emit only the final JSON on stdout (without it,
 # stdout is mixed prose + JSON, which breaks jq).
 oauth2c_stderr=$(mktemp)
@@ -35,7 +53,8 @@ oauth_response=$(oauth2c https://jetbrains.team \
   --scopes "**" \
   --pkce \
   --auth-method client_secret_basic \
-  --redirect-url "http://localhost:8080/api/space/oauth/authorization_code" \
+  --callback-addr "127.0.0.1:$oauth_port" \
+  --redirect-url "http://localhost:$oauth_port/api/space/oauth/authorization_code" \
   --authorization-endpoint "https://jetbrains.team/oauth/auth" \
   --token-endpoint "https://jetbrains.team/oauth/token" \
   --silent \
