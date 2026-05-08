@@ -1127,3 +1127,138 @@ via `POST /pdf-info` and fed into the picker UI.
      is what's at hand but visually ambiguous. No native
      "scanner" emoji; alternatives discussed but no change yet
      (📠 fax, 🔍 magnifier, 📑 bookmark tabs, 🖼 framed picture).
+
+## Print Flow — Update 2026-04-26
+
+Significant tightening of the print pipeline plus several new
+formats / UX bits since the 04-25 snapshot.
+
+### What changed
+
+  * **Pixel-perfect image print path.** Image uploads now flow
+    through PrintPreprocess.ProcessForPrintAsync which Lanczos3-
+    upscales to 600 dpi at A4 (matching the HP P2015n's 600 dpi
+    mechanical engine), grayscales, and wraps into a hand-rolled
+    single-page PDF via PrintPdfWrap. The image XObject carries
+    `/Interpolate false`, so Ghostscript inside CUPS does an
+    identity nearest-neighbor map at the rasterizer — pixels land
+    on the engine grid 1:1 with no double-resample, no CUPS
+    bilinear softening. The PDF's MediaBox stays A4 portrait;
+    for landscape orientation we rotate the image content via the
+    cm matrix rather than swapping the page dims, keeping CUPS'
+    page-fitting logic out of the way. PDF wrap is a hand-rolled
+    minimal PDF (single page, one image XObject, one content
+    stream) — ~250 lines of explicit byte-offset bookkeeping for
+    the xref table, no QuestPDF/iText/PdfSharp dependency.
+  * **Live preview.** BotPrintSession now keeps its live message
+    handle mutable; every new file upload abandons the previous
+    message ("→ session continued below ↓") and sends a fresh
+    one immediately under the user's upload, so the active session
+    UI stays in view through a sequence of files. Toggles use
+    editMessageMedia to swap the preview in place — the user sees
+    Scale / Orientation / Pages choices reshape the rendered page
+    as they pick.
+    Preview compositor (PrintPreview) draws the paper canvas with
+    faint-gray non-printable margin bands and a hairline around
+    the safe printable rect; the source is grayscaled before
+    placement so the preview matches what'll actually print.
+    Output is grayscale lossy WebP Q=80 — small enough to re-send
+    on every toggle. Caption surfaces "fills NN% of page" so the
+    user can tell at a glance whether 1:1 would land postmark-
+    sized.
+    For Pageables, the renderer's new POST /pdf-preview rasterises
+    the first 3 pages into one stacked grayscale WebP via
+    ImageMagick (Ghostscript-backed). Bot ships it as a Document
+    so Telegram preserves the bytes byte-for-byte.
+  * **1:1 fits indicator.** The 1:1 button always renders now
+    with an explicit badge — `1:1 ✓` when it fits the printable
+    rect (1 mm slop), `1:1 ⚠ margins` when it'd land in the
+    non-printable strip, `1:1 ⚠ won't fit` when it exceeds the
+    paper. Default Scale is 1:1 only when ✓.
+  * **Pages picker hides for single-page content** (images
+    always; one-page Pageables once /pdf-info reports the count).
+  * **Per-page checkboxes for Pageables ≤ 10 pages** (5 per row,
+    backed by CUPS page-range string), plus a 3×5 inline-keyboard
+    digit-pad for arbitrary range entry — no chat-text-input
+    state machine needed.
+  * **HEIC / AVIF accepted.** New /image-convert renderer endpoint
+    bounces through libheif's heif-convert (libavif's avifdec as
+    AVIF fallback) to produce a PNG, which the bot then handles
+    via the normal Image staging path. Both decoders run in
+    their own subprocesses inside the renderer's existing systemd
+    jail.
+  * **EPUB accepted** via pandoc (EPUB → docx) → soffice (docx →
+    PDF). Same shape as the Markdown path; PandocToPdfAsync
+    parameterised on source format.
+  * **CSV explicitly refused** with a "convert to ODS/XLSX first"
+    hint. soffice's CSV importer needs the column-separator /
+    quote-char wizard which doesn't fire in headless mode.
+  * **Compressed-photo consent gate (P2).** When the user uploads
+    via Telegram's Photo path (TG-recompresses in transit), the
+    inline keyboard collapses to "[☐ I accept compressed quality]"
+    + "[❌ Cancel]" — Print stays disabled until the user ticks
+    through. Caption surfaces a "⚠ Sent as Telegram media
+    (compressed). Resend as a file for full quality." line.
+  * **System fonts.** PrintScanServer now installs DejaVu /
+    Liberation / MS-corefonts / Noto Latin + CJK / Source family
+    / Cantarell / FreeFont. Ghostscript / soffice / pandoc all
+    consult fontconfig and pick up everything in
+    /run/current-system/sw/share/fonts; the renderer service
+    inherits read access through its existing system-paths
+    bindings. Means PDFs with un-embedded fonts get a plausible
+    substitute rather than the Type 3 fallback rectangles.
+  * **Stub-write end-to-end test path.** Daemon stub now writes
+    received bytes to /var/lib/printscan-daemon/printed/<ts>-<n>
+    as well as logging. Lets us inspect what would have hit CUPS
+    without burning paper. The lp-driven implementation will
+    "tee + lp" — file output stays as the audit trail.
+  * **Renderer toolchain expansion.** Added imagemagick (`magick`)
+    for /pdf-preview; libheif (`heif-convert`) and libavif
+    (`avifdec`) for /image-convert; poppler-utils (`pdfinfo`,
+    `pdftoppm`) for /pdf-info.
+
+### Hardware-specific notes (HP P2015n)
+
+  * **No hardware duplex.** The P2015dn variant has it; this one
+    doesn't. Manual duplex has its own UX flow (planned, deferred).
+  * **600 dpi mechanical engine + RET.** ProRes 1200 marketing is
+    actually 600 × 600 dpi raster + analog-laser-dwell edge
+    enhancement at the engine, not 1200 dpi rendering.
+    Bot's 600 dpi target lines up with the mechanical resolution
+    so /Interpolate false is identity, not nearest-neighbor with
+    1-pixel jaggies.
+  * **Host-based driver.** P2015n is a "host-based" laser — it
+    receives ZJStream from foo2zjs (decoded by the host CPU),
+    not PCL/PostScript. So host-side rasterization is the
+    architecture, regardless of OS. CUPS via foo2zjs does the
+    same thing on Linux that the Windows driver does on Windows.
+  * **Both trays pull from the top of their stack.** Tray 2
+    cassette is face-down, manual feed (Tray 1) is face-up.
+    Output bin is face-down, last-printed-on-top. Manual duplex
+    needs `outputorder=reverse` on the second pass plus the user
+    flipping the stack and reinserting Tray-1 face-up,
+    top-edge-first.
+
+### Deferred / open
+
+  1. **Manual-duplex sequence.** Two-step flow with paper-flip
+     hint between Pages=Odd and Pages=Even passes. Wants
+     real-printer testing — page ordering empirics depend on the
+     specific printer's stacking order.
+  2. **Real `lp` integration.** Currently the daemon writes the
+     bytes to a folder; swapping in `lp -d <queue>` is a
+     few-line change once a queue exists. Wire-format and UX
+     are stable — when this lands, the bot's pre-processed PDF
+     payload goes straight to lp without further options because
+     scale/orient/pages are already baked in (for image inputs)
+     or carried as form fields (for Pageables).
+  3. **Per-content-type upscaler variants.** v1 is Lanczos3 only;
+     line-art-aware (xBRZ / hqx) and neural (Real-ESRGAN /
+     waifu2x-ncnn-vulkan) are research-once-we-have-samples.
+  4. **cups-pdf as a real CUPS queue.** Sits next to the eventual
+     real printer queue; an env-var flips the daemon between
+     "stub-write" / "cups-pdf" / "real-lp".
+  5. **Doc-renderer test corpus.** Integration-tested by hand
+     only.
+  6. **Scanner reply-keyboard icon.** Sticking with 📷 per
+     2026-04-26 review.

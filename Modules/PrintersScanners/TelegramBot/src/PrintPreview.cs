@@ -240,46 +240,56 @@ public static class PrintPreview
 
 /// <summary>
 /// Preprocess an image upload for the printer: upscale low-pixel-count
-/// inputs so CUPS' filter chain only ever has to *down*-scale (the
-/// good direction) when fitting onto the page, then convert to
-/// grayscale (the printer is mono — there is no colour). Lanczos3
-/// for the resampler, since for the v1 we're going one-size-fits-all
-/// per the agreed plan; per-content-type variants (line-art-aware
-/// scalers, neural upscalers) are a follow-up once we've evaluated
-/// the baseline visually.
+/// inputs to 600-dpi-at-A4, convert to grayscale, then wrap into a
+/// single-page PDF whose pixel grid lines up with the HP P2015n's
+/// 600 dpi mechanical engine resolution. With <c>/Interpolate false</c>
+/// on the image XObject (set by <see cref="PrintPdfWrap"/>),
+/// Ghostscript inside CUPS does an identity nearest-neighbor map
+/// at the rasterizer and the foo2zjs filter passes the bitmap to
+/// the printer engine pixel-for-pixel — no double-resample, no
+/// CUPS-bilinear softening, just our Lanczos3 + RET edge enhancement
+/// at the engine.
 ///
 /// Preserves the image's *physical* dimensions: when we upscale the
 /// pixel count by N, we proportionally bump the dpi metadata, so the
-/// final inches-on-paper that CUPS computes from "px / dpi" stay
-/// the same. Otherwise 1:1 mode would silently start printing at
-/// 5× the user's intended size.
+/// final inches-on-paper that <see cref="PrintPdfWrap"/> computes
+/// from px / dpi stay the same. Otherwise 1:1 mode would silently
+/// start printing at 5× the user's intended size.
 /// </summary>
 public static class PrintPreprocess
 {
-    /// Target dpi at full paper size. 300 dpi grayscale A4 = ~8.7 MB
-    /// raw pixel data, comfortably inside the HP P2015n's 32 MB stock
-    /// memory. 600 dpi would also fit (~17 MB) but adds substantial
-    /// CPU on the Pi for the upscale; pick 300 as the safe default
-    /// and revisit once we have hands-on output samples.
-    private const int TargetDpi = 300;
+    /// Target dpi at full paper size. 600 dpi matches the HP P2015n's
+    /// 600-dpi mechanical engine — the rasterizer's output grid will
+    /// then map 1:1 to our pixels, so /Interpolate false in the PDF
+    /// gives identity passthrough rather than nearest-neighbor jaggies.
+    /// Memory: 600-dpi A4 grayscale = 4960×7016 px = 35 MB raw,
+    /// comfortable on a Pi 4 (4 GB RAM); after FlateDecode in the
+    /// PDF, the on-wire size is typically 5–15 MB depending on
+    /// content entropy.
+    private const int TargetDpi = 600;
 
     /// Padding factor above 1.0 — only upscale if the gain is >5%.
     /// Avoids re-encoding 4096×3072 photos that already exceed our
-    /// 300 dpi A4 target on at least one axis.
+    /// 600 dpi A4 target on at least one axis.
     private const double MinUpscaleGain = 1.05;
 
-    public sealed record Result(byte[] PngBytes, int Width, int Height, int Dpi);
+    public sealed record Result(byte[] PdfBytes, int Width, int Height, int Dpi);
 
     /// <summary>
-    /// Take the raw image bytes the bot received, return PNG bytes
-    /// to ship to the daemon. Lossless PNG keeps the upscaled pixels
-    /// intact through the daemon → CUPS handoff; CUPS decodes once.
+    /// Take the raw image bytes the bot received, return print-ready
+    /// PDF bytes wrapping a Lanczos3-upscaled grayscale rendition.
+    /// Caller ships the bytes to the daemon as application/pdf —
+    /// they go through Ghostscript identically to a user-uploaded
+    /// PDF, which lets us reuse the same end-of-pipeline code path.
     /// </summary>
     public static async Task<Result> ProcessForPrintAsync(
-        byte[] sourceBytes, double paperShortInches, double paperLongInches,
+        byte[] sourceBytes,
+        PrintScaleMode scale, PrintOrientation orientation,
+        double paperShortInches, double paperLongInches,
+        PrintableMargins margins,
         CancellationToken ct)
     {
-        using var image = await Image.LoadAsync<Rgb24>(
+        using var rgbImage = await Image.LoadAsync<Rgb24>(
             new MemoryStream(sourceBytes, writable: false), ct);
 
         // Source dpi as declared in the file metadata, falling back
@@ -288,40 +298,43 @@ public static class PrintPreprocess
         // 1:1 sizing; if a downstream user picks 1:1 on a
         // dpi-stripped Telegram photo, this is the educated guess
         // we use as the baseline.
-        var hRes = image.Metadata.HorizontalResolution;
-        var vRes = image.Metadata.VerticalResolution;
+        var hRes = rgbImage.Metadata.HorizontalResolution;
+        var vRes = rgbImage.Metadata.VerticalResolution;
         var sourceDpi = (hRes > 0 && vRes > 0) ? Math.Min(hRes, vRes) : 96.0;
 
         // Target pixel size: paper at TargetDpi. Pre-upscaling to
-        // this guarantees CUPS only ever down-samples for any Scale
-        // mode (Fit fits inside, 1:1 stays well-resourced).
+        // this guarantees the rasterizer only ever runs identity-
+        // or down-resample for any Scale mode (Fit fits inside,
+        // 1:1 stays at the engine's grid, Fill crops via clipping
+        // path on already-engine-native pixels).
         var targetLongPx  = (int)Math.Round(paperLongInches  * TargetDpi);
         var targetShortPx = (int)Math.Round(paperShortInches * TargetDpi);
 
-        var imgLong  = Math.Max(image.Width, image.Height);
-        var imgShort = Math.Min(image.Width, image.Height);
+        var imgLong  = Math.Max(rgbImage.Width, rgbImage.Height);
+        var imgShort = Math.Min(rgbImage.Width, rgbImage.Height);
         var scaleByLong  = (double)targetLongPx  / imgLong;
         var scaleByShort = (double)targetShortPx / imgShort;
         // Min of the two gives a uniform scale that hits the closer
         // axis exactly — guarantees both dimensions ≥ target without
         // overshooting one. (Math.Max would force both axes ≥ target
         // by overshooting one, doubling pixel cost for no quality
-        // win since CUPS will downscale the surplus axis anyway.)
-        var scale = Math.Min(scaleByLong, scaleByShort);
+        // win since the rasterizer will identity-map the surplus
+        // axis anyway.)
+        var scale_ = Math.Min(scaleByLong, scaleByShort);
 
-        int finalW = image.Width;
-        int finalH = image.Height;
+        int finalW = rgbImage.Width;
+        int finalH = rgbImage.Height;
         double finalDpi = sourceDpi;
-        if (scale > MinUpscaleGain)
+        if (scale_ > MinUpscaleGain)
         {
-            finalW = (int)Math.Round(image.Width  * scale);
-            finalH = (int)Math.Round(image.Height * scale);
+            finalW = (int)Math.Round(rgbImage.Width  * scale_);
+            finalH = (int)Math.Round(rgbImage.Height * scale_);
             // dpi scales with the pixel count so physical inches
             // stay constant — a 300×300 px image at 100 dpi (3"×3")
-            // upscaled to 900×900 px must report 300 dpi (still
+            // upscaled to 1800×1800 px must report 600 dpi (still
             // 3"×3") or 1:1 mode breaks.
-            finalDpi = sourceDpi * scale;
-            image.Mutate(c => c
+            finalDpi = sourceDpi * scale_;
+            rgbImage.Mutate(c => c
                 .Resize(new ResizeOptions
                 {
                     Mode = ResizeMode.Stretch,
@@ -332,24 +345,19 @@ public static class PrintPreprocess
         }
         else
         {
-            image.Mutate(c => c.Grayscale());
+            rgbImage.Mutate(c => c.Grayscale());
         }
 
-        // Keep dpi metadata current so the daemon / CUPS sees the
-        // right physical size.
-        image.Metadata.HorizontalResolution = finalDpi;
-        image.Metadata.VerticalResolution   = finalDpi;
+        // Convert to genuine 8-bit grayscale pixel format for the
+        // PDF wrap. Cuts the in-memory pixel buffer by 3× before the
+        // raw-pixel-and-deflate dance in PrintPdfWrap.
+        using var grayImage = rgbImage.CloneAs<L8>();
 
-        using var ms = new MemoryStream();
-        // PNG-Level6 is the default; we use grayscale + zlib only,
-        // no fancy filtering, which keeps encode time on a Pi
-        // tolerable for ~3 MB output.
-        await image.SaveAsPngAsync(ms, new PngEncoder
-        {
-            ColorType = PngColorType.Grayscale,
-            BitDepth = PngBitDepth.Bit8,
-            CompressionLevel = PngCompressionLevel.Level6,
-        }, ct);
-        return new Result(ms.ToArray(), finalW, finalH, (int)Math.Round(finalDpi));
+        var pdfBytes = PrintPdfWrap.WrapImage(
+            grayImage, finalDpi,
+            scale, orientation,
+            paperShortInches, paperLongInches,
+            margins);
+        return new Result(pdfBytes, finalW, finalH, (int)Math.Round(finalDpi));
     }
 }

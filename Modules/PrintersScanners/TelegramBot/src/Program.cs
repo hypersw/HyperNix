@@ -1404,15 +1404,15 @@ async Task ExecutePrintAsync(long chatId, string pendingId, CancellationToken ct
     string? error = null;
     try
     {
-        // Image preprocessing pipeline: Lanczos3 upscale (only when
-        // it'd materially improve crispness — typically Telegram-
-        // compressed photos and small web images) + grayscale
-        // conversion. Output is PNG so CUPS' filter chain decodes
-        // it once and downstream rasterization is the only resample
-        // step. PDF / PS uploads pass through untouched — vector
-        // content is rasterized directly by Ghostscript at the
-        // printer's native resolution, no benefit to bot-side
-        // pixel-level pre-processing.
+        // Image preprocessing pipeline: Lanczos3 upscale to 600 dpi
+        // (matching the HP P2015n's mechanical engine resolution),
+        // grayscale conversion, and wrap into a single-page PDF
+        // with /Interpolate false on the image XObject. Result:
+        // identity nearest-neighbor pass at Ghostscript, no
+        // CUPS-bilinear softening, pixels land on the engine grid
+        // 1:1 for the picked Scale / Orientation. PDF / PS uploads
+        // pass through untouched — Ghostscript already rasterizes
+        // their vector content directly at the engine.
         byte[] payloadBytes = p!.Data;
         string payloadName = p.FileName;
         string payloadCt   = p.ContentType;
@@ -1420,13 +1420,23 @@ async Task ExecutePrintAsync(long chatId, string pendingId, CancellationToken ct
         {
             try
             {
+                PrintableMargins margins;
+                lock (printSessionsLock)
+                {
+                    margins = printSessions.TryGetValue(chatId, out var bsLookup)
+                        ? bsLookup.Margins
+                        : new PrintableMargins();
+                }
                 var processed = await PrintPreprocess.ProcessForPrintAsync(
-                    p.Data, p.PaperShortInches, p.PaperLongInches, ct);
-                payloadBytes = processed.PngBytes;
-                payloadName  = Path.ChangeExtension(p.FileName, ".png");
-                payloadCt    = "image/png";
+                    p.Data,
+                    p.Scale, p.Orientation,
+                    p.PaperShortInches, p.PaperLongInches,
+                    margins, ct);
+                payloadBytes = processed.PdfBytes;
+                payloadName  = Path.ChangeExtension(p.FileName, ".pdf");
+                payloadCt    = "application/pdf";
                 log.LogInformation(
-                    "preprocessed {File}: {W}x{H} @ {Dpi} dpi → {Bytes} byte PNG",
+                    "preprocessed {File}: {W}x{H} @ {Dpi} dpi → {Bytes} byte PDF",
                     p.FileName, processed.Width, processed.Height,
                     processed.Dpi, payloadBytes.Length);
             }
