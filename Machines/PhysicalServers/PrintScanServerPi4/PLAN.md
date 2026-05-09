@@ -1262,3 +1262,281 @@ formats / UX bits since the 04-25 snapshot.
      only.
   6. **Scanner reply-keyboard icon.** Sticking with 📷 per
      2026-04-26 review.
+
+## Status snapshot — 2026-05-09
+
+### Hardware
+
+* **Pi 4 board**: decommissioned (PSU damaged the board). Config
+  retained at `Machines/PhysicalServers/PrintScanServerPi4/` for
+  reference and for use if a new Pi 4 ever gets flashed.
+* **Pi 5 (`GhostHome`)**: planned next deployment. Will host a
+  home-automation stack as the headline workload; print/scan is
+  a guest service on it. New machine config at
+  `Machines/PhysicalServers/GhostHome/`. Hostname / mDNS /
+  branding all use "GhostHome" regardless of which guest
+  workloads it carries.
+
+### Folder layout
+
+```
+HyperNix/
+├── Machines/
+│   ├── MicroVM/VmSshFront/                     unchanged
+│   └── PhysicalServers/                        renamed from RPi4/
+│       ├── PrintScanServerPi4/                 (decommissioned)
+│       │   ├── configuration.nix
+│       │   ├── secrets/secrets.yaml
+│       │   └── PLAN.md (this file)
+│       └── GhostHome/                          (Pi 5 incoming)
+│           ├── configuration.nix
+│           └── secrets/secrets.yaml
+├── Modules/
+│   ├── Profiles/                               new umbrella
+│   │   ├── PhysicalServerBase/                 base "any host" profile
+│   │   ├── MultiHomedNetworking/               dual-NIC source-routing
+│   │   └── PrintScanServer/                    full print/scan stack
+│   ├── PrintersScanners/...                    sub-modules unchanged
+│   ├── Monitoring/TelegramAlerts/              unchanged
+│   └── System/{AutoRebuildOnPush,
+│              AvahiPerInterfaceNames,
+│              BootStabilityProbe}              unchanged
+└── flake.nix                                   nixosConfigurations:
+                                                PrintScanServerPi4,
+                                                GhostHome
+                                                (each + -sdImage variant)
+```
+
+### Profile design
+
+Three meta-modules under `Modules/Profiles/`. Each is a NixOS
+module with `options.profiles.<name>` declaring its caller-facing
+contract; secrets / per-machine details live as required typed
+options that nix eval rejects when unset (visible "what you must
+supply" surface). Path-typed (not sops-secret-typed) to keep the
+secret-delivery story decoupled.
+
+* **PhysicalServerBase** (hardware-agnostic):
+  - administrator user (option-typed name + authorizedKeys +
+    extraGroups; other modules append via NixOS list-merge)
+  - openssh, sudo, root locked
+  - nix gc + experimental + keep-outputs + monthly auto-upgrade
+    with `cadence = enum [ "daily" "weekly" "monthly" ]`
+  - swap + zramSwap + /tmp on tmpfs + noatime
+  - hardware.enableRedistributableFirmware (default true)
+  - localFlake activation script (configurationName +
+    upstreamUrl options)
+  - telegram-alerts wired with required token + chat-id paths
+  - auto-rebuild-on-push enable
+
+* **MultiHomedNetworking** (dual-NIC bundle):
+  - `interfaces` is a list-of-records (name / fwmark /
+    routingTable / routeMetric / requiredForOnline). Default
+    matches Pi 4/5 naming (`end0` + `wlan0`).
+  - ARP-strict sysctls
+  - iptables CONNMARK + per-interface fwmark + per-interface
+    routing tables and policy rules
+  - mDNS via Avahi + per-interface-names module + resolved
+    with MulticastDNS=no
+  - x86 boxes override `interfaces` with their predictable names
+
+* **PrintScanServer** (print/scan stack):
+  - Imports LaserJetPrinter / EpkowaScanner / Daemon / Renderer /
+    TelegramBot, enables them.
+  - Required option: `bot.tokenFile`. Other options for paper
+    size, allowed users, opt-out toggles per leg.
+  - Adds x86_64 binfmt for the EpkowaScanner stub when
+    `epkowaScanner.enable`.
+  - Installs broad font set for the renderer's PDF font fallback.
+  - **(pending)** appends `scanner` and `lp` to the
+    administrator's groups via list-merge on the base profile's
+    `administrator.name` — currently this lives in each machine
+    config as a one-line `users.users.${name}.extraGroups = […]`
+    spread; planned move to profile-side per Q3 follow-up.
+
+### Sops naming convention (post 2026-05-09 rename)
+
+UpperCamelCase, `<Owner><LocalName>`. Owner is the top-level
+concern (Monitoring / PrintScan / Machine). Pure UpperCamelCase
+keeps Nix attribute access clean — no quoting, no hyphen/dot
+ambiguity, room to grow with `MonitoringSlackBotToken`,
+`PrintScanWhatsAppBotToken`, etc.
+
+| New name | Old name |
+|---|---|
+| `MonitoringTelegramBotToken` | `telegram-monitoring-bot-token` |
+| `MonitoringTelegramAlertsChatId` | `telegram-alerts-chat-id` |
+| `MonitoringTelegramLogChatId` | `telegram-log-chat-id` |
+| `PrintScanTelegramBotToken` | `printscan-bot-token` |
+| `MachineWifiPsk` | `wifi-iot-psk` |
+
+Telegram chat-id normalization: alerts and log channels are
+always-channel (never DM, never group). C# side should accept
+bare-positive id (what you copy from Telegram client tools) and
+prepend `-100` if missing. Bot's `allowedUsers` are user IDs
+(always positive); no normalization needed. Implementation
+deferred — see "Deferred items" below.
+
+### Print/scan feature status (current)
+
+Live in production code, working unless flagged otherwise:
+
+* **Image preprocess pipeline**: source → Lanczos3 upscale to
+  600 dpi at A4 → grayscale → wrap in single-page PDF with
+  `/Interpolate false` on the image XObject (so Ghostscript /
+  CUPS does identity nearest-neighbour at the printer engine).
+  dpi metadata stays in lockstep with pixel count so 1:1 mode
+  preserves physical inches.
+* **Content classifier** (combined heuristic):
+  - quantised-colour count (4-bit/channel; threshold 512)
+  - adjacent-pixel edge density (max-channel delta ≥64; threshold 5%)
+  - few colours AND sharp edges → Graphics
+  - many colours OR smooth edges → Photo
+  - ambiguous → Photo (safe default)
+  - returns ClassifierStats(UniqueQuantisedColours, EdgeDensity)
+    so caption can show numbers
+* **Real-ESRGAN routing** for Graphics-class images:
+  - bot routes via renderer's `POST /image-upscale` with
+    `realesr-animevideov3` model
+  - GPU-first (Vulkan via mesa V3DV on Pi 4/5) → CPU fallback
+    inside renderer
+  - bot-level fallback: any failure → Lanczos3 with a Result
+    flag (`NeuralFailedFellBackToLanczos`) and Error log
+  - user override: 🧠 Upscaler picker (Auto / Photo / Graphics)
+  - caption surfaces classifier verdict + stats so user sees
+    routing choice before tapping Print
+* **Multi-page PDF preview**: renderer's `POST /pdf-preview`
+  rasterises first 3 pages via ImageMagick (Ghostscript-backed)
+  to one stacked grayscale WebP. Bot ships as Document so
+  Telegram doesn't recompress.
+* **HEIC/AVIF**: bot routes via `POST /image-convert` →
+  libheif heif-convert / libavif avifdec → PNG → normal Image
+  staging path.
+* **EPUB**: pandoc → docx → soffice via `/render`.
+* **CSV**: explicitly refused.
+* **Manual duplex wizard**: 🔄 Duplex button on multi-page
+  Pageables (only when no other page constraint active).
+  Two-pass with stack-flip instructions in caption between
+  passes. Hardcoded direction; needs hands-on validation when
+  a real printer arrives.
+* **P2 compressed-photo consent**: Telegram-Photo uploads gated
+  behind explicit `[☐ I accept compressed quality]` tap.
+* **Pages picker**: All / Odd / Even radio. Per-page
+  checkbox row when pageCount ≤ 10. Custom-range digit-keyboard
+  (3×5 inline keyboard for arbitrary CUPS expressions, no
+  text-input state machine).
+* **Daemon stub**: writes received bytes to
+  `/var/lib/printscan-daemon/printed/<ts>-<filename>` for
+  end-to-end inspection without paper.
+
+### Renderer toolchain (binaries it spawns)
+
+* **soffice** (LibreOffice) — Office formats → PDF
+* **pandoc** — Markdown / EPUB → docx (then soffice)
+* **xpstopdf** (libgxps) — XPS / OXPS → PDF
+* **magick** (ImageMagick) — `/pdf-preview` rasterisation +
+  stack + WebP encode (Ghostscript-backed)
+* **pdfinfo** (poppler-utils) — `/pdf-info` page count
+* **heif-convert** (libheif) + **avifdec** (libavif) — HEIC/AVIF
+  → PNG
+* **realesrgan-ncnn-vulkan** + animevideov3 model — neural
+  upscaler for Graphics-class images
+
+### Renderer hardening
+
+`Modules/PrintersScanners/Renderer/default.nix`: PrivateNetwork,
+IPAddressDeny=any, RestrictAddressFamilies=[AF_UNIX],
+ProtectSystem=strict, ProtectHome, NoNewPrivileges, dropped
+CapabilityBoundingSet+AmbientCapabilities, Protect{KernelTunables,
+KernelModules,KernelLogs,ControlGroups,Clock,Hostname,Personality},
+Restrict{SUIDSGID,Realtime,Namespaces}. PrivateDevices left off
+(GPU access for Vulkan path); explicit
+`DeviceAllow="char-drm rw"` narrows the cgroup device-allowlist
+to just DRM. Per-job isolation via fresh subprocess per request.
+
+### Pinned facts (survive compaction)
+
+* HP LaserJet **P2015n** — host-based laser, no hardware duplex
+  (P2015dn has it). 600 dpi mechanical engine, RET edge
+  enhancement (the claimed 1200 dpi is engine 600 + analog
+  dwell-time modulation, not 1200 dpi raster). 32 MB stock
+  memory fits a 600 dpi A4 grayscale page (~17 MB raw). Driven
+  via foo2zjs which decodes the host bitmap to ZJStream for the
+  printer engine.
+* **Epson Perfection V33** scanner. USB ID 04b8:0142.
+  aarch64-on-aarch64 doesn't run the proprietary epkowa driver
+  natively; we run an x86_64 stub helper via qemu-user binfmt
+  (registered system-wide by the PrintScanServer profile when
+  `epkowaScanner.enable`).
+* **Pi 4 dual-NIC topology**: end0 + wlan0 bridged on the AP at
+  L2. Without strict ARP + CONNMARK source-routing, asymmetric
+  replies get dropped on MAC-IP-mismatch by the AP filter.
+* **Pi 5 onboard radio**: BCM43455. Same WPA2-PPSK / hidden-SSID
+  network as Pi 4 (`HyperAir.IotPsk`). No P2P (extraConfig
+  `p2p_disabled=1`).
+* **Generic mainline kernel** chosen for both Pi 4 and Pi 5
+  rather than `linuxPackages_rpiX`. cache.nixos.org has mainline
+  prebuilt; the Foundation patchset rebuilds from source on
+  every nixpkgs bump (hours on the Pi). The patchset's GPU /
+  camera / HAT-specific bits don't matter on a headless server.
+  Vulkan via realesrgan-ncnn-vulkan reaches V3D through mesa
+  userspace + mainline DRM either way.
+* **Sops decryption**: per-machine age key derived from the
+  host's `/etc/ssh/ssh_host_ed25519_key` (sops-nix's
+  `age.sshKeyPaths`). Burnt Pi 4's key is unrecoverable; new
+  GhostHome will have its own key after first boot, secrets
+  must be re-encrypted to it manually before the bot / alerts
+  services can decrypt successfully.
+
+### Deferred items (no eta — these are the "after compaction,
+remember these are open" notes)
+
+1. **Manual duplex page-pairing direction** — needs hands-on
+   testing on real printer. Wizard's flip text is best-guess for
+   the P2015n's face-down output + Tray 1 face-up-top-leading
+   feed. May need pass-2 → `outputorder=reverse`.
+2. **Real CUPS / `lp` invocation** to replace daemon stub.
+   Shape stable; one method-body change in PrintService.cs.
+3. **cups-pdf as a CUPS queue** alongside the eventual real
+   printer queue, gated by an env var.
+4. **Doc-renderer test corpus** — integration-tested by hand
+   only.
+5. **Telegram chat ID normalisation in C#** — alerts and log
+   channels are always-channel. C# should accept bare-positive
+   ids and prepend `-100`. allowedUsers stays positive (user
+   IDs). Not yet implemented; lives in Monitoring/TelegramAlerts
+   module's chat-id-file consumer.
+6. **Pi minimalist first-boot image** — currently SD image bakes
+   full configuration; services fail at first boot without sops
+   decryption. A "minimal pi-hardware-config-only" image variant
+   would let us flash, ssh in, learn host age key, encrypt
+   secrets, push to git, then the live machine self-rebuilds.
+   Open question: bake a target-machine-specific flake URL into
+   the image vs ship a universal "any new pi" image with a
+   first-boot ssh key. Not yet researched; raised by user
+   2026-05-09.
+7. **Per-content-type upscaler variants** beyond animevideov3
+   — line-art-aware (xBRZ / hqx) and photo-tuned neural
+   (realesr-x4plus). Awaiting visual evaluation of the current
+   baseline.
+8. **Pi 5 brownout-mitigation** decisions — current GhostHome
+   config doesn't include the boot-stability-probe nor the
+   throttle-history sampler that Pi 4 needed. Re-add if Pi 5
+   exhibits similar symptoms.
+9. **Q3 follow-up**: move the print-scan profile's "add
+   scanner/lp to administrator" to the profile itself rather
+   than each machine config. The profile becomes mildly aware
+   of the base profile's `administrator.name` option and uses
+   list-merge on `users.users.${that}.extraGroups`. User
+   approved this direction. NOT YET IMPLEMENTED — sitting
+   one round behind the rename.
+
+### Numbering convention for follow-up questions
+
+User explicitly noted: "Q3 (btw pls use the same number set
+for followup question numbers so that they didn't overlap with
+prev round)". When user references "Q3" in a later round, they
+mean the same topic carried over from the previous round.
+Don't renumber. Group multi-round questions under their
+original number with sub-numbering when needed (Q3.1, Q3.2,
+…).

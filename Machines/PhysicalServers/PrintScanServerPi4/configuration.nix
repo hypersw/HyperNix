@@ -139,14 +139,27 @@
     defaultSopsFile = ./secrets/secrets.yaml;
     age.sshKeyPaths = [ "/etc/ssh/ssh_host_ed25519_key" ];
 
-    secrets.telegram-monitoring-bot-token = {};
-    secrets.telegram-alerts-chat-id = {};
-    secrets.telegram-log-chat-id = {};
-    secrets.printscan-bot-token = {};
-    secrets.wifi-iot-psk = {};
+    # Naming convention: UpperCamelCase, <Owner><LocalName>. The
+    # owner is the top-level concern (Monitoring / PrintScan /
+    # Machine). UpperCamelCase keeps the Nix-side accessor clean
+    # — `config.sops.secrets.PrintScanTelegramBotToken.path` reads
+    # without quoting and without the hyphen-vs-subtraction
+    # ambiguity kebab-case carries.
+    secrets.MonitoringTelegramBotToken = {};
+    # Always-channel: the bot's C# normaliser accepts a bare
+    # positive id and prepends "-100" if missing. Group ids (also
+    # negative, but without the -100 prefix) are not expected here
+    # — keep this for channels only.
+    secrets.MonitoringTelegramAlertsChatId = {};
+    secrets.MonitoringTelegramLogChatId = {};
+    secrets.PrintScanTelegramBotToken = {};
+    secrets.MachineWifiPsk = {};
 
     templates."wpa-secrets" = {
-      content = "psk_iot=${config.sops.placeholder."wifi-iot-psk"}";
+      # `psk_iot` here is wpa_supplicant's variable-name in its
+      # secrets file — referenced by `pskRaw = "ext:psk_iot"`
+      # below. Not the sops key name (that's MachineWifiPsk).
+      content = "psk_iot=${config.sops.placeholder."MachineWifiPsk"}";
       owner = "wpa_supplicant";
     };
   };
@@ -161,9 +174,9 @@
       ];
     };
     alerts = {
-      tokenFile        = config.sops.secrets.telegram-monitoring-bot-token.path;
-      alertsChatIdFile = config.sops.secrets.telegram-alerts-chat-id.path;
-      logChatIdFile    = config.sops.secrets.telegram-log-chat-id.path;
+      tokenFile        = config.sops.secrets.MonitoringTelegramBotToken.path;
+      alertsChatIdFile = config.sops.secrets.MonitoringTelegramAlertsChatId.path;
+      logChatIdFile    = config.sops.secrets.MonitoringTelegramLogChatId.path;
     };
     localFlake.configurationName = "PrintScanServerPi4";
   };
@@ -173,7 +186,7 @@
   profiles.printScanServer = {
     enable = true;
     bot = {
-      tokenFile = config.sops.secrets.printscan-bot-token.path;
+      tokenFile = config.sops.secrets.PrintScanTelegramBotToken.path;
       allowedUsers = [
         { id = 1398173959; name = "hypersw"; }
         { id = 2074641026; name = "ol"; }

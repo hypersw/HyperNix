@@ -132,14 +132,22 @@
     defaultSopsFile = ./secrets/secrets.yaml;
     age.sshKeyPaths = [ "/etc/ssh/ssh_host_ed25519_key" ];
 
-    secrets.telegram-monitoring-bot-token = {};
-    secrets.telegram-alerts-chat-id = {};
-    secrets.telegram-log-chat-id = {};
-    secrets.printscan-bot-token = {};
-    secrets.wifi-iot-psk = {};
+    # Naming convention: UpperCamelCase, <Owner><LocalName> — see
+    # the matching block in PrintScanServerPi4's configuration.nix
+    # for the full reasoning. Keep the same names across machines
+    # so the profile wiring is uniform.
+    secrets.MonitoringTelegramBotToken = {};
+    # Always-channel: bot's C# normaliser accepts bare positive id
+    # and prepends "-100" if missing.
+    secrets.MonitoringTelegramAlertsChatId = {};
+    secrets.MonitoringTelegramLogChatId = {};
+    secrets.PrintScanTelegramBotToken = {};
+    secrets.MachineWifiPsk = {};
 
     templates."wpa-secrets" = {
-      content = "psk_iot=${config.sops.placeholder."wifi-iot-psk"}";
+      # `psk_iot` is the wpa_supplicant-internal variable name
+      # referenced by `pskRaw = "ext:psk_iot"`, not the sops key.
+      content = "psk_iot=${config.sops.placeholder."MachineWifiPsk"}";
       owner = "wpa_supplicant";
     };
   };
@@ -156,9 +164,9 @@
       ];
     };
     alerts = {
-      tokenFile        = config.sops.secrets.telegram-monitoring-bot-token.path;
-      alertsChatIdFile = config.sops.secrets.telegram-alerts-chat-id.path;
-      logChatIdFile    = config.sops.secrets.telegram-log-chat-id.path;
+      tokenFile        = config.sops.secrets.MonitoringTelegramBotToken.path;
+      alertsChatIdFile = config.sops.secrets.MonitoringTelegramAlertsChatId.path;
+      logChatIdFile    = config.sops.secrets.MonitoringTelegramLogChatId.path;
     };
     localFlake.configurationName = "GhostHome";
   };
@@ -168,7 +176,7 @@
   profiles.printScanServer = {
     enable = true;
     bot = {
-      tokenFile = config.sops.secrets.printscan-bot-token.path;
+      tokenFile = config.sops.secrets.PrintScanTelegramBotToken.path;
       allowedUsers = [
         { id = 1398173959; name = "hypersw"; }
         { id = 2074641026; name = "ol"; }
