@@ -165,19 +165,18 @@ in
     environment.systemPackages = lib.mkIf cfg.epkowaScanner.enable
       (with pkgs; [ sane-backends ]);
 
-    # Profile is mildly aware of PhysicalServerBase — it reads the
+    # Profile is mildly aware of AnyMachineBase — reads the
     # configured administrator name and appends the print/scan-
     # specific groups via NixOS list-merge. Saves machine configs
     # from each having to know that scanner+lp are needed for
     # SANE+CUPS, and from re-stating the admin user's name.
     #
-    # We don't assert that the base profile is enabled — if it's
-    # not, nix evaluation here resolves an unconfigured option
-    # default and we'd be appending groups to a "administrator"
-    # user that doesn't exist. That's a degenerate case (someone
-    # using PrintScanServer without PhysicalServerBase, which the
-    # README doesn't recommend); a hard assertion is overkill.
-    users.users.${config.profiles.physicalServerBase.administrator.name}
+    # AnyMachineBase rather than PhysicalServerBase because the
+    # admin user lives on the more general base. Print-scan can
+    # in principle run on a non-physical NixOS host (lab VM with
+    # USB-passthrough scanner + a network-attached printer); the
+    # admin-user grooming should follow.
+    users.users.${config.profiles.anyMachineBase.administrator.name}
       .extraGroups =
         lib.optionals cfg.epkowaScanner.enable [ "scanner" ]
         ++ lib.optionals cfg.laserjetPrinter.enable [ "lp" ];

@@ -153,8 +153,13 @@
   };
 
   # ── Profile wiring ──
-  profiles.physicalServerBase = {
-    enable = true;
+  # PhysicalServerBase auto-enables AnyMachineBase. Per-host data
+  # — the human's keys, alerts paths, the local-flake bootstrap —
+  # all live on the anyMachineBase namespace because they apply
+  # to any NixOS host, not just physical ones.
+  profiles.physicalServerBase.enable = true;
+
+  profiles.anyMachineBase = {
     administrator = {
       name = "administrator";
       authorizedKeys = [

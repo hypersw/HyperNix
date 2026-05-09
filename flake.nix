@@ -63,9 +63,11 @@
         # Profile meta-modules — single-import "make this host be X"
         # bundles. Compose to apply multiple at once on the same
         # machine.
+        Profiles-AnyMachineBase = import ./Modules/Profiles/AnyMachineBase;
         Profiles-PhysicalServerBase = import ./Modules/Profiles/PhysicalServerBase;
         Profiles-PrintScanServer = import ./Modules/Profiles/PrintScanServer;
         Profiles-MultiHomedNetworking = import ./Modules/Profiles/MultiHomedNetworking;
+        Profiles-PhysicalServerProvisioning = import ./Modules/Profiles/PhysicalServerProvisioning;
       };
 
       # ── NixOS Configurations ──
@@ -88,9 +90,9 @@
               # Forward the revision strings into the alerts profile
               # surface — those values come out of the flake (where
               # `self.rev` is available) and nowhere else.
-              profiles.physicalServerBase.alerts.configRevision =
+              profiles.anyMachineBase.alerts.configRevision =
                 self.rev or self.dirtyRev or "dirty";
-              profiles.physicalServerBase.alerts.nixpkgsRevision = nixpkgs.rev;
+              profiles.anyMachineBase.alerts.nixpkgsRevision = nixpkgs.rev;
             }
             ./Machines/PhysicalServers/PrintScanServerPi4/configuration.nix
           ];
@@ -115,9 +117,9 @@
             sops-nix.nixosModules.sops
             {
               system.configurationRevision = self.rev or self.dirtyRev or "dirty";
-              profiles.physicalServerBase.alerts.configRevision =
+              profiles.anyMachineBase.alerts.configRevision =
                 self.rev or self.dirtyRev or "dirty";
-              profiles.physicalServerBase.alerts.nixpkgsRevision = nixpkgs.rev;
+              profiles.anyMachineBase.alerts.nixpkgsRevision = nixpkgs.rev;
             }
             ./Machines/PhysicalServers/GhostHome/configuration.nix
           ];
@@ -129,6 +131,50 @@
             sops-nix.nixosModules.sops
             "${nixpkgs}/nixos/modules/installer/sd-card/sd-image-aarch64.nix"
             ./Machines/PhysicalServers/GhostHome/configuration.nix
+          ];
+        };
+
+        # ── GhostHome-provisioning — minimalist first-boot image
+        # the operator flashes to a fresh Pi 5 SD card. Boots,
+        # generates ssh host keys, retries `nixos-rebuild boot`
+        # against `github:hypersw/HyperNix?ref=ghosthome-ready` on
+        # a 1-minute timer until the ref exists upstream, then
+        # reboots into the full GhostHome config.
+        #
+        # The "ghosthome-ready" branch is the readiness signal:
+        # operator encrypts secrets to the new Pi's host age key
+        # (pulled via `ssh-keyscan host | ssh-to-age`), commits,
+        # then either (a) pushes the master commit AND a
+        # ghosthome-ready branch pointing at it, or
+        # (b) tags the commit `ghosthome-ready` and pushes the
+        # tag.  Both forms work with `?ref=ghosthome-ready`.
+        GhostHome-provisioning-sdImage = nixpkgs.lib.nixosSystem {
+          system = "aarch64-linux";
+          modules = [
+            nixos-hardware.nixosModules.raspberry-pi-5
+            "${nixpkgs}/nixos/modules/installer/sd-card/sd-image-aarch64.nix"
+            ./Modules/Profiles/PhysicalServerProvisioning
+            ({ ... }: {
+              # Pi 5 needs explicit extlinux opt-in — see comment
+              # in GhostHome's configuration.nix for the rationale.
+              boot.loader.grub.enable = false;
+              boot.loader.generic-extlinux-compatible.enable = true;
+
+              # Generic mainline kernel; same caching reasoning as
+              # the live config.
+              boot.kernelPackages = nixpkgs.legacyPackages.aarch64-linux.linuxPackages;
+
+              networking.hostName = "ghosthome-provisioning";
+              system.stateVersion = "25.05";
+
+              profiles.physicalServerProvisioning = {
+                enable = true;
+                targetFlakeUri = "github:hypersw/HyperNix?ref=ghosthome-ready";
+                targetConfigName = "GhostHome";
+                # 60 s default retry interval. Bump on slower
+                # networks if needed; not a tight loop anyway.
+              };
+            })
           ];
         };
       };

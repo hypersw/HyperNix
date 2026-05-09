@@ -1307,27 +1307,51 @@ HyperNix/
                                                 (each + -sdImage variant)
 ```
 
-### Profile design
+### Profile design (updated 2026-05-09)
 
-Three meta-modules under `Modules/Profiles/`. Each is a NixOS
+Five meta-modules under `Modules/Profiles/`. Each is a NixOS
 module with `options.profiles.<name>` declaring its caller-facing
 contract; secrets / per-machine details live as required typed
 options that nix eval rejects when unset (visible "what you must
 supply" surface). Path-typed (not sops-secret-typed) to keep the
 secret-delivery story decoupled.
 
-* **PhysicalServerBase** (hardware-agnostic):
+* **AnyMachineBase** (hardware-agnostic, applies to any NixOS
+  host except very-special ones like microVMs):
   - administrator user (option-typed name + authorizedKeys +
     extraGroups; other modules append via NixOS list-merge)
   - openssh, sudo, root locked
   - nix gc + experimental + keep-outputs + monthly auto-upgrade
     with `cadence = enum [ "daily" "weekly" "monthly" ]`
-  - swap + zramSwap + /tmp on tmpfs + noatime
-  - hardware.enableRedistributableFirmware (default true)
   - localFlake activation script (configurationName +
     upstreamUrl options)
   - telegram-alerts wired with required token + chat-id paths
   - auto-rebuild-on-push enable
+  - htop in systemPackages
+  - allowUnfree
+
+* **PhysicalServerBase** imports AnyMachineBase, adds
+  physical-only bits:
+  - swap + zramSwap + /tmp on tmpfs + noatime
+  - hardware.enableRedistributableFirmware (default true)
+  - usbutils
+  Auto-enables AnyMachineBase via `mkDefault` so machine configs
+  set `profiles.physicalServerBase.enable = true;` and get the
+  whole stack.
+
+* **PhysicalServerProvisioning** — minimalist first-boot image
+  profile (NEW 2026-05-09). Boots, generates ssh host keys, runs
+  a systemd timer that retries `nixos-rebuild boot --refresh
+  --flake <targetFlakeUri>#<name>` every minute until the
+  `?ref=…` exists upstream, then `systemctl reboot`s into the
+  full configuration. Doesn't import AnyMachineBase (don't want
+  auto-rebuild / alerts / sops on the provisioning side — they'd
+  fail noisily without secrets). targetFlakeUri / targetConfig-
+  Name are required options. The corresponding flake.nix entry
+  is `GhostHome-provisioning-sdImage` which uses
+  `?ref=ghosthome-ready` as the readiness signal — operator
+  encrypts secrets to the new Pi's host age key, pushes the
+  branch/tag, image self-flips on the next retry.
 
 * **MultiHomedNetworking** (dual-NIC bundle):
   - `interfaces` is a list-of-records (name / fwmark /
@@ -1510,15 +1534,20 @@ remember these are open" notes)
    cap can return cleanly. Option-side descriptions on
    PhysicalServerBase + TelegramAlerts updated to document the
    accepted forms.
-6. **Pi minimalist first-boot image** — currently SD image bakes
-   full configuration; services fail at first boot without sops
-   decryption. A "minimal pi-hardware-config-only" image variant
-   would let us flash, ssh in, learn host age key, encrypt
-   secrets, push to git, then the live machine self-rebuilds.
-   Open question: bake a target-machine-specific flake URL into
-   the image vs ship a universal "any new pi" image with a
-   first-boot ssh key. Not yet researched; raised by user
-   2026-05-09.
+6. ~~**Pi minimalist first-boot image**~~ — DONE 2026-05-09.
+   `Modules/Profiles/PhysicalServerProvisioning/` profile +
+   `nixosConfigurations.GhostHome-provisioning-sdImage` flake
+   entry. Operator workflow: build & flash; boot; pull host age
+   key via `ssh-keyscan`; encrypt secrets to it; push as a
+   branch/tag matching the image's `?ref=…` (default
+   `ghosthome-ready`); image's first-boot timer self-flips on
+   the next minute's retry. After reboot, the now-running
+   GhostHome config has its own auto-rebuild-on-push tracking
+   master (no ref filter), so the readiness ref is one-shot.
+   Cross-compile from x86_64 should be cache-hits-only on the
+   minimal closure (Linux+systemd+sshd, ~all in cache.nixos.org
+   for aarch64); the SD image build doesn't fall back to
+   qemu-user for anything substantive.
 7. **Per-content-type upscaler variants** beyond animevideov3
    — line-art-aware (xBRZ / hqx) and photo-tuned neural
    (realesr-x4plus). Awaiting visual evaluation of the current
