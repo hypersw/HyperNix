@@ -37,7 +37,7 @@ let
   # (`users`) so it doesn't leak into the rendered TOML — users is a Nix
   # module concern, not a btm config key.
   tomlFormat = pkgs.formats.toml { };
-  tomlContent = builtins.removeAttrs cfg.settings [ "users" ];
+  tomlContent = builtins.removeAttrs cfg.settings [ "deployTo" ];
   configFile = tomlFormat.generate "bottom.toml" tomlContent;
 
 in {
@@ -103,17 +103,16 @@ in {
     };
 
     settings = lib.mkOption {
-      # We allow the user to put `users = [ ... ]` *next to* the bottom
-      # TOML keys here, treating it as deployment metadata that's
-      # stripped before serialization. The alternative (sibling-of-
-      # `settings` option) made the dependency invisible: `users` only
-      # has any effect when `settings` is non-empty, and putting them
-      # together makes that obvious at the call site.
+      # The `deployTo` key sits *inside* settings on purpose: it has no
+      # effect unless settings has TOML content, and putting them
+      # together makes the dependency obvious at the call site. The
+      # serializer strips `deployTo` before writing TOML so it never
+      # leaks into bottom.toml as a bogus key.
       type = tomlFormat.type;
       default = { };
       example = lib.literalExpression ''
         {
-          users = [ "work" ];     # deployment metadata (stripped from TOML)
+          deployTo = [ "work" ];   # render this settings file for these users
           flags = {
             rate = "1s";
             process_command = true;
@@ -124,16 +123,21 @@ in {
         }
       '';
       description = ''
-        TOML settings for `bottom.toml`. The reserved key `users` is a
-        list of usernames whose `~/.config/bottom/bottom.toml` will be
-        replaced with the rendered TOML (everything else under
-        `settings`); `users` itself is stripped before serialization
-        so it never lands in the file. Set `settings = {}` (the
-        default) to leave each user's config alone.
+        TOML settings for `bottom.toml`. Two kinds of keys:
 
-        Note: btm reads only one config file per invocation (no merge
-        with a system template). The deployment is therefore
-        whole-file replacement, scoped to the explicit user list.
+        * `deployTo` — *reserved*, list of usernames. The rendered
+          TOML (everything else under `settings`) gets symlinked into
+          each listed user's `~/.config/bottom/bottom.toml`. Empty or
+          absent ⇒ no per-user files written. This key is stripped
+          before serialization so it never lands in bottom.toml.
+
+        * everything else — verbatim btm config, see the
+          [bottom config docs](https://bottom.pages.dev/stable/configuration/config-file/).
+
+        Note: btm reads only one config file per invocation, with no
+        merge against a system template. The deployment is therefore
+        whole-file replacement, scoped to the explicit `deployTo`
+        list. There is no system → user layering.
       '';
     };
   };
@@ -157,9 +161,9 @@ in {
     })
 
     (let
-       users = cfg.settings.users or [ ];
+       deployTo = cfg.settings.deployTo or [ ];
        hasContent = tomlContent != { };
-     in lib.mkIf (users != [ ] && hasContent) {
+     in lib.mkIf (deployTo != [ ] && hasContent) {
       # tmpfiles "L+" symlinks into $HOME — bypasses user ownership but
       # bottom never writes to its config so that's fine. Re-runs of
       # `nixos-rebuild switch` re-link, so settings edits propagate
@@ -168,7 +172,7 @@ in {
         "d /home/${user}/.config 0755 ${user} users -"
         "d /home/${user}/.config/bottom 0755 ${user} users -"
         "L+ /home/${user}/.config/bottom/bottom.toml - - - - ${configFile}"
-      ]) users);
+      ]) deployTo);
     })
   ]);
 }
