@@ -185,9 +185,7 @@
     };
   };
 
-  # The print/scan profile needs the administrator account in
-  # `scanner` and `lp` for SANE / CUPS access. Append via the
-  # standard NixOS list-merge.
-  users.users.${config.profiles.physicalServerBase.administrator.name}
-    .extraGroups = [ "scanner" "lp" ];
+  # (`scanner` + `lp` group membership for the administrator user
+  # is appended by the print-scan profile itself, gated on which
+  # legs are enabled. No machine-side wiring needed.)
 }
