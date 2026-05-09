@@ -2,32 +2,44 @@
 let
   cfg = config.programs.btm;
 
-  # Optional fork build: bottom (btm) patched to surface Private Commit per
-  # process and a Committed_AS / CommitLimit gauge in the memory widget,
-  # both gated by `vm.overcommit_memory == 2`. Driven by cfg.fork.enable.
-  # When the source path doesn't yet exist on the host, we fall through to
-  # the upstream package and emit a warning at eval time, so a fresh
-  # deploy can't break.
+  # Default fork source: pin a specific rev on github.com/hypersw/bottom.
+  # Bumping requires updating both `rev` and `sha256` here. Override
+  # `programs.btm.fork.src` with a local path if you're iterating on the
+  # fork before pushing.
+  defaultForkSrc = pkgs.fetchFromGitHub {
+    owner = "hypersw";
+    repo = "bottom";
+    rev = "435d3d29f1069c85adc2888bb830a46a36309120"; # f/strict-overcommit-mode tip
+    sha256 = "0388d85y55cz894jv5d8ah86af26hlk9qizx5dk6s2kn5zd2rdk0";
+  };
+
+  # Build the fork by overriding `pkgs.bottom`'s src. The fork shares
+  # `Cargo.lock` with upstream 0.12.3, so the cargoHash from nixpkgs
+  # remains valid — no override needed. If a future fork rebase touches
+  # Cargo.lock, set `cargoHash = lib.fakeHash;` here, run `nix build`
+  # once, and copy the printed hash.
+  #
+  # Local-path overrides: `cfg.fork.src` can also be set to a path on
+  # disk (e.g. /home/foo/Projects/External/bottom). When that path
+  # doesn't exist, we fall back to `pkgs.bottom` with a warning so a
+  # fresh-clone host can still rebuild.
   forkPackage =
     let
       src = cfg.fork.src;
-      # Path-existence check at module-eval time (not as a derivation): if
-      # the path doesn't exist, fall back. This lets the same config land
-      # on machines that don't have the fork checked out yet.
-      srcExists = builtins.pathExists src;
+      srcOk =
+        # `fetchFromGitHub` returns a /nix/store path that always exists.
+        # `builtins.pathExists` covers both that case and user-supplied
+        # filesystem paths during development.
+        builtins.pathExists src;
     in
-      if srcExists
+      if srcOk
       then pkgs.bottom.overrideAttrs (old: {
         version = "${old.version}-strict-overcommit";
         src = src;
-        # Fork uses the same Cargo.lock as upstream 0.12.3, so re-use the
-        # cargoHash from nixpkgs. If upstream nixpkgs bumps to a version
-        # that bumps Cargo.lock, set this to `lib.fakeHash` and `nix
-        # build` once to learn the new hash.
       })
       else lib.warn
         ("programs.btm.fork.src does not exist at ${toString src}; "
-         + "falling back to upstream pkgs.bottom. Clone the fork first.")
+         + "falling back to upstream pkgs.bottom.")
         pkgs.bottom;
 
   # The actual binary the rest of the module wires up.
@@ -77,13 +89,19 @@ in {
 
       src = lib.mkOption {
         type = lib.types.path;
-        default = /home/work/Projects/External/bottom;
+        default = defaultForkSrc;
+        defaultText = lib.literalExpression ''
+          pkgs.fetchFromGitHub {
+            owner = "hypersw"; repo = "bottom";
+            rev = "<pinned tip of f/strict-overcommit-mode>";
+            sha256 = "<...>";
+          };
+        '';
         description = ''
-          Path to the local clone of the bottom fork. Only consulted
-          when `fork.enable` is true. The default points at the
-          author's working copy; override per-host if your layout
-          differs. Once the fork is published to GitHub, replace this
-          with `pkgs.fetchFromGitHub { ... }`.
+          Source for the bottom fork. By default a `fetchFromGitHub`
+          pin on `hypersw/bottom`; override with a local path (e.g.
+          `/home/work/Projects/External/bottom`) while iterating
+          locally — anything `lib.types.path` accepts works.
         '';
       };
     };
