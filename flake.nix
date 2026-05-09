@@ -46,6 +46,8 @@
             self.nixosConfigurations.PrintScanServerPi4-sdImage.config.system.build.sdImage or null;
           Machines-PhysicalServers-GhostHome-sdImage =
             self.nixosConfigurations.GhostHome-sdImage.config.system.build.sdImage or null;
+          Machines-PhysicalServers-GhostHome-provisioning-sdImage =
+            self.nixosConfigurations.GhostHome-provisioning-sdImage.config.system.build.sdImage or null;
         });
 
       # ── NixOS Modules ──

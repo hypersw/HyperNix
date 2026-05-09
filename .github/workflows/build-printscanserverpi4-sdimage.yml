@@ -1,0 +1,67 @@
+name: Build PrintScanServerPi4 SD Image
+
+# Pi 4 hardware is decommissioned (board damaged 2026-04-21); the
+# configuration is kept as a working reference and as a fallback if
+# the role is ever re-flashed onto a fresh Pi 4. Manual-only trigger
+# so we don't burn CI minutes on hardware that isn't in production.
+on:
+  workflow_dispatch:
+
+jobs:
+  build-sd-image:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: cachix/install-nix-action@v30
+        with:
+          extra_nix_config: |
+            extra-platforms = aarch64-linux
+            experimental-features = nix-command flakes
+            extra-substituters = https://nix-community.cachix.org https://cache.nixos.org
+            extra-trusted-public-keys = nix-community.cachix.org-1:mB9FSh9qf2dCimDSUo8Zy7bkq5CX+/rkCWyvRCYg3Fs= cache.nixos.org-1:6NCHdD59X431o0gWypbMrAURkbJ16ZPMQFGspcDShjY=
+
+      # Register QEMU as binfmt interpreter for aarch64 — lets nix
+      # transparently execute aarch64 binaries during the build.
+      # Most packages come from the binary cache; QEMU only runs
+      # for uncached packages.
+      - uses: docker/setup-qemu-action@v3
+        with:
+          platforms: arm64
+
+      - name: Build SD card image
+        run: |
+          IMG_PATH=$(nix build \
+            '.#Machines-PhysicalServers-PrintScanServerPi4-sdImage' \
+            --no-link --print-out-paths \
+            --option system-features "big-parallel")
+          echo "img_path=$IMG_PATH" >> "$GITHUB_ENV"
+
+      - name: Prepare artifact
+        run: |
+          # The store path is a directory containing the .img.zst file
+          IMG_FILE=$(find "${{ env.img_path }}" -name "*.img.zst" -type f | head -1)
+          if [ -z "$IMG_FILE" ]; then
+            echo "No .img.zst file found in ${{ env.img_path }}"
+            ls -laR "${{ env.img_path }}"
+            exit 1
+          fi
+          IMG_NAME=$(basename "$IMG_FILE")
+          cp "$IMG_FILE" "$IMG_NAME"
+          echo "img_name=$IMG_NAME" >> "$GITHUB_ENV"
+          ls -lh "$IMG_NAME"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: printscanserverpi4-sdimage
+          path: ${{ env.img_name }}
+          retention-days: 7
+
+      # On tagged releases, also upload to GitHub Releases
+      - name: Create release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ${{ env.img_name }}
