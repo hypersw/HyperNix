@@ -1267,9 +1267,12 @@ formats / UX bits since the 04-25 snapshot.
 
 ### Hardware
 
-* **Pi 4 board**: decommissioned (PSU damaged the board). Config
-  retained at `Machines/PhysicalServers/PrintScanServerPi4/` for
-  reference and for use if a new Pi 4 ever gets flashed.
+* **Pi 4 board**: not currently running (5 V damage 2026-04-21
+  retired the original board). Config + provisioning image
+  actively maintained — flashing
+  `PrintScanServerPi4-provisioning-sdImage` to a fresh Pi 4
+  brings the role back via the same self-flip pattern GhostHome
+  uses; `printscan-ready-<shortRev>` is the readiness ref.
 * **Pi 5 (`GhostHome`)**: planned next deployment. Will host a
   home-automation stack as the headline workload; print/scan is
   a guest service on it. New machine config at
@@ -1284,7 +1287,7 @@ HyperNix/
 ├── Machines/
 │   ├── MicroVM/VmSshFront/                     unchanged
 │   └── PhysicalServers/                        renamed from RPi4/
-│       ├── PrintScanServerPi4/                 (decommissioned)
+│       ├── PrintScanServerPi4/                 (not currently flashed)
 │       │   ├── configuration.nix
 │       │   ├── secrets/secrets.yaml
 │       │   └── PLAN.md (this file)
@@ -1305,7 +1308,8 @@ HyperNix/
 └── flake.nix                                   nixosConfigurations:
                                                 PrintScanServerPi4,
                                                 GhostHome
-                                                (each + -sdImage variant)
+                                                (each + -sdImage variant
+                                                 + -provisioning-sdImage variant)
 ```
 
 ### Profile design (updated 2026-05-09)
@@ -1357,12 +1361,17 @@ secret-delivery story decoupled.
   configuration. Doesn't import AnyMachineBase (don't want
   auto-rebuild / alerts / sops on the provisioning side — they'd
   fail noisily without secrets). targetFlakeUri /
-  targetConfigName are required options. The corresponding
-  flake.nix entry is `GhostHome-provisioning-sdImage` which
-  uses `?ref=ghosthome-ready-<shortRev>` (per-image unique ref
-  name, baked into the image filename via
-  `image.baseName = "ghosthome-provisioning(ref=…)"` — operator
-  greps the filename to know which branch/tag to push).
+  targetConfigName are required options. Two flake.nix entries
+  consume this profile, one per host:
+  * `PrintScanServerPi4-provisioning-sdImage` →
+    `?ref=printscan-ready-<shortRev>` → flips into
+    `PrintScanServerPi4`
+  * `GhostHome-provisioning-sdImage` →
+    `?ref=ghosthome-ready-<shortRev>` → flips into `GhostHome`
+
+  Both bake the per-image readiness ref into the filename via
+  `image.baseName = "<host>-provisioning(ref=…)"` so the
+  operator greps the filename to know which branch/tag to push.
 
 * **MultiHomedNetworking** (dual-NIC bundle):
   - `interfaces` is a list-of-records (name / fwmark /

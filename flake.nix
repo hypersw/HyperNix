@@ -44,6 +44,8 @@
             self.nixosConfigurations.VmSshFront.config.microvm.declaredRunner or null;
           Machines-PhysicalServers-PrintScanServerPi4-sdImage =
             self.nixosConfigurations.PrintScanServerPi4-sdImage.config.system.build.sdImage or null;
+          Machines-PhysicalServers-PrintScanServerPi4-provisioning-sdImage =
+            self.nixosConfigurations.PrintScanServerPi4-provisioning-sdImage.config.system.build.sdImage or null;
           Machines-PhysicalServers-GhostHome-sdImage =
             self.nixosConfigurations.GhostHome-sdImage.config.system.build.sdImage or null;
           Machines-PhysicalServers-GhostHome-provisioning-sdImage =
@@ -77,10 +79,11 @@
           inherit nixpkgs microvm;
         };
 
-        # ── PrintScanServerPi4 — kept as a reference for the
-        # original Pi 4 deployment (now decommissioned). The Pi 4
-        # board is no longer running; this configuration would
-        # apply to a fresh-flashed Pi 4 with the same role.
+        # ── PrintScanServerPi4 — Pi 4 print/scan deployment.
+        # Currently not running (the original board took 5 V damage
+        # 2026-04-21 and was retired) but the configuration is
+        # actively maintained — a fresh-flashed Pi 4 boots straight
+        # into the same role via the provisioning image below.
         PrintScanServerPi4 = nixpkgs.lib.nixosSystem {
           system = "aarch64-linux";
           modules = [
@@ -105,6 +108,44 @@
             sops-nix.nixosModules.sops
             "${nixpkgs}/nixos/modules/installer/sd-card/sd-image-aarch64.nix"
             ./Machines/PhysicalServers/PrintScanServerPi4/configuration.nix
+          ];
+        };
+
+        # ── PrintScanServerPi4-provisioning — first-boot image for a
+        # fresh Pi 4 SD card. Mirrors GhostHome's provisioning
+        # pattern; see the long comment above the GhostHome variant
+        # below for the complete workflow rationale. Differences:
+        # uses the Pi 4 nixos-hardware module (which auto-toggles
+        # extlinux, so no explicit boot.loader.* needed), bakes
+        # `printscan-ready-<shortRev>` as the readiness ref, flips
+        # into `PrintScanServerPi4`.
+        PrintScanServerPi4-provisioning-sdImage = let
+          printScanReadySuffix = self.shortRev or self.dirtyShortRev or "dirtyManual";
+          printScanReadyRef = "printscan-ready-${printScanReadySuffix}";
+        in nixpkgs.lib.nixosSystem {
+          system = "aarch64-linux";
+          modules = [
+            nixos-hardware.nixosModules.raspberry-pi-4
+            "${nixpkgs}/nixos/modules/installer/sd-card/sd-image-aarch64.nix"
+            ./Modules/Profiles/PhysicalServerProvisioning
+            ({ ... }: {
+              # Generic mainline kernel; same caching reasoning as
+              # the live config.
+              boot.kernelPackages = nixpkgs.legacyPackages.aarch64-linux.linuxPackages;
+
+              networking.hostName = "printscan-provisioning";
+              system.stateVersion = "25.05";
+
+              image.baseName =
+                "printscan-provisioning(ref=${printScanReadyRef})";
+
+              hypersw.profiles.physicalServerProvisioning = {
+                enable = true;
+                targetFlakeUri =
+                  "github:hypersw/HyperNix?ref=${printScanReadyRef}";
+                targetConfigName = "PrintScanServerPi4";
+              };
+            })
           ];
         };
 

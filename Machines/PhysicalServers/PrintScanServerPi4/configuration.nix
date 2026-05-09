@@ -1,9 +1,12 @@
 { config, lib, pkgs, ... }:
 #
-# Print/scan server on a Raspberry Pi 4 — the original deployment
-# (now decommissioned; replaced by GhostHome on Pi 5). Kept here as
-# a reference for what was specific to this hardware revision in
-# case a Pi 4 ever gets re-flashed.
+# Print/scan server on a Raspberry Pi 4. The original board took
+# 5 V damage on 2026-04-21 and is currently offline; the role is
+# served by GhostHome (Pi 5) for now. The configuration here is
+# actively maintained alongside GhostHome — flashing
+# `PrintScanServerPi4-provisioning-sdImage` to a fresh Pi 4 brings
+# the role back up via the same first-boot self-flip pattern
+# GhostHome uses.
 #
 # Most of the configuration lives in three profile modules
 # (PhysicalServerBase / PrintScanServer / MultiHomedNetworking).

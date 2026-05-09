@@ -1,12 +1,19 @@
-name: Build PrintScanServerPi4 SD Image
+name: Build PrintScanServerPi4 Provisioning SD Image
 
-# Reference SD-card image for the Pi 4 print/scan deployment. The
-# board's not currently in service (took 5 V damage 2026-04-21)
-# but the config + image stay current — for first-time bring-up of
-# a fresh Pi 4 use the provisioning image instead, which auto-flips
-# into this configuration after first boot. Manual trigger only:
-# matches the GhostHome pattern, building per push burns CI on
-# images that mostly never get flashed.
+# First-boot provisioning image for PrintScanServerPi4. Same self-
+# flip pattern as the GhostHome provisioning image, just targeting
+# the Pi 4 hardware module + the PrintScanServerPi4 nixosConfig:
+# bakes `?ref=printscan-ready-<shortRev>` into the closure and
+# embeds the same shortRev (with parens around the `ref=value`
+# form) in the filename. Operator pushes
+# `printscan-ready-<shortRev>` once secrets are encrypted to the
+# new Pi's host age key and the image self-flips on next retry.
+#
+# Manual trigger only: each image bakes the *commit it was built
+# from* and is only useful for a Pi being freshly flashed with that
+# image. Building on every push would produce unique images per
+# commit but burn ~5-10 min of CI on each — over-aggressive for a
+# personal repo where most commits never lead to a flash.
 on:
   workflow_dispatch:
 
@@ -26,25 +33,20 @@ jobs:
             extra-substituters = https://nix-community.cachix.org https://cache.nixos.org
             extra-trusted-public-keys = nix-community.cachix.org-1:mB9FSh9qf2dCimDSUo8Zy7bkq5CX+/rkCWyvRCYg3Fs= cache.nixos.org-1:6NCHdD59X431o0gWypbMrAURkbJ16ZPMQFGspcDShjY=
 
-      # Register QEMU as binfmt interpreter for aarch64 — lets nix
-      # transparently execute aarch64 binaries during the build.
-      # Most packages come from the binary cache; QEMU only runs
-      # for uncached packages.
       - uses: docker/setup-qemu-action@v3
         with:
           platforms: arm64
 
-      - name: Build SD card image
+      - name: Build provisioning SD card image
         run: |
           IMG_PATH=$(nix build \
-            '.#Machines-PhysicalServers-PrintScanServerPi4-sdImage' \
+            '.#Machines-PhysicalServers-PrintScanServerPi4-provisioning-sdImage' \
             --no-link --print-out-paths \
             --option system-features "big-parallel")
           echo "img_path=$IMG_PATH" >> "$GITHUB_ENV"
 
       - name: Prepare artifact
         run: |
-          # The store path is a directory containing the .img.zst file
           IMG_FILE=$(find "${{ env.img_path }}" -name "*.img.zst" -type f | head -1)
           if [ -z "$IMG_FILE" ]; then
             echo "No .img.zst file found in ${{ env.img_path }}"
@@ -58,11 +60,10 @@ jobs:
 
       - uses: actions/upload-artifact@v4
         with:
-          name: printscanserverpi4-sdimage
+          name: printscanserverpi4-provisioning-sdimage
           path: ${{ env.img_name }}
-          retention-days: 7
+          retention-days: 30
 
-      # On tagged releases, also upload to GitHub Releases
       - name: Create release
         if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v2
