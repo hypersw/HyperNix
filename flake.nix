@@ -44,6 +44,8 @@
             self.nixosConfigurations.VmSshFront.config.microvm.declaredRunner or null;
           Machines-PhysicalServers-PrintScanServerPi4-sdImage =
             self.nixosConfigurations.PrintScanServerPi4-sdImage.config.system.build.sdImage or null;
+          Machines-PhysicalServers-GhostHome-sdImage =
+            self.nixosConfigurations.GhostHome-sdImage.config.system.build.sdImage or null;
         });
 
       # ── NixOS Modules ──
@@ -59,9 +61,11 @@
         Modules-System-AvahiPerInterfaceNames = import ./Modules/System/AvahiPerInterfaceNames;
         Modules-System-BootStabilityProbe = import ./Modules/System/BootStabilityProbe;
         # Profile meta-modules — single-import "make this host be X"
-        # bundles. Compose to apply both at once on the same machine.
+        # bundles. Compose to apply multiple at once on the same
+        # machine.
         Profiles-PhysicalServerBase = import ./Modules/Profiles/PhysicalServerBase;
         Profiles-PrintScanServer = import ./Modules/Profiles/PrintScanServer;
+        Profiles-MultiHomedNetworking = import ./Modules/Profiles/MultiHomedNetworking;
       };
 
       # ── NixOS Configurations ──
@@ -70,9 +74,10 @@
           inherit nixpkgs microvm;
         };
 
-        # The running system config — used by nixos-rebuild on the Pi.
-        # Does NOT include the SD image/installer module (that's only
-        # for CI image builds).
+        # ── PrintScanServerPi4 — kept as a reference for the
+        # original Pi 4 deployment (now decommissioned). The Pi 4
+        # board is no longer running; this configuration would
+        # apply to a fresh-flashed Pi 4 with the same role.
         PrintScanServerPi4 = nixpkgs.lib.nixosSystem {
           system = "aarch64-linux";
           modules = [
@@ -90,10 +95,6 @@
             ./Machines/PhysicalServers/PrintScanServerPi4/configuration.nix
           ];
         };
-
-        # SD image variant — includes the installer module for building
-        # flashable images. Only used by CI (GitHub Actions) and the
-        # sdImage package below.
         PrintScanServerPi4-sdImage = nixpkgs.lib.nixosSystem {
           system = "aarch64-linux";
           modules = [
@@ -104,14 +105,32 @@
           ];
         };
 
-        # Backwards-compatibility alias: the deployed Pi 4 has a
-        # /etc/nixos/flake.nix that references
-        # `upstream.nixosConfigurations.PrintScanServer` (the pre-
-        # rename name). Keep that name alive so the auto-rebuild on
-        # the live machine doesn't fail with "no such configuration"
-        # the moment this commit lands. The activation script
-        # generates the new name on freshly-flashed images.
-        PrintScanServer = self.nixosConfigurations.PrintScanServerPi4;
+        # ── GhostHome — Pi 5 home-automation server. Inherits the
+        # print/scan stack as a guest workload until a dedicated
+        # home-automation role takes its place as the headline.
+        GhostHome = nixpkgs.lib.nixosSystem {
+          system = "aarch64-linux";
+          modules = [
+            nixos-hardware.nixosModules.raspberry-pi-5
+            sops-nix.nixosModules.sops
+            {
+              system.configurationRevision = self.rev or self.dirtyRev or "dirty";
+              profiles.physicalServerBase.alerts.configRevision =
+                self.rev or self.dirtyRev or "dirty";
+              profiles.physicalServerBase.alerts.nixpkgsRevision = nixpkgs.rev;
+            }
+            ./Machines/PhysicalServers/GhostHome/configuration.nix
+          ];
+        };
+        GhostHome-sdImage = nixpkgs.lib.nixosSystem {
+          system = "aarch64-linux";
+          modules = [
+            nixos-hardware.nixosModules.raspberry-pi-5
+            sops-nix.nixosModules.sops
+            "${nixpkgs}/nixos/modules/installer/sd-card/sd-image-aarch64.nix"
+            ./Machines/PhysicalServers/GhostHome/configuration.nix
+          ];
+        };
       };
     };
 }
