@@ -1,6 +1,6 @@
 { config, lib, pkgs, ... }:
 let
-  cfg = config.services.auto-rebuild-on-push;
+  cfg = config.hypersw.services.auto-rebuild-on-push;
 
   # Unprivileged user for the checker. Named after what it *does* (poll
   # github for changes) rather than the wider system name, to make the
@@ -119,7 +119,7 @@ let
   '';
 in
 {
-  options.services.auto-rebuild-on-push = {
+  options.hypersw.services.auto-rebuild-on-push = {
     enable = lib.mkEnableOption "Poll upstream flake for changes and rebuild when new commits are pushed";
 
     interval = lib.mkOption {

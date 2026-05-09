@@ -1,6 +1,6 @@
 { config, lib, pkgs, ... }:
 let
-  cfg = config.services.telegram-alerts;
+  cfg = config.hypersw.services.telegram-alerts;
 
   # ─── Alert pipeline ──────────────────────────────────────────────────────
   #
@@ -544,7 +544,7 @@ Chart: $NETDATA_ALARM_CHART"
   '';
 in
 {
-  options.services.telegram-alerts = {
+  options.hypersw.services.telegram-alerts = {
     enable = lib.mkEnableOption "System monitoring with Telegram alerts via netdata";
 
     tokenFile = lib.mkOption {

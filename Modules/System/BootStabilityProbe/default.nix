@@ -54,7 +54,7 @@
 # ──────────────────────────────────────────────────────────────────────────────
 
 let
-  cfg = config.services.boot-stability-probe;
+  cfg = config.hypersw.services.boot-stability-probe;
 
   # Modules deferred at kernel boot via cmdline. Must match modules modprobed
   # in order in the bringup service below.
@@ -66,7 +66,7 @@ let
   allDeferred = deferredModules.usb ++ deferredModules.wifi;
 in
 {
-  options.services.boot-stability-probe = {
+  options.hypersw.services.boot-stability-probe = {
     enable = lib.mkEnableOption "staged peripheral bring-up for boot-stability diagnosis";
 
     initialSettleSeconds = lib.mkOption {

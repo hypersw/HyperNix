@@ -1,6 +1,6 @@
 { config, lib, pkgs, ... }:
 let
-  cfg = config.services.epkowa-scanner;
+  cfg = config.hypersw.services.epkowa-scanner;
 
   # Single source of truth for the SANE config directory path. Used below
   # for the /etc files we install, the login-shell env, and anywhere else
@@ -84,7 +84,7 @@ let
   });
 in
 {
-  options.services.epkowa-scanner = {
+  options.hypersw.services.epkowa-scanner = {
     enable = lib.mkEnableOption "Epson Perfection V33 scanning via SANE/epkowa";
 
     airsane.enable = lib.mkOption {
@@ -103,7 +103,7 @@ in
     #
     # Usage:
     #   systemd.services.foo.environment =
-    #     config.services.epkowa-scanner.serviceEnvironment // { ... };
+    #     config.hypersw.services.epkowa-scanner.serviceEnvironment // { ... };
     serviceEnvironment = lib.mkOption {
       type = lib.types.attrsOf lib.types.str;
       readOnly = true;

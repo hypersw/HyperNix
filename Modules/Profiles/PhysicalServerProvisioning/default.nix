@@ -54,10 +54,10 @@
 # into the real config".
 #
 let
-  cfg = config.profiles.physicalServerProvisioning;
+  cfg = config.hypersw.profiles.physicalServerProvisioning;
 in
 {
-  options.profiles.physicalServerProvisioning = {
+  options.hypersw.profiles.physicalServerProvisioning = {
     enable = lib.mkEnableOption "Minimalist first-boot provisioning image";
 
     targetFlakeUri = lib.mkOption {

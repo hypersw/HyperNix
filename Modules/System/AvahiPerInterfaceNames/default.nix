@@ -50,7 +50,7 @@
 # ──────────────────────────────────────────────────────────────────────────────
 
 let
-  cfg = config.services.avahi-per-interface-names;
+  cfg = config.hypersw.services.avahi-per-interface-names;
 
   # Runtime directory for our generated avahi-daemon.conf.
   runDir = "/run/avahi-primary-interface";
@@ -155,7 +155,7 @@ let
   '';
 in
 {
-  options.services.avahi-per-interface-names = {
+  options.hypersw.services.avahi-per-interface-names = {
     enable = lib.mkEnableOption ''
       dynamic Avahi primary-interface tracker.
 

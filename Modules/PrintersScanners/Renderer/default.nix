@@ -1,10 +1,10 @@
 { config, lib, pkgs, ... }:
 let
-  cfg = config.services.printscan-renderer;
+  cfg = config.hypersw.services.printscan-renderer;
   rendererPackage = import ./package.nix { inherit pkgs; };
 in
 {
-  options.services.printscan-renderer = {
+  options.hypersw.services.printscan-renderer = {
     enable = lib.mkEnableOption ''
       Document → PDF rendering daemon (Telegram bot's "I sent a .docx,
       please print it" path). Spawns headless LibreOffice per request,

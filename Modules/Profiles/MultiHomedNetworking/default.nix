@@ -37,14 +37,14 @@
 # with predictable interface names like `enpXsY` / `wlpXsY`.
 #
 let
-  cfg = config.profiles.multiHomedNetworking;
+  cfg = config.hypersw.profiles.multiHomedNetworking;
 in
 {
   imports = [
     ../../System/AvahiPerInterfaceNames
   ];
 
-  options.profiles.multiHomedNetworking = {
+  options.hypersw.profiles.multiHomedNetworking = {
     enable = lib.mkEnableOption "Multi-homed source-routing + mDNS bundle";
 
     interfaces = lib.mkOption {
@@ -130,7 +130,7 @@ in
   config = lib.mkIf cfg.enable {
     assertions = [{
       assertion = (builtins.length cfg.interfaces) >= 1;
-      message = "profiles.multiHomedNetworking requires at least one interface.";
+      message = "hypersw.profiles.multiHomedNetworking requires at least one interface.";
     }];
 
     # ── ARP behaviour: strict per-interface L2 identity ────────────
@@ -236,6 +236,6 @@ in
       nssmdns4 = true;
       publish.enable = true;
     };
-    services.avahi-per-interface-names.enable = true;
+    hypersw.services.avahi-per-interface-names.enable = true;
   };
 }

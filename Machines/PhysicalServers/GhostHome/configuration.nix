@@ -20,7 +20,7 @@
 #
 {
   imports = [
-    ../../../Modules/Profiles/PhysicalServerBase
+    ../../../Modules/Profiles/AnyMachineBase
     ../../../Modules/Profiles/PrintScanServer
     ../../../Modules/Profiles/MultiHomedNetworking
   ];
@@ -153,13 +153,14 @@
   };
 
   # ── Profile wiring ──
-  # PhysicalServerBase auto-enables AnyMachineBase. Per-host data
-  # — the human's keys, alerts paths, the local-flake bootstrap —
-  # all live on the anyMachineBase namespace because they apply
-  # to any NixOS host, not just physical ones.
-  profiles.physicalServerBase.enable = true;
-
-  profiles.anyMachineBase = {
+  # AnyMachineBase carries everything every NixOS host we run
+  # wants — auto-rebuild, telegram-alerts, sshd, the admin user,
+  # and on non-container hosts also redistributable firmware,
+  # zram, swap, /tmp on tmpfs, noatime on /. The container-only
+  # gate means it imports cleanly into nspawn configs too;
+  # everything below the gate auto-skips for them.
+  hypersw.profiles.anyMachineBase = {
+    enable = true;
     administrator = {
       name = "administrator";
       authorizedKeys = [
@@ -176,9 +177,9 @@
     localFlake.configurationName = "GhostHome";
   };
 
-  profiles.multiHomedNetworking.enable = true;
+  hypersw.profiles.multiHomedNetworking.enable = true;
 
-  profiles.printScanServer = {
+  hypersw.profiles.printScanServer = {
     enable = true;
     bot = {
       tokenFile = config.sops.secrets.PrintScanTelegramBotToken.path;

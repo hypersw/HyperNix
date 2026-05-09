@@ -19,7 +19,7 @@
 # settable from the caller for one-off overrides.
 #
 let
-  cfg = config.profiles.printScanServer;
+  cfg = config.hypersw.profiles.printScanServer;
 in
 {
   imports = [
@@ -30,7 +30,7 @@ in
     ../../PrintersScanners/TelegramBot
   ];
 
-  options.profiles.printScanServer = {
+  options.hypersw.profiles.printScanServer = {
     enable = lib.mkEnableOption "Full print/scan server stack (CUPS + scanner + renderer + Telegram bot)";
 
     bot = {
@@ -121,18 +121,18 @@ in
 
   config = lib.mkIf cfg.enable {
     # ── core daemon + renderer (always on when profile enabled) ──
-    services.printscan-daemon = {
+    hypersw.services.printscan-daemon = {
       enable = true;
       mediaSize = cfg.printer.mediaSize;
       nonPrintableMarginsMm = cfg.printer.nonPrintableMarginsMm;
     };
-    services.printscan-renderer.enable = true;
+    hypersw.services.printscan-renderer.enable = true;
 
     # ── opt-in legs ──────────────────────────────────────────────
-    services.laserjet-printer.enable = cfg.laserjetPrinter.enable;
-    services.epkowa-scanner.enable   = cfg.epkowaScanner.enable;
+    hypersw.services.laserjet-printer.enable = cfg.laserjetPrinter.enable;
+    hypersw.services.epkowa-scanner.enable   = cfg.epkowaScanner.enable;
 
-    services.printscan-telegram-bot = lib.mkIf cfg.bot.enable {
+    hypersw.services.printscan-telegram-bot = lib.mkIf cfg.bot.enable {
       enable = true;
       tokenFile = cfg.bot.tokenFile;
       allowedUsers = cfg.bot.allowedUsers;
@@ -171,12 +171,11 @@ in
     # from each having to know that scanner+lp are needed for
     # SANE+CUPS, and from re-stating the admin user's name.
     #
-    # AnyMachineBase rather than PhysicalServerBase because the
-    # admin user lives on the more general base. Print-scan can
-    # in principle run on a non-physical NixOS host (lab VM with
+    # The admin user lives on AnyMachineBase. Print-scan can in
+    # principle run on a non-physical NixOS host (lab VM with
     # USB-passthrough scanner + a network-attached printer); the
     # admin-user grooming should follow.
-    users.users.${config.profiles.anyMachineBase.administrator.name}
+    users.users.${config.hypersw.profiles.anyMachineBase.administrator.name}
       .extraGroups =
         lib.optionals cfg.epkowaScanner.enable [ "scanner" ]
         ++ lib.optionals cfg.laserjetPrinter.enable [ "lp" ];

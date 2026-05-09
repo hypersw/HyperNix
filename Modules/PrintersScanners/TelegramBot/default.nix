@@ -1,13 +1,13 @@
 { config, lib, pkgs, ... }:
 let
-  cfg = config.services.printscan-telegram-bot;
-  daemonCfg = config.services.printscan-daemon;
-  rendererCfg = config.services.printscan-renderer;
+  cfg = config.hypersw.services.printscan-telegram-bot;
+  daemonCfg = config.hypersw.services.printscan-daemon;
+  rendererCfg = config.hypersw.services.printscan-renderer;
   sharedPackage = import ../Shared/package.nix { inherit pkgs; };
   botPackage = import ./package.nix { inherit pkgs sharedPackage; };
 in
 {
-  options.services.printscan-telegram-bot = {
+  options.hypersw.services.printscan-telegram-bot = {
     enable = lib.mkEnableOption "Telegram bot for print/scan operations";
 
     tokenFile = lib.mkOption {
@@ -36,7 +36,7 @@ in
 
     assertions = [{
       assertion = daemonCfg.enable;
-      message = "services.printscan-telegram-bot requires services.printscan-daemon to be enabled";
+      message = "hypersw.services.printscan-telegram-bot requires hypersw.services.printscan-daemon to be enabled";
     }];
 
     systemd.services.printscan-telegram-bot = {

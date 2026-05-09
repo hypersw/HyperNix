@@ -1,9 +1,9 @@
 { config, lib, pkgs, ... }:
 let
-  cfg = config.services.laserjet-printer;
+  cfg = config.hypersw.services.laserjet-printer;
 in
 {
-  options.services.laserjet-printer = {
+  options.hypersw.services.laserjet-printer = {
     enable = lib.mkEnableOption "HP LaserJet P2015n USB printing via CUPS + foo2zjs";
   };
 

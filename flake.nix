@@ -64,7 +64,6 @@
         # bundles. Compose to apply multiple at once on the same
         # machine.
         Profiles-AnyMachineBase = import ./Modules/Profiles/AnyMachineBase;
-        Profiles-PhysicalServerBase = import ./Modules/Profiles/PhysicalServerBase;
         Profiles-PrintScanServer = import ./Modules/Profiles/PrintScanServer;
         Profiles-MultiHomedNetworking = import ./Modules/Profiles/MultiHomedNetworking;
         Profiles-PhysicalServerProvisioning = import ./Modules/Profiles/PhysicalServerProvisioning;
@@ -90,9 +89,9 @@
               # Forward the revision strings into the alerts profile
               # surface — those values come out of the flake (where
               # `self.rev` is available) and nowhere else.
-              profiles.anyMachineBase.alerts.configRevision =
+              hypersw.profiles.anyMachineBase.alerts.configRevision =
                 self.rev or self.dirtyRev or "dirty";
-              profiles.anyMachineBase.alerts.nixpkgsRevision = nixpkgs.rev;
+              hypersw.profiles.anyMachineBase.alerts.nixpkgsRevision = nixpkgs.rev;
             }
             ./Machines/PhysicalServers/PrintScanServerPi4/configuration.nix
           ];
@@ -117,9 +116,9 @@
             sops-nix.nixosModules.sops
             {
               system.configurationRevision = self.rev or self.dirtyRev or "dirty";
-              profiles.anyMachineBase.alerts.configRevision =
+              hypersw.profiles.anyMachineBase.alerts.configRevision =
                 self.rev or self.dirtyRev or "dirty";
-              profiles.anyMachineBase.alerts.nixpkgsRevision = nixpkgs.rev;
+              hypersw.profiles.anyMachineBase.alerts.nixpkgsRevision = nixpkgs.rev;
             }
             ./Machines/PhysicalServers/GhostHome/configuration.nix
           ];
@@ -189,13 +188,18 @@
               # knows exactly which branch/tag they need to push
               # for the first-boot switch to succeed. The new
               # `image.baseName` option (sd-image renamed it from
-              # `sdImage.imageBaseName` in 25.05) feeds the
-              # filename template — final result is
-              # `<base>-<nixos-label>-<arch>.img`.
+              # `sdImage.imageBaseName` in 25.05) feeds
+              # `image.fileName` — final filename ends up as
+              # `<base>.img.zst`.
+              #
+              # Format: `(ref=<value>)` rather than dash-joined so
+              # the value extracts unambiguously regardless of how
+              # many dashes either side carries —
+              # `grep -oP '\(ref=\K[^)]+'` lifts it out cleanly.
               image.baseName =
-                "ghosthome-provisioning.ref-${ghostReadyRef}";
+                "ghosthome-provisioning(ref=${ghostReadyRef})";
 
-              profiles.physicalServerProvisioning = {
+              hypersw.profiles.physicalServerProvisioning = {
                 enable = true;
                 targetFlakeUri =
                   "github:hypersw/HyperNix?ref=${ghostReadyRef}";

@@ -1,11 +1,11 @@
 { config, lib, pkgs, ... }:
 let
-  cfg = config.services.printscan-daemon;
+  cfg = config.hypersw.services.printscan-daemon;
   sharedPackage = import ../Shared/package.nix { inherit pkgs; };
   daemonPackage = import ./package.nix { inherit pkgs sharedPackage; };
 in
 {
-  options.services.printscan-daemon = {
+  options.hypersw.services.printscan-daemon = {
     enable = lib.mkEnableOption "Print/Scan daemon with Unix socket API";
 
     socketPath = lib.mkOption {
@@ -143,7 +143,7 @@ in
       # SANE backend lookup vars (SANE_CONFIG_DIR + LD_LIBRARY_PATH).
       # Must be service-level, not globalEnvironment, to avoid triggering
       # systemd PID 1 reexec on switch-to-configuration.
-      // config.services.epkowa-scanner.serviceEnvironment;
+      // config.hypersw.services.epkowa-scanner.serviceEnvironment;
 
       serviceConfig = {
         # Pin CWD to a guaranteed-empty read-only dir. systemd's default is

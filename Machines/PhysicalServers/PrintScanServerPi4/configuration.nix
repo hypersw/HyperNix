@@ -17,7 +17,7 @@
 #
 {
   imports = [
-    ../../../Modules/Profiles/PhysicalServerBase
+    ../../../Modules/Profiles/AnyMachineBase
     ../../../Modules/Profiles/PrintScanServer
     ../../../Modules/Profiles/MultiHomedNetworking
     # Pi-specific diagnostic — staged peripheral bring-up after the
@@ -80,7 +80,7 @@
   # Defers USB-A (xhci_pci) and Wi-Fi (brcmfmac) past the brownout-
   # prone first ~10 s of boot, then brings them up serially with
   # aggressive journal syncs. Pi 4-specific diagnostic.
-  services.boot-stability-probe.enable = true;
+  hypersw.services.boot-stability-probe.enable = true;
 
   # Throttle history sampler — vcgencmd's get_throttled is "events
   # since last boot", so brownout resets wipe it. Persistent log
@@ -165,13 +165,14 @@
   };
 
   # ── Profile wiring ──
-  # PhysicalServerBase auto-enables AnyMachineBase; per-host
-  # data goes on the more general (anyMachineBase) namespace
-  # because admin / alerts / localFlake apply to any NixOS host
-  # we run, not just physical ones.
-  profiles.physicalServerBase.enable = true;
-
-  profiles.anyMachineBase = {
+  # AnyMachineBase carries everything every NixOS host we run
+  # wants — auto-rebuild, telegram-alerts, sshd, the admin user,
+  # and on non-container hosts also redistributable firmware,
+  # zram, swap, /tmp on tmpfs, noatime on /. The container-only
+  # gate means it imports cleanly into nspawn configs too;
+  # everything below the gate auto-skips for them.
+  hypersw.profiles.anyMachineBase = {
+    enable = true;
     administrator = {
       name = "administrator";
       authorizedKeys = [
@@ -186,9 +187,9 @@
     localFlake.configurationName = "PrintScanServerPi4";
   };
 
-  profiles.multiHomedNetworking.enable = true;
+  hypersw.profiles.multiHomedNetworking.enable = true;
 
-  profiles.printScanServer = {
+  hypersw.profiles.printScanServer = {
     enable = true;
     bot = {
       tokenFile = config.sops.secrets.PrintScanTelegramBotToken.path;
