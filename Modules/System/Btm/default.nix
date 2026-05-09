@@ -9,8 +9,8 @@ let
   defaultForkSrc = pkgs.fetchFromGitHub {
     owner = "hypersw";
     repo = "bottom";
-    rev = "435d3d29f1069c85adc2888bb830a46a36309120"; # f/strict-overcommit-mode tip
-    sha256 = "0388d85y55cz894jv5d8ah86af26hlk9qizx5dk6s2kn5zd2rdk0";
+    rev = "73a0ee8ed18bf5d42237372ad6055bdd7bf6c8f9"; # f/strict-overcommit-mode tip
+    sha256 = "0p478q7rd2fvyqic61cqw2fsaq4v48j95zikymcbjg69zh1fj4k0";
   };
 
   # Build the fork by overriding `pkgs.bottom`'s src. The fork shares
