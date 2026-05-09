@@ -137,18 +137,35 @@
         # ── GhostHome-provisioning — minimalist first-boot image
         # the operator flashes to a fresh Pi 5 SD card. Boots,
         # generates ssh host keys, retries `nixos-rebuild boot`
-        # against `github:hypersw/HyperNix?ref=ghosthome-ready` on
-        # a 1-minute timer until the ref exists upstream, then
-        # reboots into the full GhostHome config.
+        # against the readiness ref every minute until upstream
+        # has it, then reboots into the full GhostHome config.
         #
-        # The "ghosthome-ready" branch is the readiness signal:
-        # operator encrypts secrets to the new Pi's host age key
-        # (pulled via `ssh-keyscan host | ssh-to-age`), commits,
-        # then either (a) pushes the master commit AND a
-        # ghosthome-ready branch pointing at it, or
-        # (b) tags the commit `ghosthome-ready` and pushes the
-        # tag.  Both forms work with `?ref=ghosthome-ready`.
-        GhostHome-provisioning-sdImage = nixpkgs.lib.nixosSystem {
+        # The readiness ref is pinned to the COMMIT THAT BUILT THE
+        # IMAGE — name `ghosthome-ready-<shortRev>`. That gives
+        # each image a unique ref name so old images flashed
+        # months ago don't accidentally pick up a fresh
+        # `ghosthome-ready` branch the operator pushed for a
+        # different image. Workflow:
+        #
+        #   1. Commit on master, pushed → CI (or manual) builds
+        #      the image. The image bakes
+        #      `?ref=ghosthome-ready-<shortRev>` and its filename
+        #      embeds the same shortRev so the operator can grep
+        #      images by ref.
+        #   2. Operator flashes that specific image, boots, gets
+        #      the host age key, encrypts secrets, commits.
+        #   3. Operator pushes a branch (or tag) named exactly
+        #      `ghosthome-ready-<shortRev>` pointing at the new
+        #      commit. The image's first-boot service then finds
+        #      it on its next retry.
+        #
+        # Manual / dirty-tree builds get `<shortRev>` →
+        # `dirtyManual` so they're easy to spot and won't collide
+        # with a real CI-built image.
+        GhostHome-provisioning-sdImage = let
+          ghostReadySuffix = self.shortRev or self.dirtyShortRev or "dirtyManual";
+          ghostReadyRef = "ghosthome-ready-${ghostReadySuffix}";
+        in nixpkgs.lib.nixosSystem {
           system = "aarch64-linux";
           modules = [
             nixos-hardware.nixosModules.raspberry-pi-5
@@ -167,9 +184,21 @@
               networking.hostName = "ghosthome-provisioning";
               system.stateVersion = "25.05";
 
+              # Bake the expected ref name into the image filename
+              # so an operator looking at downloaded artifacts
+              # knows exactly which branch/tag they need to push
+              # for the first-boot switch to succeed. The new
+              # `image.baseName` option (sd-image renamed it from
+              # `sdImage.imageBaseName` in 25.05) feeds the
+              # filename template — final result is
+              # `<base>-<nixos-label>-<arch>.img`.
+              image.baseName =
+                "ghosthome-provisioning.ref-${ghostReadyRef}";
+
               profiles.physicalServerProvisioning = {
                 enable = true;
-                targetFlakeUri = "github:hypersw/HyperNix?ref=ghosthome-ready";
+                targetFlakeUri =
+                  "github:hypersw/HyperNix?ref=${ghostReadyRef}";
                 targetConfigName = "GhostHome";
                 # 60 s default retry interval. Bump on slower
                 # networks if needed; not a tight loop anyway.
