@@ -1293,8 +1293,9 @@ HyperNix/
 │           └── secrets/secrets.yaml
 ├── Modules/
 │   ├── Profiles/                               new umbrella
-│   │   ├── PhysicalServerBase/                 base "any host" profile
+│   │   ├── AnyMachineBase/                     base "any host" profile
 │   │   ├── MultiHomedNetworking/               dual-NIC source-routing
+│   │   ├── PhysicalServerProvisioning/         first-boot self-flip image
 │   │   └── PrintScanServer/                    full print/scan stack
 │   ├── PrintersScanners/...                    sub-modules unchanged
 │   ├── Monitoring/TelegramAlerts/              unchanged
@@ -1309,15 +1310,19 @@ HyperNix/
 
 ### Profile design (updated 2026-05-09)
 
-Five meta-modules under `Modules/Profiles/`. Each is a NixOS
-module with `options.profiles.<name>` declaring its caller-facing
-contract; secrets / per-machine details live as required typed
-options that nix eval rejects when unset (visible "what you must
+Four meta-modules under `Modules/Profiles/`. Each is a NixOS
+module declaring its caller-facing contract under the
+`hypersw.*` option namespace (migrated 2026-05-09 from bare
+`profiles.*` / `services.*` — see "Namespace migration" below).
+Secrets / per-machine details live as required typed options
+that nix eval rejects when unset (visible "what you must
 supply" surface). Path-typed (not sops-secret-typed) to keep the
 secret-delivery story decoupled.
 
 * **AnyMachineBase** (hardware-agnostic, applies to any NixOS
-  host except very-special ones like microVMs):
+  host we run except microVMs). Two-tier `lib.mkMerge` config:
+
+  *Always-applies tier:*
   - administrator user (option-typed name + authorizedKeys +
     extraGroups; other modules append via NixOS list-merge)
   - openssh, sudo, root locked
@@ -1330,28 +1335,34 @@ secret-delivery story decoupled.
   - htop in systemPackages
   - allowUnfree
 
-* **PhysicalServerBase** imports AnyMachineBase, adds
-  physical-only bits:
-  - swap + zramSwap + /tmp on tmpfs + noatime
-  - hardware.enableRedistributableFirmware (default true)
-  - usbutils
-  Auto-enables AnyMachineBase via `mkDefault` so machine configs
-  set `profiles.physicalServerBase.enable = true;` and get the
-  whole stack.
+  *Non-container tier (`!config.boot.isContainer`):*
+  - hardware.enableRedistributableFirmware (default true,
+    overridable via `redistributableFirmware` option)
+  - swap + zramSwap + vm.swappiness=1
+  - /tmp on tmpfs
+  - noatime on /
+
+  This subsumes the old PhysicalServerBase profile (deleted
+  2026-05-09) — the `!isContainer` guard cleanly excludes
+  nspawn/declarative containers (which inherit the host
+  kernel/swap), while VMs and bare metal both get the full
+  bundle. usbutils dropped — `nix run nixpkgs#usbutils` covers
+  the once-a-year ad-hoc need without baking into closures.
 
 * **PhysicalServerProvisioning** — minimalist first-boot image
-  profile (NEW 2026-05-09). Boots, generates ssh host keys, runs
-  a systemd timer that retries `nixos-rebuild boot --refresh
-  --flake <targetFlakeUri>#<name>` every minute until the
-  `?ref=…` exists upstream, then `systemctl reboot`s into the
-  full configuration. Doesn't import AnyMachineBase (don't want
+  profile. Boots, generates ssh host keys, runs a systemd timer
+  that retries `nixos-rebuild boot --refresh --flake
+  <targetFlakeUri>#<name>` every minute until the `?ref=…`
+  exists upstream, then `systemctl reboot`s into the full
+  configuration. Doesn't import AnyMachineBase (don't want
   auto-rebuild / alerts / sops on the provisioning side — they'd
-  fail noisily without secrets). targetFlakeUri / targetConfig-
-  Name are required options. The corresponding flake.nix entry
-  is `GhostHome-provisioning-sdImage` which uses
-  `?ref=ghosthome-ready` as the readiness signal — operator
-  encrypts secrets to the new Pi's host age key, pushes the
-  branch/tag, image self-flips on the next retry.
+  fail noisily without secrets). targetFlakeUri /
+  targetConfigName are required options. The corresponding
+  flake.nix entry is `GhostHome-provisioning-sdImage` which
+  uses `?ref=ghosthome-ready-<shortRev>` (per-image unique ref
+  name, baked into the image filename via
+  `image.baseName = "ghosthome-provisioning(ref=…)"` — operator
+  greps the filename to know which branch/tag to push).
 
 * **MultiHomedNetworking** (dual-NIC bundle):
   - `interfaces` is a list-of-records (name / fwmark /
@@ -1372,11 +1383,38 @@ secret-delivery story decoupled.
   - Adds x86_64 binfmt for the EpkowaScanner stub when
     `epkowaScanner.enable`.
   - Installs broad font set for the renderer's PDF font fallback.
-  - **(pending)** appends `scanner` and `lp` to the
-    administrator's groups via list-merge on the base profile's
-    `administrator.name` — currently this lives in each machine
-    config as a one-line `users.users.${name}.extraGroups = […]`
-    spread; planned move to profile-side per Q3 follow-up.
+  - Appends `scanner` and `lp` to the administrator's groups via
+    list-merge on AnyMachineBase's `administrator.name`.
+
+### Namespace migration (2026-05-09)
+
+All custom profiles + services moved from bare `profiles.*` /
+`services.*` to `hypersw.profiles.*` / `hypersw.services.*` so
+they don't collide with upstream NixOS namespaces (and so a
+codebase reader can immediately tell what's ours vs nixpkgs').
+Renamed:
+
+| Old | New |
+|---|---|
+| `profiles.anyMachineBase.*` | `hypersw.profiles.anyMachineBase.*` |
+| `profiles.physicalServerBase.*` | (deleted; folded into anyMachineBase) |
+| `profiles.printScanServer.*` | `hypersw.profiles.printScanServer.*` |
+| `profiles.multiHomedNetworking.*` | `hypersw.profiles.multiHomedNetworking.*` |
+| `profiles.physicalServerProvisioning.*` | `hypersw.profiles.physicalServerProvisioning.*` |
+| `services.printscan-daemon.*` | `hypersw.services.printscan-daemon.*` |
+| `services.printscan-renderer.*` | `hypersw.services.printscan-renderer.*` |
+| `services.printscan-telegram-bot.*` | `hypersw.services.printscan-telegram-bot.*` |
+| `services.telegram-alerts.*` | `hypersw.services.telegram-alerts.*` |
+| `services.epkowa-scanner.*` | `hypersw.services.epkowa-scanner.*` |
+| `services.laserjet-printer.*` | `hypersw.services.laserjet-printer.*` |
+| `services.auto-rebuild-on-push.*` | `hypersw.services.auto-rebuild-on-push.*` |
+| `services.avahi-per-interface-names.*` | `hypersw.services.avahi-per-interface-names.*` |
+| `services.boot-stability-probe.*` | `hypersw.services.boot-stability-probe.*` |
+
+Systemd unit names (`systemd.services.printscan-daemon` etc.)
+are unchanged — those are ours-but-they're-systemd-unit-names,
+and reading `journalctl -u printscan-daemon` should keep working
+without a prefix.
 
 ### Sops naming convention (post 2026-05-09 rename)
 
