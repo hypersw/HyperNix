@@ -134,6 +134,69 @@ public sealed class RendererClient : IDisposable
     }
 
     /// <summary>
+    /// Run a graphics-class image through the renderer's neural
+    /// upscaler (Real-ESRGAN with the realesr-animevideov3 model).
+    /// Returns null on any failure — caller catches the null and
+    /// falls back to the bot-side Lanczos3 path so the print still
+    /// goes through. The renderer itself already does GPU→CPU
+    /// fallback for Vulkan-less hosts; this null is reserved for
+    /// "even CPU mode failed" / "renderer unreachable" / non-2xx.
+    /// </summary>
+    public async Task<byte[]?> UpscaleAsync(
+        byte[] sourceBytes, string fileName, int scale,
+        CancellationToken ct)
+    {
+        if (!Enabled)
+        {
+            _logger.LogWarning(
+                "neural upscale skipped — renderer disabled (no socket); " +
+                "graphics-class image {File} will fall back to Lanczos3",
+                fileName);
+            return null;
+        }
+        try
+        {
+            using var content = new System.Net.Http.MultipartFormDataContent();
+            var fileContent = new System.Net.Http.ByteArrayContent(sourceBytes);
+            fileContent.Headers.ContentType =
+                new System.Net.Http.Headers.MediaTypeHeaderValue("image/png");
+            content.Add(fileContent, "file", fileName);
+            content.Add(new System.Net.Http.StringContent(scale.ToString()), "scale");
+            content.Add(new System.Net.Http.StringContent("realesr-animevideov3"), "model");
+            content.Add(new System.Net.Http.StringContent("auto"), "gpu");
+
+            var sw = System.Diagnostics.Stopwatch.StartNew();
+            using var resp = await _http.PostAsync("/image-upscale", content, ct);
+            sw.Stop();
+            if (!resp.IsSuccessStatusCode)
+            {
+                var detail = (await resp.Content.ReadAsStringAsync(ct)).Trim();
+                if (detail.Length > 600) detail = detail[..600] + "…";
+                // Error-level so the operator's journalctl filter
+                // catches it — this is the "report to monitoring"
+                // hook for the upscaler-failure case.
+                _logger.LogError(
+                    "neural upscale FAILED for {File}: HTTP {Status} — {Detail}; " +
+                    "falling back to Lanczos3",
+                    fileName, (int)resp.StatusCode, detail);
+                return null;
+            }
+            var bytes = await resp.Content.ReadAsByteArrayAsync(ct);
+            _logger.LogInformation(
+                "neural upscale OK for {File}: {InBytes}B → {OutBytes}B in {Elapsed:F1}s",
+                fileName, sourceBytes.Length, bytes.Length, sw.Elapsed.TotalSeconds);
+            return bytes;
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex,
+                "neural upscale CRASHED for {File}; falling back to Lanczos3",
+                fileName);
+            return null;
+        }
+    }
+
+    /// <summary>
     /// Convert a device-specific image container (HEIC, AVIF) into
     /// a vanilla PNG that ImageSharp can decode. Throws on failure
     /// — the bot caller surfaces a friendly message.

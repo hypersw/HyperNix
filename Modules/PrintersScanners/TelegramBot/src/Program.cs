@@ -979,6 +979,8 @@ async Task StageBytesForPrintAsync(
     }
 
     int? w = null, h = null, dpi = null;
+    ContentClass? autoClass = null;
+    ClassifierStats? classStats = null;
     if (kind == PendingPrintKind.Image)
     {
         try
@@ -1003,6 +1005,28 @@ async Task StageBytesForPrintAsync(
         catch (Exception ex)
         {
             log.LogDebug("image metadata extract failed for {File}: {Err}", fileName, ex.Message);
+        }
+
+        // Run the classifier here so the pending block's caption
+        // can show "graphics (auto)" or "photo (auto)" before the
+        // user taps Print — gives them a chance to override if the
+        // auto-classification looks wrong.
+        try
+        {
+            using var classifyStream = new MemoryStream(bytes, writable: false);
+            using var rgb = await SixLabors.ImageSharp.Image.LoadAsync<
+                SixLabors.ImageSharp.PixelFormats.Rgb24>(classifyStream, ct);
+            var classified = PrintPreprocess.Classify(rgb);
+            autoClass = classified.Class;
+            classStats = classified.Stats;
+            log.LogInformation(
+                "classified {File}: class={Class}, colours={Colours}, edges={Edges:P1}",
+                fileName, autoClass, classStats.UniqueQuantisedColours,
+                classStats.EdgeDensity);
+        }
+        catch (Exception ex)
+        {
+            log.LogDebug("classifier failed for {File}: {Err}", fileName, ex.Message);
         }
     }
 
@@ -1030,6 +1054,8 @@ async Task StageBytesForPrintAsync(
         PaperLongInches  = paper.Long,
         PrintableShortInches = Math.Max(0.1, paper.Short - marginShortIn),
         PrintableLongInches  = Math.Max(0.1, paper.Long  - marginLongIn),
+        AutoClass = autoClass,
+        ClassifierStats = classStats,
     };
     if (pending.Fits1to1 == OneToOneFit.Printable)
         pending.Scale = PrintScaleMode.OneToOne;
@@ -1208,10 +1234,11 @@ async Task HandlePrintCallbackAsync(long chatId, string data, CancellationToken 
                 if (printSessions.TryGetValue(chatId, out var bs))
                     bs.View = what switch
                     {
-                        "scale"   => PrintPickerView.Scale,
-                        "orient"  => PrintPickerView.Orientation,
-                        "pages"   => PrintPickerView.Pages,
-                        "rangekb" => PrintPickerView.PageRangeKeyboard,
+                        "scale"    => PrintPickerView.Scale,
+                        "orient"   => PrintPickerView.Orientation,
+                        "pages"    => PrintPickerView.Pages,
+                        "rangekb"  => PrintPickerView.PageRangeKeyboard,
+                        "upscaler" => PrintPickerView.Upscaler,
                         _ => PrintPickerView.Main,
                     };
             }
@@ -1263,7 +1290,21 @@ async Task HandlePrintCallbackAsync(long chatId, string data, CancellationToken 
                     // the user's just-now choice.
                     bs.Pending.PageRange = "";
                 }
-                bs.View = what == "pages" ? PrintPickerView.Pages : PrintPickerView.Main;
+                else if (what == "upscaler")
+                {
+                    bs.Pending.UpscalerChoice = value switch
+                    {
+                        "photo"    => UpscalerChoice.Photo,
+                        "graphics" => UpscalerChoice.Graphics,
+                        _ => UpscalerChoice.Auto,
+                    };
+                }
+                bs.View = what switch
+                {
+                    "pages"    => PrintPickerView.Pages,
+                    "upscaler" => PrintPickerView.Upscaler,
+                    _ => PrintPickerView.Main,
+                };
             }
             await RenderPrintSessionAsync(chatId, ct);
             break;
@@ -1470,24 +1511,52 @@ async Task ExecutePrintAsync(long chatId, string pendingId, CancellationToken ct
                         ? bsLookup.Margins
                         : new PrintableMargins();
                 }
+                // Wire the renderer's neural upscaler in as an
+                // optional dep — only invoked when the classifier
+                // (or a user override) routes the image as Graphics.
+                // RendererClient.UpscaleAsync already returns null
+                // on any failure (logged at Error level so journalctl
+                // catches it as the monitoring hook); PrintPreprocess
+                // falls back to Lanczos3 when null.
+                Func<byte[], string, int, CancellationToken, Task<byte[]?>>? neural =
+                    renderer.Enabled
+                        ? (data, name, sf, c) => renderer.UpscaleAsync(data, name, sf, c)
+                        : null;
                 var processed = await PrintPreprocess.ProcessForPrintAsync(
                     p.Data,
                     p.Scale, p.Orientation,
                     p.PaperShortInches, p.PaperLongInches,
-                    margins, ct);
+                    margins,
+                    p.UpscalerChoice,
+                    neural,
+                    p.FileName,
+                    ct);
                 payloadBytes = processed.PdfBytes;
                 payloadName  = Path.ChangeExtension(p.FileName, ".pdf");
                 payloadCt    = "application/pdf";
-                // Classification logged for tuning + future routing
-                // — Photo stays on Lanczos3 (current path), Graphics
-                // is the realesr-animevideov3 candidate for follow-
-                // up integration once Vulkan-on-Pi-4 is verified
-                // in the renderer's hardened jail.
-                log.LogInformation(
-                    "preprocessed {File}: class={Class}, {W}x{H} @ {Dpi} dpi → {Bytes} byte PDF",
-                    p.FileName, processed.ContentClass,
-                    processed.Width, processed.Height,
-                    processed.Dpi, payloadBytes.Length);
+                // Surface the upscaler-used outcome at Info; the
+                // NeuralFailedFellBackToLanczos case in particular
+                // is operator-visible — Real-ESRGAN tripped, the
+                // job recovered, log line tells you to investigate.
+                if (processed.Upscaler == PrintPreprocess.UpscalerUsed.NeuralFailedFellBackToLanczos)
+                {
+                    log.LogError(
+                        "preprocessed {File}: class={Class}, neural upscaler FAILED, " +
+                        "fell back to Lanczos3 → {W}x{H} @ {Dpi} dpi, {Bytes} byte PDF " +
+                        "(quality lower than expected for graphics-class input)",
+                        p.FileName, processed.ContentClass,
+                        processed.Width, processed.Height,
+                        processed.Dpi, payloadBytes.Length);
+                }
+                else
+                {
+                    log.LogInformation(
+                        "preprocessed {File}: class={Class}, upscaler={Upscaler}, " +
+                        "{W}x{H} @ {Dpi} dpi → {Bytes} byte PDF",
+                        p.FileName, processed.ContentClass, processed.Upscaler,
+                        processed.Width, processed.Height,
+                        processed.Dpi, payloadBytes.Length);
+                }
             }
             catch (Exception ex)
             {

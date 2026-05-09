@@ -207,6 +207,134 @@ app.MapPost("/image-convert", async (HttpRequest request, CancellationToken ct) 
     }
 });
 
+// Neural upscaler — Real-ESRGAN with the realesr-animevideov3 model
+// for anime / line-art / chart / cartoon content. Bot routes to this
+// when its content classifier flags input as "graphics"; output is
+// a 2×/3×/4× PNG (one of three model variants, picked by `scale`).
+//
+// Hardware path: tries Vulkan first (Pi 5's V3D handles it; Pi 4
+// is best-effort), falls back to CPU mode (-g -1) if Vulkan init
+// errors out. The CPU fallback is the resilience story when running
+// under a Vulkan-less render farm — slower (10× ish) but always works.
+// Caller can override the path via `gpu` form field: "auto" (default,
+// try GPU then CPU), "gpu" (Vulkan only, fail if not available),
+// "cpu" (force CPU, skip Vulkan attempt).
+app.MapPost("/image-upscale", async (HttpRequest request, CancellationToken ct) =>
+{
+    var form = await request.ReadFormAsync(ct);
+    var file = form.Files.FirstOrDefault();
+    if (file is null) return Results.BadRequest("No file provided");
+    if (file.Length <= 0) return Results.BadRequest("Empty file");
+
+    var scaleStr = form["scale"].FirstOrDefault() ?? "4";
+    if (!int.TryParse(scaleStr, out var scaleX) || scaleX < 2 || scaleX > 4)
+        scaleX = 4;
+    var modelName = form["model"].FirstOrDefault() ?? "realesr-animevideov3";
+    // The animevideov3 model is split into x2/x3/x4 variants on disk
+    // (separate .bin/.param per scale). Compose the model name
+    // accordingly — this is realesrgan-ncnn-vulkan's required syntax,
+    // it doesn't accept "scale" as a separate flag for this model
+    // family.
+    var modelKey = modelName == "realesr-animevideov3"
+        ? $"{modelName}-x{scaleX}"
+        : modelName;
+    var gpuPref = (form["gpu"].FirstOrDefault() ?? "auto").ToLowerInvariant();
+
+    var jobId = Guid.NewGuid().ToString("N")[..12];
+    var stateRoot = Environment.GetEnvironmentVariable("STATE_DIRECTORY")
+        ?? "/var/lib/printscan-renderer";
+    var jobDir = Path.Combine(stateRoot, "jobs", jobId);
+    Directory.CreateDirectory(jobDir);
+    log.LogInformation(
+        "image-upscale {Job}: {File} ({Bytes} B), model={Model}, ×{Scale}, gpu={Gpu}",
+        jobId, file.FileName, file.Length, modelKey, scaleX, gpuPref);
+
+    try
+    {
+        var inputPath = Path.Combine(jobDir, MakeSafeFilename(file.FileName ?? "input"));
+        await using (var fs = File.Create(inputPath))
+            await file.CopyToAsync(fs, ct);
+        var outputPath = Path.Combine(jobDir, "out.png");
+
+        // Run with the requested compute path; auto = try Vulkan,
+        // fall back to CPU on failure.
+        async Task RunUpscale(bool useGpu)
+        {
+            var args = new List<string>
+            {
+                "-i", inputPath,
+                "-o", outputPath,
+                "-n", modelKey,
+                "-s", scaleX.ToString(),
+                "-m", ToolPaths.RealEsrganModels,
+            };
+            if (!useGpu) { args.Add("-g"); args.Add("-1"); }
+            await RunToolAsync(
+                ToolPaths.RealEsrgan, args,
+                jobDir, jobId,
+                useGpu ? "realesrgan-vulkan" : "realesrgan-cpu",
+                log, ct, TimeSpan.FromMinutes(5));
+        }
+
+        try
+        {
+            switch (gpuPref)
+            {
+                case "gpu":  await RunUpscale(useGpu: true);  break;
+                case "cpu":  await RunUpscale(useGpu: false); break;
+                default:                                              // "auto"
+                    try { await RunUpscale(useGpu: true); }
+                    catch (RenderFailedException ex)
+                    {
+                        log.LogWarning(
+                            "image-upscale {Job}: Vulkan path failed ({Err}); " +
+                            "falling back to CPU mode",
+                            jobId, Trunc(ex.Details, 200));
+                        // CPU fallback is the resilience story —
+                        // a Vulkan-less host (Pi 4 sometimes, headless
+                        // CI) still produces output, just slower.
+                        if (File.Exists(outputPath)) File.Delete(outputPath);
+                        await RunUpscale(useGpu: false);
+                    }
+                    break;
+            }
+        }
+        catch (RenderFailedException ex)
+        {
+            log.LogWarning(
+                "image-upscale {Job}: {Tool} failed: {Err}",
+                jobId, ex.Tool, Trunc(ex.Details));
+            return Results.Problem(
+                title: ex.Friendly, detail: ex.Details, statusCode: 502);
+        }
+
+        if (!File.Exists(outputPath))
+            return Results.Problem(
+                title: "neural upscaler produced no output",
+                detail: "realesrgan exited 0 but no output PNG at " + outputPath,
+                statusCode: 502);
+
+        var bytes = await File.ReadAllBytesAsync(outputPath, ct);
+        log.LogInformation(
+            "image-upscale {Job}: produced {Bytes} byte PNG",
+            jobId, bytes.Length);
+        return Results.File(bytes,
+            contentType: "image/png",
+            fileDownloadName: Path.GetFileNameWithoutExtension(file.FileName ?? "out") + ".upscaled.png");
+    }
+    catch (Exception ex)
+    {
+        log.LogError(ex, "image-upscale {Job} crashed", jobId);
+        return Results.Problem(
+            title: "image-upscale crashed",
+            detail: ex.Message, statusCode: 500);
+    }
+    finally
+    {
+        try { Directory.Delete(jobDir, recursive: true); } catch { }
+    }
+});
+
 // Multi-page PDF preview as a single grayscale WebP. The bot uses
 // this for Pageables: rasterize the first N pages, stack them
 // vertically with a thin separator, ship as a Document so Telegram

@@ -58,6 +58,17 @@ let
         // library into the renderer.
         public static readonly string Magick =
             "${pkgs.imagemagick}/bin/magick";
+        // Real-ESRGAN (ncnn-vulkan) — neural upscaler routed to by
+        // the bot when the classifier flags input as graphics
+        // (line art / charts / cartoons / coloring books). The
+        // animevideov3 model is bundled with the package and lives
+        // under share/realesrgan-ncnn-vulkan/models. Tries Vulkan
+        // first (works on Pi 5's V3D, dicey on Pi 4); falls back
+        // to CPU mode (-g -1) if Vulkan init fails.
+        public static readonly string RealEsrgan =
+            "${pkgs.realesrgan-ncnn-vulkan}/bin/realesrgan-ncnn-vulkan";
+        public static readonly string RealEsrganModels =
+            "${pkgs.realesrgan-ncnn-vulkan}/share/models";
     }
   '';
 in

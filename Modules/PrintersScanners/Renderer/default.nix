@@ -148,9 +148,18 @@ in
         #   default + above bundle already removes the highest-value
         #   syscalls (mount, swap, ptrace targeting other procs, …)
         #   indirectly via the cap-bounding-set + NoNewPrivileges.
-        # * PrivateDevices — needed if soffice ever wants /dev/shm
-        #   for its JVM bridge; default systemd PrivateTmp gives us
-        #   a per-service /dev/shm anyway.
+        # * PrivateDevices — left off so realesrgan-ncnn-vulkan can
+        #   reach /dev/dri/renderD128 for the Vulkan path on Pi 5
+        #   (V3DV driver). The neural-upscaler endpoint falls back
+        #   to CPU mode on Vulkan failure, so the worst-case impact
+        #   of /dev/dri being unavailable is a slower render, not a
+        #   broken job.
+
+        # Allow access to GPU render nodes for Vulkan compute. /dev/dri
+        # by default is exposed because PrivateDevices=false, but be
+        # explicit about the only character-device class we want
+        # reachable — keeps the cgroup device-allowlist tight.
+        DeviceAllow = [ "char-drm rw" ];
       };
     };
   };

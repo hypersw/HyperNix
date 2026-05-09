@@ -267,17 +267,35 @@ public static class PrintPreview
 /// </summary>
 public enum ContentClass { Photo, Graphics }
 
+/// <summary>Stats from <see cref="PrintPreprocess.Classify"/>.</summary>
+public sealed record ClassifierStats(
+    int UniqueQuantisedColours,
+    double EdgeDensity);
+
+/// User's manual override for the upscaler-routing decision. Auto
+/// uses the classifier's verdict; Photo / Graphics force the
+/// respective path regardless of classifier.
+public enum UpscalerChoice
+{
+    Auto,
+    Photo,
+    Graphics,
+}
+
 public static class PrintPreprocess
 {
     /// <summary>
     /// Classify an incoming image as photo-like or graphics-like
-    /// using cheap statistics: a downsampled, bit-quantised unique-
-    /// colour count. Line art / charts / cartoons typically use
-    /// few-hundred distinct colours even at 4-bit-per-channel
-    /// quantisation; photos run into thousands almost immediately.
-    /// The threshold is empirical — tune as we accumulate samples.
+    /// using two cheap heuristics combined: unique-colour count
+    /// (line art / charts have far fewer distinct colours than
+    /// continuous-tone photos) AND adjacent-pixel edge density
+    /// (sharp vector edges have many large pixel-to-pixel deltas;
+    /// continuous-tone photos have smooth gradients with very few).
+    /// Combining both signals catches near-monochrome photos
+    /// (sunsets, B&amp;W portraits) that the colour-count heuristic
+    /// alone would mis-classify.
     /// </summary>
-    public static ContentClass Classify(Image<Rgb24> image)
+    public static (ContentClass Class, ClassifierStats Stats) Classify(Image<Rgb24> image)
     {
         // Constant-cost: downsample to a bounded thumbnail before
         // counting. Aspect-preserving so we don't bias the colour
@@ -291,10 +309,14 @@ public static class PrintPreprocess
         }));
 
         // 4 bits per channel = 4096 possible quantised RGB values.
-        // Hashing into a HashSet<int> avoids a 4-KB array scan
-        // and lets us short-circuit on the threshold.
         var seen = new HashSet<int>();
-        const int GraphicsCap = 512;
+        long edgePixelCount = 0;
+        long pairCount = 0;
+        // Edge threshold: a pixel-to-pixel max-channel difference
+        // ≥ 64 (out of 255) is a "hard" edge. Photos virtually
+        // never produce this; line art does on every stroke.
+        const int EdgeMagnitudeThreshold = 64;
+
         thumb.ProcessPixelRows(accessor =>
         {
             for (int y = 0; y < accessor.Height; y++)
@@ -303,14 +325,41 @@ public static class PrintPreprocess
                 for (int x = 0; x < row.Length; x++)
                 {
                     var p = row[x];
-                    int q = ((p.R >> 4) << 8) | ((p.G >> 4) << 4) | (p.B >> 4);
+                    var q = ((p.R >> 4) << 8) | ((p.G >> 4) << 4) | (p.B >> 4);
                     seen.Add(q);
-                    if (seen.Count > GraphicsCap) return;
+                    if (x > 0)
+                    {
+                        var prev = row[x - 1];
+                        var dr = Math.Abs(p.R - prev.R);
+                        var dg = Math.Abs(p.G - prev.G);
+                        var db = Math.Abs(p.B - prev.B);
+                        if (Math.Max(dr, Math.Max(dg, db)) >= EdgeMagnitudeThreshold)
+                            edgePixelCount++;
+                        pairCount++;
+                    }
                 }
             }
         });
 
-        return seen.Count <= GraphicsCap ? ContentClass.Graphics : ContentClass.Photo;
+        var colourCount = seen.Count;
+        var edgeDensity = pairCount > 0 ? (double)edgePixelCount / pairCount : 0.0;
+
+        // Combined heuristic — see PLAN.md for thresholds rationale.
+        // The "ambiguous" middle ground falls back to Photo as the
+        // safe default: Lanczos3 on graphics is soft but not
+        // hallucinatory; neural-on-photos can produce uncanny
+        // textures.
+        var fewColours  = colourCount <= 512;
+        var manyColours = colourCount >= 1024;
+        var sharpEdges  = edgeDensity >= 0.05;
+        var smoothEdges = edgeDensity <= 0.02;
+
+        ContentClass cls;
+        if (fewColours && sharpEdges)            cls = ContentClass.Graphics;
+        else if (manyColours || smoothEdges)     cls = ContentClass.Photo;
+        else                                     cls = ContentClass.Photo;
+
+        return (cls, new ClassifierStats(colourCount, edgeDensity));
     }
 
     /// Target dpi at full paper size. 600 dpi matches the HP P2015n's
@@ -330,32 +379,96 @@ public static class PrintPreprocess
 
     public sealed record Result(
         byte[] PdfBytes, int Width, int Height, int Dpi,
-        ContentClass ContentClass);
+        ContentClass ContentClass,
+        ClassifierStats ClassifierStats,
+        UpscalerUsed Upscaler);
+
+    public enum UpscalerUsed
+    {
+        /// Lanczos3 was used for the upscale. Either the source
+        /// classified as Photo, or the user forced a Photo override,
+        /// or the source already exceeded the target resolution
+        /// (no upscale needed at all).
+        Lanczos3,
+        /// Real-ESRGAN (animevideov3) was used. Source classified
+        /// as Graphics or user forced Graphics override.
+        Neural,
+        /// Source was Graphics-class and we tried Real-ESRGAN, but
+        /// the renderer's neural endpoint failed (Vulkan unavail
+        /// AND CPU also failed, or renderer unreachable). Fell
+        /// back to Lanczos3 — the print still went through but
+        /// the user should know quality is lower than expected.
+        NeuralFailedFellBackToLanczos,
+    }
 
     /// <summary>
     /// Take the raw image bytes the bot received, return print-ready
-    /// PDF bytes wrapping a Lanczos3-upscaled grayscale rendition.
-    /// Caller ships the bytes to the daemon as application/pdf —
-    /// they go through Ghostscript identically to a user-uploaded
-    /// PDF, which lets us reuse the same end-of-pipeline code path.
+    /// PDF bytes. For Photo content (or user override): Lanczos3
+    /// upscale + grayscale + PDF wrap. For Graphics content
+    /// (animevideov3-style line art / cartoons / charts): route
+    /// through the renderer's neural upscaler first, then a final
+    /// Lanczos3 pass to hit the 600 dpi A4 target if Real-ESRGAN's
+    /// 4× output is still under the engine's resolution. Renderer
+    /// failure is non-fatal: caller logs at Error level and the
+    /// path falls through to plain Lanczos3 so the print still
+    /// goes through.
     /// </summary>
     public static async Task<Result> ProcessForPrintAsync(
         byte[] sourceBytes,
         PrintScaleMode scale, PrintOrientation orientation,
         double paperShortInches, double paperLongInches,
         PrintableMargins margins,
+        UpscalerChoice upscalerChoice,
+        Func<byte[], string, int, CancellationToken, Task<byte[]?>>? neuralUpscaler,
+        string fileName,
         CancellationToken ct)
     {
-        using var rgbImage = await Image.LoadAsync<Rgb24>(
-            new MemoryStream(sourceBytes, writable: false), ct);
+        // Classifier reads a quick downsampled thumbnail of the
+        // source to decide the upscaler route. Disposed before we
+        // open the working pipeline image so we don't carry two
+        // decodes simultaneously.
+        ContentClass autoClass;
+        ClassifierStats classStats;
+        using (var classifierImage = await Image.LoadAsync<Rgb24>(
+            new MemoryStream(sourceBytes, writable: false), ct))
+        {
+            (autoClass, classStats) = Classify(classifierImage);
+        }
+        var effectiveClass = upscalerChoice switch
+        {
+            UpscalerChoice.Photo    => ContentClass.Photo,
+            UpscalerChoice.Graphics => ContentClass.Graphics,
+            _ => autoClass,
+        };
 
-        // Classify content type for the upscaler-routing decision.
-        // For now we still always run Lanczos3 (one path on the
-        // bot, no extra deps), but the classifier decision is
-        // logged so we can validate the threshold against real
-        // uploads before wiring a neural-upscaler-routed path
-        // through the renderer's hardened jail.
-        var contentClass = Classify(rgbImage);
+        // Source bytes that'll be Lanczos3'd to the final 600 dpi
+        // target. For Graphics: try neural upscale first (4×). For
+        // Photo: skip neural, Lanczos3 directly from source.
+        byte[] workingBytes = sourceBytes;
+        UpscalerUsed upscalerUsed = UpscalerUsed.Lanczos3;
+        if (effectiveClass == ContentClass.Graphics && neuralUpscaler is not null)
+        {
+            var neuralBytes = await neuralUpscaler(sourceBytes, fileName, 4, ct);
+            if (neuralBytes is not null)
+            {
+                workingBytes = neuralBytes;
+                upscalerUsed = UpscalerUsed.Neural;
+            }
+            else
+            {
+                // Renderer failure already logged at Error level by
+                // RendererClient.UpscaleAsync; record the fallback
+                // in the Result so the bot caption surfaces it to
+                // the user.
+                upscalerUsed = UpscalerUsed.NeuralFailedFellBackToLanczos;
+            }
+        }
+
+        // Open the (possibly upscaled) working bytes for the
+        // Lanczos3-finishing + grayscale + PDF-wrap pipeline.
+        using var rgbImage = await Image.LoadAsync<Rgb24>(
+            new MemoryStream(workingBytes, writable: false), ct);
+        var contentClass = effectiveClass;
 
         // Source dpi as declared in the file metadata, falling back
         // to a screen-typical 96 when it's missing (most tg-uploaded
@@ -424,6 +537,6 @@ public static class PrintPreprocess
             paperShortInches, paperLongInches,
             margins);
         return new Result(pdfBytes, finalW, finalH, (int)Math.Round(finalDpi),
-            contentClass);
+            contentClass, classStats, upscalerUsed);
     }
 }

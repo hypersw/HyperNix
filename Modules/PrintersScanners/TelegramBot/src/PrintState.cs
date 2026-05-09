@@ -117,6 +117,19 @@ public sealed class PendingPrint
     /// not started yet"; the distinction is held by DuplexMode.
     public DuplexPhase DuplexPhase { get; set; } = DuplexPhase.NotStarted;
 
+    /// User's choice for upscaler routing. Auto uses the bot's
+    /// classifier verdict (photo / graphics); the explicit Photo /
+    /// Graphics options force the path regardless of classifier.
+    /// Image-only (pageables don't use upscaling).
+    public UpscalerChoice UpscalerChoice { get; set; } = UpscalerChoice.Auto;
+    /// Classifier verdict cached after the preview pass — surfaced
+    /// in the caption so the user sees what'd happen on print and
+    /// can override before tapping ✅.
+    public ContentClass? AutoClass { get; set; }
+    /// Stats from Classify: unique-quantised-colour count plus
+    /// edge density. Surfaced in the caption for visibility / tuning.
+    public ClassifierStats? ClassifierStats { get; set; }
+
     public const int MinReasonableDpi = 100;
     /// Tolerance for the "1:1 fits?" check. A 1 mm slop catches
     /// rounding-error overflows on otherwise page-sized scans
@@ -241,6 +254,7 @@ public enum PrintPickerView
     Orientation,
     Pages,
     PageRangeKeyboard,
+    Upscaler,
 }
 
 /// <summary>
@@ -370,6 +384,7 @@ public static class PrintMessage
             PrintPickerView.Orientation       => RenderOrientPicker(s),
             PrintPickerView.Pages             => RenderPagesPicker(s),
             PrintPickerView.PageRangeKeyboard => RenderPageRangeKeyboard(s),
+            PrintPickerView.Upscaler          => RenderUpscalerPicker(s),
             _ => RenderMain(s),
         };
         return (html, kb);
@@ -527,10 +542,31 @@ public static class PrintMessage
                 : "\n⚠ <b>Sent as Telegram media (compressed).</b> Tick the box below or resend as a file for full quality."
             : "";
 
+        // Upscaler verdict line: spell out which path will run
+        // (and what the auto-classifier saw) so the user can
+        // override before printing if the call looks off.
+        var upscalerLine = "";
+        if (p.AutoClass is not null)
+        {
+            var resolved = p.UpscalerChoice switch
+            {
+                UpscalerChoice.Photo    => "photo (Lanczos3)",
+                UpscalerChoice.Graphics => "graphics (Real-ESRGAN)",
+                _ => p.AutoClass == ContentClass.Graphics
+                    ? "graphics (Real-ESRGAN, auto)"
+                    : "photo (Lanczos3, auto)",
+            };
+            var statsHint = p.ClassifierStats is { } cs
+                ? $" <i>· {cs.UniqueQuantisedColours} colours / edges {cs.EdgeDensity:P0}</i>"
+                : "";
+            upscalerLine = $"\n🧠 Upscaler: <b>{resolved}</b>{statsHint}";
+        }
+
         return
             $"{head} · {dims}{dpi}{fillSuffix}\n" +
             $"Scale: <b>{scaleText}</b>" +
             $" · Orientation: <b>{orientText}</b>" +
+            upscalerLine +
             compressedWarn +
             "\nReady to print?";
     }
@@ -606,7 +642,10 @@ public static class PrintMessage
 
         var rows = new List<InlineKeyboardButton[]>();
 
-        // Image-only: scale + orientation pickers above the action row.
+        // Image-only: scale / orientation / upscaler pickers above
+        // the action row. Upscaler choice surfaces the classifier
+        // verdict so the user can spot mis-classification before
+        // tapping ✅ Print.
         if (p.Kind == PendingPrintKind.Image)
         {
             rows.Add(new[]
@@ -615,6 +654,12 @@ public static class PrintMessage
                     $"print:pick:scale:{p.Id}"),
                 InlineKeyboardButton.WithCallbackData($"🧭 Orient: {OrientLabel(p.Orientation, p)}",
                     $"print:pick:orient:{p.Id}"),
+            });
+            rows.Add(new[]
+            {
+                InlineKeyboardButton.WithCallbackData(
+                    $"🧠 Upscaler: {UpscalerLabel(p)}",
+                    $"print:pick:upscaler:{p.Id}"),
             });
         }
 
@@ -837,6 +882,54 @@ public static class PrintMessage
             new[] { key("-", "-"), key(",", ","), key("⌫", "BS"), key("↺", "CLR"), key("✓", "OK") },
             new[] { InlineKeyboardButton.WithCallbackData("↩ back", $"print:pick:pages:{p.Id}") },
         });
+    }
+
+    private static InlineKeyboardMarkup RenderUpscalerPicker(BotPrintSession s)
+    {
+        if (s.Pending is null)
+            return new InlineKeyboardMarkup(new[] {
+                new[] { InlineKeyboardButton.WithCallbackData("↩ back", "print:pick:main:_") }
+            });
+        var p = s.Pending;
+        string mark(UpscalerChoice c) => p.UpscalerChoice == c ? SelectedMark : UnselectedMark;
+        var autoLabel = p.AutoClass switch
+        {
+            ContentClass.Photo    => "Auto (photo → Lanczos3)",
+            ContentClass.Graphics => "Auto (graphics → Real-ESRGAN)",
+            _ => "Auto",
+        };
+        return new InlineKeyboardMarkup(new[]
+        {
+            new[]
+            {
+                InlineKeyboardButton.WithCallbackData(
+                    $"{mark(UpscalerChoice.Auto)}{autoLabel}",
+                    $"print:set:upscaler:{p.Id}:auto"),
+            },
+            new[]
+            {
+                InlineKeyboardButton.WithCallbackData(
+                    $"{mark(UpscalerChoice.Photo)}Photo (Lanczos3)",
+                    $"print:set:upscaler:{p.Id}:photo"),
+                InlineKeyboardButton.WithCallbackData(
+                    $"{mark(UpscalerChoice.Graphics)}Graphics (Real-ESRGAN)",
+                    $"print:set:upscaler:{p.Id}:graphics"),
+            },
+            new[] { InlineKeyboardButton.WithCallbackData("↩ back", $"print:pick:main:{p.Id}") },
+        });
+    }
+
+    private static string UpscalerLabel(PendingPrint p)
+    {
+        var (resolved, suffix) = p.UpscalerChoice switch
+        {
+            UpscalerChoice.Photo    => (ContentClass.Photo,    "forced"),
+            UpscalerChoice.Graphics => (ContentClass.Graphics, "forced"),
+            _ => (p.AutoClass ?? ContentClass.Photo, "auto"),
+        };
+        return resolved == ContentClass.Graphics
+            ? $"graphics ({suffix})"
+            : $"photo ({suffix})";
     }
 
     private static string ScaleLabel(PrintScaleMode m) => m switch
