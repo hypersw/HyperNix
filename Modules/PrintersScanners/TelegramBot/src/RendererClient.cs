@@ -35,12 +35,16 @@ public sealed class RendererClient : IDisposable
         }, disposeHandler: true)
         {
             BaseAddress = new Uri("http://localhost"),
-            // Renderer's hard-cap on a single soffice run is ~2 minutes
-            // (see Renderer/Program.cs). Cold-start of soffice on Pi 4
-            // is ~5–10 s, so a 3-minute client-side timeout
-            // comfortably covers anything the renderer can produce
-            // without opening us up to indefinite hangs on a bug.
-            Timeout = TimeSpan.FromMinutes(3),
+            // Sized for the longest endpoint: realesrgan's
+            // /image-upscale has a 5-minute internal hard cap (CPU
+            // fallback path on a Pi can chew through that on a big
+            // graphics-class image). 6 minutes leaves a minute of
+            // slack for the renderer to send back its 504 timeout
+            // response cleanly, which the bot then maps to
+            // "neural upscaler failed → fall back to Lanczos3".
+            // /render and /pdf-preview are typically <30s; they
+            // sit comfortably inside this ceiling.
+            Timeout = TimeSpan.FromMinutes(6),
         };
     }
 

@@ -65,11 +65,33 @@ let
     # tr; without stderr suppression that writes a cosmetic "tr: write
     # error: Broken pipe" to the journal even though the script works.
     NONCE=$(${pkgs.coreutils}/bin/tr -dc 'a-z0-9' </dev/urandom 2>/dev/null | ${pkgs.coreutils}/bin/head -c 8)
-    CHAT_ID=$(${pkgs.coreutils}/bin/cat "$CHAT_ID_FILE" 2>/dev/null || true)
-    if [ -z "$CHAT_ID" ]; then
+    # Read + trim whitespace (sops decryption can leave a trailing
+    # newline on the file).
+    CHAT_ID_RAW=$(${pkgs.coreutils}/bin/cat "$CHAT_ID_FILE" 2>/dev/null \
+      | ${pkgs.coreutils}/bin/tr -d '[:space:]' || true)
+    if [ -z "$CHAT_ID_RAW" ]; then
       echo "alert-telegram-enqueue: no chat id from $CHAT_ID_FILE" >&2
       exit 1
     fi
+    # Normalise to Telegram's "-100<id>" channel form. Both alerts
+    # and log endpoints are always-channel in our deployment (never
+    # DM, never legacy group), so a bare positive integer — what
+    # Telegram client tools show under the channel's properties — is
+    # treated as a channel id and the "-100" prefix prepended. Ids
+    # already negative (channels in canonical "-100…" form, or
+    # legacy groups with a bare "-…" prefix) pass through unchanged
+    # so the operator can deliberately point at a non-channel chat
+    # by writing the explicit-negative form into the secret. A
+    # non-numeric value is rejected — better to fail at enqueue
+    # than to drop the message into a queue the drainer can't
+    # deliver.
+    case "$CHAT_ID_RAW" in
+      -*)            CHAT_ID="$CHAT_ID_RAW" ;;
+      *[!0-9]*)
+        echo "alert-telegram-enqueue: chat id '$CHAT_ID_RAW' from $CHAT_ID_FILE is not a valid integer" >&2
+        exit 1 ;;
+      *)             CHAT_ID="-100$CHAT_ID_RAW" ;;
+    esac
     ${pkgs.coreutils}/bin/mkdir -p "${telegramSpool}"
     TMP=$(${pkgs.coreutils}/bin/mktemp -p "${telegramSpool}" ".tmp.XXXXXX")
     # mktemp creates 0600; relax to 0644 — queue content is no more
@@ -532,12 +554,27 @@ in
 
     alertsChatIdFile = lib.mkOption {
       type = lib.types.path;
-      description = "Path to file containing Telegram chat ID for high-priority alerts";
+      description = ''
+        Path to file containing Telegram chat ID for high-priority
+        alerts. Both wire forms are accepted: the bare-positive id
+        Telegram client tools show under a channel's properties
+        (e.g. <literal>1234567890</literal>) gets the
+        <literal>-100</literal> channel-namespace prefix prepended
+        automatically, and the canonical-negative form
+        (<literal>-1001234567890</literal>) passes through. Always-
+        channel in our deployment (never DM, never legacy group);
+        if you do want a bare-negative legacy group id it'll pass
+        through too, but that's an explicit operator choice.
+      '';
     };
 
     logChatIdFile = lib.mkOption {
       type = lib.types.path;
-      description = "Path to file containing Telegram chat ID for low-priority events";
+      description = ''
+        Path to file containing Telegram chat ID for low-priority
+        events. Same accepted-forms rules as
+        <literal>alertsChatIdFile</literal>.
+      '';
     };
 
     temperatureThreshold = lib.mkOption {

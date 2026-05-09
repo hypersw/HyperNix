@@ -1501,11 +1501,15 @@ remember these are open" notes)
    printer queue, gated by an env var.
 4. **Doc-renderer test corpus** — integration-tested by hand
    only.
-5. **Telegram chat ID normalisation in C#** — alerts and log
-   channels are always-channel. C# should accept bare-positive
-   ids and prepend `-100`. allowedUsers stays positive (user
-   IDs). Not yet implemented; lives in Monitoring/TelegramAlerts
-   module's chat-id-file consumer.
+5. ~~**Telegram chat ID normalisation**~~ — DONE 2026-05-09 in
+   `Modules/Monitoring/TelegramAlerts/default.nix`'s
+   `telegramEnqueue` script. Bare-positive ids get `-100`
+   prepended (channel namespace); already-negative pass
+   through; non-numeric is rejected at enqueue. RendererClient
+   HTTP timeout bumped 3 min → 6 min so /image-upscale's 5-min
+   cap can return cleanly. Option-side descriptions on
+   PhysicalServerBase + TelegramAlerts updated to document the
+   accepted forms.
 6. **Pi minimalist first-boot image** — currently SD image bakes
    full configuration; services fail at first boot without sops
    decryption. A "minimal pi-hardware-config-only" image variant

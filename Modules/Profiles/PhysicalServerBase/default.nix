@@ -91,11 +91,23 @@ in
       };
       alertsChatIdFile = lib.mkOption {
         type = lib.types.path;
-        description = "Path to file containing the Telegram chat id for alerts.";
+        description = ''
+          Path to a file containing the Telegram chat id for alerts.
+          Always-channel in our deployment; the consumer accepts both
+          bare-positive ids (the form Telegram clients show under
+          channel properties) and the canonical
+          <literal>-100…</literal> form, prepending the prefix when
+          missing. So you can copy whichever Telegram surfaces and
+          drop it into the secret unchanged.
+        '';
       };
       logChatIdFile = lib.mkOption {
         type = lib.types.path;
-        description = "Path to file containing the Telegram chat id for log forwards.";
+        description = ''
+          Path to a file containing the Telegram chat id for log
+          forwards. Same accepted-forms rules as
+          <literal>alertsChatIdFile</literal>.
+        '';
       };
       configRevision = lib.mkOption {
         type = lib.types.str;
