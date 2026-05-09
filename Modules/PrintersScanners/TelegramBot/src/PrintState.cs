@@ -109,6 +109,14 @@ public sealed class PendingPrint
     /// fresh acknowledgement.
     public bool CompressedAcknowledged { get; set; }
 
+    /// True when the user picked "🔄 Duplex" instead of plain Print.
+    /// Drives the two-pass odd-then-even sequence below.
+    public bool DuplexMode { get; set; }
+    /// Where in the manual-duplex two-pass sequence we are. NotStarted
+    /// covers both "no duplex chosen" and "duplex chosen but Step 1
+    /// not started yet"; the distinction is held by DuplexMode.
+    public DuplexPhase DuplexPhase { get; set; } = DuplexPhase.NotStarted;
+
     public const int MinReasonableDpi = 100;
     /// Tolerance for the "1:1 fits?" check. A 1 mm slop catches
     /// rounding-error overflows on otherwise page-sized scans
@@ -233,6 +241,27 @@ public enum PrintPickerView
     Orientation,
     Pages,
     PageRangeKeyboard,
+}
+
+/// <summary>
+/// Where we are in the two-pass manual duplex sequence on the
+/// HP P2015n (no hardware duplex). Pass 1 prints odd pages with
+/// the daemon's pageSelection=Odd; the user then flips the stack
+/// and reinserts into Tray 1 face-up + top-edge-first; pass 2
+/// prints even pages with pageSelection=Even.
+/// </summary>
+public enum DuplexPhase
+{
+    /// Either duplex wasn't chosen, or it was chosen but the user
+    /// hasn't started pass 1 yet.
+    NotStarted,
+    /// Pass 1 (odd pages) submitted to the daemon, in flight.
+    OddPrinting,
+    /// Pass 1 done. Bot is waiting for the user to flip the stack
+    /// and tap "Step 2: Print Even".
+    OddDone,
+    /// Pass 2 (even pages) submitted, in flight.
+    EvenPrinting,
 }
 
 /// <summary>
@@ -380,12 +409,39 @@ public static class PrintMessage
         if (s.Printing)
         {
             lines.Add("");
-            lines.Add($"⏳ <b>Printing</b> {EscapeHtml(s.Pending?.FileName ?? "…")}");
+            // Distinguish duplex passes so the user knows which leg
+            // of the two-pass sequence the printer's currently
+            // chewing on. Otherwise "Printing X" through both
+            // passes looks like a stuck single-pass print.
+            var phaseLabel = s.Pending?.DuplexPhase switch
+            {
+                DuplexPhase.OddPrinting  => "Printing odd pages of",
+                DuplexPhase.EvenPrinting => "Printing even pages of",
+                _ => "Printing",
+            };
+            lines.Add($"⏳ <b>{phaseLabel}</b> {EscapeHtml(s.Pending?.FileName ?? "…")}");
         }
         else if (s.Pending is { } p)
         {
             lines.Add("");
             lines.Add(RenderPendingBlock(p));
+            // Between the two duplex passes — explicit flip
+            // instructions tailored to the P2015n's manual feed
+            // (Tray 1: face-up, top-edge-first).
+            if (p.DuplexMode && p.DuplexPhase == DuplexPhase.OddDone)
+            {
+                lines.Add("");
+                lines.Add(
+                    "✅ <b>Step 1 of 2 done.</b> Odd pages printed.\n\n" +
+                    "📄 <b>Now flip the stack and reinsert:</b>\n" +
+                    "  1. Pick up the printed stack from the output bin.\n" +
+                    "  2. Flip it top-to-bottom (rotate 180° around the " +
+                    "horizontal axis through the middle) — page 1 ends " +
+                    "up on top, face-up.\n" +
+                    "  3. Insert into the manual feed (Tray 1) " +
+                    "face-up, top-edge feeding into the printer first.\n" +
+                    "  4. Tap <b>▶ Step 2: Print Even</b> below when ready.");
+            }
             // Echo the current page-range buffer above the digit
             // keyboard so the user sees what they're typing.
             if (s.View == PrintPickerView.PageRangeKeyboard)
@@ -526,6 +582,28 @@ public static class PrintMessage
             });
         }
 
+        // Mid-duplex: pass 1 finished, waiting for the user to flip
+        // the stack and tap Step 2. Hide all the option pickers — the
+        // settings are baked in for the duration of the duplex job.
+        if (p.DuplexMode && p.DuplexPhase == DuplexPhase.OddDone)
+        {
+            return new InlineKeyboardMarkup(new[]
+            {
+                new[]
+                {
+                    InlineKeyboardButton.WithCallbackData(
+                        "▶ Step 2: Print Even pages",
+                        $"print:duplexstep2:{p.Id}"),
+                },
+                new[]
+                {
+                    InlineKeyboardButton.WithCallbackData(
+                        "❌ Cancel duplex (odd pages already printed)",
+                        $"print:cancel:{p.Id}"),
+                },
+            });
+        }
+
         var rows = new List<InlineKeyboardButton[]>();
 
         // Image-only: scale + orientation pickers above the action row.
@@ -556,11 +634,33 @@ public static class PrintMessage
             });
         }
 
-        rows.Add(new[]
+        // Manual duplex offered when the document is multi-page and
+        // the user hasn't already constrained pages — Odd-then-Even
+        // is the whole point, so a pre-existing odd/even/range
+        // selection makes the wizard non-sensical.
+        bool offerDuplex =
+            p.Kind == PendingPrintKind.Pageable &&
+            p.PageCount is int pcD && pcD > 1 &&
+            string.IsNullOrEmpty(p.PageRange) &&
+            p.PageSelection == PageSelection.All;
+
+        if (offerDuplex)
         {
-            InlineKeyboardButton.WithCallbackData("✅ Print",  $"print:confirm:{p.Id}"),
-            InlineKeyboardButton.WithCallbackData("❌ Cancel", $"print:cancel:{p.Id}"),
-        });
+            rows.Add(new[]
+            {
+                InlineKeyboardButton.WithCallbackData("✅ Print",   $"print:confirm:{p.Id}"),
+                InlineKeyboardButton.WithCallbackData("🔄 Duplex",  $"print:duplex:{p.Id}"),
+                InlineKeyboardButton.WithCallbackData("❌ Cancel",  $"print:cancel:{p.Id}"),
+            });
+        }
+        else
+        {
+            rows.Add(new[]
+            {
+                InlineKeyboardButton.WithCallbackData("✅ Print",  $"print:confirm:{p.Id}"),
+                InlineKeyboardButton.WithCallbackData("❌ Cancel", $"print:cancel:{p.Id}"),
+            });
+        }
         return new InlineKeyboardMarkup(rows);
     }
 

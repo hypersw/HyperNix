@@ -256,8 +256,63 @@ public static class PrintPreview
 /// from px / dpi stay the same. Otherwise 1:1 mode would silently
 /// start printing at 5× the user's intended size.
 /// </summary>
+/// <summary>
+/// Two broad content categories that route to different upscalers.
+/// Photos benefit from sinc-windowed Lanczos3 (smooth tones, mild
+/// detail enhancement); graphics — line art, cartoons, charts,
+/// diagrams, scanned coloring books, screenshots — fare poorly
+/// on Lanczos3 (halos around hard edges, soft strokes) and want
+/// a shape-aware or neural upscaler instead. realesr-animevideov3
+/// is the practical pick for the latter on a Pi-class device.
+/// </summary>
+public enum ContentClass { Photo, Graphics }
+
 public static class PrintPreprocess
 {
+    /// <summary>
+    /// Classify an incoming image as photo-like or graphics-like
+    /// using cheap statistics: a downsampled, bit-quantised unique-
+    /// colour count. Line art / charts / cartoons typically use
+    /// few-hundred distinct colours even at 4-bit-per-channel
+    /// quantisation; photos run into thousands almost immediately.
+    /// The threshold is empirical — tune as we accumulate samples.
+    /// </summary>
+    public static ContentClass Classify(Image<Rgb24> image)
+    {
+        // Constant-cost: downsample to a bounded thumbnail before
+        // counting. Aspect-preserving so we don't bias the colour
+        // population.
+        const int ThumbMax = 256;
+        using var thumb = image.Clone(c => c.Resize(new ResizeOptions
+        {
+            Mode = ResizeMode.Max,
+            Size = new Size(ThumbMax, ThumbMax),
+            Sampler = KnownResamplers.Box,
+        }));
+
+        // 4 bits per channel = 4096 possible quantised RGB values.
+        // Hashing into a HashSet<int> avoids a 4-KB array scan
+        // and lets us short-circuit on the threshold.
+        var seen = new HashSet<int>();
+        const int GraphicsCap = 512;
+        thumb.ProcessPixelRows(accessor =>
+        {
+            for (int y = 0; y < accessor.Height; y++)
+            {
+                var row = accessor.GetRowSpan(y);
+                for (int x = 0; x < row.Length; x++)
+                {
+                    var p = row[x];
+                    int q = ((p.R >> 4) << 8) | ((p.G >> 4) << 4) | (p.B >> 4);
+                    seen.Add(q);
+                    if (seen.Count > GraphicsCap) return;
+                }
+            }
+        });
+
+        return seen.Count <= GraphicsCap ? ContentClass.Graphics : ContentClass.Photo;
+    }
+
     /// Target dpi at full paper size. 600 dpi matches the HP P2015n's
     /// 600-dpi mechanical engine — the rasterizer's output grid will
     /// then map 1:1 to our pixels, so /Interpolate false in the PDF
@@ -273,7 +328,9 @@ public static class PrintPreprocess
     /// 600 dpi A4 target on at least one axis.
     private const double MinUpscaleGain = 1.05;
 
-    public sealed record Result(byte[] PdfBytes, int Width, int Height, int Dpi);
+    public sealed record Result(
+        byte[] PdfBytes, int Width, int Height, int Dpi,
+        ContentClass ContentClass);
 
     /// <summary>
     /// Take the raw image bytes the bot received, return print-ready
@@ -291,6 +348,14 @@ public static class PrintPreprocess
     {
         using var rgbImage = await Image.LoadAsync<Rgb24>(
             new MemoryStream(sourceBytes, writable: false), ct);
+
+        // Classify content type for the upscaler-routing decision.
+        // For now we still always run Lanczos3 (one path on the
+        // bot, no extra deps), but the classifier decision is
+        // logged so we can validate the threshold against real
+        // uploads before wiring a neural-upscaler-routed path
+        // through the renderer's hardened jail.
+        var contentClass = Classify(rgbImage);
 
         // Source dpi as declared in the file metadata, falling back
         // to a screen-typical 96 when it's missing (most tg-uploaded
@@ -358,6 +423,7 @@ public static class PrintPreprocess
             scale, orientation,
             paperShortInches, paperLongInches,
             margins);
-        return new Result(pdfBytes, finalW, finalH, (int)Math.Round(finalDpi));
+        return new Result(pdfBytes, finalW, finalH, (int)Math.Round(finalDpi),
+            contentClass);
     }
 }

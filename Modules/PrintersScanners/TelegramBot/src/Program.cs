@@ -1329,6 +1329,49 @@ async Task HandlePrintCallbackAsync(long chatId, string data, CancellationToken 
             await RenderPrintSessionAsync(chatId, ct);
             break;
         }
+        case "duplex":
+        {
+            // print:duplex:<pid> — start the manual two-pass duplex
+            // wizard. Configures the pending for an odd-pages run,
+            // marks DuplexMode so the post-print hook knows not to
+            // clear pending after pass 1, then dispatches the print
+            // exactly like the user had tapped ✅ Print themselves.
+            var pid = parts[2];
+            if (!MatchesCurrent(pid)) return;
+            lock (printSessionsLock)
+            {
+                if (!printSessions.TryGetValue(chatId, out var bs2) ||
+                    bs2.Pending is null) break;
+                bs2.Pending.DuplexMode = true;
+                bs2.Pending.DuplexPhase = DuplexPhase.OddPrinting;
+                bs2.Pending.PageSelection = PageSelection.Odd;
+                bs2.Pending.PageRange = "";
+                bs2.View = PrintPickerView.Main;
+            }
+            await ExecutePrintAsync(chatId, pid, ct);
+            break;
+        }
+        case "duplexstep2":
+        {
+            // print:duplexstep2:<pid> — pass 2. User has flipped the
+            // stack and reinserted; we set up an even-pages run and
+            // dispatch.
+            var pid = parts[2];
+            if (!MatchesCurrent(pid)) return;
+            lock (printSessionsLock)
+            {
+                if (!printSessions.TryGetValue(chatId, out var bs2) ||
+                    bs2.Pending is null) break;
+                if (!bs2.Pending.DuplexMode ||
+                    bs2.Pending.DuplexPhase != DuplexPhase.OddDone) break;
+                bs2.Pending.DuplexPhase = DuplexPhase.EvenPrinting;
+                bs2.Pending.PageSelection = PageSelection.Even;
+                bs2.Pending.PageRange = "";
+                bs2.View = PrintPickerView.Main;
+            }
+            await ExecutePrintAsync(chatId, pid, ct);
+            break;
+        }
         case "ackcomp":
         {
             // print:ackcomp:<pid> — user clicked "I accept compressed
@@ -1435,9 +1478,15 @@ async Task ExecutePrintAsync(long chatId, string pendingId, CancellationToken ct
                 payloadBytes = processed.PdfBytes;
                 payloadName  = Path.ChangeExtension(p.FileName, ".pdf");
                 payloadCt    = "application/pdf";
+                // Classification logged for tuning + future routing
+                // — Photo stays on Lanczos3 (current path), Graphics
+                // is the realesr-animevideov3 candidate for follow-
+                // up integration once Vulkan-on-Pi-4 is verified
+                // in the renderer's hardened jail.
                 log.LogInformation(
-                    "preprocessed {File}: {W}x{H} @ {Dpi} dpi → {Bytes} byte PDF",
-                    p.FileName, processed.Width, processed.Height,
+                    "preprocessed {File}: class={Class}, {W}x{H} @ {Dpi} dpi → {Bytes} byte PDF",
+                    p.FileName, processed.ContentClass,
+                    processed.Width, processed.Height,
                     processed.Dpi, payloadBytes.Length);
             }
             catch (Exception ex)
@@ -1496,15 +1545,42 @@ async Task ExecutePrintAsync(long chatId, string pendingId, CancellationToken ct
         if (printSessions.TryGetValue(chatId, out var bs))
         {
             bs.Printing = false;
-            bs.History.Insert(0, new PrintHistoryEntry(
-                DateTimeOffset.Now, p?.FileName ?? "?", ok, error));
-            if (bs.History.Count > BotPrintSession.HistoryCap)
-                bs.History.RemoveRange(BotPrintSession.HistoryCap,
-                    bs.History.Count - BotPrintSession.HistoryCap);
-            // Drop the pending whether print succeeded or failed —
-            // user re-sends to retry; matches the scan flow's "no
-            // automatic retry" stance.
-            bs.Pending = null;
+
+            // Mid-duplex transition: pass 1 succeeded, leave the
+            // pending alive so pass 2 can pick up where it left off.
+            // The user sees "Step 2: Print Even" + flip instructions
+            // on the next render. Failure during pass 1 falls
+            // through to the normal "drop pending, log failure"
+            // path below — half-printed-odd is no recovery story.
+            if (ok && p is { DuplexMode: true, DuplexPhase: DuplexPhase.OddPrinting }
+                && bs.Pending is { } cur && cur.Id == p.Id)
+            {
+                cur.DuplexPhase = DuplexPhase.OddDone;
+                log.LogInformation(
+                    "duplex {File}: pass 1 (odd) complete, awaiting Step 2",
+                    p.FileName);
+                // Don't write a history entry here — the duplex job
+                // is one logical print that lands in history once
+                // both passes finish (or once it cancels).
+            }
+            else
+            {
+                // Final state (success or failure) — write history
+                // and drop pending. Duplex pass-2 success vs plain
+                // print success differ only in the history label
+                // for clarity.
+                var label = (p?.DuplexMode ?? false)
+                    ? (p?.DuplexPhase == DuplexPhase.EvenPrinting
+                        ? $"{p.FileName} (duplex)"
+                        : $"{p?.FileName} (duplex aborted)")
+                    : p?.FileName ?? "?";
+                bs.History.Insert(0, new PrintHistoryEntry(
+                    DateTimeOffset.Now, label, ok, error));
+                if (bs.History.Count > BotPrintSession.HistoryCap)
+                    bs.History.RemoveRange(BotPrintSession.HistoryCap,
+                        bs.History.Count - BotPrintSession.HistoryCap);
+                bs.Pending = null;
+            }
         }
     }
     await RenderPrintSessionAsync(chatId, ct);
