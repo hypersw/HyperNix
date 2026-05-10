@@ -137,8 +137,16 @@
               networking.hostName = "printscan-provisioning";
               system.stateVersion = "25.05";
 
+              # `__ref=…__` (double-underscore bracketing) is a
+              # bash-safe stand-in for the parens we'd reach for —
+              # parens leak through `image.fileName` into stdenv
+              # build hooks that `eval` filenames unquoted and
+              # break with "syntax error near unexpected token `('".
+              # Underscores have no special meaning in any shell
+              # and don't appear elsewhere in the rev → still
+              # extracts cleanly: `grep -oP '(?<=__ref=)[^_]+'`.
               image.baseName =
-                "printscan-provisioning(ref=${printScanReadyRef})";
+                "printscan-provisioning__ref=${printScanReadyRef}__";
 
               hypersw.profiles.physicalServerProvisioning = {
                 enable = true;
@@ -236,12 +244,17 @@
               # `image.fileName` — final filename ends up as
               # `<base>.img.zst`.
               #
-              # Format: `(ref=<value>)` rather than dash-joined so
-              # the value extracts unambiguously regardless of how
-              # many dashes either side carries —
-              # `grep -oP '\(ref=\K[^)]+'` lifts it out cleanly.
+              # Format: `__ref=<value>__` so the value extracts
+              # unambiguously regardless of how many dashes either
+              # side carries — `grep -oP '(?<=__ref=)[^_]+'` lifts
+              # it out cleanly. Double-underscore brackets rather
+              # than parens because parens leak through into
+              # stdenv build hooks that `eval` filenames unquoted
+              # and break with "syntax error near unexpected
+              # token `('"; underscores are special-meaning-free
+              # in every shell.
               image.baseName =
-                "ghosthome-provisioning(ref=${ghostReadyRef})";
+                "ghosthome-provisioning__ref=${ghostReadyRef}__";
 
               hypersw.profiles.physicalServerProvisioning = {
                 enable = true;

@@ -1370,8 +1370,12 @@ secret-delivery story decoupled.
     `?ref=ghosthome-ready-<shortRev>` → flips into `GhostHome`
 
   Both bake the per-image readiness ref into the filename via
-  `image.baseName = "<host>-provisioning(ref=…)"` so the
-  operator greps the filename to know which branch/tag to push.
+  `image.baseName = "<host>-provisioning__ref=…__"` so the
+  operator greps the filename to know which branch/tag to push
+  (`grep -oP '(?<=__ref=)[^_]+'`). Brackets are double underscore
+  rather than parens because parens leak into stdenv build hooks
+  that `eval` filenames unquoted and crash the build with
+  "syntax error near unexpected token `('".
 
 * **MultiHomedNetworking** (dual-NIC bundle):
   - `interfaces` is a list-of-records (name / fwmark /
