@@ -39,6 +39,12 @@
           Modules-PrintersScanners-Daemon = printScanDaemon;
           Modules-PrintersScanners-TelegramBot = printScanBot;
           Modules-PrintersScanners-Renderer = printScanRenderer;
+          # Bottom (`btm`) patched for strict-overcommit hosts: per-process
+          # PrivCmt + Fp columns and a Committed_AS/CommitLimit gauge,
+          # auto-shown when vm.overcommit_memory == 2. Same derivation the
+          # NixOS module installs. Run directly via:
+          #   nix run github:hypersw/HyperNix#Modules-System-Btm-Fork
+          Modules-System-Btm-Fork = import ./Modules/System/Btm/package.nix { inherit pkgs; };
           # Machine runner packages
           Machines-MicroVM-VmSshFront =
             self.nixosConfigurations.VmSshFront.config.microvm.declaredRunner or null;

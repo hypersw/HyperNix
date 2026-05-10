@@ -19,7 +19,7 @@ OWNER=hypersw
 REPO=bottom
 BRANCH=f/strict-overcommit-mode
 MODULE_DIR="$(cd "$(dirname "$0")" && pwd)"
-MODULE="$MODULE_DIR/default.nix"
+SOURCE="$MODULE_DIR/source.nix"
 
 if [ "$#" -gt 1 ]; then
   echo "usage: $(basename "$0") [<rev>]" >&2
@@ -64,11 +64,11 @@ echo "→ sha256: $SHA"
 # module. If there are none or several, something has been
 # refactored and the simple sed below would silently miss or
 # clobber. Bail rather than guess.
-rev_count=$(grep -c '^[[:space:]]*rev = "[0-9a-f]\{40\}";' "$MODULE" || true)
-sha_count=$(grep -c '^[[:space:]]*sha256 = "[0-9a-z]\+";'  "$MODULE" || true)
+rev_count=$(grep -c '^[[:space:]]*rev = "[0-9a-f]\{40\}";' "$SOURCE" || true)
+sha_count=$(grep -c '^[[:space:]]*sha256 = "[0-9a-z]\+";'  "$SOURCE" || true)
 if [ "$rev_count" != "1" ] || [ "$sha_count" != "1" ]; then
   echo "expected 1 rev + 1 sha256 line in $MODULE; got $rev_count + $sha_count" >&2
-  echo "(refactor probably moved the pin; update bump.sh accordingly)" >&2
+  echo "(source.nix layout probably changed; update bump.sh accordingly)" >&2
   exit 1
 fi
 
@@ -77,18 +77,18 @@ fi
 sed -i \
   -e "s|^\([[:space:]]*\)rev = \"[0-9a-f]\{40\}\";|\1rev = \"${REV}\";|" \
   -e "s|^\([[:space:]]*\)sha256 = \"[0-9a-z]\+\";|\1sha256 = \"${SHA}\";|" \
-  "$MODULE"
+  "$SOURCE"
 
 # Sanity-check the replacement actually happened.
-if ! grep -q "\"${REV}\"" "$MODULE"; then
-  echo "rev replacement failed; module is in an unknown state" >&2
+if ! grep -q "\"${REV}\"" "$SOURCE"; then
+  echo "rev replacement failed; source.nix is in an unknown state" >&2
   exit 1
 fi
-if ! grep -q "\"${SHA}\"" "$MODULE"; then
-  echo "sha256 replacement failed; module is in an unknown state" >&2
+if ! grep -q "\"${SHA}\"" "$SOURCE"; then
+  echo "sha256 replacement failed; source.nix is in an unknown state" >&2
   exit 1
 fi
 
-echo "→ patched $MODULE"
+echo "→ patched $SOURCE"
 echo
-git -C "$MODULE_DIR" --no-pager diff -- "$MODULE" || true
+git -C "$MODULE_DIR" --no-pager diff -- "$SOURCE" || true

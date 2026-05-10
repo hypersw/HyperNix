@@ -2,23 +2,11 @@
 let
   cfg = config.programs.btm;
 
-  # Default fork source: pin a specific rev on github.com/hypersw/bottom.
-  # Bumping requires updating both `rev` and `sha256` here. Override
-  # `programs.btm.fork.src` with a local path if you're iterating on the
-  # fork before pushing.
-  defaultForkSrc = pkgs.fetchFromGitHub {
-    owner = "hypersw";
-    repo = "bottom";
-    rev = "73a0ee8ed18bf5d42237372ad6055bdd7bf6c8f9"; # f/strict-overcommit-mode tip
-    sha256 = "0p478q7rd2fvyqic61cqw2fsaq4v48j95zikymcbjg69zh1fj4k0";
-  };
+  # Pinned source for the fork. Same file is consumed by the flake's
+  # `packages.<system>.Modules-System-Btm-Fork` output, so a single
+  # `./bump.sh` updates both call sites at once.
+  defaultForkSrc = pkgs.fetchFromGitHub (import ./source.nix);
 
-  # Build the fork by overriding `pkgs.bottom`'s src. The fork shares
-  # `Cargo.lock` with upstream 0.12.3, so the cargoHash from nixpkgs
-  # remains valid — no override needed. If a future fork rebase touches
-  # Cargo.lock, set `cargoHash = lib.fakeHash;` here, run `nix build`
-  # once, and copy the printed hash.
-  #
   # Local-path overrides: `cfg.fork.src` can also be set to a path on
   # disk (e.g. /home/foo/Projects/External/bottom). When that path
   # doesn't exist, we fall back to `pkgs.bottom` with a warning so a
@@ -26,17 +14,13 @@ let
   forkPackage =
     let
       src = cfg.fork.src;
-      srcOk =
-        # `fetchFromGitHub` returns a /nix/store path that always exists.
-        # `builtins.pathExists` covers both that case and user-supplied
-        # filesystem paths during development.
-        builtins.pathExists src;
+      # `fetchFromGitHub` returns a /nix/store path that always exists;
+      # `pathExists` also covers user-supplied filesystem paths during
+      # local iteration.
+      srcOk = builtins.pathExists src;
     in
       if srcOk
-      then pkgs.bottom.overrideAttrs (old: {
-        version = "${old.version}-strict-overcommit";
-        src = src;
-      })
+      then import ./package.nix { inherit pkgs; src = src; }
       else lib.warn
         ("programs.btm.fork.src does not exist at ${toString src}; "
          + "falling back to upstream pkgs.bottom.")
