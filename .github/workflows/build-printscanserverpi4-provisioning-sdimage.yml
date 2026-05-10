@@ -55,12 +55,20 @@ jobs:
           fi
           IMG_NAME=$(basename "$IMG_FILE")
           cp "$IMG_FILE" "$IMG_NAME"
+          # Artifact bundle name carries the ref-bearing stem so
+          # the GitHub UI shows the readiness ref directly in the
+          # artifact list. GitHub wraps a downloaded artifact as
+          # `<name>.zip`; stripping the .img.zst extension off the
+          # filename for the artifact name avoids a `.img.zst.zip`
+          # double-extension. Inside the zip the real .img.zst
+          # filename is unchanged.
           echo "img_name=$IMG_NAME" >> "$GITHUB_ENV"
+          echo "artifact_name=${IMG_NAME%.img.zst}" >> "$GITHUB_ENV"
           ls -lh "$IMG_NAME"
 
       - uses: actions/upload-artifact@v4
         with:
-          name: printscanserverpi4-provisioning-sdimage
+          name: ${{ env.artifact_name }}
           path: ${{ env.img_name }}
           retention-days: 30
 
