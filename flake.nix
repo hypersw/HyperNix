@@ -64,6 +64,7 @@
         Modules-System-AutoRebuildOnPush = import ./Modules/System/AutoRebuildOnPush;
         Modules-System-AvahiPerInterfaceNames = import ./Modules/System/AvahiPerInterfaceNames;
         Modules-System-BootStabilityProbe = import ./Modules/System/BootStabilityProbe;
+        Modules-System-Btm = import ./Modules/System/Btm;
         # Profile meta-modules — single-import "make this host be X"
         # bundles. Compose to apply multiple at once on the same
         # machine.
