@@ -44,12 +44,21 @@
     fsType = "vfat";
   };
 
-  # Use the generic aarch64 kernel instead of the RPi-specific one.
-  # The nixos-hardware raspberry-pi-4 module selects linuxPackages_rpi4
-  # which uses a custom kernel (linux-rpi) that is NOT in cache.nixos.org.
-  # Every nixpkgs update would trigger a kernel recompile — 4-8 hours on
-  # the Pi, 1-2 hours under QEMU emulation on CI.
-  boot.kernelPackages = pkgs.linuxPackages;
+  # Bootloader: direct EEPROM kernel boot via nvmd's loader,
+  # forced — overrides nvmd's `mkDefault "uboot"` for Pi 4. Same
+  # mode as GhostHome (Pi 5) for fleet uniformity. The mechanism
+  # is implemented generically in nvmd; no upstream user has
+  # confirmed it on Pi 4, so we're first — if it fails we fall
+  # back to `lib.mkForce "uboot"` (or remove the override
+  # entirely to inherit nvmd's default).
+  boot.loader.raspberry-pi.bootloader = lib.mkForce "kernel";
+  boot.loader.raspberry-pi.configurationLimit = 3;
+
+  # Kernel: nvmd's linuxPackages_rpi4 (Pi-Foundation patch
+  # series) — set by raspberry-pi-4.base in flake.nix. Prebuilt
+  # in their binary cache at nixos-raspberrypi.cachix.org so we
+  # don't pay the rebuild cost we used to with nixpkgs'
+  # un-cached linuxPackages_rpi4.
 
   # ── Pi 4 brownout-mitigation kernel tweaks ──────────────────────
   # Context: 2026-04-21 we observed this Pi enter a 19-cycle silent-

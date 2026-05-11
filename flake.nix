@@ -12,9 +12,34 @@
 
     sops-nix.url = "github:Mic92/sops-nix";
     sops-nix.inputs.nixpkgs.follows = "nixpkgs";
+
+    # Pi 4 + Pi 5 NixOS support. Carries Pi-vendor kernels
+    # (linuxPackages_rpi{4,5}) plus a bootloader module that
+    # supports direct EEPROM kernel boot
+    # (`boot.loader.raspberry-pi.bootloader = "kernel"`) with
+    # multi-generation retention in the firmware partition.
+    #
+    # Required for Pi 5 specifically: upstream u-boot's Pi 5
+    # USB-MSD support is broken (RP1/PCIe issues — SUSE engineers'
+    # explicit position 2025-11), so any USB-booting Pi 5 must
+    # skip u-boot. We use the same loader uniformly on Pi 4 too
+    # for fleet consistency.
+    #
+    # Follow our nixpkgs (nixos-unstable) rather than nvmd's
+    # pinned 25.11. Cost: we miss nvmd's binary cache for the
+    # Pi-vendor kernel (their cache is keyed on 25.11 builds), so
+    # the kernel rebuilds from source on each nixpkgs bump — the
+    # same property we used to avoid by going mainline. We accept
+    # the rebuild cost in exchange for not having to track two
+    # nixpkgs versions across the fleet; telemetry alerts on
+    # rebuild failure already cover us if a kernel rev breaks.
+    nixos-raspberrypi = {
+      url = "github:nvmd/nixos-raspberrypi";
+      inputs.nixpkgs.follows = "nixpkgs";
+    };
   };
 
-  outputs = { self, nixpkgs, nixos-hardware, microvm, sops-nix }:
+  outputs = { self, nixpkgs, nixos-hardware, microvm, sops-nix, nixos-raspberrypi }:
     let
       forAllSystems = nixpkgs.lib.genAttrs [ "x86_64-linux" "aarch64-linux" ];
     in
@@ -91,10 +116,19 @@
         # 2026-04-21 and was retired) but the configuration is
         # actively maintained — a fresh-flashed Pi 4 boots straight
         # into the same role via the provisioning image below.
-        PrintScanServerPi4 = nixpkgs.lib.nixosSystem {
+        PrintScanServerPi4 = nixos-raspberrypi.lib.nixosSystem {
           system = "aarch64-linux";
+          # nvmd's `lib.nixosSystem` is a drop-in wrapper around
+          # `nixpkgs.lib.nixosSystem` that injects their Pi-vendor
+          # overlays (kernel, firmware, raspberrypi-utils,
+          # bootloader bits) onto `pkgs` so their modules can
+          # reference packages like `pkgs.raspberrypi-utils`
+          # unconditionally. Defaults to using nvmd's pinned
+          # nixpkgs (currently nixos-25.11), which matches the
+          # builds in their binary cache.
+          specialArgs = { inherit nixos-raspberrypi; };
           modules = [
-            nixos-hardware.nixosModules.raspberry-pi-4
+            nixos-raspberrypi.nixosModules.raspberry-pi-4.base
             sops-nix.nixosModules.sops
             {
               system.configurationRevision = self.rev or self.dirtyRev or "dirty";
@@ -108,12 +142,29 @@
             ./Machines/PhysicalServers/PrintScanServerPi4/configuration.nix
           ];
         };
-        PrintScanServerPi4-sdImage = nixpkgs.lib.nixosSystem {
+        PrintScanServerPi4-sdImage = nixos-raspberrypi.lib.nixosSystem {
           system = "aarch64-linux";
+          # nvmd's `lib.nixosSystem` is a drop-in wrapper around
+          # `nixpkgs.lib.nixosSystem` that injects their Pi-vendor
+          # overlays (kernel, firmware, raspberrypi-utils,
+          # bootloader bits) onto `pkgs` so their modules can
+          # reference packages like `pkgs.raspberrypi-utils`
+          # unconditionally. Defaults to using nvmd's pinned
+          # nixpkgs (currently nixos-25.11), which matches the
+          # builds in their binary cache.
+          specialArgs = { inherit nixos-raspberrypi; };
           modules = [
-            nixos-hardware.nixosModules.raspberry-pi-4
+            nixos-raspberrypi.nixosModules.raspberry-pi-4.base
             sops-nix.nixosModules.sops
-            "${nixpkgs}/nixos/modules/installer/sd-card/sd-image-aarch64.nix"
+            # nvmd's sd-image module, not stock sd-image-aarch64.nix:
+            # it bumps the firmware partition to 1 GB (kernel +
+            # initrd + multiple generations live there), wires
+            # `boot.loader.raspberry-pi.{firmware,boot}PopulateCmd`
+            # into `sdImage.populate{Firmware,Root}Commands`, and
+            # imports the underlying `sd-image.nix` partition-layout
+            # module from nixpkgs. Replaces the upstream module
+            # 1-for-1, no need to keep both.
+            nixos-raspberrypi.nixosModules.sd-image
             ./Machines/PhysicalServers/PrintScanServerPi4/configuration.nix
           ];
         };
@@ -121,27 +172,48 @@
         # ── PrintScanServerPi4-provisioning — first-boot image for a
         # fresh Pi 4 SD card. Mirrors GhostHome's provisioning
         # pattern; see the long comment above the GhostHome variant
-        # below for the complete workflow rationale. Differences:
-        # uses the Pi 4 nixos-hardware module (which auto-toggles
-        # extlinux, so no explicit boot.loader.* needed), bakes
+        # below for the complete workflow rationale. Bakes
         # `printscan-ready-<shortRev>` as the readiness ref, flips
-        # into `PrintScanServerPi4`.
+        # into `PrintScanServerPi4`. Kernel + boot loader come from
+        # nvmd (`linuxPackages_rpi4`, direct-EEPROM-kernel boot via
+        # `bootloader = "kernel"` — see the live config for the
+        # full rationale).
         PrintScanServerPi4-provisioning-sdImage = let
           printScanReadySuffix = self.shortRev or self.dirtyShortRev or "dirtyManual";
           printScanReadyRef = "printscan-ready-${printScanReadySuffix}";
-        in nixpkgs.lib.nixosSystem {
+        in nixos-raspberrypi.lib.nixosSystem {
           system = "aarch64-linux";
+          # nvmd's `lib.nixosSystem` is a drop-in wrapper around
+          # `nixpkgs.lib.nixosSystem` that injects their Pi-vendor
+          # overlays (kernel, firmware, raspberrypi-utils,
+          # bootloader bits) onto `pkgs` so their modules can
+          # reference packages like `pkgs.raspberrypi-utils`
+          # unconditionally. Defaults to using nvmd's pinned
+          # nixpkgs (currently nixos-25.11), which matches the
+          # builds in their binary cache.
+          specialArgs = { inherit nixos-raspberrypi; };
           modules = [
-            nixos-hardware.nixosModules.raspberry-pi-4
-            "${nixpkgs}/nixos/modules/installer/sd-card/sd-image-aarch64.nix"
+            nixos-raspberrypi.nixosModules.raspberry-pi-4.base
+            # nvmd's sd-image module, not stock sd-image-aarch64.nix:
+            # it bumps the firmware partition to 1 GB (kernel +
+            # initrd + multiple generations live there), wires
+            # `boot.loader.raspberry-pi.{firmware,boot}PopulateCmd`
+            # into `sdImage.populate{Firmware,Root}Commands`, and
+            # imports the underlying `sd-image.nix` partition-layout
+            # module from nixpkgs. Replaces the upstream module
+            # 1-for-1, no need to keep both.
+            nixos-raspberrypi.nixosModules.sd-image
             ./Modules/Profiles/PhysicalServerProvisioning
-            ({ ... }: {
-              # Generic mainline kernel; same caching reasoning as
-              # the live config.
-              boot.kernelPackages = nixpkgs.legacyPackages.aarch64-linux.linuxPackages;
-
+            ({ lib, ... }: {
               networking.hostName = "printscan-provisioning";
               system.stateVersion = "25.05";
+
+              # Match the live Pi 4 config: direct EEPROM kernel
+              # boot with N-generation retention. sd-image-aarch64
+              # turns on extlinux unconditionally; override.
+              boot.loader.generic-extlinux-compatible.enable = lib.mkForce false;
+              boot.loader.raspberry-pi.bootloader = lib.mkForce "kernel";
+              boot.loader.raspberry-pi.configurationLimit = 3;
 
               # `__ref=…__` (double-underscore bracketing) is a
               # bash-safe stand-in for the parens we'd reach for —
@@ -151,7 +223,7 @@
               # Underscores have no special meaning in any shell
               # and don't appear elsewhere in the rev → still
               # extracts cleanly: `grep -oP '(?<=__ref=)[^_]+'`.
-              image.baseName =
+              image.baseName = lib.mkForce
                 "printscan-provisioning__ref=${printScanReadyRef}__";
 
               hypersw.profiles.physicalServerProvisioning = {
@@ -167,10 +239,19 @@
         # ── GhostHome — Pi 5 home-automation server. Inherits the
         # print/scan stack as a guest workload until a dedicated
         # home-automation role takes its place as the headline.
-        GhostHome = nixpkgs.lib.nixosSystem {
+        GhostHome = nixos-raspberrypi.lib.nixosSystem {
           system = "aarch64-linux";
+          # nvmd's `lib.nixosSystem` is a drop-in wrapper around
+          # `nixpkgs.lib.nixosSystem` that injects their Pi-vendor
+          # overlays (kernel, firmware, raspberrypi-utils,
+          # bootloader bits) onto `pkgs` so their modules can
+          # reference packages like `pkgs.raspberrypi-utils`
+          # unconditionally. Defaults to using nvmd's pinned
+          # nixpkgs (currently nixos-25.11), which matches the
+          # builds in their binary cache.
+          specialArgs = { inherit nixos-raspberrypi; };
           modules = [
-            nixos-hardware.nixosModules.raspberry-pi-5
+            nixos-raspberrypi.nixosModules.raspberry-pi-5.base
             sops-nix.nixosModules.sops
             {
               system.configurationRevision = self.rev or self.dirtyRev or "dirty";
@@ -181,14 +262,33 @@
             ./Machines/PhysicalServers/GhostHome/configuration.nix
           ];
         };
-        GhostHome-sdImage = nixpkgs.lib.nixosSystem {
+        GhostHome-sdImage = nixos-raspberrypi.lib.nixosSystem {
           system = "aarch64-linux";
+          # nvmd's `lib.nixosSystem` is a drop-in wrapper around
+          # `nixpkgs.lib.nixosSystem` that injects their Pi-vendor
+          # overlays (kernel, firmware, raspberrypi-utils,
+          # bootloader bits) onto `pkgs` so their modules can
+          # reference packages like `pkgs.raspberrypi-utils`
+          # unconditionally. Defaults to using nvmd's pinned
+          # nixpkgs (currently nixos-25.11), which matches the
+          # builds in their binary cache.
+          specialArgs = { inherit nixos-raspberrypi; };
           modules = [
-            nixos-hardware.nixosModules.raspberry-pi-5
+            nixos-raspberrypi.nixosModules.raspberry-pi-5.base
             sops-nix.nixosModules.sops
-            "${nixpkgs}/nixos/modules/installer/sd-card/sd-image-aarch64.nix"
-            # Stock sd-image-aarch64 doesn't know about Pi 5 — see
-            # comment block in the module for the gory details.
+            # nvmd's sd-image module, not stock sd-image-aarch64.nix:
+            # it bumps the firmware partition to 1 GB (kernel +
+            # initrd + multiple generations live there), wires
+            # `boot.loader.raspberry-pi.{firmware,boot}PopulateCmd`
+            # into `sdImage.populate{Firmware,Root}Commands`, and
+            # imports the underlying `sd-image.nix` partition-layout
+            # module from nixpkgs. Replaces the upstream module
+            # 1-for-1, no need to keep both.
+            nixos-raspberrypi.nixosModules.sd-image
+            # Custom Pi 5 sd-image firmware-partition fallback —
+            # imported but disabled by default; the live config
+            # uses nvmd's bootloader instead. See the module
+            # header for context on when this would be enabled.
             ./Modules/Hardware/RaspberryPi5SdImage
             ./Machines/PhysicalServers/GhostHome/configuration.nix
           ];
@@ -225,24 +325,45 @@
         GhostHome-provisioning-sdImage = let
           ghostReadySuffix = self.shortRev or self.dirtyShortRev or "dirtyManual";
           ghostReadyRef = "ghosthome-ready-${ghostReadySuffix}";
-        in nixpkgs.lib.nixosSystem {
+        in nixos-raspberrypi.lib.nixosSystem {
           system = "aarch64-linux";
+          # nvmd's `lib.nixosSystem` is a drop-in wrapper around
+          # `nixpkgs.lib.nixosSystem` that injects their Pi-vendor
+          # overlays (kernel, firmware, raspberrypi-utils,
+          # bootloader bits) onto `pkgs` so their modules can
+          # reference packages like `pkgs.raspberrypi-utils`
+          # unconditionally. Defaults to using nvmd's pinned
+          # nixpkgs (currently nixos-25.11), which matches the
+          # builds in their binary cache.
+          specialArgs = { inherit nixos-raspberrypi; };
           modules = [
-            nixos-hardware.nixosModules.raspberry-pi-5
-            "${nixpkgs}/nixos/modules/installer/sd-card/sd-image-aarch64.nix"
-            # Stock sd-image-aarch64 doesn't know about Pi 5 — see
-            # comment block in the module for the gory details.
+            nixos-raspberrypi.nixosModules.raspberry-pi-5.base
+            # nvmd's sd-image module, not stock sd-image-aarch64.nix:
+            # it bumps the firmware partition to 1 GB (kernel +
+            # initrd + multiple generations live there), wires
+            # `boot.loader.raspberry-pi.{firmware,boot}PopulateCmd`
+            # into `sdImage.populate{Firmware,Root}Commands`, and
+            # imports the underlying `sd-image.nix` partition-layout
+            # module from nixpkgs. Replaces the upstream module
+            # 1-for-1, no need to keep both.
+            nixos-raspberrypi.nixosModules.sd-image
+            # Custom Pi 5 sd-image firmware-partition fallback —
+            # imported but disabled by default; the live config
+            # uses nvmd's bootloader instead. See the module
+            # header for context on when this would be enabled.
             ./Modules/Hardware/RaspberryPi5SdImage
             ./Modules/Profiles/PhysicalServerProvisioning
-            ({ ... }: {
-              # Pi 5 needs explicit extlinux opt-in — see comment
-              # in GhostHome's configuration.nix for the rationale.
-              boot.loader.grub.enable = false;
-              boot.loader.generic-extlinux-compatible.enable = true;
-
-              # Generic mainline kernel; same caching reasoning as
-              # the live config.
-              boot.kernelPackages = nixpkgs.legacyPackages.aarch64-linux.linuxPackages;
+            ({ lib, ... }: {
+              # Match the live Pi 5 config: direct EEPROM kernel
+              # boot via nvmd's loader. No need for u-boot or
+              # extlinux on Pi 5 USB (u-boot's RP1/USB support
+              # isn't there in upstream 2026.01); EEPROM loads
+              # the kernel directly from the firmware partition.
+              # sd-image-aarch64 turns on extlinux unconditionally;
+              # override.
+              boot.loader.generic-extlinux-compatible.enable = lib.mkForce false;
+              boot.loader.raspberry-pi.bootloader = "kernel";
+              boot.loader.raspberry-pi.configurationLimit = 3;
 
               networking.hostName = "ghosthome-provisioning";
               system.stateVersion = "25.05";
@@ -265,7 +386,7 @@
               # and break with "syntax error near unexpected
               # token `('"; underscores are special-meaning-free
               # in every shell.
-              image.baseName =
+              image.baseName = lib.mkForce
                 "ghosthome-provisioning__ref=${ghostReadyRef}__";
 
               hypersw.profiles.physicalServerProvisioning = {

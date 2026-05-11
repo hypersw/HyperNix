@@ -1,6 +1,38 @@
-{ lib, pkgs, ... }:
+{ config, lib, pkgs, ... }:
 #
 # Pi-5-aware augmentation for `sd-image-aarch64.nix`.
+#
+# ── Status ───────────────────────────────────────────────────────────
+#
+# Currently **disabled by default**. We migrated GhostHome's boot
+# chain off this module onto `nvmd/nixos-raspberrypi` (a community
+# flake that ships a complete Pi-5-aware boot loader with direct
+# EEPROM kernel boot, multi-generation retention, and its own
+# binary cache — see the GhostHome live config). nvmd's
+# `boot.loader.raspberry-pi.bootloader = "kernel"` mode bypasses
+# u-boot entirely, which is required because upstream u-boot's
+# Pi 5 USB-MSD support hangs trying to enumerate devices on the
+# RP1 PCIe controller (SUSE engineers' explicit position as of
+# 2025: not supported).
+#
+# This module is kept around as a complete, working alternative
+# implementation — the chain-through-u-boot path that the stock
+# `sd-image-aarch64.nix` envisions, just with the Pi-5-specific
+# bits the upstream module is missing. It would become useful
+# again if any of:
+#   * we want to drop the nvmd flake dependency
+#   * upstream u-boot's Pi 5 USB support lands (then this module
+#     gives us the same chain Pi 4 uses)
+#   * we need to boot a Pi 5 from SD instead of USB (where u-boot
+#     does work today)
+#
+# Enable via `hypersw.hardware.raspberryPi5SdImage.enable = true`
+# on a Pi 5 sd-image configuration. Should NOT be enabled
+# simultaneously with the nvmd `bootloader = "kernel"` path —
+# both would try to manage the firmware partition's config.txt
+# and the second write would just overwrite the first.
+#
+# ── What it does (when enabled) ─────────────────────────────────────
 #
 # The stock nixpkgs sd-image-aarch64 module only populates the
 # firmware partition for Pi 2 / Pi 3 / Pi 4 / CM4 — it copies the
@@ -25,12 +57,9 @@
 #     sections from the upstream template are preserved so the
 #     same image still boots on a Pi 3/4 if anyone tries
 #
-# Pulled into a separate module so any future Pi-5-bound sd-image
-# in `flake.nix` picks it up by adding this path to its
-# `modules =` list. Pi 4 images don't need this — the upstream
-# sd-image-aarch64.nix already handles bcm2711 correctly.
-#
 let
+  cfg = config.hypersw.hardware.raspberryPi5SdImage;
+
   # Built as a fixed file rather than a heredoc inside the shell
   # commands so we don't have to fight Nix's indented-string
   # whitespace handling around the section headers.
@@ -68,15 +97,29 @@ let
   '';
 in
 {
-  sdImage.populateFirmwareCommands = lib.mkAfter ''
-    cp ${pkgs.raspberrypifw}/share/raspberrypi/boot/bcm2712-rpi-5-b.dtb firmware/
-    cp ${pkgs.ubootRaspberryPiAarch64}/u-boot.bin firmware/u-boot-rpi-arm64.bin
-    # `install` rather than `cp` for the config.txt overwrite —
-    # the upstream populateFirmwareCommands already copied its own
-    # config.txt here, and `cp` from a Nix store path preserves
-    # the 0444 source mode on the destination, so a subsequent
-    # `cp` to the same path fails with EACCES. `install -m 0644`
-    # always creates the destination fresh with explicit mode.
-    install -m 0644 ${configTxt} firmware/config.txt
-  '';
+  options.hypersw.hardware.raspberryPi5SdImage = {
+    enable = lib.mkEnableOption ''
+      Pi-5-aware augmentation of `sd-image-aarch64.nix`'s
+      populateFirmwareCommands (drops bcm2712 DTB + arm64 u-boot
+      into the firmware partition, rewrites config.txt with [pi5]
+      section). Disabled by default because the live system uses
+      `nvmd/nixos-raspberrypi` instead (see the module header for
+      the full context). Enable only on Pi 5 sd-image
+      configurations that DON'T also use the nvmd boot loader
+    '';
+  };
+
+  config = lib.mkIf cfg.enable {
+    sdImage.populateFirmwareCommands = lib.mkAfter ''
+      cp ${pkgs.raspberrypifw}/share/raspberrypi/boot/bcm2712-rpi-5-b.dtb firmware/
+      cp ${pkgs.ubootRaspberryPiAarch64}/u-boot.bin firmware/u-boot-rpi-arm64.bin
+      # `install` rather than `cp` for the config.txt overwrite —
+      # the upstream populateFirmwareCommands already copied its own
+      # config.txt here, and `cp` from a Nix store path preserves
+      # the 0444 source mode on the destination, so a subsequent
+      # `cp` to the same path fails with EACCES. `install -m 0644`
+      # always creates the destination fresh with explicit mode.
+      install -m 0644 ${configTxt} firmware/config.txt
+    '';
+  };
 }

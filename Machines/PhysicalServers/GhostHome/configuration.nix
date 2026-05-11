@@ -40,33 +40,31 @@
     fsType = "vfat";
   };
 
-  # Bootloader: extlinux on /boot/firmware (the same pattern as the
-  # Pi 4 deployment). The nixos-hardware raspberry-pi-5 module
-  # doesn't toggle this on by default the way the Pi 4 module does,
-  # so we have to set it explicitly here. GRUB is disabled to
-  # silence its "configure boot.loader.grub.devices" assertion.
-  boot.loader.grub.enable = false;
-  boot.loader.generic-extlinux-compatible.enable = true;
-
-  # Generic aarch64 kernel rather than linuxPackages_rpi5. Two
-  # reasons:
-  #   1. Cache. linuxPackages_rpi5 is a custom kernel (linux-rpi
-  #      with the Foundation's patch series), not present in
-  #      cache.nixos.org. Every nixpkgs bump rebuilds it from
-  #      source; on a Pi 5 that's still 30–60 minutes of CPU per
-  #      kernel rev. The generic mainline kernel is always cached.
-  #   2. The Foundation patches we'd give up — GPU / camera /
-  #      hardware-video-decode / HAT overlays — are irrelevant on
-  #      a headless server. The mainline ARM64 kernel has full
-  #      Pi 5 support (BCM2712, V3D Pi-5 GPU via vc4 driver,
-  #      onboard NIC, USB-C, etc) since the post-release uptake.
-  #      Realesr-ncnn-vulkan reaches V3D via mesa userspace +
-  #      mainline DRM — works either way.
+  # Bootloader: direct EEPROM kernel boot via nvmd's loader
+  # (`boot.loader.raspberry-pi.bootloader = "kernel"`). The
+  # firmware partition holds the kernel image + initrd + cmdline
+  # directly; the Pi 5 EEPROM loads them and jumps into Linux
+  # with no u-boot in the chain.
   #
-  # Switch to linuxPackages_rpi5 only if a Pi-specific feature we
-  # want shows up (camera ribbon, wireless-via-host-firmware quirks,
-  # GPIO HAT overlays) and the build cost is justified.
-  boot.kernelPackages = pkgs.linuxPackages;
+  # Why no u-boot: upstream u-boot's Pi 5 USB-MSD support is
+  # broken — RP1/PCIe driver isn't there, so u-boot hangs trying
+  # to enumerate the USB SSD on Pi 5 (SUSE engineers' explicit
+  # 2025-11 statement). The Pi 5 EEPROM itself reads USB fine, so
+  # skipping u-boot dodges the only problem layer.
+  #
+  # Generation retention: 3 (last three system generations are
+  # kept under /boot/firmware/nixos/<N>/ for manual rollback —
+  # mount the FAT partition on another box, copy a previous gen's
+  # files over the FAT root to recover from a bad upgrade).
+  boot.loader.raspberry-pi.bootloader = "kernel";
+  boot.loader.raspberry-pi.configurationLimit = 3;
+
+  # Kernel comes from nvmd's Pi-5-vendor package
+  # (linuxPackages_rpi5, Foundation patch series) — set by
+  # raspberry-pi-5.base in flake.nix. Their binary cache at
+  # nixos-raspberrypi.cachix.org has it prebuilt, so we don't
+  # pay the rebuild cost we'd have paid going through
+  # nixpkgs' uncached linuxPackages_rpi5.
 
   # Headless boot tweaks — same rationale as the Pi 4 config but
   # without the brownout-mitigation bundle. Pi 5's PMIC + 5 V power
