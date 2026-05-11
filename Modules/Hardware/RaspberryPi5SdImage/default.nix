@@ -65,6 +65,12 @@ in
   sdImage.populateFirmwareCommands = lib.mkAfter ''
     cp ${pkgs.raspberrypifw}/share/raspberrypi/boot/bcm2712-rpi-5-b.dtb firmware/
     cp ${pkgs.ubootRaspberryPiAarch64}/u-boot.bin firmware/u-boot-rpi-arm64.bin
-    cp ${configTxt} firmware/config.txt
+    # `install` rather than `cp` for the config.txt overwrite —
+    # the upstream populateFirmwareCommands already copied its own
+    # config.txt here, and `cp` from a Nix store path preserves
+    # the 0444 source mode on the destination, so a subsequent
+    # `cp` to the same path fails with EACCES. `install -m 0644`
+    # always creates the destination fresh with explicit mode.
+    install -m 0644 ${configTxt} firmware/config.txt
   '';
 }
