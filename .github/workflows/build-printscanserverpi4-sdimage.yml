@@ -61,6 +61,10 @@ jobs:
           name: printscanserverpi4-sdimage
           path: ${{ env.img_name }}
           retention-days: 7
+          # Payload is already zstd-compressed — skip the
+          # artifact-API's second compression pass. See the
+          # provisioning workflows for the full rationale.
+          compression-level: 0
 
       # On tagged releases, also upload to GitHub Releases
       - name: Create release

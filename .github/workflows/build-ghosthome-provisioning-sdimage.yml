@@ -71,6 +71,14 @@ jobs:
           name: ${{ env.artifact_name }}
           path: ${{ env.img_name }}
           retention-days: 30
+          # The payload is already zstd-compressed (.img.zst). Skip
+          # the artifact-API's second compression pass — it spends
+          # minutes recompressing already-compressed bytes for zero
+          # size benefit. `compression-level: 0` produces a STORED
+          # zip (thin wrapper, no recompression). The wrapper
+          # itself is unavoidable: actions/upload-artifact always
+          # zip-wraps, that's how GitHub's artifact storage works.
+          compression-level: 0
 
       - name: Create release
         if: startsWith(github.ref, 'refs/tags/')
