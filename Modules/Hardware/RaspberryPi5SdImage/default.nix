@@ -51,6 +51,12 @@ let
 
     [pi5]
     kernel=u-boot-rpi-arm64.bin
+    # Defensive: skip the EEPROM's pre-boot "does this OS indicate
+    # support for Pi 5" check. The check passes for us anyway
+    # (bcm2712-rpi-5-b.dtb is right there in this partition), but
+    # turning it off rules out that whole code path when diagnosing
+    # future boot stalls.
+    os_check=0
 
     [cm4]
     otg_mode=1
