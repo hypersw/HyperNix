@@ -187,6 +187,9 @@
             nixos-hardware.nixosModules.raspberry-pi-5
             sops-nix.nixosModules.sops
             "${nixpkgs}/nixos/modules/installer/sd-card/sd-image-aarch64.nix"
+            # Stock sd-image-aarch64 doesn't know about Pi 5 — see
+            # comment block in the module for the gory details.
+            ./Modules/Hardware/RaspberryPi5SdImage
             ./Machines/PhysicalServers/GhostHome/configuration.nix
           ];
         };
@@ -227,6 +230,9 @@
           modules = [
             nixos-hardware.nixosModules.raspberry-pi-5
             "${nixpkgs}/nixos/modules/installer/sd-card/sd-image-aarch64.nix"
+            # Stock sd-image-aarch64 doesn't know about Pi 5 — see
+            # comment block in the module for the gory details.
+            ./Modules/Hardware/RaspberryPi5SdImage
             ./Modules/Profiles/PhysicalServerProvisioning
             ({ ... }: {
               # Pi 5 needs explicit extlinux opt-in — see comment
