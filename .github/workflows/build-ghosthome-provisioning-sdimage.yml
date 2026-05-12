@@ -19,7 +19,12 @@ on:
 
 jobs:
   build-sd-image:
-    runs-on: ubuntu-latest
+    # Native aarch64 — no QEMU. GitHub's `ubuntu-24.04-arm` is
+    # free for public repos and runs Linux kernel + nix builds
+    # at native speed; the alternative (x86_64 runner + qemu-user
+    # binfmt) timed out at 2h+ when the Pi-vendor kernel had to
+    # rebuild under emulation.
+    runs-on: ubuntu-24.04-arm
     timeout-minutes: 120
 
     steps:
@@ -28,14 +33,9 @@ jobs:
       - uses: cachix/install-nix-action@v30
         with:
           extra_nix_config: |
-            extra-platforms = aarch64-linux
             experimental-features = nix-command flakes
             extra-substituters = https://nix-community.cachix.org https://cache.nixos.org
             extra-trusted-public-keys = nix-community.cachix.org-1:mB9FSh9qf2dCimDSUo8Zy7bkq5CX+/rkCWyvRCYg3Fs= cache.nixos.org-1:6NCHdD59X431o0gWypbMrAURkbJ16ZPMQFGspcDShjY=
-
-      - uses: docker/setup-qemu-action@v3
-        with:
-          platforms: arm64
 
       - name: Build provisioning SD card image
         run: |
