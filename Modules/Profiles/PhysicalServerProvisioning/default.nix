@@ -55,6 +55,78 @@
 #
 let
   cfg = config.hypersw.profiles.physicalServerProvisioning;
+
+  # Log file that first-boot-switch tees its stdout+stderr to, so
+  # the HTTP status endpoint can serve verbose nix-build output
+  # (which journalctl truncates) alongside the journal.
+  switchLogFile = "/var/log/first-boot-switch.log";
+
+  # Tiny Python HTTP server that re-renders the journal + log on
+  # every request. Python rather than busybox httpd / nginx /
+  # darkhttpd because (a) we just want one dynamic endpoint, no
+  # static-file routing, (b) Python's stdlib http.server gives us
+  # proper HTTP semantics in ~30 lines, (c) closure cost is a
+  # one-time ~30 MB hit on a provisioning image that's already
+  # ~3 GB and short-lived.
+  logServer = pkgs.writeTextFile {
+    name = "first-boot-log-server.py";
+    executable = true;
+    text = ''
+      #!${pkgs.python3}/bin/python3
+      """
+      Read-only HTTP endpoint streaming a snapshot of
+      first-boot-switch's progress on every GET. No auth — the
+      data is just systemd journal lines + the switch's stdout
+      tee'd to a log file, neither sensitive, and the
+      provisioning image isn't supposed to live past the first
+      successful switch.
+      """
+      import http.server
+      import subprocess
+      import os
+
+      JOURNALCTL = "${pkgs.systemd}/bin/journalctl"
+      LOG_FILE = "${switchLogFile}"
+
+      class Handler(http.server.BaseHTTPRequestHandler):
+          def do_GET(self):
+              parts = [b"=== first-boot-switch.service journal (last 5000 lines) ===\n"]
+              try:
+                  parts.append(subprocess.check_output([
+                      JOURNALCTL, "--no-pager", "--output=short-iso",
+                      "-u", "first-boot-switch.service",
+                      "-n", "5000",
+                  ]))
+              except subprocess.CalledProcessError as e:
+                  parts.append(b"(journalctl exited non-zero)\n")
+                  parts.append(e.output or b"")
+              parts.append(("\n=== %s ===\n" % LOG_FILE).encode())
+              if os.path.exists(LOG_FILE):
+                  with open(LOG_FILE, "rb") as f:
+                      parts.append(f.read())
+              else:
+                  # Plain ASCII -- Python bytes literals reject non-ASCII chars.
+                  parts.append(b"(no log file yet -- first-boot-switch hasn't run a full attempt)\n")
+              body = b"".join(parts)
+              self.send_response(200)
+              self.send_header("Content-Type", "text/plain; charset=utf-8")
+              self.send_header("Cache-Control", "no-store")
+              self.send_header("Content-Length", str(len(body)))
+              self.end_headers()
+              self.wfile.write(body)
+
+          def log_message(self, fmt, *args):
+              # Quiet the per-request access log — uninteresting,
+              # and would clutter the journal we're serving.
+              pass
+
+      addr = os.environ.get("FIRST_BOOT_LOG_BIND", "0.0.0.0")
+      port = int(os.environ.get("FIRST_BOOT_LOG_PORT", "80"))
+      server = http.server.HTTPServer((addr, port), Handler)
+      print(f"first-boot-log-server: listening on {addr}:{port}", flush=True)
+      server.serve_forever()
+    '';
+  };
 in
 {
   options.hypersw.profiles.physicalServerProvisioning = {
@@ -107,6 +179,32 @@ in
         '';
       };
     };
+
+    statusHttp = {
+      enable = lib.mkOption {
+        type = lib.types.bool;
+        default = true;
+        description = ''
+          Expose first-boot-switch's progress over a read-only
+          HTTP endpoint on the LAN. Useful because the first
+          successful switch on a Pi rebuilds the live system's
+          kernel from source (we don't get nvmd's cache hits
+          when following our own nixpkgs pin), which can take
+          30–60 min on a Pi 5. The operator points a browser at
+          the Pi's IP and sees the live journal + log of the
+          retry attempts, no auth needed — the data is just
+          systemd journal lines + nix-build stdout, nothing
+          sensitive. Image is short-lived anyway; the moment the
+          switch succeeds we reboot into the real config which
+          doesn't carry this endpoint.
+        '';
+      };
+      port = lib.mkOption {
+        type = lib.types.port;
+        default = 80;
+        description = "TCP port for the status HTTP endpoint.";
+      };
+    };
   };
 
   config = lib.mkIf cfg.enable {
@@ -116,7 +214,8 @@ in
       useDHCP = true;
       firewall = {
         enable = true;
-        allowedTCPPorts = [ 22 ];
+        allowedTCPPorts = [ 22 ]
+          ++ lib.optional cfg.statusHttp.enable cfg.statusHttp.port;
       };
     };
 
@@ -162,21 +261,88 @@ in
         # CWD-relative writes inside nixos-rebuild.
         WorkingDirectory = "/var/empty";
         ExecStart = pkgs.writeShellScript "first-boot-switch" ''
-          set -eu
-          # --refresh: ignore any cached "ref doesn't exist" entry
-          # so the moment the operator pushes the readiness ref,
-          # the next retry picks it up. --no-write-lock-file: don't
-          # try to write a flake.lock anywhere (the image's rootfs
-          # is read-only at activation time anyway).
-          ${pkgs.nixos-rebuild}/bin/nixos-rebuild boot \
-            --refresh \
-            --no-write-lock-file \
-            --flake "${cfg.targetFlakeUri}#${cfg.targetConfigName}"
-          # Sync filesystems, then reboot. systemctl reboot
-          # returns immediately and the kernel handles the rest.
-          ${pkgs.coreutils}/bin/sync
+          # `pipefail` is CRITICAL — without it, the `… | tee` at
+          # the end of the rebuild pipeline below masks
+          # `nixos-rebuild`'s non-zero exit and the script
+          # proceeds to `systemctl reboot` on every failed
+          # attempt. That bricks the retry loop and (in the
+          # nixosTest VM) kills the test-driver shell mid-run.
+          set -euo pipefail
+          # Tee stdout+stderr into a log file the HTTP status
+          # endpoint serves alongside the journal. journalctl
+          # truncates long lines so verbose `nix-build` output
+          # would be hard to read straight from the journal —
+          # the file gives the operator the full firehose.
+          ${pkgs.coreutils}/bin/mkdir -p $(${pkgs.coreutils}/bin/dirname ${switchLogFile})
+          {
+            echo "[$(${pkgs.coreutils}/bin/date -Iseconds)] starting first-boot-switch attempt → ${cfg.targetFlakeUri}#${cfg.targetConfigName}"
+            # --refresh: ignore any cached "ref doesn't exist"
+            # entry so the moment the operator pushes the
+            # readiness ref, the next retry picks it up.
+            # --no-write-lock-file: don't try to write a
+            # flake.lock anywhere (the image's rootfs is
+            # read-only at activation time anyway).
+            # --print-build-logs: surface each derivation's
+            # build progress in real time rather than waiting
+            # for the whole thing to finish.
+            ${pkgs.nixos-rebuild}/bin/nixos-rebuild boot \
+              --refresh \
+              --no-write-lock-file \
+              --print-build-logs \
+              --flake "${cfg.targetFlakeUri}#${cfg.targetConfigName}"
+            echo "[$(${pkgs.coreutils}/bin/date -Iseconds)] switch succeeded — syncing + rebooting"
+            ${pkgs.coreutils}/bin/sync
+          } 2>&1 | ${pkgs.coreutils}/bin/tee -a ${switchLogFile}
+          # systemctl reboot returns immediately; the kernel
+          # handles the rest.
           ${pkgs.systemd}/bin/systemctl reboot
         '';
+      };
+    };
+
+    # Read-only HTTP status endpoint. Serves the journal of
+    # first-boot-switch.service + the verbose tee'd log from
+    # the ExecStart above, regenerated on every GET.
+    systemd.services.first-boot-log = lib.mkIf cfg.statusHttp.enable {
+      description = "Read-only HTTP endpoint serving first-boot-switch progress";
+      after = [ "network.target" ];
+      wantedBy = [ "multi-user.target" ];
+      environment = {
+        FIRST_BOOT_LOG_PORT = toString cfg.statusHttp.port;
+      };
+      serviceConfig = {
+        Type = "simple";
+        ExecStart = "${logServer}";
+        Restart = "always";
+        RestartSec = "5s";
+        # Run unprivileged via systemd's DynamicUser. The script
+        # only needs to read the journal (systemd-journal group)
+        # and read the log file. Low-port bind needs the cap.
+        DynamicUser = true;
+        SupplementaryGroups = [ "systemd-journal" ];
+        AmbientCapabilities = lib.optionals (cfg.statusHttp.port < 1024) [ "CAP_NET_BIND_SERVICE" ];
+        CapabilityBoundingSet = lib.optionals (cfg.statusHttp.port < 1024) [ "CAP_NET_BIND_SERVICE" ];
+        # Hardening — endpoint reads journal + log, nothing else.
+        NoNewPrivileges = true;
+        ProtectSystem = "strict";
+        ProtectHome = true;
+        PrivateTmp = true;
+        PrivateDevices = true;
+        ProtectKernelTunables = true;
+        ProtectKernelModules = true;
+        ProtectKernelLogs = true;
+        ProtectControlGroups = true;
+        ProtectClock = true;
+        ProtectHostname = true;
+        LockPersonality = true;
+        RestrictSUIDSGID = true;
+        RestrictRealtime = true;
+        RestrictNamespaces = true;
+        RestrictAddressFamilies = [ "AF_INET" "AF_INET6" ];
+        # The tee'd log file lives outside the journal — grant
+        # explicit read access since DynamicUser otherwise can't
+        # see it under ProtectSystem=strict.
+        ReadOnlyPaths = [ switchLogFile ];
       };
     };
 

@@ -97,6 +97,71 @@
         default = import ./Modules;
       };
 
+      # ── Checks (automated tests) ──
+      # `nix build .#checks.x86_64-linux.first-boot-log` boots a
+      # NixOS VM with the provisioning profile enabled, triggers
+      # a deliberately-failing first-boot-switch (bogus readiness
+      # ref), then curls the status HTTP endpoint and asserts
+      # it returns the failure journal. Catches regressions in
+      # the endpoint without a Pi roundtrip.
+      checks = forAllSystems (system:
+        let
+          pkgs = nixpkgs.legacyPackages.${system};
+        in {
+          first-boot-log = pkgs.testers.nixosTest {
+            name = "first-boot-log-endpoint";
+            nodes.machine = { ... }: {
+              imports = [ ./Modules ];
+              hypersw.profiles.physicalServerProvisioning = {
+                enable = true;
+                # Deliberately bogus ref — first-boot-switch
+                # tries the rebuild, fails, the failure lands in
+                # the journal where the endpoint can serve it.
+                targetFlakeUri = "github:hypersw/HyperNix?ref=does-not-exist-test-marker";
+                targetConfigName = "GhostHome";
+              };
+              # The default openssh+sudo+root-lock from the
+              # profile is fine for the test VM; nothing to
+              # override.
+            };
+            testScript = ''
+              machine.wait_for_unit("first-boot-log.service")
+              machine.wait_for_open_port(80)
+
+              # Trigger first-boot-switch synchronously (no
+              # `--no-block`). systemctl `start` on a Type=oneshot
+              # blocks until the unit exits. We pipe through
+              # `|| true` because we EXPECT it to fail (bogus
+              # ref / sandboxed test VM has no network anyway).
+              # The point is to land SOMETHING in the journal/log
+              # that the endpoint can serve back.
+              machine.execute("systemctl start first-boot-switch.service || true", timeout=120)
+              machine.execute("journalctl --sync")
+
+              output = machine.succeed("${pkgs.curl}/bin/curl --silent --max-time 5 http://localhost/")
+              print("=== endpoint output ===")
+              print(output)
+              print("=== end ===")
+
+              # Endpoint structure must be right — section
+              # headers present, content well-formed.
+              assert "first-boot-switch.service journal" in output, \
+                f"endpoint should label the journal section, got: {output[:500]}"
+              assert "/var/log/first-boot-switch.log" in output, \
+                f"endpoint should label the log file section, got: {output[:500]}"
+
+              # After triggering the service, either the journal
+              # has entries OR the tee'd log file does — at
+              # least one must show evidence of activity. Pure
+              # "no content anywhere" means the wiring is broken.
+              has_journal_content = "-- No entries --" not in output
+              has_log_content = "(no log file yet" not in output
+              assert has_journal_content or has_log_content, \
+                f"after triggering first-boot-switch, neither journal nor log file has content; endpoint wiring is broken. Got: {output[:1500]}"
+            '';
+          };
+        });
+
       # ── NixOS Configurations ──
       nixosConfigurations = {
         VmSshFront = import ./Machines/MicroVM/VmSshFront/nixos.nix {
