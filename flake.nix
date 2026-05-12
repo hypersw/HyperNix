@@ -84,21 +84,35 @@
         });
 
       # ── NixOS Modules ──
+      # Only the profile meta-modules + truly standalone modules
+      # are exposed here. The PrintersScanners/* submodules,
+      # TelegramAlerts, AutoRebuildOnPush, and AvahiPerInterface-
+      # Names are NOT exposed individually because the profile
+      # meta-modules (`Profiles-*`) already pull them in via
+      # `imports = [...]`. Exposing both creates a double-import
+      # path when a consumer does `attrValues nixosModules` →
+      # imports list (e.g. NixConfig's `import-flake <hypernix>`
+      # helper) — the same module reaches the NixOS module system
+      # twice, once directly and once transitively, and NixOS
+      # flags it as "The option X is already declared" because
+      # the dedup mechanism doesn't recognise the two paths as
+      # the same module.
+      #
+      # Consequence for consumers: to use a sub-module, import
+      # the relevant profile and enable just the leg(s) you want
+      # via the profile's options (`hypersw.profiles.printScan-
+      # Server.bot.enable = false;` etc.) rather than importing
+      # the sub-module directly.
       nixosModules = {
         Git-SshAskpassCredentialHelper = import ./Modules/Git/SshAskpassCredentialHelper;
-        Modules-PrintersScanners-LaserJetPrinter = import ./Modules/PrintersScanners/LaserJetPrinter;
-        Modules-PrintersScanners-EpkowaScanner = import ./Modules/PrintersScanners/EpkowaScanner;
-        Modules-PrintersScanners-Daemon = import ./Modules/PrintersScanners/Daemon;
-        Modules-PrintersScanners-TelegramBot = import ./Modules/PrintersScanners/TelegramBot;
-        Modules-PrintersScanners-Renderer = import ./Modules/PrintersScanners/Renderer;
-        Modules-Monitoring-TelegramAlerts = import ./Modules/Monitoring/TelegramAlerts;
-        Modules-System-AutoRebuildOnPush = import ./Modules/System/AutoRebuildOnPush;
-        Modules-System-AvahiPerInterfaceNames = import ./Modules/System/AvahiPerInterfaceNames;
+        # Standalone modules — not imported by any profile, so
+        # safe to expose directly.
         Modules-System-BootStabilityProbe = import ./Modules/System/BootStabilityProbe;
         Modules-System-Btm = import ./Modules/System/Btm;
         # Profile meta-modules — single-import "make this host be X"
         # bundles. Compose to apply multiple at once on the same
-        # machine.
+        # machine. Each profile transitively imports the
+        # sub-modules it bundles.
         Profiles-AnyMachineBase = import ./Modules/Profiles/AnyMachineBase;
         Profiles-PrintScanServer = import ./Modules/Profiles/PrintScanServer;
         Profiles-MultiHomedNetworking = import ./Modules/Profiles/MultiHomedNetworking;
