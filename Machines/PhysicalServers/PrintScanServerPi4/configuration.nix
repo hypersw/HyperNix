@@ -20,12 +20,12 @@
 #
 {
   imports = [
-    ../../../Modules/Profiles/AnyMachineBase
-    ../../../Modules/Profiles/PrintScanServer
-    ../../../Modules/Profiles/MultiHomedNetworking
-    # Pi-specific diagnostic — staged peripheral bring-up after the
-    # 2026-04-22 silent-reset boot loop. Pi-4-specific.
-    ../../../Modules/System/BootStabilityProbe
+    # The whole HyperNix module-list: every sub-module + every
+    # profile, loaded once. Activation is via option-setting
+    # below (`hypersw.profiles.X.enable = true`,
+    # `hypersw.services.boot-stability-probe.enable = true`, …).
+    # See `Modules/default.nix` for the rationale on this shape.
+    ../../../Modules
   ];
 
   networking.hostName = "printscan";

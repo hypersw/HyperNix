@@ -31,10 +31,11 @@ let
   }.${cfg.autoUpgrade.cadence};
 in
 {
-  imports = [
-    ../../System/AutoRebuildOnPush
-    ../../Monitoring/TelegramAlerts
-  ];
+  # No `imports` here — `Modules/default.nix` (the module-list)
+  # loads AutoRebuildOnPush and TelegramAlerts centrally, so this
+  # profile can reference their options without pulling them in
+  # again (which would create a duplicate route through the
+  # import graph). See `Modules/default.nix` for the rationale.
 
   options.hypersw.profiles.anyMachineBase = {
     enable = lib.mkEnableOption "Cross-cutting base profile for any NixOS host";

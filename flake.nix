@@ -84,39 +84,17 @@
         });
 
       # ── NixOS Modules ──
-      # Only the profile meta-modules + truly standalone modules
-      # are exposed here. The PrintersScanners/* submodules,
-      # TelegramAlerts, AutoRebuildOnPush, and AvahiPerInterface-
-      # Names are NOT exposed individually because the profile
-      # meta-modules (`Profiles-*`) already pull them in via
-      # `imports = [...]`. Exposing both creates a double-import
-      # path when a consumer does `attrValues nixosModules` →
-      # imports list (e.g. NixConfig's `import-flake <hypernix>`
-      # helper) — the same module reaches the NixOS module system
-      # twice, once directly and once transitively, and NixOS
-      # flags it as "The option X is already declared" because
-      # the dedup mechanism doesn't recognise the two paths as
-      # the same module.
+      # Single entry point: `default` imports the
+      # `Modules/default.nix` module-list which transitively loads
+      # every module HyperNix ships. Mirrors nixpkgs' pattern
+      # (everything reachable through one well-known import,
+      # consumers activate via option-setting, no enumeration on
+      # the consumer side).
       #
-      # Consequence for consumers: to use a sub-module, import
-      # the relevant profile and enable just the leg(s) you want
-      # via the profile's options (`hypersw.profiles.printScan-
-      # Server.bot.enable = false;` etc.) rather than importing
-      # the sub-module directly.
+      # See `Modules/default.nix` for the full discussion of why
+      # we expose only the bundle rather than a per-module map.
       nixosModules = {
-        Git-SshAskpassCredentialHelper = import ./Modules/Git/SshAskpassCredentialHelper;
-        # Standalone modules — not imported by any profile, so
-        # safe to expose directly.
-        Modules-System-BootStabilityProbe = import ./Modules/System/BootStabilityProbe;
-        Modules-System-Btm = import ./Modules/System/Btm;
-        # Profile meta-modules — single-import "make this host be X"
-        # bundles. Compose to apply multiple at once on the same
-        # machine. Each profile transitively imports the
-        # sub-modules it bundles.
-        Profiles-AnyMachineBase = import ./Modules/Profiles/AnyMachineBase;
-        Profiles-PrintScanServer = import ./Modules/Profiles/PrintScanServer;
-        Profiles-MultiHomedNetworking = import ./Modules/Profiles/MultiHomedNetworking;
-        Profiles-PhysicalServerProvisioning = import ./Modules/Profiles/PhysicalServerProvisioning;
+        default = import ./Modules;
       };
 
       # ── NixOS Configurations ──
@@ -217,7 +195,7 @@
             # module from nixpkgs. Replaces the upstream module
             # 1-for-1, no need to keep both.
             nixos-raspberrypi.nixosModules.sd-image
-            ./Modules/Profiles/PhysicalServerProvisioning
+            ./Modules
             ({ lib, ... }: {
               networking.hostName = "printscan-provisioning";
               system.stateVersion = "25.05";
@@ -299,10 +277,12 @@
             # module from nixpkgs. Replaces the upstream module
             # 1-for-1, no need to keep both.
             nixos-raspberrypi.nixosModules.sd-image
-            # Custom Pi 5 sd-image firmware-partition fallback —
-            # imported but disabled by default; the live config
-            # uses nvmd's bootloader instead. See the module
-            # header for context on when this would be enabled.
+            # Imported only when an sd-image module is in scope;
+            # not in the universal `./Modules` bundle because the
+            # `sdImage.*` options it references don't exist on
+            # live (non-sd-image) machine configs. Inert by
+            # default — gated on
+            # `hypersw.hardware.raspberryPi5SdImage.enable`.
             ./Modules/Hardware/RaspberryPi5SdImage
             ./Machines/PhysicalServers/GhostHome/configuration.nix
           ];
@@ -361,12 +341,12 @@
             # module from nixpkgs. Replaces the upstream module
             # 1-for-1, no need to keep both.
             nixos-raspberrypi.nixosModules.sd-image
-            # Custom Pi 5 sd-image firmware-partition fallback —
-            # imported but disabled by default; the live config
-            # uses nvmd's bootloader instead. See the module
-            # header for context on when this would be enabled.
+            # Imported only here (sd-image scope), not in the
+            # universal `./Modules` bundle — its `sdImage.*`
+            # option references would otherwise blow up live
+            # configs. Inert by default.
             ./Modules/Hardware/RaspberryPi5SdImage
-            ./Modules/Profiles/PhysicalServerProvisioning
+            ./Modules
             ({ lib, ... }: {
               # Match the live Pi 5 config: direct EEPROM kernel
               # boot via nvmd's loader. No need for u-boot or

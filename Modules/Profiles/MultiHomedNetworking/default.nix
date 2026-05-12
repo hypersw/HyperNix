@@ -40,9 +40,9 @@ let
   cfg = config.hypersw.profiles.multiHomedNetworking;
 in
 {
-  imports = [
-    ../../System/AvahiPerInterfaceNames
-  ];
+  # No `imports` here — `Modules/default.nix` (the module-list)
+  # loads AvahiPerInterfaceNames centrally. See `Modules/default.nix`
+  # for the rationale.
 
   options.hypersw.profiles.multiHomedNetworking = {
     enable = lib.mkEnableOption "Multi-homed source-routing + mDNS bundle";

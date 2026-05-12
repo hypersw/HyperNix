@@ -20,9 +20,11 @@
 #
 {
   imports = [
-    ../../../Modules/Profiles/AnyMachineBase
-    ../../../Modules/Profiles/PrintScanServer
-    ../../../Modules/Profiles/MultiHomedNetworking
+    # The whole HyperNix module-list: every sub-module + every
+    # profile, loaded once. Activation is via option-setting
+    # below (`hypersw.profiles.X.enable = true`, etc.). See
+    # `Modules/default.nix` for the rationale on this shape.
+    ../../../Modules
   ];
 
   networking.hostName = "GhostHome";

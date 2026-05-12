@@ -22,13 +22,12 @@ let
   cfg = config.hypersw.profiles.printScanServer;
 in
 {
-  imports = [
-    ../../PrintersScanners/LaserJetPrinter
-    ../../PrintersScanners/EpkowaScanner
-    ../../PrintersScanners/Daemon
-    ../../PrintersScanners/Renderer
-    ../../PrintersScanners/TelegramBot
-  ];
+  # No `imports` here — `Modules/default.nix` (the module-list)
+  # loads the LaserJetPrinter / EpkowaScanner / Daemon / Renderer
+  # / TelegramBot sub-modules centrally. This profile only
+  # declares its own option surface and sets the sub-modules'
+  # `enable` flags in its `config` block. See
+  # `Modules/default.nix` for the rationale.
 
   options.hypersw.profiles.printScanServer = {
     enable = lib.mkEnableOption "Full print/scan server stack (CUPS + scanner + renderer + Telegram bot)";
