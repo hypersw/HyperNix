@@ -2,14 +2,36 @@ keys:
   # Admin — can encrypt/decrypt all secrets
   - &admin age1rs2lpa3lwwclafjjeku8tv2d84x6kys8lkthd206amctd74usatqq6nffp
 
-  # Machines — can decrypt their own secrets at activation time
-  # RPi4 PrintScanServer (derived from SSH host ed25519 key)
+  # Per-machine age keys, derived from each box's SSH ed25519 host
+  # key with `ssh-to-age`. Each machine can decrypt only its own
+  # secrets at activation time.
+
+  # PrintScanServerPi4 — the ORIGINAL Pi 4's SSH host key. The
+  # board took 5 V damage 2026-04-21 and is currently offline; if
+  # a fresh Pi 4 gets flashed, its SSH host key will be DIFFERENT
+  # and the age recipient here needs replacing then re-encrypting.
+  # Kept as a placeholder for now.
   - &printscan age1pkty9mf7g48zu7ru4hsl3v2pg4r6slv7waeqmgfahxntap5qq38suw8rh4
 
+  # GhostHome — Pi 5 host key as of the 2026-05 first flash.
+  # Derived via:
+  #   ssh-keyscan -t ed25519 ghosthome.local | ssh-to-age
+  - &ghosthome age14kjvy08ccvgt5hnncc09szlep6kjrkqcumyda30wks9kkyv32s9seex2rs
+
 creation_rules:
-  # PrintScanServer secrets — admin + the machine itself
-  - path_regex: Machines/RPi4/PrintScanServer/secrets/secrets\.yaml$
+  # PrintScanServerPi4 secrets — admin + the machine itself.
+  # Path updated from the original `Machines/RPi4/PrintScanServer`
+  # to the post-restructure `Machines/PhysicalServers/PrintScanServerPi4`
+  # location.
+  - path_regex: Machines/PhysicalServers/PrintScanServerPi4/secrets/secrets\.yaml$
     key_groups:
       - age:
           - *admin
           - *printscan
+
+  # GhostHome secrets — admin + the machine itself.
+  - path_regex: Machines/PhysicalServers/GhostHome/secrets/secrets\.yaml$
+    key_groups:
+      - age:
+          - *admin
+          - *ghosthome
