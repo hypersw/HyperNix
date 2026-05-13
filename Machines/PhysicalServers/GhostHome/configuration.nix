@@ -75,38 +75,47 @@
   # vcgencmd throttle-history sampler. Re-add if we actually
   # observe brownout symptoms.
   boot.kernelParams = [
-    # HDMI temporarily kept ON during initial bring-up. The
-    # original intent was "headless server, no monitor at steady
-    # state, save a hair of GPU + framebuffer memory by killing
-    # the connectors entirely". But during this Pi 5's first
-    # weeks on USB-SSD storage we want to be able to plug a
-    # monitor in and see kernel boot text / oops messages when
-    # diagnosing post-switch hangs — `video=…:d` blanks the
-    # framebuffer console and removes that diagnostic channel.
-    # Re-enable the two `video=HDMI-A-X:d` lines once the live
-    # config is unambiguously stable.
-    # "video=HDMI-A-1:d"
-    # "video=HDMI-A-2:d"
+    # vc4-drm hang workaround (Pi 5). The Pi-vendor kernel's vc4
+    # GPU driver has a non-deterministic init-order race on
+    # BCM2712 that wedges in initrd at IOMMU attach time when
+    # parallel service init creates enough pressure (matched
+    # exactly by nvmd/nixos-raspberrypi#57 + several other open
+    # upstream issues; no kernel-side fix as of mid-2026).
+    # Provisioning image worked because its service set was
+    # small enough to win the race by luck; the live config
+    # consistently loses it. Disable the entire vc4 stack at
+    # module-load time — headless server, we don't need the
+    # V3D GPU. HDMI text output dies as a side effect.
+    "modprobe.blacklist=vc4,vc4_kms_v3d,v3d,drm,drm_kms_helper"
 
-    # ramoops region for kernel-triggered-reset forensics. Doesn't
-    # catch full power loss (RAM is wiped); useful for kernel
-    # oopses / panics that survive a warm reboot.
-    "ramoops.mem_address=0x08000000"
-    "ramoops.mem_size=0x100000"
-    "ramoops.record_size=0x20000"
-    "ramoops.console_size=0x20000"
-    "ramoops.ecc=1"
+    # ramoops kernel-cmdline reservation removed. The address
+    # `0x08000000` (128 MB) was Pi-4-inherited; on Pi 5 it sits
+    # adjacent to firmware-patched reserved-memory nodes
+    # (`blconfig`, `blpubkey`) whose runtime placement we don't
+    # control, and the kernel's own ramoops documentation pairs
+    # this canonical address with `mem=128M` (which caps RAM
+    # below the reservation) — a pairing we never had. Plausible
+    # contributor to the vc4 race in addition to the GPU driver
+    # bug itself. Re-add later via the device-tree
+    # `reserved-memory` node form (which participates in early
+    # memblock setup) or at a high address well clear of Pi 5
+    # firmware reservations.
   ];
-  boot.kernelModules = [ "ramoops" ];
 
   # Disable the BT/camera kernel modules. Pi 5 uses a similar
   # BCM43xx WiFi/BT silicon and the same camera-ribbon CSI on
   # bcm2835_v4l2; blacklisting BT trims a small amount of init
   # work and protects against any camera-ribbon probing on a
   # board with no camera attached.
+  #
+  # vc4 / v3d additions are the workaround discussed in
+  # boot.kernelParams above; redundant with `modprobe.blacklist=`
+  # there but ensures the running system also refuses to load
+  # them if something tries via modprobe later.
   boot.blacklistedKernelModules = [
     "btbcm" "hci_uart" "bluetooth"
     "bcm2835_v4l2" "bcm2835_mmal_vchiq"
+    "vc4" "vc4_kms_v3d" "v3d"
   ];
   hardware.bluetooth.enable = false;
 
