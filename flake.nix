@@ -163,6 +163,16 @@
               assert "age1" in output, \
                 f"endpoint should embed the age-converted host key (prefix `age1`), got: {output[:1500]}"
 
+              # Liveness/health stats must all surface in the
+              # header — they're the "is this box alive and
+              # making progress" signal during a long build.
+              for label in (
+                  "Uptime:", "Load avg:", "Memory:",
+                  "CPU temp:", "Network RX:",
+              ):
+                  assert label in output, \
+                    f"endpoint should surface {label!r}, got: {output[:1500]}"
+
               # The readiness-ref + repo + target-config must
               # also surface so the operator knows what to push.
               assert "Target GitHub repo" in output, \

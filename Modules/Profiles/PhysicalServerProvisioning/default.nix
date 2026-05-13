@@ -144,6 +144,90 @@ let
           except OSError as e:
               return f"(could not read {SSH_HOST_PUBKEY}: {e})"
 
+      def humanize_bytes(b):
+          for unit in ("B", "KiB", "MiB", "GiB", "TiB"):
+              if b < 1024:
+                  return f"{b:.1f} {unit}" if unit != "B" else f"{int(b)} {unit}"
+              b /= 1024
+          return f"{b:.1f} PiB"
+
+      def read_uptime():
+          try:
+              with open("/proc/uptime") as f:
+                  s = float(f.read().split()[0])
+              h, rem = divmod(int(s), 3600)
+              m, sec = divmod(rem, 60)
+              return f"{h}h {m:02d}m {sec:02d}s"
+          except OSError:
+              return "n/a"
+
+      def read_loadavg():
+          try:
+              with open("/proc/loadavg") as f:
+                  p = f.read().split()
+              return f"{p[0]} / {p[1]} / {p[2]} (1/5/15 min)"
+          except (OSError, IndexError):
+              return "n/a"
+
+      def read_memory():
+          try:
+              info = {}
+              with open("/proc/meminfo") as f:
+                  for line in f:
+                      k, _, v = line.partition(":")
+                      info[k.strip()] = int(v.strip().split()[0]) * 1024
+              total = info["MemTotal"]
+              # MemAvailable counts reclaimable caches as free — a more
+              # honest "do we have room to allocate" number than MemFree.
+              avail = info.get("MemAvailable", info.get("MemFree", 0))
+              used = total - avail
+              pct = (used / total) * 100 if total else 0
+              return f"{humanize_bytes(used)} / {humanize_bytes(total)} used ({pct:.0f}%)"
+          except (OSError, KeyError, ValueError):
+              return "n/a"
+
+      def read_cpu_temp():
+          # Pick the max across all thermal_zone* sensors — on Pi 5
+          # there's typically one zone for the SoC; on x86 there can
+          # be several (per-core, chipset). Max is the actionable
+          # one. Returns "n/a" if no thermal sensors exist (some VMs).
+          try:
+              max_c = None
+              base = "/sys/class/thermal"
+              for entry in sorted(os.listdir(base)):
+                  if not entry.startswith("thermal_zone"):
+                      continue
+                  tpath = f"{base}/{entry}/temp"
+                  try:
+                      with open(tpath) as f:
+                          c = int(f.read().strip()) / 1000.0
+                  except (OSError, ValueError):
+                      continue
+                  if max_c is None or c > max_c:
+                      max_c = c
+              return f"{max_c:.1f}°C" if max_c is not None else "n/a"
+          except OSError:
+              return "n/a"
+
+      def read_net_rx():
+          # Sum rx_bytes over all interfaces except `lo`. Reasonable
+          # proxy for "how much have we pulled from cache.nixos.org".
+          try:
+              total = 0
+              with open("/proc/net/dev") as f:
+                  for line in f:
+                      if ":" not in line:
+                          continue
+                      name, _, rest = line.partition(":")
+                      if name.strip() == "lo":
+                          continue
+                      fields = rest.split()
+                      if fields:
+                          total += int(fields[0])
+              return f"{humanize_bytes(total)} since boot"
+          except (OSError, ValueError):
+              return "n/a"
+
       def ssh_to_age(ssh_pubkey):
           try:
               out = subprocess.check_output(
@@ -158,7 +242,8 @@ let
 
       # Programmatic HTML render — avoiding str.format because CSS
       # has `{` / `}` that would otherwise need escaping.
-      def render(ssh_pubkey, age_pubkey, journal, log_text):
+      def render(ssh_pubkey, age_pubkey, journal, log_text,
+                 uptime, loadavg, memory, cpu_temp, net_rx):
           esc = html.escape
           repo, repo_url, ref = parse_target()
           repo_html = (
@@ -201,6 +286,11 @@ let
               "<dt>Target nixosConfiguration:</dt><dd><code>" + esc(TARGET_CONFIG_NAME) + "</code></dd>"
               "<dt>SSH host key (raw):</dt><dd>" + esc(ssh_pubkey) + "</dd>"
               "<dt>SSH host key (age):</dt><dd>" + esc(age_pubkey) + "</dd>"
+              "<dt>Uptime:</dt><dd>" + esc(uptime) + "</dd>"
+              "<dt>Load avg:</dt><dd>" + esc(loadavg) + "</dd>"
+              "<dt>Memory:</dt><dd>" + esc(memory) + "</dd>"
+              "<dt>CPU temp:</dt><dd>" + esc(cpu_temp) + "</dd>"
+              "<dt>Network RX:</dt><dd>" + esc(net_rx) + "</dd>"
               "</dl></header>"
               "<main>"
               "<div class='pane'>"
@@ -226,7 +316,15 @@ let
               age_pubkey = ssh_to_age(ssh_pubkey)
               journal = read_journal()
               log_text = read_log()
-              body = render(ssh_pubkey, age_pubkey, journal, log_text).encode("utf-8")
+              uptime = read_uptime()
+              loadavg = read_loadavg()
+              memory = read_memory()
+              cpu_temp = read_cpu_temp()
+              net_rx = read_net_rx()
+              body = render(
+                  ssh_pubkey, age_pubkey, journal, log_text,
+                  uptime, loadavg, memory, cpu_temp, net_rx,
+              ).encode("utf-8")
               self.send_response(200)
               self.send_header("Content-Type", "text/html; charset=utf-8")
               self.send_header("Cache-Control", "no-store")
@@ -360,6 +458,25 @@ in
       extraGroups = [ "wheel" ];
       openssh.authorizedKeys.keys = cfg.administrator.authorizedKeys;
     };
+
+    # Compressed RAM-backed swap as an OOM safety net for the
+    # first-boot kernel rebuild. nvmd's binary cache is keyed on
+    # their nixpkgs pin (we follow ours instead), so on the first
+    # `nixos-rebuild boot --refresh` the Pi-vendor kernel
+    # rebuilds from source — and the parallel link/compile phase
+    # can spike memory hard enough to OOM-kill nix on a 4 GB Pi 5.
+    # zram is the right shape here: no SSD wear, decompresses
+    # faster than a real swap partition, costs only CPU which
+    # is plentiful when we're already burning it on a kernel
+    # build anyway. `vm.swappiness = 1` keeps swap a last
+    # resort — kernel only reaches for it when truly OOM-bound,
+    # not as a routine alternative to dropping page cache.
+    zramSwap = {
+      enable = true;
+      memoryPercent = 50;
+      algorithm = "zstd";
+    };
+    boot.kernel.sysctl."vm.swappiness" = 1;
 
     nix = {
       settings = {
