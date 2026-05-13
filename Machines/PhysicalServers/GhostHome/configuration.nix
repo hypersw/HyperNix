@@ -186,26 +186,29 @@
     localFlake.configurationName = "GhostHome";
   };
 
-  # ── Optional profiles — temporarily disabled ────────────────
-  # PHASE 1 (right now): minimal-baseline live config that just
-  # boots, has ssh + sudo, sends Telegram telemetry, and runs the
-  # auto-rebuild-on-push loop. Goal is to get OFF the provisioning
-  # image cleanly first.
-  #
+  # Pi-host-side networking — networkd, per-interface DHCP/
+  # routing, ARP-strict sysctls + iptables CONNMARK source
+  # routing for the end0+wlan0 dual-interface bridge case, Avahi
+  # mDNS publication of `ghosthome.local`, resolved as stub
+  # resolver. Re-enabled here because the first phase-1 attempt
+  # disabled it along with printScanServer; that was overzealous
+  # — multiHomedNetworking has no x86_64 build dependencies and
+  # is genuinely required for the Pi to be reachable on the LAN
+  # by hostname.
+  hypersw.profiles.multiHomedNetworking.enable = true;
+
+  # ── PrintScanServer (workload, not infrastructure) — off ───
+  # PHASE 1 (now): GhostHome boots, is reachable, has telemetry,
+  # auto-rebuilds-on-push. No print/scan workload.
   # PHASE 2 (later, interactively from the booted live config):
-  # re-enable the profiles below and resolve whatever breaks one
-  # at a time. The first-boot build failed when both were on
-  # because PrintScanServer → EpkowaScanner pulls in an
-  # x86_64-linux derivation (the proprietary Epson interpreter's
-  # stub) and the provisioning image / Pi build host doesn't have
-  # qemu-x86_64 binfmt registered, so the x86 derivation can't be
-  # built. Tractable but not on the critical path right now.
+  # uncomment the block below and resolve whatever breaks. It
+  # was the cause of the first-boot build failure — the
+  # EpkowaScanner leg pulls in an x86_64-linux derivation (the
+  # proprietary Epson interpreter stub) and the provisioning
+  # image / Pi build host doesn't have qemu-x86_64 binfmt
+  # registered, so the cross-arch derivation can't be built.
+  # Tractable but not on the critical path.
   #
-  # Each line below re-enables one profile; bring them back one
-  # at a time after we have shell access on the live system and
-  # can iterate without 30-60 min rebuild roundtrips.
-  #
-  # hypersw.profiles.multiHomedNetworking.enable = true;
   # hypersw.profiles.printScanServer = {
   #   enable = true;
   #   bot = {
