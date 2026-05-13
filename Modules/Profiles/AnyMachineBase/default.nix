@@ -204,28 +204,54 @@ in
       upstreamPin = lib.mkOption {
         type = lib.types.nullOr (lib.types.submodule {
           options = {
-            rev = lib.mkOption { type = lib.types.str; };
-            narHash = lib.mkOption { type = lib.types.str; };
-            lastModified = lib.mkOption { type = lib.types.int; };
+            rev          = lib.mkOption { type = lib.types.str;  };
+            narHash      = lib.mkOption { type = lib.types.str;  };
+            lastModified = lib.mkOption { type = lib.types.int;  };
+            sourcePath   = lib.mkOption { type = lib.types.path; };
           };
         });
         default = null;
         description = ''
           When non-null, the activation script writes
           <literal>/etc/nixos/flake.lock</literal> alongside the
-          generated <literal>flake.nix</literal>, pinning the
-          <literal>upstream</literal> input to this rev/narHash/
-          lastModified. Avoids the first-boot chicken-and-egg where
-          the first auto-rebuild-checker tick has to fetch all
-          transitive inputs from GitHub and trips its secondary
-          rate limit before any subsequent tick can win.
+          generated <literal>flake.nix</literal>. The lock is
+          derived from <literal>sourcePath/flake.lock</literal>
+          (the upstream HyperNix flake's own lock, in-store) by a
+          jq transform that:
+            1. Renames upstream's "root" node → "upstream" and
+               attaches the pin (rev / narHash / lastModified) as
+               its <literal>locked</literal> entry.
+            2. Overrides upstream's <literal>nixpkgs</literal> and
+               <literal>nixos-hardware</literal> inputs to be
+               follows-pointers to the shim root — matching the
+               <literal>upstream.inputs.X.follows = "X"</literal>
+               directives in the shim's flake.nix.
+            3. Adds a new "root" node with three direct inputs:
+               <literal>nixpkgs</literal>,
+               <literal>nixos-hardware</literal>,
+               <literal>upstream</literal>.
+            4. Prepends <literal>"upstream"</literal> to every
+               follows-path in non-root nodes (their targets used
+               to be root-relative in upstream's lock, now they're
+               reachable via <literal>upstream</literal> from the
+               shim root).
 
-          Set this from <literal>self</literal> in the flake's
-          outputs — typically
+          Wire from <literal>self</literal> in the flake's
+          outputs:
           <literal>{ rev = self.rev; narHash = self.narHash;
-          lastModified = self.lastModified; }</literal>, conditional
-          on <literal>self ? rev</literal> so dirty trees fall back
-          to lazy resolution.
+          lastModified = self.lastModified; sourcePath = self; }</literal>,
+          conditional on <literal>self ? rev</literal> so dirty
+          trees fall back to lazy resolution (no pre-baked lock,
+          the first auto-rebuild tick generates one from cold).
+
+          Without this baking, the first checker tick has to do
+          full transitive flake-locking from GitHub anonymously,
+          which trips the secondary rate limit before any tick
+          can win and persist a lock to disk. See the long
+          comment on
+          <literal>system.activationScripts.localFlake</literal>
+          (in this same file) for why the shim has the
+          multi-input shape rather than a single-input one.
         '';
       };
     };
@@ -364,47 +390,184 @@ in
       ];
 
       # ── local-flake bootstrap ─────────────────────────────────────
-      # Two files written as a pair iff neither exists yet:
+      # ## What this writes
       #
-      #   - /etc/nixos/flake.nix  — a one-input shim re-exporting
-      #     upstream.nixosConfigurations.<name>. No nixpkgs /
-      #     nixos-hardware declared at the shim level: they're not
-      #     used by anyone (the shim's outputs only touch upstream),
-      #     and dropping them shrinks /etc/nixos/flake.lock to two
-      #     nodes (root + upstream) instead of the full transitive
-      #     closure. Upstream resolves its own inputs from ITS own
-      #     flake.lock, which is in the store at evaluation time.
+      # A pair of files at /etc/nixos/, iff neither exists yet:
       #
-      #   - /etc/nixos/flake.lock — pinned upstream entry from
-      #     `localFlake.upstreamPin` (which the flake's outputs
-      #     wires from `self`). Skips the chicken-and-egg of "first
-      #     auto-rebuild tick has to lock from cold and trips
-      #     GitHub's secondary rate limit". Subsequent ticks just
-      #     read this file + `git ls-remote` upstream master — no
-      #     archive fetches, no api.github.com calls.
+      #   - flake.nix  — a MULTI-input shim with three direct
+      #     inputs (nixpkgs, nixos-hardware, upstream) and follows
+      #     directives wiring upstream's nixpkgs / nixos-hardware
+      #     to the shim's top-level ones. See "Why multi-input"
+      #     below.
       #
-      # If the lock pin is null (dirty tree, build without rev),
+      #   - flake.lock — pre-baked by a jq transform of upstream's
+      #     own flake.lock (in-store via pin.sourcePath). Avoids
+      #     the first-boot chicken-and-egg where the auto-rebuild
+      #     checker would have to do anonymous full-graph flake-
+      #     locking from GitHub on its first tick — and trip the
+      #     secondary rate limit before any tick can win and
+      #     persist a lock to disk.
+      #
+      # If the pin is null (dirty tree, build without self.rev),
       # only flake.nix is written; the first checker tick will
       # generate the lock the slow way.
+      #
+      # ## Why multi-input (the load-bearing design point)
+      #
+      # The shim's top-level nixpkgs / nixos-hardware are
+      # MOVABLE HANDLES, separable from whatever upstream pinned
+      # in its own lock. Two distinct refresh modes ride on top:
+      #
+      #   - Routine "update from github" (the auto-rebuild-on-push
+      #     loop, ~every 5 min) runs:
+      #       nix flake update upstream --flake /etc/nixos
+      #     This refreshes only the `upstream` input. Because of
+      #     the follows directives, upstream's view of nixpkgs is
+      #     pinned to the shim's top-level nixpkgs — which DIDN'T
+      #     change. No kernel rebuild, no nixpkgs-rooted derivation
+      #     hash churn. Fast incremental switches on every push.
+      #
+      #   - Periodic system upgrade (daily / weekly / monthly per
+      #     machine role, the system.autoUpgrade timer in this
+      #     same profile) runs:
+      #       nix flake update --flake /etc/nixos
+      #     With no input name, this advances EVERY input —
+      #     including the shim's top-level nixpkgs, which moves
+      #     to the current head of nixos-unstable. The follows
+      #     directives then carry that new nixpkgs into upstream's
+      #     evaluation. Result: fresh kernel + security patches +
+      #     glibc / openssl / etc. updates, even if upstream's own
+      #     flake.lock has been stale for months.
+      #
+      # The single-input variant (shim has only `upstream`) is
+      # simpler but eliminates this asymmetry — the box's nixpkgs
+      # is then frozen to whatever upstream pins, and security
+      # upgrades require a HyperNix commit. We want the box to be
+      # able to grab the freshest kernel autonomously.
+      #
+      # ## The jq lock transform
+      #
+      # `nix flake metadata` on the multi-input shim would compute
+      # an 11-node lock (root + nixpkgs + nixos-hardware +
+      # upstream + each transitive flake of upstream). The same
+      # data is already in upstream's own flake.lock — we just
+      # need to restructure it for the shim's perspective:
+      #
+      #   1. Walk every non-root node, prepend "upstream" to
+      #      array-typed (follows) input entries. Targets that
+      #      were root-relative in upstream's lock are now
+      #      reachable via upstream from the shim root.
+      #
+      #   2. Build an "upstream" node from upstream's old root
+      #      data + the pin's locked/original. Override its
+      #      nixpkgs / nixos-hardware entries to follows-pointers
+      #      to the shim root (matching the
+      #      `upstream.inputs.X.follows = "X"` directives in the
+      #      shim's flake.nix below).
+      #
+      #   3. Replace "root" with the shim's 3-input form.
+      #
+      # Build-time runCommand keeps the jq invocation off the
+      # boot critical path — it runs once per system generation,
+      # not on every activation.
       system.activationScripts.localFlake = lib.mkIf cfg.localFlake.enable (
         let
           pin = cfg.localFlake.upstreamPin;
-          # Parse the upstream URL into owner/repo for the lock's
-          # `original` block. We only support the github:owner/repo
-          # form here; anything else and we'd need a parser, which
-          # isn't worth it for a default we own.
+          # Parse upstreamUrl ("github:owner/repo") for the
+          # baked lock's `original` block on the upstream node.
           urlNoScheme = lib.removePrefix "github:" cfg.localFlake.upstreamUrl;
           urlParts = lib.splitString "/" urlNoScheme;
           upstreamOwner = lib.head urlParts;
           upstreamRepo  = lib.elemAt urlParts 1;
+
+          # jq transform — see the long header comment above for
+          # the three-step derivation. The output is a single
+          # store-path .lock file the activation script cp's into
+          # place; the runCommand wrapper runs it once per system
+          # generation rather than on every boot.
+          jqProgram = ''
+            .nodes |= with_entries(
+              if .key == "root" then .
+              else .value |= (
+                if .inputs == null then .
+                else .inputs |= with_entries(
+                  .value |= (if type == "array" then ["upstream"] + . else . end)
+                )
+                end
+              )
+              end
+            ) |
+            .nodes.upstream = (.nodes.root + {
+              locked: {
+                type: "github",
+                owner: $upstream_owner,
+                repo: $upstream_repo,
+                rev: $upstream_rev,
+                narHash: $upstream_narHash,
+                lastModified: ($upstream_lastModified | tonumber)
+              },
+              original: {
+                type: "github",
+                owner: $upstream_owner,
+                repo: $upstream_repo
+              }
+            } | .inputs.nixpkgs = ["nixpkgs"]
+              | .inputs["nixos-hardware"] = ["nixos-hardware"]) |
+            .nodes.root = {
+              inputs: {
+                nixpkgs: "nixpkgs",
+                "nixos-hardware": "nixos-hardware",
+                upstream: "upstream"
+              }
+            }
+          '';
+
+          bakedLock =
+            if pin == null then null
+            else pkgs.runCommand "shim-flake.lock" {} ''
+              ${pkgs.jq}/bin/jq \
+                --arg upstream_rev          "${pin.rev}" \
+                --arg upstream_narHash      "${pin.narHash}" \
+                --arg upstream_lastModified "${toString pin.lastModified}" \
+                --arg upstream_owner        "${upstreamOwner}" \
+                --arg upstream_repo         "${upstreamRepo}" \
+                '${jqProgram}' \
+                ${pin.sourcePath}/flake.lock > $out
+            '';
         in ''
           if [ ! -f /etc/nixos/flake.nix ] && [ ! -f /etc/nixos/flake.lock ]; then
             mkdir -p /etc/nixos
             cat > /etc/nixos/flake.nix << 'FLAKE'
-          # GENERATED by NixOS activation script — to customize, delete
-          # this file and create your own.
+          # GENERATED by NixOS activation script — to customize,
+          # delete this file and create your own.
+          #
+          # Multi-input shim. The top-level nixpkgs / nixos-hardware
+          # are MOVABLE HANDLES, separable from upstream's pin.
+          # Combined with the follows directives below:
+          #
+          #   - `nix flake update upstream` refreshes only upstream
+          #     (auto-rebuild-on-push, ~every 5 min) — cheap, no
+          #     transitive rebuild because nixpkgs stays put.
+          #   - `nix flake update` (no args, periodic auto-upgrade
+          #     timer) advances every input including nixpkgs to
+          #     current nixos-unstable — fresh kernel + patches
+          #     even if upstream's lock is stale.
+          #
+          # See the long header comment on
+          # system.activationScripts.localFlake in the HyperNix
+          # AnyMachineBase profile for the full asymmetric-refresh
+          # rationale.
           {
-            inputs.upstream.url = "${cfg.localFlake.upstreamUrl}";
+            inputs = {
+              nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
+              nixos-hardware.url = "github:NixOS/nixos-hardware";
+              upstream = {
+                url = "${cfg.localFlake.upstreamUrl}";
+                inputs.nixpkgs.follows = "nixpkgs";
+                inputs.nixos-hardware.follows = "nixos-hardware";
+              };
+            };
+
             outputs = { upstream, ... }: {
               nixosConfigurations.default =
                 upstream.nixosConfigurations.${cfg.localFlake.configurationName};
@@ -412,30 +575,7 @@ in
           }
           FLAKE
         '' + lib.optionalString (pin != null) ''
-            cat > /etc/nixos/flake.lock << 'LOCK'
-          {
-            "version": 7,
-            "root": "root",
-            "nodes": {
-              "root": { "inputs": { "upstream": "upstream" } },
-              "upstream": {
-                "locked": {
-                  "type": "github",
-                  "owner": "${upstreamOwner}",
-                  "repo": "${upstreamRepo}",
-                  "rev": "${pin.rev}",
-                  "narHash": "${pin.narHash}",
-                  "lastModified": ${toString pin.lastModified}
-                },
-                "original": {
-                  "type": "github",
-                  "owner": "${upstreamOwner}",
-                  "repo": "${upstreamRepo}"
-                }
-              }
-            }
-          }
-          LOCK
+            install -m 0644 ${bakedLock} /etc/nixos/flake.lock
         '' + ''
           fi
         ''

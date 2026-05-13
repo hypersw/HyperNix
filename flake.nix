@@ -254,6 +254,7 @@
                   rev          = self.rev;
                   narHash      = self.narHash;
                   lastModified = self.lastModified;
+                  sourcePath   = self;
                 } else null;
             }
             ./Machines/PhysicalServers/PrintScanServerPi4/configuration.nix
@@ -383,6 +384,7 @@
                   rev          = self.rev;
                   narHash      = self.narHash;
                   lastModified = self.lastModified;
+                  sourcePath   = self;
                 } else null;
             }
             ./Machines/PhysicalServers/GhostHome/configuration.nix
