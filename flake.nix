@@ -110,7 +110,7 @@
         in {
           first-boot-log = pkgs.testers.nixosTest {
             name = "first-boot-log-endpoint";
-            nodes.machine = { ... }: {
+            nodes.machine = { lib, ... }: {
               imports = [ ./Modules ];
               hypersw.profiles.physicalServerProvisioning = {
                 enable = true;
@@ -120,9 +120,17 @@
                 targetFlakeUri = "github:hypersw/HyperNix?ref=does-not-exist-test-marker";
                 targetConfigName = "GhostHome";
               };
-              # The default openssh+sudo+root-lock from the
-              # profile is fine for the test VM; nothing to
-              # override.
+              # Override the real-world 4 GB swap file to
+              # something the test VM's sandbox disk can fit.
+              # 256 MB is enough to exercise the swap-creation
+              # code path without blowing past the disk image.
+              swapDevices = lib.mkForce [{
+                device = "/var/swapfile";
+                size = 256;
+              }];
+              # Default test VM disk is 1 GB which barely fits
+              # the closure + swap; bump for headroom.
+              virtualisation.diskSize = 4096;
             };
             testScript = ''
               machine.wait_for_unit("first-boot-log.service")

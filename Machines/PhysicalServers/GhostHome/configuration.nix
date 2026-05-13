@@ -177,21 +177,35 @@
     localFlake.configurationName = "GhostHome";
   };
 
-  hypersw.profiles.multiHomedNetworking.enable = true;
-
-  hypersw.profiles.printScanServer = {
-    enable = true;
-    bot = {
-      tokenFile = config.sops.secrets.PrintScanTelegramBotToken.path;
-      allowedUsers = [
-        { id = 1398173959; name = "hypersw"; }
-        { id = 2074641026; name = "ol"; }
-        { id = 6935307009; name = "alice"; }
-      ];
-    };
-  };
-
-  # (`scanner` + `lp` group membership for the administrator user
-  # is appended by the print-scan profile itself, gated on which
-  # legs are enabled. No machine-side wiring needed.)
+  # ── Optional profiles — temporarily disabled ────────────────
+  # PHASE 1 (right now): minimal-baseline live config that just
+  # boots, has ssh + sudo, sends Telegram telemetry, and runs the
+  # auto-rebuild-on-push loop. Goal is to get OFF the provisioning
+  # image cleanly first.
+  #
+  # PHASE 2 (later, interactively from the booted live config):
+  # re-enable the profiles below and resolve whatever breaks one
+  # at a time. The first-boot build failed when both were on
+  # because PrintScanServer → EpkowaScanner pulls in an
+  # x86_64-linux derivation (the proprietary Epson interpreter's
+  # stub) and the provisioning image / Pi build host doesn't have
+  # qemu-x86_64 binfmt registered, so the x86 derivation can't be
+  # built. Tractable but not on the critical path right now.
+  #
+  # Each line below re-enables one profile; bring them back one
+  # at a time after we have shell access on the live system and
+  # can iterate without 30-60 min rebuild roundtrips.
+  #
+  # hypersw.profiles.multiHomedNetworking.enable = true;
+  # hypersw.profiles.printScanServer = {
+  #   enable = true;
+  #   bot = {
+  #     tokenFile = config.sops.secrets.PrintScanTelegramBotToken.path;
+  #     allowedUsers = [
+  #       { id = 1398173959; name = "hypersw"; }
+  #       { id = 2074641026; name = "ol"; }
+  #       { id = 6935307009; name = "alice"; }
+  #     ];
+  #   };
+  # };
 }

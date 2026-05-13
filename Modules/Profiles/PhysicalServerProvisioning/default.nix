@@ -459,23 +459,31 @@ in
       openssh.authorizedKeys.keys = cfg.administrator.authorizedKeys;
     };
 
-    # Compressed RAM-backed swap as an OOM safety net for the
-    # first-boot kernel rebuild. nvmd's binary cache is keyed on
-    # their nixpkgs pin (we follow ours instead), so on the first
-    # `nixos-rebuild boot --refresh` the Pi-vendor kernel
-    # rebuilds from source — and the parallel link/compile phase
-    # can spike memory hard enough to OOM-kill nix on a 4 GB Pi 5.
-    # zram is the right shape here: no SSD wear, decompresses
-    # faster than a real swap partition, costs only CPU which
-    # is plentiful when we're already burning it on a kernel
-    # build anyway. `vm.swappiness = 1` keeps swap a last
-    # resort — kernel only reaches for it when truly OOM-bound,
-    # not as a routine alternative to dropping page cache.
+    # Two-tier OOM safety net for the first-boot kernel rebuild.
+    # We follow our own nixpkgs pin, so nvmd's binary cache for
+    # `linux_rpi5` doesn't apply and the kernel rebuilds from
+    # source on the first `nixos-rebuild boot --refresh` — the
+    # parallel link phase can spike memory enough to OOM-kill nix
+    # on a 4 GB Pi 5 without any release valve.
+    #
+    # Tier 1: zramSwap — compressed RAM, ~0 wear, faster than
+    # real swap. Engages first under memory pressure.
+    # Tier 2: 4 GB swap file on the rootfs (which sd-image grows
+    # to fill the medium on first boot via `boot.growPartition`).
+    # Belt-and-braces: zram-compressed RAM tops out at ~2× phys
+    # RAM, and if a build step really wants more, the disk swap
+    # is the floor. With `swappiness = 1` it's only touched at
+    # the literal edge of OOM, so SSD wear is a non-issue — the
+    # blocks stay unused in practice.
     zramSwap = {
       enable = true;
       memoryPercent = 50;
       algorithm = "zstd";
     };
+    swapDevices = lib.mkDefault [{
+      device = "/var/swapfile";
+      size = 4096;
+    }];
     boot.kernel.sysctl."vm.swappiness" = 1;
 
     nix = {
