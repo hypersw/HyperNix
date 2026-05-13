@@ -16,7 +16,7 @@ keys:
   # GhostHome — Pi 5 host key as of the 2026-05 first flash.
   # Derived via:
   #   ssh-keyscan -t ed25519 ghosthome.local | ssh-to-age
-  - &ghosthome age14kjvy08ccvgt5hnncc09szlep6kjrkqcumyda30wks9kkyv32s9seex2rs
+  - &ghosthome age1ytnwt43a0tw0fvs40ffryh802g5z0qs5mst7gja2dg5mrhq6eauqp0gv3m
 
 creation_rules:
   # PrintScanServerPi4 secrets — admin + the machine itself.
