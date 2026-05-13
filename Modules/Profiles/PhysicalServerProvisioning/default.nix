@@ -61,55 +61,136 @@ let
   # (which journalctl truncates) alongside the journal.
   switchLogFile = "/var/log/first-boot-switch.log";
 
-  # Tiny Python HTTP server that re-renders the journal + log on
-  # every request. Python rather than busybox httpd / nginx /
-  # darkhttpd because (a) we just want one dynamic endpoint, no
-  # static-file routing, (b) Python's stdlib http.server gives us
-  # proper HTTP semantics in ~30 lines, (c) closure cost is a
-  # one-time ~30 MB hit on a provisioning image that's already
-  # ~3 GB and short-lived.
+  # Tiny Python HTTP server that re-renders a 2-pane HTML status
+  # page on every request: journal of first-boot-switch in the
+  # left pane, the tee'd verbose log in the right, plus a header
+  # showing the host's SSH ed25519 public key and its age-key
+  # form so the operator can copy it straight into `.sops.yaml`
+  # without ssh-keyscanning from another box. Python rather than
+  # busybox httpd / nginx / darkhttpd because we want one dynamic
+  # endpoint, no static-file routing — stdlib http.server gives
+  # us proper HTTP semantics in a few dozen lines; closure cost
+  # is a one-time ~30 MB hit on a short-lived 3 GB image.
   logServer = pkgs.writeTextFile {
     name = "first-boot-log-server.py";
     executable = true;
     text = ''
       #!${pkgs.python3}/bin/python3
       """
-      Read-only HTTP endpoint streaming a snapshot of
-      first-boot-switch's progress on every GET. No auth — the
-      data is just systemd journal lines + the switch's stdout
-      tee'd to a log file, neither sensitive, and the
-      provisioning image isn't supposed to live past the first
-      successful switch.
+      Read-only HTTP endpoint rendering first-boot-switch progress
+      as a 2-pane HTML page. No auth — the data is just journal
+      lines + the switch's stdout tee'd to a log file + the host's
+      SSH public key (which is meant to be public). Image is
+      short-lived and meant to expose this info to the operator
+      on the LAN.
       """
       import http.server
       import subprocess
       import os
+      import html
 
       JOURNALCTL = "${pkgs.systemd}/bin/journalctl"
+      SSH_TO_AGE = "${pkgs.ssh-to-age}/bin/ssh-to-age"
+      SSH_HOST_PUBKEY = "/etc/ssh/ssh_host_ed25519_key.pub"
       LOG_FILE = "${switchLogFile}"
+
+      def read_journal():
+          try:
+              out = subprocess.check_output([
+                  JOURNALCTL, "--no-pager", "--output=short-iso",
+                  "-u", "first-boot-switch.service",
+                  "-n", "5000",
+              ]).decode("utf-8", errors="replace")
+          except subprocess.CalledProcessError as e:
+              out = ((e.output or b"").decode("utf-8", errors="replace")
+                     + "\n(journalctl exited non-zero)")
+          return out
+
+      def read_log():
+          if os.path.exists(LOG_FILE):
+              with open(LOG_FILE, "rb") as f:
+                  return f.read().decode("utf-8", errors="replace")
+          # ASCII only -- avoids any encoding-edge-case issues.
+          return "(no log file yet -- first-boot-switch hasn't run a full attempt)"
+
+      def read_ssh_pubkey():
+          try:
+              with open(SSH_HOST_PUBKEY, "r") as f:
+                  return f.read().strip()
+          except OSError as e:
+              return f"(could not read {SSH_HOST_PUBKEY}: {e})"
+
+      def ssh_to_age(ssh_pubkey):
+          try:
+              out = subprocess.check_output(
+                  [SSH_TO_AGE],
+                  input=ssh_pubkey.encode() + b"\n",
+                  stderr=subprocess.STDOUT,
+                  timeout=5,
+              )
+              return out.decode("utf-8", errors="replace").strip()
+          except Exception as e:
+              return f"(ssh-to-age failed: {e})"
+
+      # Programmatic HTML render — avoiding str.format because CSS
+      # has `{` / `}` that would otherwise need escaping.
+      def render(ssh_pubkey, age_pubkey, journal, log_text):
+          esc = html.escape
+          return (
+              "<!DOCTYPE html><html><head>"
+              "<title>first-boot-switch status</title>"
+              "<meta charset='utf-8'>"
+              "<style>"
+              "html,body{height:100%;margin:0;padding:0;"
+              "font-family:ui-monospace,Menlo,Consolas,monospace}"
+              "body{display:flex;flex-direction:column;height:100vh}"
+              "header{padding:.4em .7em;background:#222;color:#ddd;"
+              "border-bottom:1px solid #555;font-size:.85em}"
+              "header dl{margin:0;display:grid;"
+              "grid-template-columns:max-content 1fr;column-gap:.7em;row-gap:.15em}"
+              "header dt{color:#fc6;white-space:nowrap}"
+              "header dd{margin:0;word-break:break-all;user-select:all}"
+              "main{display:flex;flex-direction:row;flex:1;overflow:hidden}"
+              ".pane{flex:1;height:100%;overflow:auto;"
+              "border-right:1px solid #888}"
+              ".pane:last-child{border-right:none}"
+              "h2{margin:0;padding:.4em .7em;background:#eee;"
+              "position:sticky;top:0;font-size:.95em;"
+              "border-bottom:1px solid #ccc}"
+              "pre{margin:0;padding:.5em .7em;white-space:pre-wrap;"
+              "word-break:break-word;font-size:.85em}"
+              "</style></head><body>"
+              "<header><dl>"
+              "<dt>SSH host key (raw):</dt><dd>" + esc(ssh_pubkey) + "</dd>"
+              "<dt>SSH host key (age):</dt><dd>" + esc(age_pubkey) + "</dd>"
+              "</dl></header>"
+              "<main>"
+              "<div class='pane'>"
+              "<h2>first-boot-switch.service journal</h2>"
+              "<pre>" + esc(journal) + "</pre>"
+              "</div>"
+              "<div class='pane'>"
+              "<h2>" + esc(LOG_FILE) + "</h2>"
+              "<pre>" + esc(log_text) + "</pre>"
+              "</div>"
+              "</main>"
+              # Scroll each pane to its bottom on load so the most
+              # recent log lines are visible without manual scroll.
+              # No auto-refresh — operator triggers reload.
+              "<script>document.querySelectorAll('.pane')"
+              ".forEach(p=>{p.scrollTop=p.scrollHeight});</script>"
+              "</body></html>"
+          )
 
       class Handler(http.server.BaseHTTPRequestHandler):
           def do_GET(self):
-              parts = [b"=== first-boot-switch.service journal (last 5000 lines) ===\n"]
-              try:
-                  parts.append(subprocess.check_output([
-                      JOURNALCTL, "--no-pager", "--output=short-iso",
-                      "-u", "first-boot-switch.service",
-                      "-n", "5000",
-                  ]))
-              except subprocess.CalledProcessError as e:
-                  parts.append(b"(journalctl exited non-zero)\n")
-                  parts.append(e.output or b"")
-              parts.append(("\n=== %s ===\n" % LOG_FILE).encode())
-              if os.path.exists(LOG_FILE):
-                  with open(LOG_FILE, "rb") as f:
-                      parts.append(f.read())
-              else:
-                  # Plain ASCII -- Python bytes literals reject non-ASCII chars.
-                  parts.append(b"(no log file yet -- first-boot-switch hasn't run a full attempt)\n")
-              body = b"".join(parts)
+              ssh_pubkey = read_ssh_pubkey()
+              age_pubkey = ssh_to_age(ssh_pubkey)
+              journal = read_journal()
+              log_text = read_log()
+              body = render(ssh_pubkey, age_pubkey, journal, log_text).encode("utf-8")
               self.send_response(200)
-              self.send_header("Content-Type", "text/plain; charset=utf-8")
+              self.send_header("Content-Type", "text/html; charset=utf-8")
               self.send_header("Cache-Control", "no-store")
               self.send_header("Content-Length", str(len(body)))
               self.end_headers()
@@ -373,9 +454,11 @@ in
 
     # Tiny systemPackages — htop is enough for the operator to
     # `top` if they ssh in to see what's chewing CPU during a
-    # rebuild. Everything else lands with the full configuration
-    # on first reboot.
-    environment.systemPackages = with pkgs; [ htop ];
+    # rebuild. ssh-to-age is also exposed on PATH so the
+    # operator can manually convert a key on the shell if the
+    # HTTP endpoint isn't reachable (the endpoint already shows
+    # the converted age key, this is the fallback).
+    environment.systemPackages = with pkgs; [ htop ssh-to-age ];
 
     # Avahi for mDNS publication so the operator can reach the
     # box at `<hostname>.local` from any LAN device with mDNS

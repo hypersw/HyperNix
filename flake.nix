@@ -143,12 +143,25 @@
               print(output)
               print("=== end ===")
 
-              # Endpoint structure must be right — section
-              # headers present, content well-formed.
+              # HTML structure assertions.
+              assert "<!DOCTYPE html>" in output, \
+                f"endpoint should return HTML, got: {output[:500]}"
               assert "first-boot-switch.service journal" in output, \
-                f"endpoint should label the journal section, got: {output[:500]}"
+                f"endpoint should label the journal pane, got: {output[:500]}"
               assert "/var/log/first-boot-switch.log" in output, \
-                f"endpoint should label the log file section, got: {output[:500]}"
+                f"endpoint should label the log pane, got: {output[:500]}"
+
+              # SSH host key + age conversion must appear in the
+              # header — the whole point is the operator can
+              # grab the age recipient straight off the page.
+              assert "SSH host key (raw)" in output, \
+                f"endpoint should label the raw SSH key section, got: {output[:1000]}"
+              assert "SSH host key (age)" in output, \
+                f"endpoint should label the age key section, got: {output[:1000]}"
+              assert "ssh-ed25519 AAAA" in output, \
+                f"endpoint should embed the raw SSH ed25519 host key, got: {output[:1500]}"
+              assert "age1" in output, \
+                f"endpoint should embed the age-converted host key (prefix `age1`), got: {output[:1500]}"
 
               # After triggering the service, either the journal
               # has entries OR the tee'd log file does — at
