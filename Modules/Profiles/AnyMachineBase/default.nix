@@ -257,6 +257,60 @@ in
         nixpkgsRevision = cfg.alerts.nixpkgsRevision;
       };
 
+      # ── DNS: systemd-resolved with DoT + DNSSEC ─────────────────
+      # Override the ISP's DHCP-supplied DNS with known-good
+      # privacy-respecting resolvers. ISP DNS is opaque (no
+      # logging policy commitment, often logs + sells, no DNSSEC
+      # validation, no DoT support), so we always route through
+      # Quad9 → Cloudflare instead.
+      #
+      # * `settings.Resolve.DNS` (primary): Quad9, security-
+      #   focused — DNSSEC-validating, blocks known-malware
+      #   domains via PCH/threat intel. Both v4 and v6, with
+      #   the SNI hint after `#` for DoT certificate
+      #   validation. Quad9's primary anycast endpoint plus
+      #   the secondary for resilience.
+      # * `fallbackDns` (used when primary fails to respond):
+      #   Cloudflare 1.1.1.1 — fastest commercial resolver,
+      #   DoT-capable, DNSSEC-validating. Same v4+v6 pair
+      #   with SNI.
+      # * `domains = [ "~." ]`: wildcard match — route ALL
+      #   queries to the global DNS above, overriding any
+      #   per-link DHCP-supplied DNS. Without this, dhcpcd /
+      #   networkd would install the ISP's DNS as the link's
+      #   resolver and resolved would prefer it over our global.
+      # * `dnsovertls = "true"`: REQUIRE DoT. If TLS to the
+      #   upstream fails for any reason, queries fail (rather
+      #   than silently downgrading to plain UDP/53 which the
+      #   ISP can read + manipulate). `opportunistic` would
+      #   downgrade silently, `false` would never use DoT.
+      # * `dnssec = "allow-downgrade"`: validate DNSSEC when
+      #   the zone is signed; allow unsigned zones through
+      #   (most of the long tail of the web isn't DNSSEC-
+      #   signed yet, "true" would break those).
+      #
+      # mDNS (`*.local`) handling lives in MultiHomedNetworking
+      # which flips `MulticastDNS = "no"` so Avahi can own it
+      # without fighting resolved.
+      services.resolved = {
+        enable = true;
+        settings.Resolve = {
+          DNS =
+            "9.9.9.9#dns.quad9.net "
+            + "149.112.112.112#dns.quad9.net "
+            + "2620:fe::fe#dns.quad9.net "
+            + "2620:fe::9#dns.quad9.net";
+          FallbackDNS =
+            "1.1.1.1#cloudflare-dns.com "
+            + "1.0.0.1#cloudflare-dns.com "
+            + "2606:4700:4700::1111#cloudflare-dns.com "
+            + "2606:4700:4700::1001#cloudflare-dns.com";
+          Domains = "~.";
+          DNSOverTLS = "true";
+          DNSSEC = "allow-downgrade";
+        };
+      };
+
       # ── sshd ──────────────────────────────────────────────────────
       services.openssh = {
         enable = true;
