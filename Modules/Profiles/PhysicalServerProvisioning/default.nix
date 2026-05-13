@@ -243,7 +243,19 @@ in
     };
 
     nix = {
-      settings.experimental-features = [ "nix-command" "flakes" ];
+      settings = {
+        experimental-features = [ "nix-command" "flakes" ];
+        # No internal download retries. `nix flake metadata`
+        # otherwise hits GitHub up to 5 times with exponential
+        # backoff (0.35s → 0.55s → 1.3s → 2.0s) per
+        # `nixos-rebuild` invocation, which spams the API + the
+        # status HTTP feed before the systemd timer's 60s gap
+        # kicks in. Transient failures (network blip, GitHub
+        # rate limit) are still handled at the systemd-timer
+        # level: the service exits, the timer fires again in
+        # `retryIntervalSec`. One probe per attempt, not five.
+        download-attempts = 1;
+      };
     };
 
     # The first-boot service. Runs once per timer trigger. Type=
