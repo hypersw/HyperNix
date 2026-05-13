@@ -83,10 +83,13 @@
     # upstream issues; no kernel-side fix as of mid-2026).
     # Provisioning image worked because its service set was
     # small enough to win the race by luck; the live config
-    # consistently loses it. Disable the entire vc4 stack at
+    # consistently loses it. Disable the vc4 / V3D stack at
     # module-load time — headless server, we don't need the
-    # V3D GPU. HDMI text output dies as a side effect.
-    "modprobe.blacklist=vc4,vc4_kms_v3d,v3d,drm,drm_kms_helper"
+    # GPU. Crucially we do NOT blacklist drm / drm_kms_helper:
+    # those are the DRM core that simpledrm rides on, and we
+    # want simpledrm to take over the firmware framebuffer so
+    # HDMI text output keeps working without vc4.
+    "modprobe.blacklist=vc4,vc4_kms_v3d,v3d"
 
     # ramoops kernel-cmdline reservation removed. The address
     # `0x08000000` (128 MB) was Pi-4-inherited; on Pi 5 it sits
@@ -118,6 +121,18 @@
     "vc4" "vc4_kms_v3d" "v3d"
   ];
   hardware.bluetooth.enable = false;
+
+  # With vc4 blacklisted we lose the full KMS path, so HDMI text
+  # output would go dark. simpledrm rides on the firmware-set
+  # framebuffer (the one the EEPROM/start.elf programmed before
+  # Linux took over) and exposes it as /dev/fb0 + DRM, which is
+  # all the kernel console and getty need. Load it early so the
+  # console is live from initrd; we don't get mode-set, resize,
+  # or hot-plug, but for a headless server that's only ever
+  # looked at via HDMI as a recovery probe, that's exactly the
+  # tradeoff we want — no GPU driver, no race, but a readable
+  # console if you plug a monitor in.
+  boot.initrd.kernelModules = [ "simpledrm" ];
 
   # Wireless: the AP we attach to. Pi 5's BCM4345 onboard radio
   # supports the same WPA2-PPSK / 5 GHz the Pi 4 uses — same
