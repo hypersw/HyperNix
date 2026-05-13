@@ -75,9 +75,18 @@
   # vcgencmd throttle-history sampler. Re-add if we actually
   # observe brownout symptoms.
   boot.kernelParams = [
-    # HDMI off — never has a monitor attached.
-    "video=HDMI-A-1:d"
-    "video=HDMI-A-2:d"
+    # HDMI temporarily kept ON during initial bring-up. The
+    # original intent was "headless server, no monitor at steady
+    # state, save a hair of GPU + framebuffer memory by killing
+    # the connectors entirely". But during this Pi 5's first
+    # weeks on USB-SSD storage we want to be able to plug a
+    # monitor in and see kernel boot text / oops messages when
+    # diagnosing post-switch hangs — `video=…:d` blanks the
+    # framebuffer console and removes that diagnostic channel.
+    # Re-enable the two `video=HDMI-A-X:d` lines once the live
+    # config is unambiguously stable.
+    # "video=HDMI-A-1:d"
+    # "video=HDMI-A-2:d"
 
     # ramoops region for kernel-triggered-reset forensics. Doesn't
     # catch full power loss (RAM is wiped); useful for kernel
