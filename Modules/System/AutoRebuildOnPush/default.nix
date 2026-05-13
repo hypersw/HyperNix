@@ -168,12 +168,22 @@ in
     # Timer drives the *checker*. The switcher is path-activated — it
     # fires when (and only when) the checker has decided to trigger a
     # switch. No direct timer → switcher coupling.
+    #
+    # Cadence note: `OnUnitInactiveSec` rather than `OnUnitActiveSec`.
+    # The difference matters on the unhappy path — if a tick takes a
+    # long time (slow Pi unpacking nix flake metadata's transitive
+    # fetches, a 76 s GitHub-rate-limit retry-after wait, …), Active
+    # would back-to-back-fire the next tick the moment the slow one
+    # finishes (a "missed" fire that's now overdue). Inactive waits
+    # for the full interval *after* the previous attempt completes —
+    # what we actually want for a poller against a rate-limited
+    # external endpoint. No bursts, no thundering on recovery.
     systemd.timers.auto-rebuild-github-checker = {
       description = "Poll upstream flake for changes";
       wantedBy = [ "timers.target" ];
       timerConfig = {
         OnBootSec = "2min";
-        OnUnitActiveSec = cfg.interval;
+        OnUnitInactiveSec = cfg.interval;
         RandomizedDelaySec = "30s";
       };
     };
@@ -196,6 +206,17 @@ in
       serviceConfig = {
         Type = "oneshot";
         ExecStart = checkerScript;
+
+        # First-ever tick on a fresh /etc/nixos has to do real work:
+        # nix lazily fetches every transitive input and unpacks it on
+        # a Pi-class CPU. If the unit times out mid-fetch, the next
+        # tick starts the same burst over against a still-cooling
+        # GitHub rate-limit window — escalating, not converging.
+        # 15 min is generous enough to absorb nix's 76 s
+        # retry-after sleeps + slow tarball unpacks on SD/WiFi,
+        # without being so long that a genuinely-stuck tick blocks
+        # the next attempt for half an hour.
+        TimeoutStartSec = "15min";
 
         User = checkerUser;
         Group = checkerUser;

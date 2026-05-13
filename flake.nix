@@ -241,6 +241,20 @@
               hypersw.profiles.anyMachineBase.alerts.configRevision =
                 self.rev or self.dirtyRev or "dirty";
               hypersw.profiles.anyMachineBase.alerts.nixpkgsRevision = nixpkgs.rev;
+              # Pin the local-flake bootstrap's upstream entry to
+              # the rev that built this system. Activation writes
+              # /etc/nixos/flake.lock from this; the first
+              # auto-rebuild tick then reads it instead of
+              # cold-fetching the full transitive input closure
+              # from GitHub. Only set on clean trees — dirty
+              # builds have no canonical narHash and fall back to
+              # lazy resolution.
+              hypersw.profiles.anyMachineBase.localFlake.upstreamPin =
+                if self ? rev then {
+                  rev          = self.rev;
+                  narHash      = self.narHash;
+                  lastModified = self.lastModified;
+                } else null;
             }
             ./Machines/PhysicalServers/PrintScanServerPi4/configuration.nix
           ];
@@ -361,6 +375,15 @@
               hypersw.profiles.anyMachineBase.alerts.configRevision =
                 self.rev or self.dirtyRev or "dirty";
               hypersw.profiles.anyMachineBase.alerts.nixpkgsRevision = nixpkgs.rev;
+              # See PrintScanServerPi4 above for the rationale on
+              # baking the upstream pin into the local-flake
+              # bootstrap.
+              hypersw.profiles.anyMachineBase.localFlake.upstreamPin =
+                if self ? rev then {
+                  rev          = self.rev;
+                  narHash      = self.narHash;
+                  lastModified = self.lastModified;
+                } else null;
             }
             ./Machines/PhysicalServers/GhostHome/configuration.nix
           ];
