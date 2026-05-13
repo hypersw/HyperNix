@@ -546,11 +546,24 @@ in
               --no-write-lock-file \
               --print-build-logs \
               --flake "${cfg.targetFlakeUri}#${cfg.targetConfigName}"
-            echo "[$(${pkgs.coreutils}/bin/date -Iseconds)] switch succeeded — syncing + rebooting"
+            # Countdown before reboot. The reboot otherwise fires
+            # within ~200 ms of the rebuild finishing — too fast
+            # for an operator watching the HTTP status feed to
+            # confirm "yes the switch landed" before the box
+            # disappears. 90 s with 10 s ticks gives a clear
+            # window to refresh the page, see the success
+            # marker, and watch the countdown roll to zero.
+            echo "[$(${pkgs.coreutils}/bin/date -Iseconds)] switch succeeded — counting down to reboot"
+            for s in 90 80 70 60 50 40 30 20 10; do
+              echo "[$(${pkgs.coreutils}/bin/date -Iseconds)] reboot in ''${s}s"
+              ${pkgs.coreutils}/bin/sleep 10
+            done
+            echo "[$(${pkgs.coreutils}/bin/date -Iseconds)] syncing + rebooting now"
             ${pkgs.coreutils}/bin/sync
           } 2>&1 | ${pkgs.coreutils}/bin/tee -a ${switchLogFile}
           # systemctl reboot returns immediately; the kernel
-          # handles the rest.
+          # handles the rest. Outside the {…} pipeline so the
+          # tee'd log gets fully flushed first.
           ${pkgs.systemd}/bin/systemctl reboot
         '';
       };
