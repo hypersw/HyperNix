@@ -163,6 +163,21 @@
               assert "age1" in output, \
                 f"endpoint should embed the age-converted host key (prefix `age1`), got: {output[:1500]}"
 
+              # The readiness-ref + repo + target-config must
+              # also surface so the operator knows what to push.
+              assert "Target GitHub repo" in output, \
+                f"endpoint should label the target repo, got: {output[:1500]}"
+              assert "hypersw/HyperNix" in output, \
+                f"endpoint should show the target repo, got: {output[:1500]}"
+              assert "Readiness ref" in output, \
+                f"endpoint should label the readiness ref, got: {output[:1500]}"
+              assert "does-not-exist-test-marker" in output, \
+                f"endpoint should embed the readiness ref name parsed from targetFlakeUri, got: {output[:1500]}"
+              assert "Target nixosConfiguration" in output, \
+                f"endpoint should label the target configuration name, got: {output[:1500]}"
+              assert "GhostHome" in output, \
+                f"endpoint should show the target config name (`GhostHome`), got: {output[:1500]}"
+
               # After triggering the service, either the journal
               # has entries OR the tee'd log file does — at
               # least one must show evidence of activity. Pure

@@ -93,6 +93,30 @@ let
       SSH_TO_AGE = "${pkgs.ssh-to-age}/bin/ssh-to-age"
       SSH_HOST_PUBKEY = "/etc/ssh/ssh_host_ed25519_key.pub"
       LOG_FILE = "${switchLogFile}"
+      TARGET_FLAKE_URI = os.environ.get("FIRST_BOOT_TARGET_FLAKE_URI", "")
+      TARGET_CONFIG_NAME = os.environ.get("FIRST_BOOT_TARGET_CONFIG_NAME", "")
+
+      def parse_target():
+          """Pull (repo_short, repo_url, ref_name) out of TARGET_FLAKE_URI.
+
+          Recognises the `github:owner/repo?ref=NAME` flake-URI form
+          which is what the provisioning profile is wired for. For
+          anything else (gitlab:, sourcehut:, plain git+ssh URLs)
+          we fall back to displaying the raw URI as the repo and
+          leaving ref empty.
+          """
+          uri = TARGET_FLAKE_URI
+          if not uri.startswith("github:"):
+              return (uri, "", "")
+          body = uri[len("github:"):]
+          repo, _, query = body.partition("?")
+          ref = ""
+          for param in query.split("&"):
+              if param.startswith("ref="):
+                  ref = param[len("ref="):]
+                  break
+          url = f"https://github.com/{repo}"
+          return (repo, url, ref)
 
       def read_journal():
           try:
@@ -136,6 +160,15 @@ let
       # has `{` / `}` that would otherwise need escaping.
       def render(ssh_pubkey, age_pubkey, journal, log_text):
           esc = html.escape
+          repo, repo_url, ref = parse_target()
+          repo_html = (
+              f"<a href='{esc(repo_url)}' target='_blank'>{esc(repo)}</a>"
+              if repo_url else esc(repo)
+          )
+          ref_html = (
+              esc(ref) if ref
+              else "<em>(no ref= in target URI)</em>"
+          )
           return (
               "<!DOCTYPE html><html><head>"
               "<title>first-boot-switch status</title>"
@@ -150,6 +183,8 @@ let
               "grid-template-columns:max-content 1fr;column-gap:.7em;row-gap:.15em}"
               "header dt{color:#fc6;white-space:nowrap}"
               "header dd{margin:0;word-break:break-all;user-select:all}"
+              "header dd code{background:#000;color:#fdd;padding:0 .25em;border-radius:.15em}"
+              "header a{color:#9cf}"
               "main{display:flex;flex-direction:row;flex:1;overflow:hidden}"
               ".pane{flex:1;height:100%;overflow:auto;"
               "border-right:1px solid #888}"
@@ -161,6 +196,9 @@ let
               "word-break:break-word;font-size:.85em}"
               "</style></head><body>"
               "<header><dl>"
+              "<dt>Target GitHub repo:</dt><dd>" + repo_html + "</dd>"
+              "<dt>Readiness ref to push:</dt><dd><code>" + ref_html + "</code></dd>"
+              "<dt>Target nixosConfiguration:</dt><dd><code>" + esc(TARGET_CONFIG_NAME) + "</code></dd>"
               "<dt>SSH host key (raw):</dt><dd>" + esc(ssh_pubkey) + "</dd>"
               "<dt>SSH host key (age):</dt><dd>" + esc(age_pubkey) + "</dd>"
               "</dl></header>"
@@ -402,6 +440,11 @@ in
       wantedBy = [ "multi-user.target" ];
       environment = {
         FIRST_BOOT_LOG_PORT = toString cfg.statusHttp.port;
+        # Surface the target flake URI + config name to the
+        # endpoint so the header can show the operator which
+        # readiness ref they need to push and where.
+        FIRST_BOOT_TARGET_FLAKE_URI = cfg.targetFlakeUri;
+        FIRST_BOOT_TARGET_CONFIG_NAME = cfg.targetConfigName;
       };
       serviceConfig = {
         Type = "simple";
