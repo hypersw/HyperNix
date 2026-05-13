@@ -524,8 +524,12 @@ in
 
           bakedLock =
             if pin == null then null
-            else pkgs.runCommand "shim-flake.lock" {} ''
-              ${pkgs.jq}/bin/jq \
+            # buildPackages.* runs on the build platform, not the
+            # target. Lets x86 dev hosts pre-verify the transform
+            # without cross-building for aarch64; the Pi itself
+            # runs everything native so this is a no-op there.
+            else pkgs.buildPackages.runCommand "shim-flake.lock" {} ''
+              ${pkgs.buildPackages.jq}/bin/jq \
                 --arg upstream_rev          "${pin.rev}" \
                 --arg upstream_narHash      "${pin.narHash}" \
                 --arg upstream_lastModified "${toString pin.lastModified}" \
