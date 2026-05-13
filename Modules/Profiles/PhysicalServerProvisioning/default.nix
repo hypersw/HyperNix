@@ -364,5 +364,57 @@ in
     # rebuild. Everything else lands with the full configuration
     # on first reboot.
     environment.systemPackages = with pkgs; [ htop ];
+
+    # Avahi for mDNS publication so the operator can reach the
+    # box at `<hostname>.local` from any LAN device with mDNS
+    # support (most modern Macs/Linux, Windows w/ Bonjour, etc.)
+    # — much friendlier than scanning the LAN by ARP to find the
+    # DHCP-assigned IP. Publication-only; no service browsing
+    # needed on the provisioning image.
+    services.avahi = {
+      enable = true;
+      publish = {
+        enable = true;
+        addresses = true;       # publish A/AAAA records for the hostname
+        workstation = false;    # no "workstation" SRV record clutter
+        userServices = false;
+      };
+      nssmdns4 = true;          # also resolves .local locally
+    };
+    # mDNS uses UDP/5353 — needs the firewall open. The Avahi
+    # NixOS module flips `openFirewall` on automatically when
+    # `publish.enable = true`, but be explicit so it survives a
+    # firewall option override.
+    networking.firewall.allowedUDPPorts = [ 5353 ];
+
+    # Heartbeat ACT LED. Pi 4's activity LED defaults to the
+    # `mmc0` trigger which conveniently blinks on every SD-card
+    # read, giving an "I'm alive" signal incidentally. Pi 5 + USB
+    # boot doesn't drive ACT on disk reads (USB storage doesn't
+    # hook the same trigger), and the operator stares at a steady
+    # green LED for an hour wondering if the box has hung. Switch
+    # the LED to a `heartbeat` trigger so it pulses regularly as
+    # long as the kernel scheduler is alive — a visible liveness
+    # signal independent of any service running.
+    systemd.services.rpi-act-led-heartbeat = {
+      description = "Set the Pi activity LED to the heartbeat trigger";
+      after = [ "sysinit.target" ];
+      wantedBy = [ "multi-user.target" ];
+      serviceConfig = {
+        Type = "oneshot";
+        RemainAfterExit = true;
+        ExecStart = pkgs.writeShellScript "rpi-act-led-heartbeat" ''
+          set -eu
+          # /sys/class/leds/ACT/trigger only exists on Pi (and a
+          # few other ARM SBCs). Skip silently elsewhere.
+          if [ -e /sys/class/leds/ACT/trigger ]; then
+            echo heartbeat > /sys/class/leds/ACT/trigger
+            echo "rpi-act-led-heartbeat: ACT trigger set to heartbeat"
+          else
+            echo "rpi-act-led-heartbeat: no /sys/class/leds/ACT — skipping"
+          fi
+        '';
+      };
+    };
   };
 }
