@@ -261,9 +261,15 @@ let
       #    until the next section header), then append a fresh one.
       #    The [all] block and every other section pass through
       #    unmodified.
+      #
+      #    The header regex allows trailing whitespace via
+      #    [[:space:]]*$ — covers both operator-added spaces and
+      #    CRLF line endings (\r is a [[:space:]] member, so a
+      #    `[tryboot]\r` line still matches without us needing to
+      #    pre-normalise the file).
       CONFIG_TMP=$(mktemp "$FIRMWARE_DIR/.config.txt.new.XXXXXX")
       awk '
-        /^\[tryboot\]$/ { in_tryboot = 1; next }
+        /^\[tryboot\][[:space:]]*$/ { in_tryboot = 1; next }
         in_tryboot && /^\[/ { in_tryboot = 0 }
         !in_tryboot { print }
       ' "$CONFIG" > "$CONFIG_TMP"
