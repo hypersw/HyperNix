@@ -5,18 +5,35 @@
 #
 # ## Workflow
 #
-#   1. Stage a candidate generation alongside the live one. Boot once
-#      into the candidate via Pi 5 EEPROM tryboot.
-#   2. If the candidate boots cleanly, SSH in, verify by hand, then
-#      promote with the ordinary `sudo nixos-rebuild boot` (which
-#      runs nvmd's regular bootloader stage and makes the candidate's
-#      gen the new default).
-#   3. If the candidate doesn't come back (kernel panic, missing
+#   1. `sudo nixos-rebuild-boot-once --flake …` — builds the
+#      candidate, stages its files into a sidecar directory, marks
+#      config.txt's [tryboot] section. Exits without rebooting,
+#      same posture as `nixos-rebuild boot`.
+#   2. `sudo tryboot-reboot` — explicit second action. Reboots
+#      into the EEPROM's tryboot mode. Until this command runs,
+#      the Pi keeps running the current LKG; the [tryboot]
+#      configuration is staged but dormant.
+#   3. If the candidate boots cleanly, SSH in, verify by hand,
+#      then promote with the ordinary `sudo nixos-rebuild boot`
+#      (which runs nvmd's regular bootloader stage and makes the
+#      candidate's gen the new default — also wipes the [tryboot]
+#      section as a side effect of nvmd rewriting config.txt
+#      from its template).
+#   4. If the candidate doesn't come back (kernel panic, missing
 #      driver, network broken in initrd), pull power. The EEPROM's
 #      one-shot flag was consumed by the failed attempt; the next
 #      boot reads `config.txt`'s [all] block and the LKG kernel
 #      returns. Zero userspace cooperation, enforced by firmware
 #      before the kernel runs.
+#
+#   Splitting stage and reboot has a useful safety property: if
+#   the operator stages a candidate then runs `nixos-rebuild
+#   boot` or `nixos-rebuild switch` (or auto-rebuild fires) BEFORE
+#   triggering the tryboot, nvmd's regular bootloader stage runs
+#   on the next switch and rewrites config.txt from the template
+#   — wiping the [tryboot] section and the stale candidate is
+#   cleaned up by removeObsoleteGenerations on the next stage.
+#   No leaked tryboot state across day-to-day rebuilds.
 #
 # ## Critical design invariant: [all] is never touched
 #
@@ -69,6 +86,48 @@ let
   # `inlineStage` body below becomes a fallback for older nvmd.
   hasUpstreamStageCmd =
     (config.boot.loader.raspberry-pi.stageGenCmd or null) != null;
+
+  # Companion to nixos-rebuild-boot-once — fires the actual tryboot
+  # reboot once the operator is ready. Kept separate so the
+  # stage step matches `nixos-rebuild boot` semantics (mark for
+  # next boot, don't reboot now); the reboot is the operator's
+  # explicit second action, same as `sudo reboot` after the
+  # vanilla `nixos-rebuild boot` flow.
+  trybootRebootWrapper = pkgs.buildPackages.writeShellApplication {
+    name = "tryboot-reboot";
+    runtimeInputs = with pkgs.buildPackages; [
+      coreutils gnugrep systemd
+    ];
+    text = ''
+      # tryboot-reboot — reboot into the Pi 5 EEPROM's tryboot mode.
+      # Pre-flight check: refuse to fire if config.txt has no
+      # [tryboot] section (= nothing was staged, the reboot would
+      # be a wasted round-trip into the current LKG).
+
+      if [ "$EUID" -ne 0 ]; then
+        echo "error: must be run as root (try: sudo tryboot-reboot)" >&2
+        exit 1
+      fi
+
+      CONFIG=/boot/firmware/config.txt
+
+      if [ ! -f "$CONFIG" ]; then
+        echo "error: $CONFIG not found — Pi-firmware-managed boot not detected." >&2
+        exit 1
+      fi
+
+      if ! grep -q '^\[tryboot\]' "$CONFIG"; then
+        echo "error: no [tryboot] section in $CONFIG — nothing to try." >&2
+        echo "       run \`sudo nixos-rebuild-boot-once …\` first." >&2
+        exit 1
+      fi
+
+      echo "==> rebooting into tryboot mode in 5s — Ctrl+C aborts."
+      echo "    on failure to come back, power-cycle to revert."
+      sleep 5
+      systemctl reboot --reboot-argument="0 tryboot"
+    '';
+  };
 
   piWrapper = pkgs.buildPackages.writeShellApplication {
     name = "nixos-rebuild-boot-once";
@@ -215,9 +274,16 @@ let
           candidate dir: $CANDIDATE_DIR/
           [tryboot] os_prefix=nixos/$CANDIDATE_NAME/
 
-        Rebooting in 10s — Ctrl+C aborts.
+        Did NOT reboot. To trigger the tryboot, run:
+          sudo tryboot-reboot
+          # or equivalently:
+          sudo systemctl reboot --reboot-argument="0 tryboot"
 
-        AFTER REBOOT:
+        Until the tryboot is triggered, the Pi continues running
+        the current LKG normally. Any nixos-rebuild boot / switch
+        in the meantime cleanly wipes the [tryboot] state.
+
+        AFTER YOU TRIGGER THE TRYBOOT REBOOT:
           On success: ssh in, verify everything you care about, then
                        \`sudo nixos-rebuild boot\` to promote the
                        candidate to LKG (nvmd's normal stage takes
@@ -227,16 +293,24 @@ let
       ================================================================
 
       BANNER
-      sleep 10
-      systemctl reboot --reboot-argument="0 tryboot"
     '';
   };
 in {
   options.hypersw.system.bootOnce = {
     enable = lib.mkEnableOption ''
-      `nixos-rebuild-boot-once` — stage a new system generation as a
-      Pi 5 tryboot candidate. Power-cycle reverts on failure;
-      `nixos-rebuild boot` from inside the candidate promotes.
+      `nixos-rebuild-boot-once` + `tryboot-reboot` — split-action
+      one-shot kernel testing on Pi 5.
+
+      `nixos-rebuild-boot-once` stages a candidate generation and
+      marks config.txt's [tryboot] section. It does NOT reboot —
+      that matches `nixos-rebuild boot` semantics. The Pi keeps
+      running the current LKG until the operator explicitly
+      triggers a tryboot reboot via the companion `tryboot-reboot`
+      command (or directly via
+      `systemctl reboot --reboot-argument="0 tryboot"`).
+
+      Power-cycle from inside the tryboot reverts to LKG.
+      `nixos-rebuild boot` from inside the candidate promotes it.
     '';
   };
 
@@ -268,7 +342,7 @@ in {
     }
 
     (lib.mkIf isPiKernelBootloader {
-      environment.systemPackages = [ piWrapper ];
+      environment.systemPackages = [ piWrapper trybootRebootWrapper ];
 
       # Bumped from nvmd's default of 4 so a staged tryboot candidate
       # has FAT-partition headroom alongside the active default and
