@@ -44,6 +44,7 @@
     ./Monitoring/TelegramAlerts
     ./System/AutoRebuildOnPush
     ./System/AvahiPerInterfaceNames
+    ./System/BootOnce
     ./System/BootStabilityProbe
     ./System/Btm
     # `Hardware/RaspberryPi5SdImage` is NOT in the bundle. It sets

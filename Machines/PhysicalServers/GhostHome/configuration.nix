@@ -221,6 +221,12 @@
   # by hostname.
   hypersw.profiles.multiHomedNetworking.enable = true;
 
+  # `sudo nixos-rebuild-boot-once --flake /etc/nixos#default` —
+  # stages a candidate kernel via Pi 5 tryboot, power-cycle reverts.
+  # First use will be the mainline-kernel migration; see the module
+  # header for the full workflow rationale.
+  hypersw.system.bootOnce.enable = true;
+
   # ── PrintScanServer (workload, not infrastructure) — off ───
   # PHASE 1 (now): GhostHome boots, is reachable, has telemetry,
   # auto-rebuilds-on-push. No print/scan workload.
