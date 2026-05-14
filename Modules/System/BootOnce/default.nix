@@ -1,78 +1,86 @@
 { config, lib, pkgs, ... }:
 #
 # BootOnce — `nixos-rebuild-boot-once` wrapper for tryboot-style
-# one-shot kernel testing.
+# one-shot kernel testing on Pi 5.
 #
-# Models a Pi 5 / EFI workflow where the operator wants to:
+# ## Workflow
 #
-#   1. Stage a new system generation as a candidate.
-#   2. Reboot into the candidate exactly once.
-#   3a. If the candidate boots cleanly, SSH in, verify everything
-#       (network, services, peripherals), then run a normal
-#       `sudo nixos-rebuild boot` to promote the candidate to LKG.
-#   3b. If the candidate doesn't come back (hang in initrd, kernel
-#       panic, no network), pull power. The next boot reads the
-#       UNCHANGED default → LKG kernel returns. Zero userspace
-#       cooperation required — the rollback is enforced by
-#       firmware before the kernel runs.
+#   1. Stage a candidate generation alongside the live one. Boot once
+#      into the candidate via Pi 5 EEPROM tryboot.
+#   2. If the candidate boots cleanly, SSH in, verify by hand, then
+#      promote with the ordinary `sudo nixos-rebuild boot` (which
+#      runs nvmd's regular bootloader stage and makes the candidate's
+#      gen the new default).
+#   3. If the candidate doesn't come back (kernel panic, missing
+#      driver, network broken in initrd), pull power. The EEPROM's
+#      one-shot flag was consumed by the failed attempt; the next
+#      boot reads `config.txt`'s [all] block and the LKG kernel
+#      returns. Zero userspace cooperation, enforced by firmware
+#      before the kernel runs.
 #
-# This is structurally identical to systemd-boot's `bootctl
-# set-oneshot` or UEFI's `BootNext` variable, just spelled in
-# Pi 5 EEPROM terms (the `[tryboot]` filter in `config.txt`
-# combined with the `reboot "0 tryboot"` magic argument).
+# ## Critical design invariant: [all] is never touched
 #
-# Why no auto-promote daemon: the candidate is "good" only when
-# the operator's intuition says so — network-reachable, services
-# green, the specific bits being tested are working. That's
-# explicit judgment, not a unit-determinable predicate. So we
-# expose a stage-and-reboot command (this module) and leave the
-# promotion to a plain `nixos-rebuild boot` once the operator is
-# satisfied. Power-cycle is the implicit revert; nothing else.
+# This module's wrapper script writes to two things, both isolated
+# from the live boot path:
 #
-# Currently only the Pi 5 `kernel` bootloader path is wired. The
-# module asserts hard on other bootloaders so a misconfiguration
-# fails at build time rather than producing a wrapper that
-# silently no-ops.
+#   1. `/boot/firmware/nixos/tryboot/` — a fresh per-gen directory
+#      we own exclusively. nvmd's regular bootloader stage doesn't
+#      use this name (it uses `default/` and `<N>-default/`), and
+#      its retention logic leaves it untouched. Our wrapper rebuilds
+#      this directory atomically (.tmp.$$ + mv) on each run.
+#
+#   2. The `[tryboot]` section of `/boot/firmware/config.txt`. We
+#      strip any prior `[tryboot]` block (awk-based, range-scoped)
+#      and append a fresh one pointing at `nixos/tryboot/`. The
+#      `[all]` section and every other filter section are read but
+#      never modified. We write atomically (to a tempfile, then mv).
+#
+# Net effect: if the wrapper crashes at *any* point, the worst case
+# is a truncated `[tryboot]` block at the end of config.txt — which
+# the Pi EEPROM ignores in non-tryboot mode. The LKG boot path
+# (config.txt's [all] -> nixos/default/) is structurally invariant
+# under our script's behaviour.
+#
+# ## Implementation note: staging primitives
+#
+# This module currently does its own minimal file-copy into
+# `nixos/tryboot/` — kernel.img, initrd, cmdline.txt, DTBs, overlays.
+# It pins to nvmd's current Pi-5-`kernel`-bootloader file-layout
+# conventions (matches `kernelboot-gen-builder.sh` +
+# `install-device-tree.sh` from nvmd/nixos-raspberrypi as of
+# 2026-05).
+#
+# An upstream nvmd patch is queued (`stageGenCmd` option in
+# `boot.loader.raspberry-pi`, see
+# https://github.com/nvmd/nixos-raspberrypi) that exposes nvmd's
+# per-gen builder as a primitive. Once it lands and we bump nvmd,
+# the wrapper switches to using `config.boot.loader.raspberry-pi.stageGenCmd`
+# instead of the inline shell — same external behaviour, drops the
+# divergence-risk surface.
 #
 let
   cfg = config.hypersw.system.bootOnce;
 
-  # Bootloader detection — only one branch will produce a wrapper.
-  # Future: add systemd-boot (bootctl set-oneshot) + grub (grub-reboot)
-  # branches here.
   isPiKernelBootloader =
     (config.boot.loader.raspberry-pi.bootloader or null) == "kernel";
 
-  # The set of config.txt directives we copy from the candidate's
-  # [all] block into the new [tryboot] block. Anything in here
-  # gets overridden on the tryboot pass; anything not in here
-  # stays at whatever the LKG default chose (HDMI tweaks, GPIO
-  # pin setup, etc. — properties of the BOX, not the kernel).
-  #
-  # Conservative on purpose: a too-narrow filter leaves the
-  # tryboot kernel without an initramfs and it dies in early
-  # boot. A too-wide filter overrides hardware-specific config
-  # and might prevent the box from coming up at all. Start with
-  # the standard kernel-side directives; extend when an actual
-  # failure case justifies it.
-  tryBootFieldsRx = "^(kernel|initramfs|cmdline|os_check|device_tree|dtoverlay)=";
+  # Future: when nvmd's stageGenCmd option lands upstream + we bump,
+  # this branch will pick up the official primitive and the
+  # `inlineStage` body below becomes a fallback for older nvmd.
+  hasUpstreamStageCmd =
+    (config.boot.loader.raspberry-pi.stageGenCmd or null) != null;
 
-  # buildPackages.* runs the shellcheck pass on the build platform,
-  # so x86 dev hosts can verify the wrapper without aarch64 emulation.
-  # On the Pi (native build) this is a no-op alias.
   piWrapper = pkgs.buildPackages.writeShellApplication {
     name = "nixos-rebuild-boot-once";
-    runtimeInputs = with pkgs.buildPackages; [ coreutils gnugrep systemd ];
-    # nixos-rebuild itself is on /run/current-system/sw/bin, so it
-    # resolves via PATH at invocation time; not pulled in here to
-    # avoid pinning to a specific nixos-rebuild package version.
+    runtimeInputs = with pkgs.buildPackages; [
+      coreutils gnugrep gawk gnused systemd
+    ];
     text = ''
       # nixos-rebuild-boot-once — build a NixOS generation and queue
-      # it as a one-shot Pi 5 tryboot. Power-cycle on failure
-      # reverts to the LKG kernel; `nixos-rebuild boot` on success
-      # promotes the candidate to LKG.
+      # it as a one-shot Pi 5 tryboot. Power-cycle on failure reverts;
+      # `nixos-rebuild boot` from inside the candidate promotes.
       #
-      # Args pass through to `nixos-rebuild boot`:
+      # Args pass through to `nixos-rebuild build`:
       #   sudo nixos-rebuild-boot-once --flake /etc/nixos#default
       #   sudo nixos-rebuild-boot-once --flake github:hypersw/HyperNix#GhostHome
 
@@ -83,74 +91,143 @@ let
 
       FIRMWARE_DIR=/boot/firmware
       CONFIG="$FIRMWARE_DIR/config.txt"
+      CANDIDATE_NAME=tryboot
+      CANDIDATE_DIR="$FIRMWARE_DIR/nixos/$CANDIDATE_NAME"
 
       if [ ! -f "$CONFIG" ]; then
-        echo "error: $CONFIG not found — this host doesn't look Pi-firmware-managed." >&2
+        echo "error: $CONFIG not found — Pi-firmware-managed boot not detected." >&2
         echo "       boot-once is currently wired only for the Pi 5 'kernel' bootloader." >&2
         exit 1
       fi
 
-      # Snapshot LKG config before nixos-rebuild boot mutates it.
-      # Stored in /tmp (tmpfs) rather than alongside config.txt so a
-      # failed run never leaves stray .lkg.* files on the FAT
-      # partition that subsequent rebuilds might mis-parse.
-      LKG_BACKUP=$(mktemp /tmp/config.lkg.XXXXXX.txt)
-      cp -a "$CONFIG" "$LKG_BACKUP"
-      cleanup() { rm -f "$LKG_BACKUP" "$NEW_CONFIG" 2>/dev/null || true; }
-      NEW_CONFIG=""
-      trap cleanup EXIT
+      # 1) Build the candidate system. `nixos-rebuild build` doesn't
+      #    touch /boot/firmware, doesn't run activation, just produces
+      #    a system store path under ./result (or wherever cwd is).
+      #    Run from /tmp to avoid leaving a ./result symlink in the
+      #    operator's working dir.
+      WORKDIR=$(mktemp -d)
+      cleanup_workdir() { rm -rf "$WORKDIR" 2>/dev/null || true; }
+      trap cleanup_workdir EXIT
 
-      echo "==> running 'nixos-rebuild boot' to stage the candidate…"
-      # `boot` (not `switch`): stage the candidate as the next-boot
-      # default + copy its kernel/initrd/dtb to /boot/firmware/nixos/
-      # <gen>/, but DO NOT activate it on the running system. We
-      # then rewrite config.txt below so the candidate is reached
-      # only via tryboot, not via the normal boot path.
-      nixos-rebuild boot "$@"
+      echo "==> building candidate via 'nixos-rebuild build $*'…"
+      (cd "$WORKDIR" && nixos-rebuild build "$@")
 
-      # Extract the candidate's kernel-relevant directives (now in
-      # the [all] block of config.txt, courtesy of the stage above).
-      CANDIDATE_BLOCK=$(grep -E ${lib.escapeShellArg tryBootFieldsRx} "$CONFIG" || true)
-      if [ -z "$CANDIDATE_BLOCK" ]; then
-        echo "error: nixos-rebuild boot ran but $CONFIG has no kernel= line. Aborting." >&2
-        cp -a "$LKG_BACKUP" "$CONFIG"
+      SYSTEM_PATH=$(readlink -f "$WORKDIR/result")
+      if [ -z "$SYSTEM_PATH" ] || [ ! -d "$SYSTEM_PATH" ]; then
+        echo "error: nixos-rebuild build ran but no result symlink at $WORKDIR/result" >&2
         exit 1
       fi
+      if [ ! -f "$SYSTEM_PATH/kernel" ] || [ ! -f "$SYSTEM_PATH/initrd" ]; then
+        echo "error: candidate $SYSTEM_PATH missing kernel/initrd" >&2
+        exit 1
+      fi
+      echo "    candidate: $SYSTEM_PATH"
 
-      # Atomically swap config.txt back to LKG + append a [tryboot]
-      # section pointing at the candidate. mv on the same filesystem
-      # is atomic; on FAT the rename is a single directory-entry
-      # update, no torn-write window.
-      NEW_CONFIG=$(mktemp "$FIRMWARE_DIR/.config.new.XXXXXX.txt")
+      # 2) Stage the candidate into $CANDIDATE_DIR atomically.
+      #    Replicates the file layout nvmd's `kernelboot-gen-builder.sh`
+      #    + `install-device-tree.sh` produce, minus the system-link
+      #    and kernel-link bookkeeping files (which nvmd uses for
+      #    its own state tracking — the Pi EEPROM doesn't read them).
+      #
+      #    Pinned to nvmd's behaviour as of 2026-05: kernel.img,
+      #    initrd, cmdline.txt, *.dtb, overlays/*. Re-verify on nvmd
+      #    bumps; switch to the upstream `stageGenCmd` primitive when
+      #    available.
+      STAGE_TMP="$CANDIDATE_DIR.tmp.$$"
+      cleanup_stage() {
+        cleanup_workdir
+        rm -rf "$STAGE_TMP" 2>/dev/null || true
+      }
+      trap cleanup_stage EXIT
+
+      mkdir -p "$STAGE_TMP"
+
+      cp "$(readlink -f "$SYSTEM_PATH/kernel")" "$STAGE_TMP/kernel.img.tmp"
+      mv "$STAGE_TMP/kernel.img.tmp" "$STAGE_TMP/kernel.img"
+
+      cp "$(readlink -f "$SYSTEM_PATH/initrd")" "$STAGE_TMP/initrd.tmp"
+      mv "$STAGE_TMP/initrd.tmp" "$STAGE_TMP/initrd"
+
+      # cmdline.txt mirrors what nvmd writes: kernel-params + init=
+      # pointing at the candidate system's init script.
+      printf '%s init=%s/init\n' \
+        "$(cat "$SYSTEM_PATH/kernel-params")" \
+        "$SYSTEM_PATH" \
+        > "$STAGE_TMP/cmdline.txt"
+
+      # DTBs: $SYSTEM_PATH/dtbs/ is a symlink to the kernel package's
+      # device-tree output. Pi-vendor kernels lay broadcom DTBs under
+      # broadcom/, but EEPROM looks at $os_prefix/ root — so we
+      # flatten broadcom/*.dtb into the gen dir alongside any
+      # top-level .dtb files.
+      DTB_SRC=$(readlink -f "$SYSTEM_PATH/dtbs" 2>/dev/null || true)
+      if [ -n "$DTB_SRC" ] && [ -d "$DTB_SRC" ]; then
+        shopt -s nullglob
+        for dtb in "$DTB_SRC"/*.dtb "$DTB_SRC"/broadcom/*.dtb; do
+          cp "$dtb" "$STAGE_TMP/$(basename "$dtb").tmp"
+          mv "$STAGE_TMP/$(basename "$dtb").tmp" "$STAGE_TMP/$(basename "$dtb")"
+        done
+        if [ -d "$DTB_SRC/overlays" ]; then
+          mkdir -p "$STAGE_TMP/overlays"
+          for ovr in "$DTB_SRC/overlays"/*; do
+            cp "$ovr" "$STAGE_TMP/overlays/$(basename "$ovr").tmp"
+            mv "$STAGE_TMP/overlays/$(basename "$ovr").tmp" \
+               "$STAGE_TMP/overlays/$(basename "$ovr")"
+          done
+        fi
+        shopt -u nullglob
+      fi
+
+      # Swap into place atomically — single mv at the parent level.
+      rm -rf "$CANDIDATE_DIR.bkp.$$" 2>/dev/null || true
+      if [ -d "$CANDIDATE_DIR" ]; then
+        mv "$CANDIDATE_DIR" "$CANDIDATE_DIR.bkp.$$"
+      fi
+      mv "$STAGE_TMP" "$CANDIDATE_DIR"
+      rm -rf "$CANDIDATE_DIR.bkp.$$" 2>/dev/null || true
+
+      # 3) Replace the [tryboot] block in config.txt atomically.
+      #    awk-based: strip any prior [tryboot] section (from header
+      #    until the next section header), then append a fresh one.
+      #    The [all] block and every other section pass through
+      #    unmodified.
+      CONFIG_TMP=$(mktemp "$FIRMWARE_DIR/.config.txt.new.XXXXXX")
+      awk '
+        /^\[tryboot\]$/ { in_tryboot = 1; next }
+        in_tryboot && /^\[/ { in_tryboot = 0 }
+        !in_tryboot { print }
+      ' "$CONFIG" > "$CONFIG_TMP"
+
       {
-        cat "$LKG_BACKUP"
-        printf '\n[tryboot]\n%s\n' "$CANDIDATE_BLOCK"
-      } > "$NEW_CONFIG"
+        echo ""
+        echo "[tryboot]"
+        echo "os_prefix=nixos/$CANDIDATE_NAME/"
+      } >> "$CONFIG_TMP"
+
       sync
-      mv "$NEW_CONFIG" "$CONFIG"
-      NEW_CONFIG=""  # consumed; don't try to rm it in cleanup
+      mv "$CONFIG_TMP" "$CONFIG"
       sync
 
-      cat <<'BANNER'
+      cat <<BANNER
 
       ================================================================
         Candidate staged for one-shot boot via Pi 5 tryboot.
+          candidate dir: $CANDIDATE_DIR/
+          [tryboot] os_prefix=nixos/$CANDIDATE_NAME/
+
         Rebooting in 10s — Ctrl+C aborts.
 
         AFTER REBOOT:
           On success: ssh in, verify everything you care about, then
-                       `sudo nixos-rebuild boot` to promote the
-                       candidate to LKG.
+                       \`sudo nixos-rebuild boot\` to promote the
+                       candidate to LKG (nvmd's normal stage takes
+                       over from here).
           On failure: power-cycle the Pi. The unconsumed [all] block
                        in config.txt boots the previous kernel.
       ================================================================
 
       BANNER
       sleep 10
-      # systemctl reboot --reboot-argument= passes the string through
-      # to reboot(2)'s extra argument, which the Pi firmware reads as
-      # the tryboot one-shot trigger. Plain `reboot` from systemd
-      # doesn't propagate the argument.
       systemctl reboot --reboot-argument="0 tryboot"
     '';
   };
@@ -165,9 +242,6 @@ in {
 
   config = lib.mkIf cfg.enable (lib.mkMerge [
     {
-      # Hard assertion — fail at build time on hosts whose
-      # bootloader doesn't have a wired implementation yet.
-      # Cheaper than shipping a wrapper that silently no-ops.
       assertions = [
         {
           assertion = isPiKernelBootloader;
@@ -180,21 +254,25 @@ in {
           '';
         }
       ];
+
+      # Future-proofing: warn if upstream nvmd grows the stageGenCmd
+      # primitive — at that point we should refactor this wrapper to
+      # delegate to it rather than vendoring the file-copy logic.
+      warnings = lib.optional hasUpstreamStageCmd ''
+        nvmd's `boot.loader.raspberry-pi.stageGenCmd` is now
+        available upstream. The BootOnce module is still using its
+        inline vendored stage; switch the wrapper at
+        Modules/System/BootOnce to delegate to that option instead
+        and drop the inline shell.
+      '';
     }
 
     (lib.mkIf isPiKernelBootloader {
       environment.systemPackages = [ piWrapper ];
 
-      # configurationLimit=3 means the firmware partition holds up
-      # to 3 generations. Boot-once stages a candidate as a 4th
-      # potential slot via `nixos-rebuild boot`, which would evict
-      # the oldest — and if that oldest happens to be the
-      # currently-running LKG, we'd lose the rollback target. Warn
-      # if there's no headroom over the typical case.
-      #
-      # mkDefault rather than mkForce so per-host overrides win;
-      # the user might know their Pi has plenty of FAT space and
-      # want more retention regardless.
+      # Bumped from nvmd's default of 4 so a staged tryboot candidate
+      # has FAT-partition headroom alongside the active default and
+      # rotated-out gens. Per-host configs can override.
       boot.loader.raspberry-pi.configurationLimit = lib.mkDefault 5;
     })
   ]);
