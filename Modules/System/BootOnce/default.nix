@@ -6,12 +6,14 @@
 # ## Workflow
 #
 #   1. `sudo nixos-rebuild-boot-once --flake …` — builds the
-#      candidate, stages its files into a sidecar directory, marks
-#      config.txt's [tryboot] section, then prompts whether to
-#      reboot now. The build can be long (hours, on first kernel
-#      rebuild from source); the prompt blocks until input so the
-#      operator can step away. Default is no; the candidate stays
-#      dormant until the operator explicitly triggers the reboot.
+#      candidate, stages its files into a sidecar directory, and
+#      writes /boot/firmware/tryboot.txt (a fork of config.txt
+#      with os_prefix swapped to point at the candidate), then
+#      prompts whether to reboot now. The build can be long
+#      (hours, on first kernel rebuild from source); the prompt
+#      blocks until input so the operator can step away. Default
+#      is no; the candidate stays dormant until the operator
+#      explicitly triggers the reboot.
 #   2. If the operator answers "y", the command issues the tryboot
 #      reboot directly. Otherwise (no, or non-interactive), they
 #      can trigger it later with `sudo reboot-tryboot` — a small
@@ -24,26 +26,24 @@
 #   3. If the candidate boots cleanly, SSH in, verify by hand,
 #      then promote with the ordinary `sudo nixos-rebuild boot`
 #      (which runs nvmd's regular bootloader stage and makes the
-#      candidate's gen the new default — also wipes the [tryboot]
-#      section as a side effect of nvmd rewriting config.txt
-#      from its template).
+#      candidate's gen the new default). The stale tryboot.txt
+#      is harmless — it points at nixos/tryboot/, which nvmd's
+#      removeObsoleteGenerations will delete on the next stage,
+#      leaving tryboot.txt with a broken reference until next
+#      stage rewrites it (or it's manually removed).
 #   4. If the candidate doesn't come back (kernel panic, missing
 #      driver, network broken in initrd), pull power. The EEPROM's
 #      one-shot flag was consumed by the failed attempt; the next
-#      boot reads `config.txt`'s [all] block and the LKG kernel
+#      boot reads `config.txt` (NOT tryboot.txt) and the LKG kernel
 #      returns. Zero userspace cooperation, enforced by firmware
 #      before the kernel runs.
 #
-#   Useful safety property: if the operator stages a candidate
-#   then runs `nixos-rebuild boot` or `nixos-rebuild switch` (or
-#   auto-rebuild fires) BEFORE triggering the tryboot, nvmd's
-#   regular bootloader stage runs on the next switch and rewrites
-#   config.txt from the template — wiping the [tryboot] section
-#   and the stale candidate is cleaned up by
-#   removeObsoleteGenerations on the next stage. No leaked tryboot
-#   state across day-to-day rebuilds.
+#   Useful safety property: config.txt is structurally invariant
+#   under this wrapper. Even a botched tryboot.txt only causes the
+#   EEPROM to fall back to config.txt (= LKG) — the failure mode
+#   is "candidate didn't try" rather than "LKG broke."
 #
-# ## Critical design invariant: [all] is never touched
+# ## Critical design invariant: config.txt is never touched
 #
 # This module's wrapper script writes to two things, both isolated
 # from the live boot path:
@@ -54,17 +54,22 @@
 #      its retention logic leaves it untouched. Our wrapper rebuilds
 #      this directory atomically (.tmp.$$ + mv) on each run.
 #
-#   2. The `[tryboot]` section of `/boot/firmware/config.txt`. We
-#      strip any prior `[tryboot]` block (awk-based, range-scoped)
-#      and append a fresh one pointing at `nixos/tryboot/`. The
-#      `[all]` section and every other filter section are read but
-#      never modified. We write atomically (to a tempfile, then mv).
+#   2. `/boot/firmware/tryboot.txt` — a complete fork of config.txt
+#      with the `os_prefix=nixos/default/` directive sed-swapped to
+#      `os_prefix=nixos/tryboot/`. The Pi 5 EEPROM has documented
+#      semantics: when the tryboot one-shot flag is set, the
+#      firmware reads `tryboot.txt` IF IT EXISTS, otherwise falls
+#      back to `config.txt` with `[tryboot]` filter sections
+#      enabled. By writing a full-config alternate file we get
+#      the cleaner of the two mechanisms — no filter-section
+#      ordering quirks, no parser interaction with `[all]`, no
+#      edits to `config.txt` at all.
 #
-# Net effect: if the wrapper crashes at *any* point, the worst case
-# is a truncated `[tryboot]` block at the end of config.txt — which
-# the Pi EEPROM ignores in non-tryboot mode. The LKG boot path
-# (config.txt's [all] -> nixos/default/) is structurally invariant
-# under our script's behaviour.
+# Net effect: `config.txt` is byte-for-byte invariant under this
+# wrapper's behaviour. If our staging crashes at any point, the
+# worst case is a missing or partial `tryboot.txt` — which the
+# EEPROM falls back from (back to config.txt → [all] → LKG). The
+# LKG boot path is structurally impossible to perturb here.
 #
 # ## Implementation note: staging primitives
 #
@@ -112,24 +117,19 @@ let
     ];
     text = ''
       # reboot-tryboot — reboot into the Pi 5 EEPROM's tryboot mode.
-      # Pre-flight check: refuse to fire if config.txt has no
-      # [tryboot] section (= nothing was staged, the reboot would
-      # be a wasted round-trip into the current LKG).
+      # Pre-flight: refuse if there's no tryboot.txt on the
+      # firmware partition (= nothing staged, the reboot would
+      # fall through to config.txt for a wasted LKG round-trip).
 
       if [ "$EUID" -ne 0 ]; then
         echo "error: must be run as root (try: sudo reboot-tryboot)" >&2
         exit 1
       fi
 
-      CONFIG=/boot/firmware/config.txt
+      TRYBOOT_CFG=/boot/firmware/tryboot.txt
 
-      if [ ! -f "$CONFIG" ]; then
-        echo "error: $CONFIG not found — Pi-firmware-managed boot not detected." >&2
-        exit 1
-      fi
-
-      if ! grep -q '^\[tryboot\]' "$CONFIG"; then
-        echo "error: no [tryboot] section in $CONFIG — nothing to try." >&2
+      if [ ! -f "$TRYBOOT_CFG" ]; then
+        echo "error: $TRYBOOT_CFG not found — nothing staged for tryboot." >&2
         echo "       run \`sudo nixos-rebuild-boot-once …\` first." >&2
         exit 1
       fi
@@ -256,32 +256,46 @@ let
       mv "$STAGE_TMP" "$CANDIDATE_DIR"
       rm -rf "$CANDIDATE_DIR.bkp.$$" 2>/dev/null || true
 
-      # 3) Replace the [tryboot] block in config.txt atomically.
-      #    awk-based: strip any prior [tryboot] section (from header
-      #    until the next section header), then append a fresh one.
-      #    The [all] block and every other section pass through
-      #    unmodified.
+      # 3) Compose /boot/firmware/tryboot.txt — a complete fork of
+      #    config.txt with the os_prefix directive swapped to point
+      #    at our candidate. config.txt itself is not opened for
+      #    writing.
       #
-      #    The header regex allows trailing whitespace via
-      #    [[:space:]]*$ — covers both operator-added spaces and
-      #    CRLF line endings (\r is a [[:space:]] member, so a
-      #    `[tryboot]\r` line still matches without us needing to
-      #    pre-normalise the file).
-      CONFIG_TMP=$(mktemp "$FIRMWARE_DIR/.config.txt.new.XXXXXX")
-      awk '
-        /^\[tryboot\][[:space:]]*$/ { in_tryboot = 1; next }
-        in_tryboot && /^\[/ { in_tryboot = 0 }
-        !in_tryboot { print }
-      ' "$CONFIG" > "$CONFIG_TMP"
+      #    The Pi 5 EEPROM, when the one-shot tryboot flag is set,
+      #    reads tryboot.txt INSTEAD of config.txt (full alternate
+      #    config, not a filter overlay). If we got the swap right,
+      #    the candidate boots with everything else identical to
+      #    LKG. If anything in our write is broken, the EEPROM
+      #    falls back to config.txt — i.e. LKG — so the failure
+      #    mode is silent recovery rather than wedge.
+      TRYBOOT_CFG="$FIRMWARE_DIR/tryboot.txt"
+      TRYBOOT_CFG_TMP=$(mktemp "$FIRMWARE_DIR/.tryboot.txt.new.XXXXXX")
 
-      {
-        echo ""
-        echo "[tryboot]"
-        echo "os_prefix=nixos/$CANDIDATE_NAME/"
-      } >> "$CONFIG_TMP"
+      # sed replaces every occurrence of `os_prefix=nixos/default/`
+      # with `os_prefix=nixos/<CANDIDATE_NAME>/`. nvmd's config.txt
+      # template has exactly one such line under [all], emitted
+      # from hardware.raspberry-pi.config.all.options.os_prefix.
+      # We don't validate the count — a multi-os_prefix config
+      # produced by some future nvmd template would still be
+      # forked correctly.
+      sed "s|^os_prefix=nixos/default/|os_prefix=nixos/$CANDIDATE_NAME/|" \
+        "$CONFIG" > "$TRYBOOT_CFG_TMP"
+
+      # Sanity check: the substituted file MUST contain at least
+      # one os_prefix line pointing at the candidate. If not, the
+      # original config.txt didn't have the expected form and
+      # tryboot.txt would inadvertently point at the LKG gen
+      # (i.e. boot LKG via the tryboot path) — confusing but not
+      # damaging. Bail loudly so the operator notices.
+      if ! grep -q "^os_prefix=nixos/$CANDIDATE_NAME/" "$TRYBOOT_CFG_TMP"; then
+        echo "error: no 'os_prefix=nixos/default/' line found in $CONFIG;" >&2
+        echo "       tryboot.txt would point at LKG, not the candidate. Aborting." >&2
+        rm -f "$TRYBOOT_CFG_TMP"
+        exit 1
+      fi
 
       sync
-      mv "$CONFIG_TMP" "$CONFIG"
+      mv "$TRYBOOT_CFG_TMP" "$TRYBOOT_CFG"
       sync
 
       cat <<BANNER
@@ -289,15 +303,18 @@ let
       ================================================================
         Candidate staged for one-shot boot via Pi 5 tryboot.
           candidate dir: $CANDIDATE_DIR/
-          [tryboot] os_prefix=nixos/$CANDIDATE_NAME/
+          tryboot config: $TRYBOOT_CFG
+            (forked from config.txt, os_prefix swapped to
+             nixos/$CANDIDATE_NAME/)
+          config.txt:    untouched
 
         AFTER REBOOT:
           On success: ssh in, verify everything you care about, then
                        \`sudo nixos-rebuild boot\` to promote the
                        candidate to LKG (nvmd's normal stage takes
                        over from here).
-          On failure: power-cycle the Pi. The unconsumed [all] block
-                       in config.txt boots the previous kernel.
+          On failure: power-cycle the Pi. The unconsumed config.txt
+                       boots the previous kernel.
       ================================================================
 
       BANNER
