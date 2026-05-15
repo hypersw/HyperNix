@@ -61,12 +61,29 @@
   boot.loader.raspberry-pi.bootloader = "kernel";
   boot.loader.raspberry-pi.configurationLimit = 3;
 
-  # Kernel comes from nvmd's Pi-5-vendor package
-  # (linuxPackages_rpi5, Foundation patch series) — set by
-  # raspberry-pi-5.base in flake.nix. Their binary cache at
-  # nixos-raspberrypi.cachix.org has it prebuilt, so we don't
-  # pay the rebuild cost we'd have paid going through
-  # nixpkgs' uncached linuxPackages_rpi5.
+  # Kernel: force the mainline nixpkgs kernel, overriding nvmd's
+  # vendor package (linuxPackages_rpi5, Foundation patch series)
+  # that raspberry-pi-5.base would otherwise wire up.
+  #
+  # Why not the vendor kernel: nvmd's binary cache at
+  # nixos-raspberrypi.cachix.org is keyed on their pinned
+  # nixpkgs (currently 25.11), and we track nixos-unstable for
+  # fleet consistency. That cache mismatch means the vendor kernel
+  # has to rebuild from source on every nixpkgs bump — ~3 hours
+  # CPU-saturated on this Pi 5, every month, blocking the
+  # auto-upgrade cycle for that whole window. Demonstrated cost,
+  # not theoretical: we paid it once during initial bring-up.
+  #
+  # What we lose: nvmd's vendor-only multimedia bits (camera CSI
+  # via bcm2835_v4l2, VPU offload, the full vc4-drm stack — but
+  # we already blacklist vc4 anyway because of its IOMMU init
+  # race). Nothing on the headless home-automation critical path.
+  #
+  # What mainline gives us (6.10+, we're on 6.12): full Pi 5
+  # support — BCM2712 SoC, RP1 PCIe controller (USB + Ethernet +
+  # GPIO), brcmfmac WiFi, EEPROM direct-kernel-boot. Cached on
+  # cache.nixos.org, so substitution rather than source rebuild.
+  boot.kernelPackages = lib.mkForce pkgs.linuxPackages_latest;
 
   # Headless boot tweaks — same rationale as the Pi 4 config but
   # without the brownout-mitigation bundle. Pi 5's PMIC + 5 V power
