@@ -79,11 +79,19 @@
   # we already blacklist vc4 anyway because of its IOMMU init
   # race). Nothing on the headless home-automation critical path.
   #
-  # What mainline gives us (6.10+, we're on 6.12): full Pi 5
-  # support — BCM2712 SoC, RP1 PCIe controller (USB + Ethernet +
-  # GPIO), brcmfmac WiFi, EEPROM direct-kernel-boot. Cached on
-  # cache.nixos.org, so substitution rather than source rebuild.
-  boot.kernelPackages = lib.mkForce pkgs.linuxPackages_latest;
+  # Pulling the Pi-vendor kernel directly from nixpkgs
+  # (linuxPackages_rpi5) rather than via nvmd. Hypothesis: nixpkgs
+  # builds rpi-vendor kernels for aarch64 on Hydra and caches
+  # them on cache.nixos.org — if true, we get the Pi-patched
+  # kernel (which we know boots on this hardware) without the
+  # cache-miss source rebuild that comes from following nvmd's
+  # flake (whose cachix is keyed to their pinned 25.11 nixpkgs).
+  #
+  # Earlier attempt with linuxPackages_latest (mainline 7.0)
+  # cached cleanly but hung in early boot — almost certainly
+  # because the EEPROM/armstub→kernel handover protocol on the
+  # Pi 5 expects the vendor's patched kernel, not stock mainline.
+  boot.kernelPackages = lib.mkForce pkgs.linuxPackages_rpi5;
 
   # Headless boot tweaks — same rationale as the Pi 4 config but
   # without the brownout-mitigation bundle. Pi 5's PMIC + 5 V power
