@@ -994,13 +994,16 @@ async Task StageBytesForPrintAsync(
             // — when the unit is anything else (cm) we'd need to
             // convert; for the printable-direct path here all the
             // formats we accept use PixelsPerInch.
+            // Trust whatever pHYs the file reports. The previous
+            // sub-100 nuke was masking the very screenshots we want
+            // to default Fit on — see the PLAN.md "Print Flow Update
+            // 2026-05-17" entry. PendingPrint.Fits1to1 falls back to
+            // a 96-dpi assumption when Dpi stays null, which keeps
+            // the 1:1 badge meaningful for unstamped screenshots.
             var hRes = info.Metadata.HorizontalResolution;
             var vRes = info.Metadata.VerticalResolution;
             if (hRes > 0 && vRes > 0)
-            {
                 dpi = (int)Math.Round(Math.Min(hRes, vRes));
-                if (dpi < PendingPrint.MinReasonableDpi) dpi = null;
-            }
         }
         catch (Exception ex)
         {
@@ -1057,8 +1060,43 @@ async Task StageBytesForPrintAsync(
         AutoClass = autoClass,
         ClassifierStats = classStats,
     };
-    if (pending.Fits1to1 == OneToOneFit.Printable)
-        pending.Scale = PrintScaleMode.OneToOne;
+    // Coverage-based default scale-mode picker.
+    //
+    // The screenshot-on-A4 case taught us that "fits 1:1 inside
+    // printable area" is a necessary but NOT sufficient condition
+    // for picking 1:1 as the default: a 647×500 image at 96 dpi is
+    // 6.7×5.2 inches and technically fits, but covers ~10% of A4 and
+    // ends up looking like a stamp. The user almost always meant
+    // "use the page" in that situation.
+    //
+    // Rule (only applies to images with a usable size estimate):
+    //   coverage < 25%  → Fit (image is small, fill the page)
+    //   25% ≤ coverage ≤ 110% AND fits-1:1 in some sense → 1:1
+    //     (sweet spot — close enough to page that 1:1 is what
+    //      the user almost always means; we also accept slight
+    //      overflow into the non-printable margin because a 110%
+    //      cap catches registration-marked masters where the
+    //      bleed is intentional)
+    //   coverage > 110% → Fit (image is huge, scale down to fit)
+    if (pending.Kind == PendingPrintKind.Image &&
+        pending.PixelWidth is int pw && pending.PixelHeight is int ph)
+    {
+        var d = pending.Dpi is int explicitDpi
+            ? (double)explicitDpi
+            : PendingPrint.NoMetadataFallbackDpi;
+        var shortIn = Math.Min(pw, ph) / d;
+        var longIn  = Math.Max(pw, ph) / d;
+        var coverage =
+            (shortIn * longIn) /
+            (pending.PaperShortInches * pending.PaperLongInches);
+
+        var fits = pending.Fits1to1 is
+            OneToOneFit.Printable or OneToOneFit.PaperFitsMarginsClipped;
+
+        pending.Scale = (coverage is >= 0.25 and <= 1.10 && fits)
+            ? PrintScaleMode.OneToOne
+            : PrintScaleMode.Fit;
+    }
 
     lock (printSessionsLock)
     {

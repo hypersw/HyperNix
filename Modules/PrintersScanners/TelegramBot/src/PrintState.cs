@@ -71,8 +71,11 @@ public sealed class PendingPrint
     public required PendingPrintKind Kind { get; init; }
     public int? PixelWidth { get; init; }
     public int? PixelHeight { get; init; }
-    /// Image dpi from the file's metadata, when present and ≥ minimum
-    /// for "1:1 makes sense" (see <see cref="MinReasonableDpi"/>).
+    /// Image dpi from the file's metadata, when present. Falls back to
+    /// 96 dpi at point-of-use when null (Windows screenshot / ImageSharp
+    /// PNG default — see PrintPreview's `originalSourceDpi` and the
+    /// PLAN.md "Print Flow Update 2026-05-17" entry for the rationale
+    /// for dropping the previous MinReasonableDpi=100 floor).
     public int? Dpi { get; init; }
     public PrintScaleMode Scale { get; set; } = PrintScaleMode.Fit;
     public PrintOrientation Orientation { get; set; } = PrintOrientation.Auto;
@@ -130,7 +133,11 @@ public sealed class PendingPrint
     /// edge density. Surfaced in the caption for visibility / tuning.
     public ClassifierStats? ClassifierStats { get; set; }
 
-    public const int MinReasonableDpi = 100;
+    /// Fallback DPI used by the "1:1 fits?" check when the image has
+    /// no embedded resolution metadata. Matches the same fallback the
+    /// preview / print pipeline uses for the upscaler's pHYs stamp,
+    /// so the badge and the actual print agree on what 1:1 means.
+    public const double NoMetadataFallbackDpi = 96.0;
     /// Tolerance for the "1:1 fits?" check. A 1 mm slop catches
     /// rounding-error overflows on otherwise page-sized scans
     /// without classifying them as "won't fit".
@@ -156,11 +163,18 @@ public sealed class PendingPrint
         get
         {
             if (Kind != PendingPrintKind.Image) return OneToOneFit.NotApplicable;
-            if (Dpi is not int d || d < MinReasonableDpi) return OneToOneFit.NotApplicable;
             if (PixelWidth is not int w || PixelHeight is not int h)
                 return OneToOneFit.NotApplicable;
-            var shortIn = Math.Min(w, h) / (double)d;
-            var longIn  = Math.Max(w, h) / (double)d;
+            // No metadata-DPI floor: a missing/sub-100 pHYs no longer
+            // suppresses the 1:1 verdict. Screenshots commonly report
+            // 96 dpi (or nothing) and we still want to surface "fits"
+            // / "overflows" honestly, plus drive the coverage-based
+            // default-mode picker in Program.cs.
+            var d = Dpi is int explicitDpi
+                ? (double)explicitDpi
+                : NoMetadataFallbackDpi;
+            var shortIn = Math.Min(w, h) / d;
+            var longIn  = Math.Max(w, h) / d;
             var slopIn = FitSlopMm * InchesPerMm;
             if (shortIn <= PrintableShortInches + slopIn &&
                 longIn  <= PrintableLongInches  + slopIn)
@@ -730,12 +744,17 @@ public static class PrintMessage
         // an explicit positive ✓ when 1:1 fits — the previous "no
         // badge" rendering was ambiguous (does silence mean "fits"
         // or "no info"?).
-        var oneOneLabel = "1:1" + p.Fits1to1 switch
+        var oneOneLabel = p.Fits1to1 switch
         {
-            OneToOneFit.Printable               => " ✓",
-            OneToOneFit.PaperFitsMarginsClipped => " ⚠ margins",
-            OneToOneFit.Overflows               => " ⚠ won't fit",
-            _ => "",
+            OneToOneFit.Printable               => "1:1 ✓",
+            OneToOneFit.PaperFitsMarginsClipped => "1:1 ⚠ margins",
+            // Distinct red marker for the "exceeds paper" case — the
+            // yellow ⚠ on PaperFitsMarginsClipped is a recoverable
+            // trade-off (you lose a couple mm of edge); Overflows
+            // means real content will be cropped off the sheet. The
+            // visual gap keeps it from blending in.
+            OneToOneFit.Overflows               => "1:1 🛑 won't fit",
+            _ => "1:1",
         };
         var rows = new List<InlineKeyboardButton[]>();
         var row = new List<InlineKeyboardButton>
