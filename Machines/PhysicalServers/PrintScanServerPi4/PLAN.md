@@ -2034,3 +2034,52 @@ got blocked by the impl-change inhibitor. The local lock
 divergence comes from /etc/nixos having been manually
 `nix flake update`d at some past point — auto-rebuild itself
 never touches anything but `upstream`.
+
+### Print-job progress wire (added 2026-05-17)
+
+Renderer's `/image-upscale` is `text/event-stream` now. Frames
+(after the standard `data: <json>\n\n` SSE encoding):
+
+  * `{"type":"progress","percent":42.0}` — emitted per percent
+    step from realesrgan-ncnn-vulkan's stdout/stderr. Throttled
+    server-side so duplicate floor()'d values don't flood.
+  * `{"type":"stage","stage":"cpu-fallback"}` — when the auto
+    path bails out of GPU into CPU. Logged in the bot for
+    debug, not surfaced to the user.
+  * `{"type":"error","title":"...","detail":"..."}` — terminal,
+    no `result` follows.
+  * `{"type":"result","bytes":"<base64>"}` — terminal, contains
+    the upscaled PNG inline. Bot decodes and pHYs-stamps the
+    bytes before returning to PrintPreprocess.
+
+Bot's RendererClient consumes the stream incrementally
+(`HttpCompletionOption.ResponseHeadersRead` + `StreamReader.
+ReadLineAsync`) and reports per-pass percent via
+`IProgress<double>` to PrintPreprocess.
+
+PrintPreprocess pre-walks the multi-pass loop's 1.5× ratio
+gate once before the first pass to decide how many passes will
+fire. Surface-area weights (pass N = 16^N units) reserve each
+pass's slice of the global bar. Stage detail is the literal
+"neural pass M of N · KK%" string.
+
+### Future work: CUPS-side progress
+
+Today PrintService is still the stub (writes to disk +
+2-second sleep). When real CUPS lands, `PrintStage.Printing`
+is the slot where its per-job percent shows up:
+
+  * IPP attribute `job-media-progress` is spec for the
+    per-job percent (cups-tools exposes via `lpstat -o
+    PRINTER -W not-completed` and `cupsGetJobs2`).
+  * For HP P2015n via foo2zjs the practical granularity is
+    per-page, not per-byte — `job-impressions-completed` /
+    `job-impressions` gives the right ratio.
+  * Poll on a ~1 s timer while the job is in flight; feed the
+    bot's `BotPrintSession.PrintProgress` field same as the
+    preprocess path. The live message already has the
+    "🖨 Printing X" stage line, only the bar needs filling in.
+
+Until then `PrintStage.Printing` shows the stage label with
+no bar (PrintProgress=-1), which is fine for the stub's 2-s
+sleep but worth fleshing out before real prints can land.
