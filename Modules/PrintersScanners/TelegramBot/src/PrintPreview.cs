@@ -1,3 +1,4 @@
+using Microsoft.Extensions.Logging;
 using PrintScan.Shared;
 using SixLabors.ImageSharp;
 using SixLabors.ImageSharp.Drawing;
@@ -416,8 +417,15 @@ public static class PrintPreprocess
         UpscalerChoice upscalerChoice,
         Func<byte[], string, int, double, CancellationToken, Task<byte[]?>>? neuralUpscaler,
         string fileName,
+        Microsoft.Extensions.Logging.ILogger? logger,
         CancellationToken ct)
     {
+        // Step-log everything that happens. Print is operator-initiated
+        // (one user, low volume, no PII concerns), so trading log
+        // verbosity for full pipeline reconstructability from journal
+        // is the right call — if a print looks wrong we want to be
+        // able to tell which step compromised it without re-running.
+        logger ??= Microsoft.Extensions.Logging.Abstractions.NullLogger.Instance;
         // Source metadata read (DPI in particular) needs to happen
         // BEFORE the neural upscale so we can pass it through to the
         // upscaler client — which uses it to stamp the right pHYs
@@ -435,9 +443,19 @@ public static class PrintPreprocess
         // own PNG default) when the source has no pHYs at all. Matches
         // PendingPrint.NoMetadataFallbackDpi so the "1:1 fits?" badge
         // in the UI and the preview-pipeline assumption agree.
-        var originalSourceDpi = (origHRes > 0 && origVRes > 0)
+        var hasMetadataDpi = origHRes > 0 && origVRes > 0;
+        var originalSourceDpi = hasMetadataDpi
             ? Math.Min(origHRes, origVRes)
             : 96.0;
+        logger.LogInformation(
+            "preprocess {File}: source {W}x{H} px, dpi={Dpi} ({Source}), " +
+            "paper={PaperShort}x{PaperLong}in, " +
+            "margins L={ML}/R={MR}/T={MT}/B={MB} mm, scale={Scale}, orient={Orient}",
+            fileName, sourceInfo.Width, sourceInfo.Height,
+            originalSourceDpi, hasMetadataDpi ? "metadata" : "fallback-96",
+            paperShortInches, paperLongInches,
+            margins.LeftMm, margins.RightMm, margins.TopMm, margins.BottomMm,
+            scale, orientation);
 
         // Classifier reads a quick downsampled thumbnail of the
         // source to decide the upscaler route. Disposed before we
@@ -456,6 +474,11 @@ public static class PrintPreprocess
             UpscalerChoice.Graphics => ContentClass.Graphics,
             _ => autoClass,
         };
+        logger.LogInformation(
+            "preprocess {File}: classifier auto={Auto} (colours={Colours}, edges={Edges:P1}), " +
+            "user-choice={Choice} => effective={Effective}",
+            fileName, autoClass, classStats.UniqueQuantisedColours,
+            classStats.EdgeDensity, upscalerChoice, effectiveClass);
 
         // Source bytes that'll be Lanczos3'd to the final 600 dpi
         // target. For Graphics: run Real-ESRGAN ×4, and if the result
@@ -503,6 +526,11 @@ public static class PrintPreprocess
             var currentDpi   = originalSourceDpi;
             var appliedScale = 1;
 
+            logger.LogInformation(
+                "preprocess {File}: neural-upscale starting, target long axis = {TargetLong} px " +
+                "(canvas long = paper × {Dpi} dpi)",
+                fileName, targetLongPx, TargetDpi);
+
             for (int pass = 0; pass < 2; pass++)
             {
                 // Stop overshooting beyond ~1.1×: if we're already
@@ -511,19 +539,39 @@ public static class PrintPreprocess
                 // remaining gap. Specifically, we proceed only when
                 // another ×4 would land us comfortably past target.
                 var remainingRatio = (double)targetLongPx / currentLong;
-                if (remainingRatio < 1.5 && pass > 0) break;
+                if (remainingRatio < 1.5 && pass > 0)
+                {
+                    logger.LogInformation(
+                        "preprocess {File}: neural pass {Pass} skipped, " +
+                        "remaining ratio {Ratio:F2} < 1.5 (already ≥ 66 % of target)",
+                        fileName, pass, remainingRatio);
+                    break;
+                }
                 // First pass always runs (we entered this branch
                 // because the bot routed Graphics → neural); the
                 // ratio check only gates the SECOND pass.
 
+                logger.LogInformation(
+                    "preprocess {File}: neural pass {Pass} start, " +
+                    "input long={InLong} dpi={InDpi}, scale=×4, remaining ratio={Ratio:F2}",
+                    fileName, pass, currentLong, currentDpi, remainingRatio);
+                var passSw = System.Diagnostics.Stopwatch.StartNew();
                 var passBytes = await neuralUpscaler(
                     currentBytes, fileName, 4, currentDpi, ct);
+                passSw.Stop();
                 if (passBytes is null)
                 {
                     // Neural failed on this pass. If pass 0: signal
                     // fallback to caller, fall through to Lanczos3
                     // from source. If pass 1: keep what pass 0 gave
                     // us (already a valid Neural result).
+                    logger.LogWarning(
+                        "preprocess {File}: neural pass {Pass} FAILED after {Elapsed:F1}s; " +
+                        "{Outcome}",
+                        fileName, pass, passSw.Elapsed.TotalSeconds,
+                        pass == 0
+                            ? "falling back to Lanczos3 from source"
+                            : "keeping pass-0 result, skipping further passes");
                     if (pass == 0)
                         upscalerUsed = UpscalerUsed.NeuralFailedFellBackToLanczos;
                     break;
@@ -533,6 +581,11 @@ public static class PrintPreprocess
                 currentDpi   *= 4;
                 appliedScale *= 4;
                 upscalerUsed = UpscalerUsed.Neural;
+                logger.LogInformation(
+                    "preprocess {File}: neural pass {Pass} OK in {Elapsed:F1}s, " +
+                    "now long={OutLong} dpi={OutDpi}, cumulative ×{Cum}",
+                    fileName, pass, passSw.Elapsed.TotalSeconds,
+                    currentLong, currentDpi, appliedScale);
 
                 // Done if the next pass would clearly overshoot the
                 // overshoot — pass 0 ratio check above handles
@@ -600,6 +653,12 @@ public static class PrintPreprocess
         var marginBPx = (int)Math.Round(margins.BottomMm * TargetDpi / 25.4);
         var printableW = canvasW - marginLPx - marginRPx;
         var printableH = canvasH - marginTPx - marginBPx;
+        logger.LogInformation(
+            "preprocess {File}: canvas={CW}x{CH} px (full paper), " +
+            "printable={PW}x{PH} px (canvas minus margins L={ML}/R={MR}/T={MT}/B={MB} px), " +
+            "effective orient={Orient}",
+            fileName, canvasW, canvasH, printableW, printableH,
+            marginLPx, marginRPx, marginTPx, marginBPx, effectiveOrient);
 
         // Pre-rotate the working image for landscape so its long axis
         // ends up across the canvas's long axis. After rotation:
@@ -656,6 +715,14 @@ public static class PrintPreprocess
         // Stretch because we've already locked the target W×H
         // ourselves and don't want ImageSharp's own aspect-handling
         // to second-guess (which it does in Max / Pad modes).
+        logger.LogInformation(
+            "preprocess {File}: scale-mode {Mode} → content rect {CW}x{CH} px " +
+            "(from working {WW}x{WH} px @ {WD} dpi); Lanczos3 ratio H={Rh:F3} V={Rv:F3} " +
+            "({Direction})",
+            fileName, scale, contentW, contentH, srcW, srcH, workingDpi,
+            (double)contentW / srcW, (double)contentH / srcH,
+            (contentW >= srcW && contentH >= srcH) ? "up"
+                : (contentW <= srcW && contentH <= srcH) ? "down" : "mixed");
         rgbImage.Mutate(c => c
             .Resize(new ResizeOptions
             {
@@ -676,6 +743,10 @@ public static class PrintPreprocess
         var offsetY = (canvasH - contentH) / 2;
         canvas.Mutate(c =>
             c.DrawImage(grayContent, new Point(offsetX, offsetY), 1.0f));
+        logger.LogInformation(
+            "preprocess {File}: composited at ({Ox},{Oy}) into white {CW}x{CH} L8 canvas; " +
+            "wrapping to PDF",
+            fileName, offsetX, offsetY, canvasW, canvasH);
         canvas.Metadata.HorizontalResolution = TargetDpi;
         canvas.Metadata.VerticalResolution   = TargetDpi;
         canvas.Metadata.ResolutionUnits =
@@ -686,6 +757,13 @@ public static class PrintPreprocess
         // has all of that baked in.
         var pdfBytes = PrintPdfWrap.WrapImage(
             canvas, paperShortInches, paperLongInches);
+        logger.LogInformation(
+            "preprocess {File}: PDF wrap done, MediaBox={MW:F1}x{MH:F1} pt " +
+            "({PaperShort}x{PaperLong} in), image XObject={CW}x{CH} px /Interpolate=false, " +
+            "{Bytes} byte PDF; pipeline complete (upscaler={Upscaler}, finalDpi={Dpi})",
+            fileName, paperShortInches * 72.0, paperLongInches * 72.0,
+            paperShortInches, paperLongInches, canvasW, canvasH,
+            pdfBytes.Length, upscalerUsed, TargetDpi);
 
         return new Result(pdfBytes, canvasW, canvasH, TargetDpi,
             contentClass, classStats, upscalerUsed);

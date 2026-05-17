@@ -1096,6 +1096,12 @@ async Task StageBytesForPrintAsync(
         pending.Scale = (coverage is >= 0.25 and <= 1.10 && fits)
             ? PrintScaleMode.OneToOne
             : PrintScaleMode.Fit;
+        log.LogInformation(
+            "staged {File}: {W}x{H} px @ {Dpi} dpi ({DpiSrc}) → {SI:F2}x{LI:F2} in, " +
+            "coverage={Cov:P0}, 1:1 verdict={Verdict}, default scale={Scale}",
+            fileName, pw, ph, (int)d,
+            pending.Dpi is int ? "metadata" : "fallback-96",
+            shortIn, longIn, coverage, pending.Fits1to1, pending.Scale);
     }
 
     lock (printSessionsLock)
@@ -1569,6 +1575,7 @@ async Task ExecutePrintAsync(long chatId, string pendingId, CancellationToken ct
                     p.UpscalerChoice,
                     neural,
                     p.FileName,
+                    log,
                     ct);
                 payloadBytes = processed.PdfBytes;
                 payloadName  = Path.ChangeExtension(p.FileName, ".pdf");
