@@ -231,13 +231,29 @@ app.MapPost("/image-convert", async (HttpRequest request, CancellationToken ct) 
 // when its content classifier flags input as "graphics"; output is
 // a 2×/3×/4× PNG (one of three model variants, picked by `scale`).
 //
-// Hardware path: tries Vulkan first (Pi 5's V3D handles it; Pi 4
-// is best-effort), falls back to CPU mode (-g -1) if Vulkan init
-// errors out. The CPU fallback is the resilience story when running
-// under a Vulkan-less render farm — slower (10× ish) but always works.
-// Caller can override the path via `gpu` form field: "auto" (default,
-// try GPU then CPU), "gpu" (Vulkan only, fail if not available),
-// "cpu" (force CPU, skip Vulkan attempt).
+// Hardware path: the binary is ncnn-vulkan-only — it calls
+// vkCreateInstance unconditionally at process startup, BEFORE the
+// `-g` flag is consulted, so there is no "Vulkan-less" execution
+// path. "CPU mode" (`-g -1`) inside this binary just means "use
+// the loader's first ICD without device-side compute", not "skip
+// Vulkan init". A host with no ICDs at all fails in ~10 ms with
+// `vkCreateInstance failed -9 / invalid gpu device`.
+//
+// Pi 5 deployment hits this directly: hardware.graphics.enable is
+// off (stage-1 boot stall), so no ICDs are registered globally.
+// The renderer service therefore wires VK_ICD_FILENAMES =
+// {mesa}/share/vulkan/icd.d/lvp_icd.<arch>.json (Mesa's llvmpipe
+// software Vulkan) at the systemd-unit env level. v3dv (the Pi 5's
+// real V3D7 driver) was tested and fails to compile ncnn's compute
+// shaders; details in PLAN.md "Neural upscale on the Pi 5 — Vulkan
+// ICD investigation".
+//
+// Caller can override the path via `gpu` form field: "auto"
+// (default — try GPU first, fall back to CPU mode within the
+// available ICD), "gpu" (Vulkan device only, fail if not exposed),
+// "cpu" (force CPU mode via `-g -1`). On llvmpipe both modes are
+// CPU under the hood; the gpu/cpu distinction matters only on
+// hosts with a hardware Vulkan device.
 app.MapPost("/image-upscale", async (HttpRequest request, CancellationToken ct) =>
 {
     var form = await request.ReadFormAsync(ct);

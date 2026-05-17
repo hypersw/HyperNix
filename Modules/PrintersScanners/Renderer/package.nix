@@ -89,4 +89,18 @@ pkgs.buildDotnetModule {
   # Pin libreoffice as a runtime dep so it's part of the package
   # closure — the systemd unit doesn't otherwise reference it.
   passthru.libreoffice = pkgs.libreoffice;
+
+  # Mesa + vulkan-loader pinned here so the renderer's nix closure
+  # carries them, and so the systemd unit in default.nix can grab
+  # the same store paths without re-importing nixpkgs. Real-ESRGAN's
+  # ncnn-vulkan backend requires a working Vulkan ICD at process
+  # init — it calls vkCreateInstance before honouring the -g -1
+  # (CPU mode) flag, so a bare "no ICD" environment fails fast even
+  # in CPU mode. Pi 5's hardware V3DV driver compiles the model's
+  # compute shaders incorrectly ("Failed to pack instruction" → core
+  # dump in 17 s), so the only viable ICD on this hardware is Mesa's
+  # llvmpipe (software Vulkan). default.nix wires VK_ICD_FILENAMES
+  # to the llvmpipe ICD only.
+  passthru.mesa = pkgs.mesa;
+  passthru.vulkanLoader = pkgs.vulkan-loader;
 }

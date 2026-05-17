@@ -67,6 +67,38 @@ in
         # shutdown-hang fix as the print/scan daemon. See the long
         # comment in ../Daemon/default.nix for the full story.
         DOTNET_EnableDiagnostics_Debugger = "0";
+
+        # Vulkan wiring for Real-ESRGAN-ncnn-vulkan.
+        #
+        # The binary calls vkCreateInstance unconditionally at startup,
+        # before the -g flag is consulted, so even "CPU mode" demands a
+        # working Vulkan ICD on disk. On a fresh GhostHome (no
+        # hardware.graphics.enable) there is no ICD registered, hence
+        # the production failure pattern:
+        #     vkCreateInstance failed -9 / invalid gpu device
+        # in 0.0 s on both attempts.
+        #
+        # We can't turn on hardware.graphics.enable globally — it stalls
+        # stage-1 init on this Pi 5 image (suspected race between v3d/vc4
+        # KMS init and the rest of stage 1). So this is a renderer-
+        # service-local Vulkan setup: bind the loader's library into
+        # LD_LIBRARY_PATH and point VK_ICD_FILENAMES at the LLVM-pipe ICD
+        # only. Mesa's v3dv driver (hardware Vulkan on the Pi 5's V3D 7)
+        # was tested — it fails to compile the realesr-animevideov3
+        # compute shaders ("MESA: error: Failed to pack instruction …
+        # utof t197.l, t196; thrsw") and core-dumps in ~17 s. Until that
+        # Mesa-v3dv-vs-ncnn-vulkan-compute issue is fixed upstream, the
+        # only viable ICD on the Pi is llvmpipe.
+        #
+        # Llvmpipe is pure CPU Vulkan — needs no /dev/dri access, no
+        # video/render group, no kernel modules. Benchmarked on a
+        # 500x647 → 2000x2588 (×4) realesr-animevideov3 run: ~30 s
+        # on Pi 5 four-core, vs ~10 s on a desktop x86 with the same
+        # llvmpipe.
+        LD_LIBRARY_PATH = "${rendererPackage.vulkanLoader}/lib";
+        VK_ICD_FILENAMES =
+          "${rendererPackage.mesa}/share/vulkan/icd.d/lvp_icd."
+          + "${pkgs.stdenv.hostPlatform.parsed.cpu.name}.json";
       };
 
       serviceConfig = {
