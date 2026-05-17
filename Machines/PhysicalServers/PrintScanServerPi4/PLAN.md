@@ -1883,3 +1883,46 @@ where we have full control of the kernel and sampling.
   4. Multi-pass neural upscale (overshoot then Lanczos-down).
   5. UX: drop MinReasonableDpi, coverage-driven default mode,
      red-overrun badge on 1:1 button.
+
+### Real-paper test patterns to run at 600 dpi 1:1
+
+For verifying the pipeline end-to-end on the actual printer once
+hardware is connected. Goal: catch any sub-pixel scaling drift,
+nearest-neighbor misfit, and resolving-power loss between source
+PNG and toner-on-paper.
+
+Off-the-shelf charts (general resolution / MTF):
+
+  * USAF 1951 three-bar chart — find the smallest still-resolvable
+    group. Public domain, easy printable PDFs at
+    en.wikipedia.org/wiki/1951_USAF_resolution_test_chart and
+    sites.astro.caltech.edu/~lah/ay105/pdf/e2-usaf1951.pdf.
+  * Siemens star — radial spokes, aliasing visible as
+    hyperbolic-divergence in the centre.
+    blog.kasson.com/lens-screening-testing/printable-siemens-star-targets/
+  * Ronchi rulings — fixed-frequency square-wave gratings;
+    cleanest moiré-against-engine-grid indicator.
+  * Bealecorner curated PDFs (incl. ISO 12233):
+    bealecorner.org/red/test-patterns/.
+
+Custom patterns we should generate (pixel-defined at 4962×7014):
+these expose the specific failure modes the engine-grid-lockstep
+design is supposed to prevent, and the public charts don't cover
+them well because they're defined in mm, not pixels.
+
+  * Nyquist combs — alternating black/white 1-px rows (horizontal,
+    vertical, 45°). Any resampling in the chain collapses these
+    to grey.
+  * Single-pixel diagonals at 0.5°, 1°, 2°, 5° — periodic jogs
+    against a straight ruler reveal sub-pixel drift, with each
+    jog spaced 1/(scale-error) pixels.
+  * 1-px-dot grid at 8/16/32 px spacing — missing or doubled
+    dots reveal cumulative drift.
+  * 1-px-thick concentric circles — radial moiré if the bitmap
+    isn't pixel-aligned.
+
+A small generator that emits a single 4962×7014 PNG combining
+these (USAF group + Siemens star + the four pixel-locked patterns)
+would be the canonical "did the whole stack stay pixel-perfect"
+acceptance test. ImageSharp does this cleanly — defer until we
+have a real printer attached.
