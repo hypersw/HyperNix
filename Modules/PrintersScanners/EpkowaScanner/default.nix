@@ -33,7 +33,36 @@ let
   # x86_64 side uses the same nixpkgs as the host — the stub only does pure
   # CPU work (ESC/I byte munging) under qemu-user, which handles arbitrary
   # glibc syscalls fine. No USB ioctl drama since USB stays aarch64-native.
-
+  #
+  # ── BUILD-TIME CHICKEN-AND-EGG (read before failing here) ──
+  # The store paths derived from pkgsX86 below (notably
+  # pkgsX86.epkowa.plugins.*) are x86_64-linux derivations. To
+  # MATERIALISE them in the local store during `nixos-rebuild
+  # switch`, nix needs one of:
+  #
+  #   - A cache hit on cache.nixos.org (epkowa plugins are unfree;
+  #     Hydra coverage is patchy, so don't assume).
+  #   - A remote x86_64 builder configured via nix.buildMachines.
+  #   - Local qemu-x86_64 binfmt registration on THIS HOST.
+  #
+  # The binfmt switch is `boot.binfmt.emulatedSystems` — set below
+  # under the `registerX86_64Binfmt` option. The option defaults
+  # to whatever `enable` is, so a happy-path one-step switch works
+  # when cache substitution succeeds.
+  #
+  # The hazard case: a host where cache substitution misses AND
+  # binfmt isn't already registered. nixos-rebuild build runs on
+  # the CURRENT system, before activation, so flipping `enable`
+  # → true won't register binfmt in time for the build that
+  # depends on it. Result: build fails with "a 'x86_64-linux'
+  # builder is required to build /nix/store/...drv".
+  #
+  # If you hit that here, pre-stage binfmt one auto-rebuild cycle
+  # in advance by setting:
+  #   hypersw.services.epkowa-scanner.registerX86_64Binfmt = true;
+  # WITHOUT setting `enable = true`. Wait for the switch to
+  # activate, then flip `enable = true` in a second commit. The
+  # second build phase now has qemu-x86_64 available.
   pkgsX86 = import pkgs.path { system = "x86_64-linux"; config.allowUnfree = true; };
 
   # Rust stub, cross-compiled to x86_64 (rustPlatform uses native cross-
@@ -87,6 +116,35 @@ in
   options.hypersw.services.epkowa-scanner = {
     enable = lib.mkEnableOption "Epson Perfection V33 scanning via SANE/epkowa";
 
+    registerX86_64Binfmt = lib.mkOption {
+      type = lib.types.bool;
+      default = cfg.enable;
+      description = ''
+        Register qemu-user x86_64-linux binfmt on this host. Needed
+        at RUNTIME to execute the x86_64 IPC stub helper that loads
+        the proprietary Epson interpreter, and at BUILD time on a
+        non-x86_64 host to build the x86_64 plugin derivations that
+        appear in the scanner's closure (when those aren't already
+        cached on a binary substituter).
+
+        Defaults to whatever <literal>enable</literal> is — happy
+        path: one-step switch works when cache substitution covers
+        the x86_64 plugins.
+
+        Hazard case: on a host where x86_64 plugins aren't cached
+        AND no remote x86_64 builder is configured, the FIRST
+        switch to <literal>enable = true</literal> fails because
+        the build phase runs on the current system (no binfmt yet,
+        the option only activates after the switch completes).
+        Pre-stage by setting <literal>registerX86_64Binfmt = true</literal>
+        explicitly one auto-rebuild cycle BEFORE flipping
+        <literal>enable = true</literal> — the next switch then has
+        qemu-x86_64 available during its build phase. See the long
+        comment block above <literal>pkgsX86</literal> in this
+        module for the full story.
+      '';
+    };
+
     airsane.enable = lib.mkOption {
       type = lib.types.bool;
       default = true;
@@ -115,7 +173,18 @@ in
     };
   };
 
-  config = lib.mkIf cfg.enable {
+  config = lib.mkMerge [
+    # x86_64 binfmt — opt-in, decoupled from `enable` so an operator
+    # can pre-stage it one auto-rebuild cycle ahead of the full
+    # enable. Cheap when standalone (just qemu-x86_64 + systemd
+    # binfmt registration at boot), so the only reason this isn't
+    # always-on is to keep the closure small on hosts that never
+    # use the scanner.
+    (lib.mkIf cfg.registerX86_64Binfmt {
+      boot.binfmt.emulatedSystems = [ "x86_64-linux" ];
+    })
+
+    (lib.mkIf cfg.enable {
     hardware.sane = {
       enable = true;
       extraBackends = [ iscanWithIpcProxy ];
@@ -144,5 +213,6 @@ in
 
     services.saned.enable = true;
     networking.firewall.allowedTCPPorts = [ 6566 ];
-  };
+    })
+  ];
 }

@@ -137,13 +137,13 @@ in
       allowedUsers = cfg.bot.allowedUsers;
     };
 
-    # ── x86_64 binfmt for the EpkowaScanner stub ──
-    # The Epson scanner driver path uses a short-lived x86_64 helper
-    # per scan (see EpkowaStubX64/PROTOCOL.md). qemu-user runs it
-    # transparently. The binfmt registration is system-wide, not
-    # daemon-local, so it lives at this composition layer.
-    boot.binfmt.emulatedSystems =
-      lib.mkIf cfg.epkowaScanner.enable [ "x86_64-linux" ];
+    # x86_64 binfmt registration for the Epson stub now lives in
+    # the EpkowaScanner module itself (decoupled from `enable` via
+    # `registerX86_64Binfmt`, defaulted to `enable`) so an operator
+    # can pre-stage it without enabling the full scanner stack —
+    # see the long header comment in
+    # Modules/PrintersScanners/EpkowaScanner/default.nix for the
+    # chicken-and-egg this avoids on first activation.
 
     # ── fonts ─────────────────────────────────────────────────────
     fonts.packages = lib.mkIf cfg.fonts.enable (with pkgs; [

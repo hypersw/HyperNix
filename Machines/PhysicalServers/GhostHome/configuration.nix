@@ -227,18 +227,23 @@
   # header for the full workflow rationale.
   hypersw.system.bootOnce.enable = true;
 
-  # ── PrintScanServer (workload, not infrastructure) — off ───
-  # PHASE 1 (now): GhostHome boots, is reachable, has telemetry,
-  # auto-rebuilds-on-push. No print/scan workload.
-  # PHASE 2 (later, interactively from the booted live config):
-  # uncomment the block below and resolve whatever breaks. It
-  # was the cause of the first-boot build failure — the
-  # EpkowaScanner leg pulls in an x86_64-linux derivation (the
-  # proprietary Epson interpreter stub) and the provisioning
-  # image / Pi build host doesn't have qemu-x86_64 binfmt
-  # registered, so the cross-arch derivation can't be built.
-  # Tractable but not on the critical path.
+  # ── PrintScanServer (workload, not infrastructure) ─────────
+  # STAGE 1 (this commit): pre-register x86_64-linux qemu-user
+  # binfmt on the running system, WITHOUT enabling the scanner
+  # stack or the broader print/scan profile. The scanner module's
+  # closure references x86_64 derivations (the proprietary Epson
+  # interpreter plugins via `pkgsX86.epkowa.plugins.*`); if those
+  # aren't already cached on cache.nixos.org and binfmt isn't
+  # already registered on the build host, the first switch that
+  # enables the scanner fails because `nixos-rebuild build` runs
+  # on the CURRENT system, before activation. Two-step
+  # activation gives the next build phase access to qemu-x86_64
+  # so cross-arch derivations can be built locally.
   #
+  # STAGE 2 (next commit, after this one's auto-rebuild lands):
+  # uncomment the `printScanServer` block below.
+  hypersw.services.epkowa-scanner.registerX86_64Binfmt = true;
+
   # hypersw.profiles.printScanServer = {
   #   enable = true;
   #   bot = {
