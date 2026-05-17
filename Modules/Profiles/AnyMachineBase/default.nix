@@ -272,6 +272,19 @@ in
           keep-outputs = true;
           keep-derivations = true;
         };
+        # Deprioritise nix-daemon (and the build workers it spawns)
+        # to the kernel's lowest scheduling class on both CPU and
+        # IO. SCHED_IDLE / ionice idle means "run only when nothing
+        # else wants the CPU / disk" — so a months-spanning kernel
+        # rebuild on a Pi 5 (where nixpkgs' linuxPackages_rpi5
+        # cache-misses against our nixos-unstable pin and we pay a
+        # ~3h source build each monthly auto-upgrade) yields
+        # immediately to telegram-bot, scanner driver, Home
+        # Assistant, etc.  Build wall-time goes up under contention
+        # (an idle box still gets full CPU/IO), but the box stays
+        # responsive throughout the build window.
+        daemonCPUSchedPolicy = "idle";
+        daemonIOSchedClass   = "idle";
         gc = {
           automatic = true;
           # Day after the auto-upgrade window so any breakage gets
