@@ -415,9 +415,19 @@ public static class PrintPreprocess
         double paperShortInches, double paperLongInches,
         PrintableMargins margins,
         UpscalerChoice upscalerChoice,
-        Func<byte[], string, int, double, CancellationToken, Task<byte[]?>>? neuralUpscaler,
+        // (source, name, scale, srcDpi, IProgress<double>?, ct) → Task<byte[]?>
+        // IProgress<double> emits 0..100 over a single neural pass; this
+        // function maps those into a global percent across however many
+        // passes will fire, weighted by surface area (pass N's
+        // contribution = 16^N units, see comment in the loop).
+        Func<byte[], string, int, double, IProgress<double>?, CancellationToken, Task<byte[]?>>? neuralUpscaler,
         string fileName,
         Microsoft.Extensions.Logging.ILogger? logger,
+        // Reports overall preprocess progress to the caller: int = 0..100
+        // global percent across the whole preprocess pipeline; string =
+        // optional stage detail (e.g. "neural pass 1 of 2"). Null when
+        // not interested.
+        Action<int, string?>? onProgress,
         CancellationToken ct)
     {
         // Step-log everything that happens. Print is operator-initiated
@@ -497,6 +507,32 @@ public static class PrintPreprocess
             var targetLongPx = (int)Math.Round(
                 Math.Max(paperShortInches, paperLongInches) * TargetDpi);
 
+            // Predict how many neural passes will fire so we can
+            // pre-compute progress weights. The loop's gate is
+            //   ratio = targetLongPx / currentLong  ≥ 1.5
+            // for pass N>0 (pass 0 always runs). Walk that gate once
+            // up front rather than discovering pass count mid-stream.
+            int expectedPasses = 1;
+            {
+                var initialLong = Math.Max(sourceInfo.Width, sourceInfo.Height);
+                if ((double)targetLongPx / (initialLong * 4) >= 1.5)
+                    expectedPasses = 2;
+            }
+            // Surface-area weights: pass N produces 16^N pixels per
+            // source pixel (×4 each side). Compute time scales roughly
+            // with output area (measured: pass 0 ≈ 30 s, pass 1 ≈
+            // 370 s on Pi 5 llvmpipe; ratio ≈ 12 ×, close to the 16 ×
+            // surface-area weighting). Allocate the bar accordingly.
+            double[] passWeights = new double[expectedPasses];
+            double cumWeight = 0;
+            for (int i = 0; i < expectedPasses; i++)
+            {
+                passWeights[i] = System.Math.Pow(16, i + 1);
+                cumWeight += passWeights[i];
+            }
+            double totalWeight = cumWeight;
+            double completedWeight = 0;
+
             // Multi-pass loop. State tracked between passes:
             //   currentBytes   — the latest neural output (PNG with
             //                    correctly-stamped pHYs).
@@ -556,9 +592,40 @@ public static class PrintPreprocess
                     "input long={InLong} dpi={InDpi}, scale=×4, remaining ratio={Ratio:F2}",
                     fileName, pass, currentLong, currentDpi, remainingRatio);
                 var passSw = System.Diagnostics.Stopwatch.StartNew();
+                // Map this pass's 0..100 inner percent onto the slice
+                // of the global bar this pass owns. completed weight
+                // already covers prior passes; this pass adds up to
+                // passWeights[pass] units as it runs.
+                double startPctForPass = completedWeight / totalWeight * 100.0;
+                double passSpanPct = passWeights[pass] / totalWeight * 100.0;
+                int lastReportedGlobal = -1;
+                var passProgress = new Progress<double>(innerPct =>
+                {
+                    var global = startPctForPass + (innerPct / 100.0) * passSpanPct;
+                    var globalI = (int)System.Math.Floor(global);
+                    if (globalI != lastReportedGlobal)
+                    {
+                        lastReportedGlobal = globalI;
+                        onProgress?.Invoke(
+                            globalI,
+                            expectedPasses > 1
+                                ? $"neural pass {pass + 1} of {expectedPasses} · {innerPct:F0}%"
+                                : $"neural · {innerPct:F0}%");
+                    }
+                });
+                // Initial-state notification: bot wants to swap from
+                // "Preparing" indeterminate to a real bar immediately
+                // when the pass starts, even before realesrgan emits
+                // its first percent line (≈3 s of model load latency).
+                onProgress?.Invoke(
+                    (int)System.Math.Floor(startPctForPass),
+                    expectedPasses > 1
+                        ? $"neural pass {pass + 1} of {expectedPasses} · 0%"
+                        : "neural · 0%");
                 var passBytes = await neuralUpscaler(
-                    currentBytes, fileName, 4, currentDpi, ct);
+                    currentBytes, fileName, 4, currentDpi, passProgress, ct);
                 passSw.Stop();
+                completedWeight += passWeights[pass];
                 if (passBytes is null)
                 {
                     // Neural failed on this pass. If pass 0: signal

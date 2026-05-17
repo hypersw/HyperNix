@@ -157,6 +157,7 @@ public sealed class RendererClient : IDisposable
     /// </summary>
     public async Task<byte[]?> UpscaleAsync(
         byte[] sourceBytes, string fileName, int scale, double sourceDpi,
+        IProgress<double>? progress,
         CancellationToken ct)
     {
         if (!Enabled)
@@ -178,23 +179,107 @@ public sealed class RendererClient : IDisposable
             content.Add(new System.Net.Http.StringContent("realesr-animevideov3"), "model");
             content.Add(new System.Net.Http.StringContent("auto"), "gpu");
 
+            using var req = new System.Net.Http.HttpRequestMessage(
+                System.Net.Http.HttpMethod.Post, "/image-upscale")
+            { Content = content };
+            req.Headers.Accept.ParseAdd("text/event-stream");
+
             var sw = System.Diagnostics.Stopwatch.StartNew();
-            using var resp = await _http.PostAsync("/image-upscale", content, ct);
-            sw.Stop();
+            // HttpCompletionOption.ResponseHeadersRead so we get the
+            // body stream as soon as the renderer's set headers and
+            // flushed (which it does eagerly so the bot can start
+            // rendering "0 %" immediately rather than after the first
+            // ~5 s of upscale work).
+            using var resp = await _http.SendAsync(req,
+                System.Net.Http.HttpCompletionOption.ResponseHeadersRead, ct);
             if (!resp.IsSuccessStatusCode)
             {
                 var detail = (await resp.Content.ReadAsStringAsync(ct)).Trim();
                 if (detail.Length > 600) detail = detail[..600] + "…";
-                // Error-level so the operator's journalctl filter
-                // catches it — this is the "report to monitoring"
-                // hook for the upscaler-failure case.
                 _logger.LogError(
                     "neural upscale FAILED for {File}: HTTP {Status} — {Detail}; " +
                     "falling back to Lanczos3",
                     fileName, (int)resp.StatusCode, detail);
                 return null;
             }
-            var rawBytes = await resp.Content.ReadAsByteArrayAsync(ct);
+
+            // Stream the SSE response. Frames are
+            //   "data: <json>\n\n"
+            // where <json> is one of:
+            //   { "type": "progress", "percent": 42.0 }
+            //   { "type": "stage",    "stage":   "cpu-fallback" }
+            //   { "type": "error",    "title":   "...", "detail": "..." }
+            //   { "type": "result",   "bytes":   "<base64>" }
+            await using var body = await resp.Content.ReadAsStreamAsync(ct);
+            using var reader = new System.IO.StreamReader(body, System.Text.Encoding.UTF8);
+            var frame = new System.Text.StringBuilder();
+            byte[]? rawBytes = null;
+            string? errorTitle = null, errorDetail = null;
+            while (!ct.IsCancellationRequested)
+            {
+                var line = await reader.ReadLineAsync(ct);
+                if (line is null) break;     // EOF
+                if (line.Length == 0)
+                {
+                    if (frame.Length == 0) continue;
+                    var payload = frame.ToString();
+                    frame.Clear();
+                    using var doc = System.Text.Json.JsonDocument.Parse(payload);
+                    var root = doc.RootElement;
+                    var type = root.GetProperty("type").GetString();
+                    switch (type)
+                    {
+                        case "progress":
+                            if (root.TryGetProperty("percent", out var pctEl))
+                                progress?.Report(pctEl.GetDouble());
+                            break;
+                        case "stage":
+                            // Stage transitions inside one upscale call
+                            // (e.g. cpu-fallback). Logged for debug but
+                            // doesn't bubble to the bot — caller treats
+                            // the whole call as one logical pass.
+                            _logger.LogDebug(
+                                "neural upscale stage transition: {Stage}",
+                                root.TryGetProperty("stage", out var st)
+                                    ? st.GetString() : "?");
+                            break;
+                        case "error":
+                            errorTitle  = root.TryGetProperty("title",  out var t)
+                                ? t.GetString() : "?";
+                            errorDetail = root.TryGetProperty("detail", out var d)
+                                ? d.GetString() : null;
+                            break;
+                        case "result":
+                            if (root.TryGetProperty("bytes", out var b))
+                                rawBytes = System.Convert.FromBase64String(b.GetString() ?? "");
+                            break;
+                    }
+                    continue;
+                }
+                if (line.StartsWith("data: ", System.StringComparison.Ordinal))
+                    frame.Append(line[6..]);
+                else if (line.StartsWith("data:", System.StringComparison.Ordinal))
+                    frame.Append(line[5..]);
+                // Other field lines (event:, id:, retry:) ignored.
+            }
+            sw.Stop();
+
+            if (errorTitle is not null)
+            {
+                _logger.LogError(
+                    "neural upscale FAILED for {File}: {Title} — {Detail}; " +
+                    "falling back to Lanczos3",
+                    fileName, errorTitle, errorDetail);
+                return null;
+            }
+            if (rawBytes is null)
+            {
+                _logger.LogError(
+                    "neural upscale FAILED for {File}: stream ended without a " +
+                    "result event ({Bytes}B received); falling back to Lanczos3",
+                    fileName, body.Length);
+                return null;
+            }
 
             // pHYs enforcement: realesrgan-ncnn strips resolution
             // metadata. We know what it SHOULD be (sourceDpi × scale
@@ -203,12 +288,24 @@ public sealed class RendererClient : IDisposable
             // the PNG with the correct pHYs stamp before returning.
             var stampedBytes = await StampPngDpiAsync(rawBytes, sourceDpi * scale, ct);
 
+            // Final "100 %" — the renderer's last progress event lands
+            // just before its `result` event, but ncnn-vulkan's percent
+            // line maxes at 91.67 % (it stops emitting once the writer
+            // thread takes over the tail). Push a synthetic 100 % so
+            // the bot's bar lands clean.
+            progress?.Report(100.0);
+
             _logger.LogInformation(
                 "neural upscale OK for {File}: {InBytes}B → {OutBytes}B " +
                 "(stamped @ {Dpi:F0} dpi) in {Elapsed:F1}s",
                 fileName, sourceBytes.Length, stampedBytes.Length,
                 sourceDpi * scale, sw.Elapsed.TotalSeconds);
             return stampedBytes;
+        }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested)
+        {
+            throw;  // let the bot's cancel path see this as a cancel,
+                    // not a transient null
         }
         catch (Exception ex)
         {

@@ -254,22 +254,41 @@ app.MapPost("/image-convert", async (HttpRequest request, CancellationToken ct) 
 // "cpu" (force CPU mode via `-g -1`). On llvmpipe both modes are
 // CPU under the hood; the gpu/cpu distinction matters only on
 // hosts with a hardware Vulkan device.
-app.MapPost("/image-upscale", async (HttpRequest request, CancellationToken ct) =>
+// Note: this endpoint returns text/event-stream rather than a one-shot
+// PNG. Each line of realesrgan-ncnn-vulkan's stdout that matches "NN.NN%"
+// becomes a `progress` SSE event; the final upscaled PNG goes out as a
+// terminal `result` event with the bytes base64-encoded inline. The bot
+// consumes this with a streaming HTTP client so it can paint a live
+// progress bar in Telegram during the ~30 s pass-0 / ~6 min pass-1
+// neural work on the Pi 5 (llvmpipe-software-Vulkan CPU path).
+//
+// We could split progress (SSE) from result (separate GET) to avoid
+// base64 overhead, but base64 on a ~7 MB PNG is ~9.3 MB string — fits
+// comfortably in HTTP/1.1 chunked body and JsonSerializer's UTF-8
+// writer, and keeps the bot's failure paths simpler (one connection
+// owns the whole lifecycle).
+app.MapPost("/image-upscale", async (HttpContext ctx, CancellationToken ct) =>
 {
+    var request = ctx.Request;
+    if (!request.HasFormContentType)
+    {
+        ctx.Response.StatusCode = StatusCodes.Status400BadRequest;
+        await ctx.Response.WriteAsync("No multipart form body", ct);
+        return;
+    }
     var form = await request.ReadFormAsync(ct);
     var file = form.Files.FirstOrDefault();
-    if (file is null) return Results.BadRequest("No file provided");
-    if (file.Length <= 0) return Results.BadRequest("Empty file");
+    if (file is null || file.Length <= 0)
+    {
+        ctx.Response.StatusCode = StatusCodes.Status400BadRequest;
+        await ctx.Response.WriteAsync("No file provided", ct);
+        return;
+    }
 
     var scaleStr = form["scale"].FirstOrDefault() ?? "4";
     if (!int.TryParse(scaleStr, out var scaleX) || scaleX < 2 || scaleX > 4)
         scaleX = 4;
     var modelName = form["model"].FirstOrDefault() ?? "realesr-animevideov3";
-    // The animevideov3 model is split into x2/x3/x4 variants on disk
-    // (separate .bin/.param per scale). Compose the model name
-    // accordingly — this is realesrgan-ncnn-vulkan's required syntax,
-    // it doesn't accept "scale" as a separate flag for this model
-    // family.
     var modelKey = modelName == "realesr-animevideov3"
         ? $"{modelName}-x{scaleX}"
         : modelName;
@@ -284,6 +303,49 @@ app.MapPost("/image-upscale", async (HttpRequest request, CancellationToken ct) 
         "image-upscale {Job}: {File} ({Bytes} B), model={Model}, ×{Scale}, gpu={Gpu}",
         jobId, file.FileName, file.Length, modelKey, scaleX, gpuPref);
 
+    // Set up the SSE response shape eagerly. Headers go out before any
+    // tool runs so the bot can attach to the stream and render the
+    // "Preparing… 0 %" state immediately.
+    ctx.Response.StatusCode = StatusCodes.Status200OK;
+    ctx.Response.ContentType = "text/event-stream";
+    ctx.Response.Headers.CacheControl = "no-cache, no-transform";
+    ctx.Response.Headers["X-Accel-Buffering"] = "no";
+    await ctx.Response.Body.FlushAsync(ct);
+
+    var sseJson = new System.Text.Json.JsonSerializerOptions
+    {
+        DefaultIgnoreCondition = System.Text.Json.Serialization.JsonIgnoreCondition.WhenWritingNull,
+    };
+
+    async Task EmitAsync(object payload)
+    {
+        var json = System.Text.Json.JsonSerializer.Serialize(payload, sseJson);
+        var frame = "data: " + json + "\n\n";
+        await ctx.Response.WriteAsync(frame, ct);
+        await ctx.Response.Body.FlushAsync(ct);
+    }
+
+    // Throttle progress events: realesrgan emits ~120 lines per pass on
+    // Pi 5 (one per ≈0.25 s); we don't want to flood the bot. Drop any
+    // line whose floor(pct) didn't move from the previous emit. Final
+    // line (>= 100) always emits.
+    var lastPctEmitted = -1;
+    Func<string, Task> onLine = async (line) =>
+    {
+        line = line.Trim();
+        if (line.Length < 2 || line[^1] != '%') return;
+        var numeric = line[..^1];
+        if (!double.TryParse(numeric,
+                System.Globalization.NumberStyles.Float,
+                System.Globalization.CultureInfo.InvariantCulture,
+                out var pct))
+            return;
+        var floored = (int)System.Math.Floor(pct);
+        if (floored == lastPctEmitted && pct < 100) return;
+        lastPctEmitted = floored;
+        await EmitAsync(new { type = "progress", percent = pct });
+    };
+
     try
     {
         var inputPath = Path.Combine(jobDir, MakeSafeFilename(file.FileName ?? "input"));
@@ -291,8 +353,6 @@ app.MapPost("/image-upscale", async (HttpRequest request, CancellationToken ct) 
             await file.CopyToAsync(fs, ct);
         var outputPath = Path.Combine(jobDir, "out.png");
 
-        // Run with the requested compute path; auto = try Vulkan,
-        // fall back to CPU on failure.
         async Task RunUpscale(bool useGpu)
         {
             var args = new List<string>
@@ -308,7 +368,13 @@ app.MapPost("/image-upscale", async (HttpRequest request, CancellationToken ct) 
                 ToolPaths.RealEsrgan, args,
                 jobDir, jobId,
                 useGpu ? "realesrgan-vulkan" : "realesrgan-cpu",
-                log, ct, TimeSpan.FromMinutes(5));
+                log, ct, TimeSpan.FromMinutes(20),
+                // Realesrgan writes percent lines to stderr, not
+                // stdout — surprised me but matches the binary's
+                // behaviour. Wire the callback on both streams to
+                // be robust against future build changes.
+                onStdoutLine: onLine,
+                onStderrLine: onLine);
         }
 
         try
@@ -317,7 +383,7 @@ app.MapPost("/image-upscale", async (HttpRequest request, CancellationToken ct) 
             {
                 case "gpu":  await RunUpscale(useGpu: true);  break;
                 case "cpu":  await RunUpscale(useGpu: false); break;
-                default:                                              // "auto"
+                default:
                     try { await RunUpscale(useGpu: true); }
                     catch (RenderFailedException ex)
                     {
@@ -325,10 +391,9 @@ app.MapPost("/image-upscale", async (HttpRequest request, CancellationToken ct) 
                             "image-upscale {Job}: Vulkan path failed ({Err}); " +
                             "falling back to CPU mode",
                             jobId, Trunc(ex.Details, 200));
-                        // CPU fallback is the resilience story —
-                        // a Vulkan-less host (Pi 4 sometimes, headless
-                        // CI) still produces output, just slower.
                         if (File.Exists(outputPath)) File.Delete(outputPath);
+                        await EmitAsync(new { type = "stage", stage = "cpu-fallback" });
+                        lastPctEmitted = -1;
                         await RunUpscale(useGpu: false);
                     }
                     break;
@@ -339,30 +404,45 @@ app.MapPost("/image-upscale", async (HttpRequest request, CancellationToken ct) 
             log.LogWarning(
                 "image-upscale {Job}: {Tool} failed: {Err}",
                 jobId, ex.Tool, Trunc(ex.Details));
-            return Results.Problem(
-                title: ex.Friendly, detail: ex.Details, statusCode: 502);
+            await EmitAsync(new
+            {
+                type = "error",
+                title = ex.Friendly,
+                detail = Trunc(ex.Details, 400),
+            });
+            return;
         }
 
         if (!File.Exists(outputPath))
-            return Results.Problem(
-                title: "neural upscaler produced no output",
-                detail: "realesrgan exited 0 but no output PNG at " + outputPath,
-                statusCode: 502);
+        {
+            await EmitAsync(new
+            {
+                type = "error",
+                title = "neural upscaler produced no output",
+                detail = "realesrgan exited 0 but no output PNG at " + outputPath,
+            });
+            return;
+        }
 
         var bytes = await File.ReadAllBytesAsync(outputPath, ct);
         log.LogInformation(
             "image-upscale {Job}: produced {Bytes} byte PNG",
             jobId, bytes.Length);
-        return Results.File(bytes,
-            contentType: "image/png",
-            fileDownloadName: Path.GetFileNameWithoutExtension(file.FileName ?? "out") + ".upscaled.png");
+        await EmitAsync(new
+        {
+            type = "result",
+            bytes = System.Convert.ToBase64String(bytes),
+        });
+    }
+    catch (OperationCanceledException) when (ct.IsCancellationRequested)
+    {
+        log.LogInformation("image-upscale {Job}: client cancelled mid-stream", jobId);
     }
     catch (Exception ex)
     {
         log.LogError(ex, "image-upscale {Job} crashed", jobId);
-        return Results.Problem(
-            title: "image-upscale crashed",
-            detail: ex.Message, statusCode: 500);
+        try { await EmitAsync(new { type = "error", title = "image-upscale crashed", detail = ex.Message }); }
+        catch { }
     }
     finally
     {
@@ -658,7 +738,9 @@ static async Task<(int pageCount, string raw)> PdfInfoAsync(
 static async Task RunToolAsync(
     string exe, IReadOnlyList<string> args,
     string workDir, string jobId, string toolName,
-    ILogger log, CancellationToken ct, TimeSpan timeout)
+    ILogger log, CancellationToken ct, TimeSpan timeout,
+    Func<string, Task>? onStdoutLine = null,
+    Func<string, Task>? onStderrLine = null)
 {
     var psi = new ProcessStartInfo(exe)
     {
@@ -677,12 +759,26 @@ static async Task RunToolAsync(
 
     using var killCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
     killCts.CancelAfter(timeout);
-    var stdoutTask = proc.StandardOutput.ReadToEndAsync(killCts.Token);
-    var stderrTask = proc.StandardError.ReadToEndAsync(killCts.Token);
+
+    // Reader strategy: when a per-line callback is wired in (used by
+    // /image-upscale for SSE progress), stream line-by-line and invoke
+    // the callback on each. Otherwise fall back to the bulk
+    // ReadToEndAsync that buffers the whole output until exit — same
+    // shape as before, no behaviour change for the rest of the
+    // pipeline (soffice, pandoc, magick, …).
+    Task<string> stdoutTask = onStdoutLine is not null
+        ? ReadLinesAsync(proc.StandardOutput, onStdoutLine, killCts.Token)
+        : proc.StandardOutput.ReadToEndAsync(killCts.Token);
+    Task<string> stderrTask = onStderrLine is not null
+        ? ReadLinesAsync(proc.StandardError, onStderrLine, killCts.Token)
+        : proc.StandardError.ReadToEndAsync(killCts.Token);
+
     try { await proc.WaitForExitAsync(killCts.Token); }
     catch (OperationCanceledException)
     {
         try { proc.Kill(entireProcessTree: true); } catch { }
+        if (ct.IsCancellationRequested)
+            throw;  // caller-initiated cancel: let it propagate
         throw new RenderFailedException(toolName,
             $"{toolName} timed out after {timeout.TotalSeconds:F0}s",
             "Killed by parent. " +
@@ -720,6 +816,39 @@ static string MakeSafeFilename(string name)
 
 static string Trunc(string s, int max = 800) =>
     s.Length <= max ? s : s[..max] + "…";
+
+/// <summary>
+/// Stream a process's stdout/stderr line by line, invoke a callback on
+/// each, and ALSO accumulate the full output so the caller still gets
+/// the same "complete captured output" that ReadToEndAsync would have
+/// produced. Used by /image-upscale to push realesrgan's percent
+/// lines out over SSE while keeping the bulk-captured output around
+/// for the post-mortem log line and the RenderFailedException's
+/// `details` field on a non-zero exit.
+///
+/// Realesrgan-ncnn-vulkan emits one line per percent step
+/// ("0.00%\n8.33%\n16.67%\n...100.00%"), interleaved with one-time
+/// banner lines (GPU enumeration, model load). Both go through the
+/// same channel; the caller parses what it cares about.
+/// </summary>
+static async Task<string> ReadLinesAsync(
+    System.IO.StreamReader reader,
+    Func<string, Task> onLine,
+    CancellationToken ct)
+{
+    var sb = new System.Text.StringBuilder();
+    while (!ct.IsCancellationRequested)
+    {
+        string? line;
+        try { line = await reader.ReadLineAsync(ct); }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested) { break; }
+        if (line is null) break;
+        sb.Append(line).Append('\n');
+        try { await onLine(line); }
+        catch { /* a flaky callback must not break process draining */ }
+    }
+    return sb.ToString();
+}
 
 namespace PrintScan.Renderer
 {

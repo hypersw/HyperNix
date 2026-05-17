@@ -183,21 +183,11 @@ public static class StatusMessage
         }
         else
         {
-            var bar = $"⏳ {ProgressBar(s.ScanProgress)} {s.ScanProgress}%";
+            var bar = $"⏳ {BotUiBits.ProgressBar(s.ScanProgress)} {s.ScanProgress}%";
             scanLabel = s.QueuedScans > 0 ? $"{bar} +{s.QueuedScans}" : bar;
         }
         rows.Add(new[] { InlineKeyboardButton.WithCallbackData(scanLabel, $"scan:{sid}") });
         return new InlineKeyboardMarkup(rows);
-    }
-
-    // Progress bar for the in-flight scan status line. 10 segments,
-    // ▰ filled / ▱ empty — monospaced in Telegram, reads cleanly
-    // across desktop and mobile clients. Caps at 10/10 even if the
-    // daemon's estimate reports >100 (shouldn't, but be defensive).
-    private static string ProgressBar(int pct)
-    {
-        var filled = Math.Clamp(pct / 10, 0, 10);
-        return new string('▰', filled) + new string('▱', 10 - filled);
     }
 
     // Radio-button emojis for current-selection indication in the

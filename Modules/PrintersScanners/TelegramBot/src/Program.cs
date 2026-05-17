@@ -1253,6 +1253,12 @@ async Task HandlePrintCallbackAsync(long chatId, string data, CancellationToken 
     //   print:set:<scale|orient>:<pendingId>:<value> — apply value, back to main
     //   print:confirm:<pendingId>                    — kick off the print
     //   print:cancel:<pendingId>                     — drop the pending
+    //   print:cancelprinting:<pendingId>             — abort an in-flight print
+    //                                                  (CTS cancel → renderer
+    //                                                  kills realesrgan;
+    //                                                  pending stays for
+    //                                                  retry with different
+    //                                                  options)
     var parts = data.Split(':');
     if (parts.Length < 3) return;
     var verb = parts[1];
@@ -1366,6 +1372,27 @@ async Task HandlePrintCallbackAsync(long chatId, string data, CancellationToken 
                 }
             }
             await RenderPrintSessionAsync(chatId, ct);
+            break;
+        }
+        case "cancelprinting":
+        {
+            // Mid-print abort. The print task itself owns its CTS;
+            // tapping Cancel just trips it. ExecutePrintAsync's
+            // catch (OperationCanceledException) branch handles the
+            // re-render + restores the pending menu. We deliberately
+            // leave bs.Pending in place so a follow-up "tweak setting
+            // and re-Confirm" works without re-uploading.
+            var pid = parts[2];
+            if (!MatchesCurrent(pid)) return;
+            CancellationTokenSource? cts;
+            lock (printSessionsLock)
+            {
+                cts = s.PrintCts;
+            }
+            cts?.Cancel();
+            // Cancel doesn't immediately re-render — ExecutePrintAsync
+            // does that itself in its catch / finally so we don't race
+            // with its in-flight RenderPrintSessionAsync calls.
             break;
         }
         case "confirm":
@@ -1518,6 +1545,7 @@ async Task HandlePrintCallbackAsync(long chatId, string data, CancellationToken 
 async Task ExecutePrintAsync(long chatId, string pendingId, CancellationToken ct)
 {
     PendingPrint? p;
+    CancellationTokenSource printCts;
     lock (printSessionsLock)
     {
         if (!printSessions.TryGetValue(chatId, out var bs)) return;
@@ -1525,7 +1553,18 @@ async Task ExecutePrintAsync(long chatId, string pendingId, CancellationToken ct
         if (bs.Printing) return;          // re-entry guard
         bs.Printing = true;
         p = bs.Pending;
+        // Linked CTS so the cancel-button handler can trip it without
+        // having to touch the bot's process-wide ct. Tearing this down
+        // is the finally block's job; nulling PrintCts there keeps
+        // ghost cancellation attempts from a stale post-print tap
+        // from doing anything.
+        printCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+        bs.PrintCts = printCts;
+        bs.PrintStage = PrintStage.Preparing;
+        bs.PrintStageDetail = "";
+        bs.PrintProgress = -1;
     }
+    var ctP = printCts.Token;
     await RenderPrintSessionAsync(chatId, ct);
 
     bool ok = false;
@@ -1562,11 +1601,31 @@ async Task ExecutePrintAsync(long chatId, string pendingId, CancellationToken ct
                 // on any failure (logged at Error level so journalctl
                 // catches it as the monitoring hook); PrintPreprocess
                 // falls back to Lanczos3 when null.
-                Func<byte[], string, int, double, CancellationToken, Task<byte[]?>>? neural =
+                Func<byte[], string, int, double, IProgress<double>?, CancellationToken, Task<byte[]?>>? neural =
                     renderer.Enabled
-                        ? (data, name, sf, srcDpi, c) =>
-                            renderer.UpscaleAsync(data, name, sf, srcDpi, c)
+                        ? (data, name, sf, srcDpi, prog, c) =>
+                            renderer.UpscaleAsync(data, name, sf, srcDpi, prog, c)
                         : null;
+                // Plumb preprocess progress up to the live TG message.
+                // PrintPreprocess emits global percent + a stage detail
+                // (e.g. "neural pass 1 of 2 · 42 %"); we just stash on
+                // the session and re-render. Editing TG is rate-limited
+                // by TG's bot API anyway (1 edit / a few seconds); the
+                // bot's outer SSE → state-update → render loop drives
+                // the cadence.
+                void onPreprocessProgress(int pct, string? detail)
+                {
+                    lock (printSessionsLock)
+                    {
+                        if (!printSessions.TryGetValue(chatId, out var bsPp)) return;
+                        bsPp.PrintProgress = pct;
+                        bsPp.PrintStageDetail = detail ?? "";
+                    }
+                    // Render fires-and-forgets so we don't block the
+                    // neural pipeline on TG-API latency. Bot API
+                    // already handles its own rate-limit / retry.
+                    _ = RenderPrintSessionAsync(chatId, ct);
+                }
                 var processed = await PrintPreprocess.ProcessForPrintAsync(
                     p.Data,
                     p.Scale, p.Orientation,
@@ -1576,7 +1635,8 @@ async Task ExecutePrintAsync(long chatId, string pendingId, CancellationToken ct
                     neural,
                     p.FileName,
                     log,
-                    ct);
+                    onPreprocessProgress,
+                    ctP);
                 payloadBytes = processed.PdfBytes;
                 payloadName  = Path.ChangeExtension(p.FileName, ".pdf");
                 payloadCt    = "application/pdf";
@@ -1604,6 +1664,15 @@ async Task ExecutePrintAsync(long chatId, string pendingId, CancellationToken ct
                         processed.Dpi, payloadBytes.Length);
                 }
             }
+            catch (OperationCanceledException) when (ctP.IsCancellationRequested)
+            {
+                // User-initiated cancel mid-preprocess (most common
+                // case — graphics-class neural upscale takes ~7 min).
+                // Re-throw out of ExecutePrintAsync so the outer catch
+                // sees it and routes to the cancel cleanup branch
+                // (preserve Pending, no history entry, render menu).
+                throw;
+            }
             catch (Exception ex)
             {
                 // Fail-open: ship the original bytes if pre-processing
@@ -1614,6 +1683,17 @@ async Task ExecutePrintAsync(long chatId, string pendingId, CancellationToken ct
                     p.FileName);
             }
         }
+
+        lock (printSessionsLock)
+        {
+            if (printSessions.TryGetValue(chatId, out var bsStage))
+            {
+                bsStage.PrintStage = PrintStage.Sending;
+                bsStage.PrintStageDetail = "";
+                bsStage.PrintProgress = -1;
+            }
+        }
+        await RenderPrintSessionAsync(chatId, ct);
 
         using var content = new MultipartFormDataContent();
         var fileContent = new ByteArrayContent(payloadBytes);
@@ -1645,9 +1725,50 @@ async Task ExecutePrintAsync(long chatId, string pendingId, CancellationToken ct
                 return new System.Net.Sockets.NetworkStream(sock, ownsSocket: true);
             }
         }) { BaseAddress = new Uri("http://localhost") };
-        var resp = await http.PostAsync("/print", content, ct);
+        // We can't cleanly separate "uploading to daemon" from "daemon
+        // is shipping to printer" client-side — POST blocks until the
+        // daemon's PrintAsync returns. Flip the stage now anyway so
+        // the user sees "Printing" while the daemon's stub-sleep
+        // (today) / CUPS job-poll (future) runs — closer to the truth
+        // than "Sending" for the whole duration.
+        lock (printSessionsLock)
+        {
+            if (printSessions.TryGetValue(chatId, out var bsP))
+            {
+                bsP.PrintStage = PrintStage.Printing;
+                bsP.PrintStageDetail = "";
+                bsP.PrintProgress = -1;
+            }
+        }
+        await RenderPrintSessionAsync(chatId, ct);
+
+        var resp = await http.PostAsync("/print", content, ctP);
         ok = resp.IsSuccessStatusCode;
         if (!ok) error = $"HTTP {(int)resp.StatusCode}";
+    }
+    catch (OperationCanceledException) when (ctP.IsCancellationRequested && !ct.IsCancellationRequested)
+    {
+        // User-initiated cancel (Cancel button → CTS trip). Distinct
+        // from a real failure: the Pending stays so the user can
+        // tweak settings (e.g. flip Upscaler to Photo) and re-tap
+        // ✅ Print without re-uploading.
+        log.LogInformation("print of {File} cancelled by user", p?.FileName);
+        lock (printSessionsLock)
+        {
+            if (printSessions.TryGetValue(chatId, out var bsCx))
+            {
+                bsCx.Printing = false;
+                bsCx.PrintCts = null;
+                bsCx.PrintStage = PrintStage.None;
+                bsCx.PrintStageDetail = "";
+                bsCx.PrintProgress = -1;
+                // Pending stays put on purpose — see comment on the
+                // print:cancelprinting handler.
+            }
+        }
+        printCts.Dispose();
+        await RenderPrintSessionAsync(chatId, ct);
+        return;
     }
     catch (Exception ex)
     {
@@ -1660,6 +1781,10 @@ async Task ExecutePrintAsync(long chatId, string pendingId, CancellationToken ct
         if (printSessions.TryGetValue(chatId, out var bs))
         {
             bs.Printing = false;
+            bs.PrintCts = null;
+            bs.PrintStage = PrintStage.None;
+            bs.PrintStageDetail = "";
+            bs.PrintProgress = -1;
 
             // Mid-duplex transition: pass 1 succeeded, leave the
             // pending alive so pass 2 can pick up where it left off.
@@ -1698,6 +1823,7 @@ async Task ExecutePrintAsync(long chatId, string pendingId, CancellationToken ct
             }
         }
     }
+    printCts.Dispose();
     await RenderPrintSessionAsync(chatId, ct);
 }
 

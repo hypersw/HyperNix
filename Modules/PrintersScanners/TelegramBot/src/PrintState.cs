@@ -47,6 +47,29 @@ public sealed class BotPrintSession
     /// to swap the keyboard out for a "printing…" caption.
     public bool Printing { get; set; }
 
+    /// Cancellation source for the in-flight print job. Created when
+    /// ExecutePrintAsync starts (and linked with the bot's process-
+    /// wide ct); cleared in its finally block. Cancel-button taps
+    /// during Printing call <see cref="CancellationTokenSource.Cancel"/>
+    /// here, which propagates all the way down to the renderer's
+    /// realesrgan subprocess kill via the HTTP client.
+    public CancellationTokenSource? PrintCts { get; set; }
+
+    /// Current pipeline stage while <see cref="Printing"/>. Drives the
+    /// header line ("🧠 Preparing…" / "🖨 Printing…") in the live
+    /// message — what the user sees changes mid-job as we move from
+    /// preprocess into actually shipping the bytes.
+    public PrintStage PrintStage { get; set; } = PrintStage.None;
+
+    /// Free-form stage-detail (e.g. "neural pass 2 of 2") appended
+    /// after the stage label. Empty when no detail to surface.
+    public string PrintStageDetail { get; set; } = "";
+
+    /// 0..100, weighted across the whole print pipeline. -1 means
+    /// "indeterminate" (show spinner, no bar) — used during stages
+    /// like "uploading to daemon" where percent isn't meaningful.
+    public int PrintProgress { get; set; } = -1;
+
     /// Last few completed jobs, newest-first. Trimmed at
     /// <see cref="HistoryCap"/> so the session message doesn't grow
     /// unboundedly.
@@ -293,6 +316,32 @@ public enum DuplexPhase
 }
 
 /// <summary>
+/// Pipeline stage of an in-flight print. Drives the live-message
+/// header so the user can tell apart "we're still preparing the
+/// bitmap on the Pi" from "we shipped it, printer is now chewing
+/// on it". The preprocessing pass dominates wall time when neural
+/// upscale fires (~7 min on the Pi 5's CPU Vulkan), so making the
+/// distinction visible matters — without it a 7-minute wait for
+/// preprocess looks indistinguishable from a stuck job.
+/// </summary>
+public enum PrintStage
+{
+    /// Idle (printer session not actively printing).
+    None,
+    /// Image preprocess: classifier, neural upscale (×4 + optional
+    /// ×4), Lanczos finish, PDF wrap. Where the bulk of the time
+    /// goes for graphics-class images.
+    Preparing,
+    /// Uploading the prepared PDF to the daemon over the local
+    /// socket. Brief but non-zero on slow IO.
+    Sending,
+    /// Daemon has the bytes, ships them to CUPS, printer rasterises
+    /// and prints. Today: stub print (~2 s); future: actual CUPS
+    /// where job-media-progress gives a real per-page percent.
+    Printing,
+}
+
+/// <summary>
 /// Parser/serializer for CUPS page-range notation
 /// (e.g. "1-3,5,7-9"). Used both by the per-page checkbox UI
 /// (toggle ↔ string conversion) and by the digit-keyboard custom-
@@ -446,9 +495,38 @@ public static class PrintMessage
             {
                 DuplexPhase.OddPrinting  => "Printing odd pages of",
                 DuplexPhase.EvenPrinting => "Printing even pages of",
-                _ => "Printing",
+                _ => null,
             };
-            lines.Add($"⏳ <b>{phaseLabel}</b> {EscapeHtml(s.Pending?.FileName ?? "…")}");
+            // Pipeline-stage line. The PrintStage drives the emoji +
+            // label so the user can tell apart "still processing the
+            // bitmap on the Pi" from "shipped to CUPS, printer is
+            // chewing on it". Bar emitted when we have a usable
+            // percent (PrintProgress >= 0); otherwise an indeterminate
+            // spinner-ish caption.
+            var (stageIcon, stageWord) = s.PrintStage switch
+            {
+                PrintStage.Preparing => ("🧠", "Preparing"),
+                PrintStage.Sending   => ("📤", "Sending to printer"),
+                PrintStage.Printing  => ("🖨", "Printing"),
+                _                     => ("⏳", phaseLabel ?? "Printing"),
+            };
+            var detail = string.IsNullOrEmpty(s.PrintStageDetail)
+                ? ""
+                : $" · <i>{EscapeHtml(s.PrintStageDetail)}</i>";
+            lines.Add(
+                $"{stageIcon} <b>{stageWord}</b> " +
+                $"{EscapeHtml(s.Pending?.FileName ?? "…")}{detail}");
+            if (s.PrintProgress >= 0)
+            {
+                lines.Add(
+                    $"<code>{BotUiBits.ProgressBar(s.PrintProgress)}</code> " +
+                    $"{s.PrintProgress}%");
+            }
+            // The legacy phase-label (Odd/Even duplex) shows below
+            // the stage line so the duplex wizard's two-pass flow
+            // is still spelled out when active.
+            if (phaseLabel is not null)
+                lines.Add($"   <i>({phaseLabel})</i>");
         }
         else if (s.Pending is { } p)
         {
@@ -600,6 +678,26 @@ public static class PrintMessage
 
     private static InlineKeyboardMarkup? RenderMain(BotPrintSession s)
     {
+        // While a print is in flight, the only meaningful action is
+        // abort. Cancel here propagates all the way to the renderer's
+        // realesrgan subprocess via the per-session CTS (see
+        // BotPrintSession.PrintCts and ExecutePrintAsync's wiring).
+        // After cancellation the pending stays put so the user can
+        // tweak options (e.g. flip Upscaler to Photo) and re-tap
+        // ✅ Print without re-uploading.
+        if (s.Printing && s.Pending is { } printingP)
+        {
+            return new InlineKeyboardMarkup(new[]
+            {
+                new[]
+                {
+                    InlineKeyboardButton.WithCallbackData(
+                        "❌ Cancel",
+                        $"print:cancelprinting:{printingP.Id}"),
+                },
+            });
+        }
+
         // Idle session (no pending, not printing): nothing actionable
         // beyond the deep-link "end" in the header. Returning null
         // strips the inline keyboard entirely; the persistent reply
