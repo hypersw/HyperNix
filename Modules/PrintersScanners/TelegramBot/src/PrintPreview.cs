@@ -447,16 +447,17 @@ public static class PrintPreprocess
         // "input to whatever the Lanczos finish does").
         var sourceInfo = await Image.IdentifyAsync(
             new MemoryStream(sourceBytes, writable: false), ct);
-        var origHRes = sourceInfo.Metadata.HorizontalResolution;
-        var origVRes = sourceInfo.Metadata.VerticalResolution;
-        // Fallback to 96 dpi (Windows screenshot default, ImageSharp's
-        // own PNG default) when the source has no pHYs at all. Matches
-        // PendingPrint.NoMetadataFallbackDpi so the "1:1 fits?" badge
-        // in the UI and the preview-pipeline assumption agree.
-        var hasMetadataDpi = origHRes > 0 && origVRes > 0;
-        var originalSourceDpi = hasMetadataDpi
-            ? Math.Min(origHRes, origVRes)
-            : 96.0;
+        // ImageMetaDpi.ReadMinDpi normalises whatever ImageSharp gives
+        // us (raw pHYs value + ResolutionUnits) into dpi. Windows
+        // screenshots emit pHYs with unit=ppm and value=3780 (= 96 dpi
+        // × 39.37 in/m); without normalisation the preprocess sees
+        // "3780 dpi" and the upscaler pHYs stamp comes out 39× too
+        // high. Fallback to 96 dpi matches PendingPrint.NoMetadataFallbackDpi
+        // so the "1:1 fits?" badge in the UI and the preview-pipeline
+        // assumption agree on what an unstamped image is worth.
+        var dpiMaybe = ImageMetaDpi.ReadMinDpi(sourceInfo.Metadata);
+        var hasMetadataDpi = dpiMaybe is not null;
+        var originalSourceDpi = dpiMaybe ?? 96.0;
         logger.LogInformation(
             "preprocess {File}: source {W}x{H} px, dpi={Dpi} ({Source}), " +
             "paper={PaperShort}x{PaperLong}in, " +
@@ -678,11 +679,12 @@ public static class PrintPreprocess
         // it's whatever the source had. Defensive fallback to the
         // original DPI we measured if the working image's metadata
         // somehow went missing.
-        var workingHRes = rgbImage.Metadata.HorizontalResolution;
-        var workingVRes = rgbImage.Metadata.VerticalResolution;
-        var workingDpi  = (workingHRes > 0 && workingVRes > 0)
-            ? Math.Min(workingHRes, workingVRes)
-            : originalSourceDpi;
+        // Same unit-aware read as above. After our RendererClient
+        // pHYs stamp the working image's metadata is always in
+        // PixelsPerInch (the stamp writes that explicitly), but be
+        // defensive about Photo paths where we didn't restamp.
+        var workingDpi = ImageMetaDpi.ReadMinDpi(rgbImage.Metadata)
+            ?? originalSourceDpi;
 
         // Auto-orientation: source's wider-than-tall hint goes to
         // landscape, else portrait. Resolved once here; the canvas

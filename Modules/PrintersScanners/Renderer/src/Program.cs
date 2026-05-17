@@ -62,6 +62,22 @@ builder.Host.UseSystemd();
 // loop pins a core in StackTrace.ToString allocations.
 builder.WebHost.ConfigureKestrel(opts => opts.ListenHandle((ulong)3));
 
+// Graceful-shutdown window: how long the host keeps Kestrel alive
+// after SIGTERM, letting in-flight requests finish naturally before
+// RequestAborted fires on them. Default is 30 s — fine for soffice /
+// pandoc work but way short for /image-upscale, which on Pi 5 CPU
+// Vulkan takes ~30 s (pass 0) to ~6 min (pass 1). Without this bump,
+// an auto-rebuild that restarts the renderer mid-upscale will abort
+// the bot's HTTP call after 30 s, which kills the realesrgan child
+// and orphans the bot's TG status message at whatever progress it
+// last rendered. Match the unit's TimeoutStopSec (defined in
+// default.nix) with 1 min slack for the SSE final-event write + the
+// host's post-Kestrel cleanup.
+builder.Services.Configure<Microsoft.Extensions.Hosting.HostOptions>(opts =>
+{
+    opts.ShutdownTimeout = System.TimeSpan.FromMinutes(14);
+});
+
 var app = builder.Build();
 var log = app.Services.GetRequiredService<ILogger<Program>>();
 log.LogInformation(

@@ -128,10 +128,16 @@ in
 
         # Hard cap on stop time. soffice processes that hang past this
         # get SIGKILLed by systemd; service Restart=always brings the
-        # daemon back. 30 s comfortably exceeds our in-process render
-        # timeout (2 min cap inside Program.cs is for individual jobs;
-        # this is daemon-shutdown).
-        TimeoutStopSec = "30s";
+        # daemon back. 15 min picked to accommodate /image-upscale
+        # being mid-flight when a service swap (e.g. auto-rebuild)
+        # hits the renderer — on Pi 5 CPU Vulkan, neural pass 1 alone
+        # takes ~6 min for a A4-engine-grid target. The host's
+        # ShutdownTimeout (Program.cs) is set to 14 min, 1 min shorter
+        # than this, so Kestrel finishes draining naturally before
+        # systemd's SIGKILL would land. soffice itself is bounded by
+        # the 2-min per-job cap in Program.cs and doesn't need any of
+        # this headroom — the long tail is neural upscale only.
+        TimeoutStopSec = "15min";
         KillSignal = "SIGTERM";
 
         # ── Hardening ─────────────────────────────────────────────

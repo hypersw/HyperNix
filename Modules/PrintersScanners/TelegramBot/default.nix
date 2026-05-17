@@ -76,10 +76,16 @@ in
         # systemd credential — decrypted file available at $CREDENTIALS_DIRECTORY/telegram-token
         LoadCredential = "telegram-token:${cfg.tokenFile}";
 
-        # Allow graceful drain of in-flight TG uploads on SIGTERM.
-        # 5min upper bound on a single upload (TG's 50MB cap / typical
-        # LAN speeds).
-        TimeoutStopSec = "5min";
+        # Allow graceful drain of in-flight user operations on SIGTERM.
+        # Two kinds of work are counted: scan deliveries (TG re-encode +
+        # upload, capped by TG's 50 MB / typical LAN speeds at a few
+        # minutes) and print pipeline runs (image preprocess + Real-ESRGAN
+        # multi-pass + Lanczos finish + PDF wrap — ~7 min worst-case for
+        # a 500×647 screenshot on Pi 5 llvmpipe, can be longer for larger
+        # graphics-class inputs). 15 min gives the bot's internal drain
+        # (PrintDrainTimeout = 12 min, see Program.cs) headroom for the
+        # actual abort + cleanup to land before systemd's SIGKILL.
+        TimeoutStopSec = "15min";
         KillSignal = "SIGTERM";
         SendSIGHUP = false;
 

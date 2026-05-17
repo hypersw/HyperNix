@@ -60,17 +60,50 @@ var sessionsLock = new Lock();
 var printSessions = new Dictionary<long, BotPrintSession>();
 var printSessionsLock = new Lock();
 
-// In-flight scan-delivery counter. We don't gate concurrency on it
+// In-flight user-op counter. We don't gate concurrency on it
 // (Telegram tolerates parallel uploads to different chats fine) — it
-// only exists so graceful shutdown can wait until pending scans have
-// finished re-encoding and uploading before the process exits.
+// only exists so graceful shutdown can wait until pending operations
+// have finished before the process exits. Counts BOTH scan deliveries
+// AND print-job pipeline runs; the latter dominate when graphics
+// neural upscale fires (multi-minute runs on Pi 5's CPU Vulkan).
 var inFlightCount = 0;
 
 // ── Cancellation / shutdown ─────────────────────────────────────────────────
+//
+// Two CTSes so SIGTERM / Ctrl-C can stop accepting new work without
+// killing in-flight ops:
+//
+//   appCts        — cancelled on SIGTERM. Stops the TG long-poll loop,
+//                   the SSE→daemon subscriber, and the printer-status
+//                   poller. Anything safe to drop on shutdown takes
+//                   appCts.Token.
+//
+//   shutdownCts   — cancelled ONLY when the in-flight drain phase
+//                   times out (~10 min default) or never. ExecutePrintAsync
+//                   uses shutdownCts.Token so a multi-minute neural
+//                   upscale survives the SIGTERM that's freezing the
+//                   poller. Daemon-side ShutdownGate gives /print the
+//                   same property; we needed the matching gate
+//                   bot-side because the print pipeline spends most of
+//                   its wall time in the bot (preprocess + upscale),
+//                   not in the daemon.
+//
+// On SIGTERM/Ctrl-C: appCts cancels immediately. Main's finally then
+// blocks until inFlightCount == 0 OR PrintDrainTimeout elapses, after
+// which shutdownCts.Cancel() forces any stragglers to abort.
 
-using var cts = new CancellationTokenSource();
-Console.CancelKeyPress += (_, e) => { e.Cancel = true; cts.Cancel(); };
-AppDomain.CurrentDomain.ProcessExit += (_, _) => cts.Cancel();
+using var appCts = new CancellationTokenSource();
+using var shutdownCts = new CancellationTokenSource();
+// Drain window for in-flight prints when the bot is asked to stop.
+// Sized larger than the worst-case neural upscale we know about
+// (~7 min for the 500×647 screenshot test case on Pi 5 llvmpipe);
+// any single print taking longer than this is genuinely stuck and
+// killing it is reasonable. Matches the unit's TimeoutStopSec
+// (defined in default.nix) with 2 min slack for the actual abort
+// to land and shutdown to wrap up.
+var PrintDrainTimeout = TimeSpan.FromMinutes(12);
+Console.CancelKeyPress += (_, e) => { e.Cancel = true; appCts.Cancel(); };
+AppDomain.CurrentDomain.ProcessExit += (_, _) => appCts.Cancel();
 
 // ── Bot identity + commands ─────────────────────────────────────────────────
 
@@ -81,7 +114,7 @@ AppDomain.CurrentDomain.ProcessExit += (_, _) => cts.Cancel();
 // make before the main poll loop (which has its own catch+sleep) in a
 // retry with capped exponential back-off.
 var me = await Retry.Transient(
-    () => bot.GetMe(), "bot.GetMe()", log, cts.Token);
+    () => bot.GetMe(), "bot.GetMe()", log, appCts.Token);
 var botUsername = me.Username
     ?? throw new Exception("bot.GetMe() returned no username — token may be wrong");
 log.LogInformation("bot identity: @{Username} (id={Id})", botUsername, me.Id);
@@ -93,7 +126,7 @@ await Retry.Transient(
         new() { Command = "status",  Description = "📊 Printer & scanner status" },
         new() { Command = "help",    Description = "❓ How to use this bot" },
     ]),
-    "bot.SetMyCommands()", log, cts.Token);
+    "bot.SetMyCommands()", log, appCts.Token);
 
 // "…" suffix on Scanner/Printer to convey "this opens a UI" — same
 // connotation as the Windows menu-item ellipsis. Status doesn't get
@@ -109,39 +142,76 @@ log.LogInformation("bot starting, allowed users: {Users}, socket: {Sock}",
 
 // ── Background loops ────────────────────────────────────────────────────────
 
-var sseLoop = Task.Run(() => RunSseLoopAsync(cts.Token));
-var printerPollLoop = Task.Run(() => PollPrinterStatusAsync(cts.Token));
+var sseLoop = Task.Run(() => RunSseLoopAsync(appCts.Token));
+var printerPollLoop = Task.Run(() => PollPrinterStatusAsync(appCts.Token));
 var pollOffset = 0;
 
 try
 {
-    while (!cts.IsCancellationRequested)
+    while (!appCts.IsCancellationRequested)
     {
         try
         {
-            var updates = await bot.GetUpdates(pollOffset, timeout: 30, cancellationToken: cts.Token);
+            var updates = await bot.GetUpdates(pollOffset, timeout: 30, cancellationToken: appCts.Token);
             foreach (var u in updates)
             {
                 pollOffset = u.Id + 1;
-                _ = Task.Run(() => HandleUpdateAsync(u, cts.Token));
+                // HandleUpdateAsync routes user input (callbacks, file
+                // uploads). Those handlers in turn launch
+                // ExecutePrintAsync — which switches its outer ct from
+                // appCts to shutdownCts so a SIGTERM here doesn't kill
+                // a multi-minute neural upscale mid-flight. See the
+                // shutdownCts comment near the top of main.
+                _ = Task.Run(() => HandleUpdateAsync(u, appCts.Token));
             }
         }
         catch (OperationCanceledException) { break; }
         catch (Exception ex)
         {
             log.LogError(ex, "poll error");
-            try { await Task.Delay(5000, cts.Token); } catch { break; }
+            try { await Task.Delay(5000, appCts.Token); } catch { break; }
         }
     }
 }
 finally
 {
-    log.LogInformation("draining in-flight uploads before exit");
+    // Drain phase: appCts already cancelled (the poll/SSE loops are
+    // stopping), but in-flight prints + scan deliveries hold
+    // inFlightCount > 0 until they finish. Wait up to PrintDrainTimeout
+    // for them to complete naturally. Past the deadline, fall back to
+    // shutdownCts.Cancel() so the next layer down (renderer HTTP call,
+    // realesrgan subprocess) gets told to give up.
+    var nInitial = Volatile.Read(ref inFlightCount);
+    if (nInitial > 0)
+    {
+        log.LogInformation(
+            "draining {N} in-flight operation(s) before exit " +
+            "(deadline {Sec:F0}s)",
+            nInitial, PrintDrainTimeout.TotalSeconds);
+    }
     var drainStart = DateTime.UtcNow;
     while (Volatile.Read(ref inFlightCount) > 0 &&
-           DateTime.UtcNow - drainStart < TimeSpan.FromSeconds(30))
+           DateTime.UtcNow - drainStart < PrintDrainTimeout)
     {
-        try { await Task.Delay(100); } catch { break; }
+        try { await Task.Delay(500); } catch { break; }
+    }
+    var nRemaining = Volatile.Read(ref inFlightCount);
+    if (nRemaining > 0)
+    {
+        log.LogWarning(
+            "drain timeout reached after {Sec:F0}s with {N} op(s) still " +
+            "in flight; forcing cancellation",
+            (DateTime.UtcNow - drainStart).TotalSeconds, nRemaining);
+        shutdownCts.Cancel();
+        // Give the now-cancelled stragglers a brief moment to unwind
+        // their finally blocks (TG message edit, etc.).
+        try { await Task.Delay(5_000); } catch { }
+    }
+    else if (nInitial > 0)
+    {
+        log.LogInformation(
+            "drain complete in {Sec:F1}s — all ops finished cleanly",
+            (DateTime.UtcNow - drainStart).TotalSeconds);
     }
     try { await sseLoop; } catch { }
     try { await printerPollLoop; } catch { }
@@ -994,16 +1064,17 @@ async Task StageBytesForPrintAsync(
             // — when the unit is anything else (cm) we'd need to
             // convert; for the printable-direct path here all the
             // formats we accept use PixelsPerInch.
-            // Trust whatever pHYs the file reports. The previous
-            // sub-100 nuke was masking the very screenshots we want
-            // to default Fit on — see the PLAN.md "Print Flow Update
-            // 2026-05-17" entry. PendingPrint.Fits1to1 falls back to
-            // a 96-dpi assumption when Dpi stays null, which keeps
-            // the 1:1 badge meaningful for unstamped screenshots.
-            var hRes = info.Metadata.HorizontalResolution;
-            var vRes = info.Metadata.VerticalResolution;
-            if (hRes > 0 && vRes > 0)
-                dpi = (int)Math.Round(Math.Min(hRes, vRes));
+            // Trust whatever pHYs the file reports — but go through
+            // ImageMetaDpi.ReadMinDpi which honours ResolutionUnits.
+            // Windows screenshots emit pHYs with unit=pixels-per-meter
+            // and value 3780 (= 96 dpi × 39.37 in/m); the previous
+            // "treat HorizontalResolution as dpi" read 3780 as the
+            // dpi, blowing up the 1:1-fit verdict and the upscaler
+            // pHYs stamp. PendingPrint.Fits1to1 falls back to a
+            // 96-dpi assumption when Dpi stays null, which keeps the
+            // 1:1 badge meaningful for unstamped screenshots.
+            var dpiD = ImageMetaDpi.ReadMinDpi(info.Metadata);
+            if (dpiD is double d) dpi = (int)Math.Round(d);
         }
         catch (Exception ex)
         {
@@ -1553,18 +1624,38 @@ async Task ExecutePrintAsync(long chatId, string pendingId, CancellationToken ct
         if (bs.Printing) return;          // re-entry guard
         bs.Printing = true;
         p = bs.Pending;
-        // Linked CTS so the cancel-button handler can trip it without
-        // having to touch the bot's process-wide ct. Tearing this down
-        // is the finally block's job; nulling PrintCts there keeps
-        // ghost cancellation attempts from a stale post-print tap
-        // from doing anything.
-        printCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+        // Linked CTS. Two parents:
+        //   * shutdownCts — the bot-wide "force abort" token. NOT the
+        //     incoming ct (which is appCts.Token, cancelled on SIGTERM).
+        //     Decoupling here is what lets a multi-minute neural upscale
+        //     survive an auto-rebuild-induced bot restart: main's drain
+        //     phase waits up to PrintDrainTimeout for inFlightCount to
+        //     hit zero before tripping shutdownCts. See the shutdownCts
+        //     comment near the top of main and the inFlightCount
+        //     accounting wrapping this whole method.
+        //   * (no explicit parent for the cancel button) — bs.PrintCts
+        //     is what the cancel-print handler trips; same CTS so
+        //     either source cancels the same downstream.
+        printCts = CancellationTokenSource.CreateLinkedTokenSource(shutdownCts.Token);
         bs.PrintCts = printCts;
         bs.PrintStage = PrintStage.Preparing;
         bs.PrintStageDetail = "";
         bs.PrintProgress = -1;
     }
     var ctP = printCts.Token;
+    // Bump the in-flight counter so main's drain phase blocks on this
+    // print finishing. Decrement happens in the unconditional finally
+    // at the end (after all the cancel/error/success branches), via
+    // the local `decremented` flag so we don't double-count if the
+    // method returns early from a catch.
+    Interlocked.Increment(ref inFlightCount);
+    var inFlightDecremented = 0;
+    void DecrementInFlight()
+    {
+        if (Interlocked.Exchange(ref inFlightDecremented, 1) == 0)
+            Interlocked.Decrement(ref inFlightCount);
+    }
+
     await RenderPrintSessionAsync(chatId, ct);
 
     bool ok = false;
@@ -1767,6 +1858,7 @@ async Task ExecutePrintAsync(long chatId, string pendingId, CancellationToken ct
             }
         }
         printCts.Dispose();
+        DecrementInFlight();
         await RenderPrintSessionAsync(chatId, ct);
         return;
     }
@@ -1824,6 +1916,7 @@ async Task ExecutePrintAsync(long chatId, string pendingId, CancellationToken ct
         }
     }
     printCts.Dispose();
+    DecrementInFlight();
     await RenderPrintSessionAsync(chatId, ct);
 }
 
