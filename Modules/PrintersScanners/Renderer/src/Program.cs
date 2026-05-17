@@ -35,13 +35,32 @@ if (Environment.GetEnvironmentVariable("LISTEN_FDS") is null)
 var builder = WebApplication.CreateBuilder(args);
 builder.Host.UseSystemd();
 
-builder.WebHost.ConfigureKestrel(opts =>
-{
-    var sock = new System.Net.Sockets.Socket(
-        new System.Net.Sockets.SafeSocketHandle(
-            new IntPtr(3), ownsHandle: true));
-    opts.ListenHandle((ulong)sock.Handle.ToInt64());
-});
+// systemd-activated socket comes in on fd 3 (LISTEN_FDS protocol).
+// Hand it straight to Kestrel — ListenHandle wraps the raw handle
+// itself.
+//
+// Past bug, this was written as:
+//
+//   builder.WebHost.ConfigureKestrel(opts => {
+//     var sock = new Socket(new SafeSocketHandle((IntPtr)3,
+//                                                ownsHandle: true));
+//     opts.ListenHandle((ulong)sock.Handle.ToInt64());
+//   });
+//
+// — creating an intermediate Socket #1 with `ownsHandle: true`,
+// then passing its handle value to ListenHandle (which internally
+// wraps the same fd 3 in Socket #2). Net result: two Socket objects
+// both implicitly owning fd 3.
+//
+// The lambda returns, `sock` is GC-collectible. As soon as GC
+// finalizes it (~one request worth of allocation pressure later),
+// its finalizer runs and closes fd 3. Linux then reuses fd 3 for
+// the next file-open in the renderer (job dir cleanup, log flush,
+// anything). Kestrel's still-live Socket #2 calls accept() on what
+// it thinks is its listener but is now a regular file → ENOTSOCK
+// → exception storm. Symptom: works exactly once, then the accept
+// loop pins a core in StackTrace.ToString allocations.
+builder.WebHost.ConfigureKestrel(opts => opts.ListenHandle((ulong)3));
 
 var app = builder.Build();
 var log = app.Services.GetRequiredService<ILogger<Program>>();
