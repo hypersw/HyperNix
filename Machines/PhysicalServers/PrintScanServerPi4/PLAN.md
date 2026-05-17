@@ -1926,3 +1926,60 @@ these (USAF group + Siemens star + the four pixel-locked patterns)
 would be the canonical "did the whole stack stay pixel-perfect"
 acceptance test. ImageSharp does this cleanly — defer until we
 have a real printer attached.
+
+### Neural upscale on the Pi 5 — Vulkan ICD investigation (2026-05-17)
+
+Symptom: Real-ESRGAN-ncnn-vulkan binary fails fast on the Pi with
+`vkCreateInstance failed -9 / invalid gpu device` in both Vulkan
+and CPU (`-g -1`) modes. The binary calls vkCreateInstance
+unconditionally before honouring `-g`, so a host with no Vulkan
+ICD at all is a hard fail even for "CPU mode". GhostHome runs
+without `hardware.graphics.enable` because that toggle wedged
+stage-1 init on this Pi 5 image (suspected race between v3d/vc4
+KMS init and the rest of stage 1) — so the global graphics stack
+isn't an option.
+
+Findings from on-Pi experiments (with `nix-shell -p mesa
+vulkan-loader vulkan-tools` and explicit `VK_ICD_FILENAMES`):
+
+  * **lvp_icd.aarch64.json (llvmpipe — Mesa software Vulkan)**:
+    works. No `/dev/dri` access required, no video/render group,
+    no kernel modules. Vulkan 1.4.341 instance comes up; ncnn
+    compute shaders compile and run on CPU.
+    Timing (500x647 grayscale source, realesr-animevideov3 ×4):
+      - pass 0 (500x647 → 2000x2588): ~25–30 s wall-clock
+      - pass 1 (2000x2588 → 8000x10352): ~370 s wall-clock
+      - Lanczos finish + composite: ~5 s
+      - grand total per print job: ~7 min on the Pi 5 four-core
+    For comparison the same pipeline runs in ~45 s on an
+    x86_64 laptop with llvmpipe.
+
+  * **broadcom_icd.aarch64.json (v3dv — Pi 5 V3D7 hardware
+    Vulkan)**: detected (Vulkan 1.3, V3DV Mesa 26.1.0, device
+    "V3D 7.1.10.2"), but ncnn's compute shaders fail to compile:
+      MESA: error: Failed to pack instruction 120: utof t197.l,
+            t196; thrsw
+      MESA: error: Failed to compile MESA_SHADER_COMPUTE prog 29
+            with any strategy
+      vkCreateComputePipelines failed -13
+    Core-dumps in ~17 s. Not usable until Mesa v3dv fixes
+    instruction packing for ncnn's compute pipelines. Worth
+    re-checking after major Mesa bumps.
+
+Decision: deploy llvmpipe-only ICD via the renderer's systemd
+unit `environment.{VK_ICD_FILENAMES,LD_LIBRARY_PATH}` (no global
+graphics enable; mesa + vulkan-loader pulled in via the renderer
+package's `passthru`). Pass timings imply the multi-pass loop's
+1.5× threshold is fine to keep — but if Pi-side latency turns
+out to feel sluggish in practice, two follow-ups are worth
+investigating:
+
+  1. Raise the multi-pass threshold from 1.5 to ~3.0 so pass 1
+     only fires when pass 0 leaves us with a > 3× gap. Most
+     graphics inputs at sensible upload sizes already clear that
+     bar after a single pass; the Lanczos finish handles the
+     residual.
+  2. Compare `nixpkgs#waifu2x-converter-cpp` (OpenCL/OpenCV,
+     no Vulkan dep) and `nixpkgs#upscayl-ncnn` (same Vulkan
+     dep — likely same outcome). waifu2x-converter-cpp is the
+     more promising lane if llvmpipe latency is the bottleneck.
