@@ -1518,9 +1518,10 @@ async Task ExecutePrintAsync(long chatId, string pendingId, CancellationToken ct
                 // on any failure (logged at Error level so journalctl
                 // catches it as the monitoring hook); PrintPreprocess
                 // falls back to Lanczos3 when null.
-                Func<byte[], string, int, CancellationToken, Task<byte[]?>>? neural =
+                Func<byte[], string, int, double, CancellationToken, Task<byte[]?>>? neural =
                     renderer.Enabled
-                        ? (data, name, sf, c) => renderer.UpscaleAsync(data, name, sf, c)
+                        ? (data, name, sf, srcDpi, c) =>
+                            renderer.UpscaleAsync(data, name, sf, srcDpi, c)
                         : null;
                 var processed = await PrintPreprocess.ProcessForPrintAsync(
                     p.Data,

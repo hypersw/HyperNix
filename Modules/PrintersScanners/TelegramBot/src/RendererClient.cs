@@ -145,9 +145,18 @@ public sealed class RendererClient : IDisposable
     /// goes through. The renderer itself already does GPU→CPU
     /// fallback for Vulkan-less hosts; this null is reserved for
     /// "even CPU mode failed" / "renderer unreachable" / non-2xx.
+    ///
+    /// Stamps the upscaled PNG with `pHYs = sourceDpi × scale` before
+    /// returning. realesrgan-ncnn-vulkan strips resolution metadata
+    /// from its output, which used to cascade through PrintPreprocess
+    /// as "source DPI = 96 default" and produce a 6×-too-large image
+    /// declared at 6×-too-low DPI; see Print Flow Update 2026-05-17
+    /// in PLAN.md for the full story. Re-stamping at the API boundary
+    /// keeps downstream consumers honest without each having to know
+    /// the upscaler's quirks.
     /// </summary>
     public async Task<byte[]?> UpscaleAsync(
-        byte[] sourceBytes, string fileName, int scale,
+        byte[] sourceBytes, string fileName, int scale, double sourceDpi,
         CancellationToken ct)
     {
         if (!Enabled)
@@ -185,11 +194,21 @@ public sealed class RendererClient : IDisposable
                     fileName, (int)resp.StatusCode, detail);
                 return null;
             }
-            var bytes = await resp.Content.ReadAsByteArrayAsync(ct);
+            var rawBytes = await resp.Content.ReadAsByteArrayAsync(ct);
+
+            // pHYs enforcement: realesrgan-ncnn strips resolution
+            // metadata. We know what it SHOULD be (sourceDpi × scale
+            // — physical print size is preserved by the upscale,
+            // pixels-per-inch grows by the upscale factor). Re-encode
+            // the PNG with the correct pHYs stamp before returning.
+            var stampedBytes = await StampPngDpiAsync(rawBytes, sourceDpi * scale, ct);
+
             _logger.LogInformation(
-                "neural upscale OK for {File}: {InBytes}B → {OutBytes}B in {Elapsed:F1}s",
-                fileName, sourceBytes.Length, bytes.Length, sw.Elapsed.TotalSeconds);
-            return bytes;
+                "neural upscale OK for {File}: {InBytes}B → {OutBytes}B " +
+                "(stamped @ {Dpi:F0} dpi) in {Elapsed:F1}s",
+                fileName, sourceBytes.Length, stampedBytes.Length,
+                sourceDpi * scale, sw.Elapsed.TotalSeconds);
+            return stampedBytes;
         }
         catch (Exception ex)
         {
@@ -197,6 +216,50 @@ public sealed class RendererClient : IDisposable
                 "neural upscale CRASHED for {File}; falling back to Lanczos3",
                 fileName);
             return null;
+        }
+    }
+
+    /// <summary>
+    /// Decode a PNG, set its pHYs chunk to <paramref name="dpi"/> on
+    /// both axes, re-encode. Used to fix realesrgan-ncnn's habit of
+    /// dropping the resolution chunk on its output. Falls back to
+    /// the input bytes verbatim on any decode/encode error — better
+    /// to have a DPI-less PNG than no output at all (downstream
+    /// PrintPreprocess will still complete with a 96-dpi fallback).
+    /// </summary>
+    private async Task<byte[]> StampPngDpiAsync(
+        byte[] pngBytes, double dpi, CancellationToken ct)
+    {
+        try
+        {
+            using var img = await SixLabors.ImageSharp.Image.LoadAsync(
+                new MemoryStream(pngBytes, writable: false), ct);
+            img.Metadata.HorizontalResolution = dpi;
+            img.Metadata.VerticalResolution   = dpi;
+            // ImageSharp's PNG encoder writes ResolutionUnits separately
+            // from the Image's Metadata.ResolutionUnits property. Set
+            // PixelsPerInch explicitly so the pHYs unit byte (1 = m,
+            // 0 = unspecified) is correct — ImageSharp converts dpi
+            // to pixels-per-meter under the hood when writing.
+            img.Metadata.ResolutionUnits =
+                SixLabors.ImageSharp.Metadata.PixelResolutionUnit.PixelsPerInch;
+            using var ms = new MemoryStream();
+            // SaveAsPngAsync is only an extension on Image<TPixel>; on
+            // the non-generic Image returned by LoadAsync we go through
+            // SaveAsync with an explicit PngEncoder. Same on-disk output.
+            await img.SaveAsync(
+                ms,
+                new SixLabors.ImageSharp.Formats.Png.PngEncoder(),
+                ct);
+            return ms.ToArray();
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex,
+                "could not stamp pHYs on upscaler output ({Bytes}B); " +
+                "passing through unmodified",
+                pngBytes.Length);
+            return pngBytes;
         }
     }
 
