@@ -1624,3 +1624,262 @@ mean the same topic carried over from the previous round.
 Don't renumber. Group multi-round questions under their
 original number with sub-numbering when needed (Q3.1, Q3.2,
 …).
+
+## Print Flow — Update 2026-05-17 (pixel-grid lockstep redesign)
+
+### Symptoms that prompted this round
+
+First production print of a 647×500 PNG at 96 dpi (Windows
+screenshot of a colouring book page) surfaced two compounding
+defects:
+
+  * The auto-classifier correctly routed Graphics →
+    Real-ESRGAN ×4 (output 2588×2000). But realesrgan-ncnn-vulkan
+    emits the upscaled PNG WITHOUT a pHYs chunk, so the bot's
+    downstream pipeline read the working PNG's DPI as ImageSharp's
+    default 96 — the upscale factor was effectively erased from
+    the metadata. PrintPreprocess then Lanczos3'd to 6421×4962 at
+    a declared 238 dpi (= 96 × 2.481 — the additional Lanczos
+    factor needed to reach the 600-dpi paper target). The PDF
+    wrap dutifully drew that 238-dpi image at its declared
+    physical size: ~27 × 21 inches. Way bigger than A4.
+  * The "1:1 default" picker rejected the source as having no
+    usable DPI because `MinReasonableDpi = 100` filtered out 96.
+    With no DPI, `Fits1to1` returned `NotApplicable`, the
+    default-mode-when-it-fits branch didn't fire, and the
+    `PendingPrint.Scale` field's initial value
+    (`PrintScaleMode.OneToOne`) stayed put. Net effect: bot
+    defaulted to 1:1 on an image where 1:1 meant "27-inch image
+    on 8.27-inch paper, corner shown" — described to the bot as
+    "covers 0% of the page" (very nearly true since the visible
+    portion was clipped to a fraction of one corner). Manual
+    flip to Fit produced the right result, but it shouldn't have
+    needed a manual override.
+
+The Fit-mode end result also exposed a quieter design wart: the
+Lanczos finishing pass scaled to paper-pixel dimensions, but
+PrintPdfWrap's Fit-mode cm matrix subsequently squeezed the
+image into the smaller printable rectangle. The ratio of
+paper / printable on A4 with 4.23 mm margins is 1.042, which
+showed up as 600 / 0.96 = **625 dpi effective ppi reported by
+`pdfimages -list`** on the printed-stub PDF. Two slightly
+different definitions of "the target size" interacting through
+the cm matrix.
+
+### Core redesign: the bitmap IS the engine pixel grid
+
+The whole point of the prior `/Interpolate false` + 600-dpi
+upscale was to prevent any downstream resample at Ghostscript,
+foo2zjs, or the printer's RET. The redesign makes that
+invariant unconditional under every Scale mode by sizing the
+output bitmap to the **engine's full-paper pixel grid**, not
+the printable area, and pre-composing every Scale mode's
+content placement INSIDE that grid.
+
+A4 at 600 dpi = exactly 4962 × 7016 px. The bot emits a
+single-page PDF whose:
+
+  * `MediaBox` = `[0 0 595.44 841.68]` (A4 in pt).
+  * One `Image XObject` of exactly 4962 × 7016 px, declared
+    `/Interpolate false`, /BitsPerComponent 8, /DeviceGray.
+  * cm matrix = `595.44 0 0 841.68 0 0` — pure scale, no
+    translate, image fills MediaBox exactly. The cm has
+    integer-friendly multiplicities (image's 4962 px × 72/600 =
+    595.44 pt, image's 7016 px × 72/600 = 841.68 pt → the cm
+    exactly maps Image-XObject unit square to MediaBox).
+  * No clip, no rotation, no fractional offsets.
+
+Ghostscript inside the foo2zjs filter chain rasterises this
+PDF. The image's pixel pitch IS the engine's dot pitch, so
+nearest-neighbour at the rasterizer is identity. foo2zjs hands
+the bitmap to the printer's mechanical engine unchanged.
+
+### Why full paper, not printable area, for the output bitmap
+
+Margins are operator-configured in mm. At 600 dpi:
+
+  * 4.23 mm = 4.23 × 600 / 25.4 = **99.92 px** (fractional)
+  * 5 mm    = 5 × 600 / 25.4    = **118.11 px** (fractional)
+
+If we sized the bitmap to the printable rectangle and asked the
+cm matrix to translate it to `(left_margin_pt, bottom_margin_pt)`,
+that translate would carry the fractional pixel offset directly
+into the rasterizer's space — Ghostscript would resample
+neighbouring pixels to reconstruct the fractionally-shifted
+grid, and the engine receives a sub-pixel-blurred version of
+the source.
+
+Sizing the bitmap to the FULL paper grid and filling the margin
+areas with white inside the bitmap avoids that: the cm matrix
+needs no translate (the image starts at MediaBox origin), and
+the engine's mechanical non-printable strip just doesn't reach
+the white edges. The printer doesn't know we put pixels there;
+it simply can't print them. Crucially, the pixel grid alignment
+holds regardless of what margin configuration the user picks —
+even an absurd 7.3 mm setting can't introduce sub-pixel shift
+because the bitmap is always 4962 × 7016 starting at (0,0).
+
+### Scale-mode semantics inside the engine grid
+
+Common pipeline:
+  1. Decide effective orientation (Auto picks landscape iff
+     source is wider than tall; Portrait/Landscape force it).
+  2. Compute the content rectangle in engine pixels per Scale
+     mode (see below). All four corners are integer.
+  3. Lanczos3 source to exactly those integer dimensions. No
+     `Math.Round(scale_factor × srcW)` — the target pixel count
+     is the input to the resize, the ratio is whatever it is.
+  4. Composite into a 4962 × 7016 white-fill canvas at the
+     centre of the content rectangle. If the content rect
+     overflows the canvas (1:1 on an oversized source), crop at
+     canvas bounds.
+  5. PDF wrap as above. `Result.{Width,Height,Dpi}` always
+     report the canvas dims and 600 dpi — they describe the
+     output bitmap, not the source.
+
+  * **1:1**: target rect = `(srcW_in × 600, srcH_in × 600)` —
+    the source's declared physical size at engine DPI. Centred
+    on canvas. If source is bigger than canvas it gets cropped
+    at canvas edges (1:1 + oversized = "show me the centre of
+    the image at native size" — explicit operator choice).
+  * **Fit**: target rect = largest rectangle inside the
+    printable-in-engine-pixels rectangle that preserves source
+    aspect. (Printable = paper minus margins; margins go through
+    `Math.Round(margin_mm × 600 / 25.4)` to get integer px.)
+  * **Fill**: target rect = smallest rectangle that COVERS the
+    printable-in-engine-px rectangle while preserving aspect.
+    May exceed printable on one axis; gets cropped at the canvas
+    edges (which sit at paper edges, not printable, so a few
+    pixels of margin overflow are visible if the printer's
+    mechanical margin allows).
+
+For "Fit decision" semantics (e.g., classifying coverage,
+deciding default mode), the bot reasons about printable
+dimensions even though the output bitmap is full-paper. So
+margin configuration affects USER-FACING SIZING decisions but
+never affects the output bitmap's pixel structure.
+
+### Upscale path — multi-pass smart upscale + always-Lanczos finish
+
+The path becomes (Graphics class):
+
+  1. Real-ESRGAN ×4 pass. Result is `srcW × 4, srcH × 4`.
+  2. If the longer dimension is still under `target_long × 0.9`,
+     run a second Real-ESRGAN pass: ×2 if the remaining ratio is
+     ≤ 2, else ×4. Cap at 2 neural passes total.
+  3. Lanczos3 to the exact target integer pixel dimensions (down
+     by whatever fraction the neural overshoot landed on). Always
+     run; Lanczos3 is the only step that hits integer-exact
+     pixels.
+
+Rationale: Real-ESRGAN's deep-network output is sharpest when
+it's downscaled by a small factor (the network produces output
+that's slightly larger than asked; downsampling by Lanczos
+preserves the synthesised detail). Lanczos UP from a too-small
+neural output adds soft texture from interpolation, which is
+what the user observed as "softer than a manual desktop
+upscale." Always finishing with a small Lanczos-down kept the
+sharpest detail of the neural pass while landing on exact
+pixels.
+
+For Photo class (or graphics-class with neural unavailable):
+single Lanczos3 pass from source to target. Same exact-pixel
+contract. Photo content doesn't benefit from neural; the
+network would add hallucinatory texture instead.
+
+For sources already LARGER than the target (high-resolution
+photos exceeding 4962 × 7016 on the long axis), the same
+Lanczos3 step runs down to the target. No special-casing.
+
+### DPI enforcement at every component boundary
+
+The realesrgan-ncnn binary doesn't write pHYs. To prevent metadata
+leakage at that boundary, `RendererClient.UpscaleAsync` now
+re-encodes the returned PNG through ImageSharp with:
+
+  * `Metadata.HorizontalResolution = sourceDpi × neuralScale`
+  * `Metadata.VerticalResolution   = sourceDpi × neuralScale`
+
+The caller passes the source's DPI explicitly. If the source had
+no pHYs, the caller passes 96 (the most common screenshot DPI
+and ImageSharp's own PNG default; calling it "sourceDpi unknown"
+and falling back to 96 is the same operational behaviour as
+today minus the rejection).
+
+### Coverage-driven default scale mode + dropping MinReasonableDpi
+
+`MinReasonableDpi = 100` is removed. 96 dpi is THE most common
+DPI in the wild (Windows screenshot default + every browser
+"save as image" + every macOS Retina screenshot at 144 → 96
+after retina-density normalisation by Telegram). Rejecting it
+as "unreasonable" causes the wrong default mode.
+
+Replacement: if a PNG's pHYs is absent or ≤ 0, fall back to 96
+as a low-confidence guess. Any positive DPI is accepted as-is.
+
+Default scale mode is now driven by **linear coverage**:
+
+```
+linearCoverage = max(srcShortInches / paperShortInches,
+                     srcLongInches  / paperLongInches)
+```
+
+with srcShortInches = `min(srcWidthPx, srcHeightPx) / sourceDpi`
+and srcLongInches the matching max. The thresholds:
+
+  * `coverage < 0.25`: Fit — at 1:1 the source would look lost
+    on the page (less than a quarter on the longest axis).
+  * `0.25 ≤ coverage ≤ 1.10`: 1:1 — respect the source's declared
+    physical size. The 1.10 ceiling allows slight overrun for
+    bleed/registration-mark workflows where the source genuinely
+    is paper-sized-plus-a-bit.
+  * `coverage > 1.10`: Fit — source is clearly bigger than paper,
+    Fit is the user's intent.
+
+The 1:1 button badge:
+  * `1:1 ✓` (green) — coverage fits within printable area.
+  * `1:1 ⚠ margins` (orange) — fits paper, exceeds printable.
+  * `1:1 ⚠ won't fit` (red) — exceeds paper. Previously this
+    used the same orange ⚠ as the margin-clip case; now it's
+    visually distinct so the operator can tell at a glance.
+
+### Result-shape changes
+
+`PrintPreprocess.ProcessForPrintAsync` continues to return a
+`Result(PdfBytes, Width, Height, Dpi, ContentClass,
+ClassifierStats, Upscaler)`. With the redesign:
+
+  * `Width`, `Height`: still report the BITMAP dimensions — but
+    now they're always `paperShortIn × 600, paperLongIn × 600`
+    (4962 × 7016 for A4). They describe what we sent to CUPS.
+  * `Dpi`: always 600. The "report what we sent" reading.
+  * The interesting content dimensions (post-upscale, pre-pad)
+    move into the log line — caller sees both
+    `output 4962x7016 @ 600dpi (content 4762x3676 from 647x500 src,
+    neural=Real-ESRGAN-x4-x2, finish=Lanczos3-down)`. The exact
+    content size + every step taken is now operator-visible.
+
+### What CUPS / Ghostscript / foo2zjs see now
+
+Identical to before but with one tighter invariant: the PDF's
+image XObject is exactly 4962 × 7016 px (for A4), MediaBox is
+A4 in pt, cm is pure scale to MediaBox. /Interpolate false plus
+exact pixel-grid alignment means nearest-neighbour at the
+rasterizer is identity, foo2zjs filter passes bytes unchanged,
+engine receives the bitmap with zero resample at any stage. The
+only place a downscale could happen is during the Lanczos
+finishing pass inside PrintPreprocess — which is the only stage
+where we have full control of the kernel and sampling.
+
+### Implementation, split into commits
+
+  1. PLAN.md (this commit).
+  2. RendererClient.UpscaleAsync: stamp pHYs on the returned PNG
+     via ImageSharp using caller-supplied sourceDpi × neuralScale.
+  3. PrintPreprocess: switch to engine-grid bitmap targeting,
+     exact pixel sizing per Scale mode, white-fill canvas
+     composite, finalDpi always 600. PrintPdfWrap simplified to
+     identity cm matrix.
+  4. Multi-pass neural upscale (overshoot then Lanczos-down).
+  5. UX: drop MinReasonableDpi, coverage-driven default mode,
+     red-overrun badge on 1:1 button.
