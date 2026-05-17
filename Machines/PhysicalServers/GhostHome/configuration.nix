@@ -228,31 +228,25 @@
   hypersw.system.bootOnce.enable = true;
 
   # ── PrintScanServer (workload, not infrastructure) ─────────
-  # STAGE 1 (this commit): pre-register x86_64-linux qemu-user
-  # binfmt on the running system, WITHOUT enabling the scanner
-  # stack or the broader print/scan profile. The scanner module's
-  # closure references x86_64 derivations (the proprietary Epson
-  # interpreter plugins via `pkgsX86.epkowa.plugins.*`); if those
-  # aren't already cached on cache.nixos.org and binfmt isn't
-  # already registered on the build host, the first switch that
-  # enables the scanner fails because `nixos-rebuild build` runs
-  # on the CURRENT system, before activation. Two-step
-  # activation gives the next build phase access to qemu-x86_64
-  # so cross-arch derivations can be built locally.
-  #
-  # STAGE 2 (next commit, after this one's auto-rebuild lands):
-  # uncomment the `printScanServer` block below.
-  hypersw.services.epkowa-scanner.registerX86_64Binfmt = true;
-
-  # hypersw.profiles.printScanServer = {
-  #   enable = true;
-  #   bot = {
-  #     tokenFile = config.sops.secrets.PrintScanTelegramBotToken.path;
-  #     allowedUsers = [
-  #       { id = 1398173959; name = "hypersw"; }
-  #       { id = 2074641026; name = "ol"; }
-  #       { id = 6935307009; name = "alice"; }
-  #     ];
-  #   };
-  # };
+  # Activated in two stages — see commit history for the
+  # rationale, but in short: the EpkowaScanner module pulls in
+  # x86_64-linux plugin derivations that aren't cached on
+  # cache.nixos.org (unfree, Hydra skips them), so the first
+  # activation needs qemu-x86_64 binfmt pre-registered. Stage 1
+  # set `registerX86_64Binfmt = true` on its own; stage 2 (this
+  # commit) flips the full profile. The explicit binfmt opt-in
+  # is no longer needed (it defaults to the scanner's `enable`
+  # value, which is true once the profile is on) — drop it once
+  # this lands cleanly.
+  hypersw.profiles.printScanServer = {
+    enable = true;
+    bot = {
+      tokenFile = config.sops.secrets.PrintScanTelegramBotToken.path;
+      allowedUsers = [
+        { id = 1398173959; name = "hypersw"; }
+        { id = 2074641026; name = "ol"; }
+        { id = 6935307009; name = "alice"; }
+      ];
+    };
+  };
 }
