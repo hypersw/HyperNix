@@ -31,131 +31,34 @@ public static class PrintPdfWrap
 {
     /// <summary>
     /// Build a print-ready single-page PDF whose page geometry is
-    /// the configured paper, with the supplied grayscale image
-    /// placed per the chosen scale + orientation. Returns the PDF
-    /// bytes ready to ship to the daemon as application/pdf.
+    /// the configured paper, wrapping a bitmap that has ALREADY been
+    /// composed to the engine pixel grid for the full paper
+    /// (paperShort × 600 px by paperLong × 600 px for A4 = 4962×7016).
+    /// Scale-mode placement, orientation, margin insets, and
+    /// white-fill have all been baked into the bitmap by the caller
+    /// (PrintPreprocess.ProcessForPrintAsync). This function's job
+    /// is just to wrap that bitmap in a minimal-viable PDF whose cm
+    /// matrix maps the image XObject identity-onto the MediaBox.
     /// </summary>
     public static byte[] WrapImage(
-        Image<L8> grayImage, double imageDpi,
-        PrintScaleMode scale, PrintOrientation orientation,
-        double paperShortInches, double paperLongInches,
-        PrintableMargins margins)
+        Image<L8> grayImage,
+        double paperShortInches, double paperLongInches)
     {
-        // Resolve "Auto" against the image aspect — wider-than-tall
-        // → landscape, otherwise portrait. Keeps the printed long
-        // axis of the image aligned with the paper's long axis.
-        var effectiveOrient = orientation switch
-        {
-            PrintOrientation.Auto =>
-                grayImage.Width > grayImage.Height
-                    ? PrintOrientation.Landscape
-                    : PrintOrientation.Portrait,
-            var o => o,
-        };
-
-        // PDF user space is 1/72 inch. The MediaBox is always the
-        // physical paper in portrait — the printer feeds A4 short-
-        // edge-first, content "rotation" for landscape is done in
-        // the cm matrix below, not by swapping the page dimensions.
-        // (Swapping would fight CUPS' own page-fitting logic when
-        // the queue's media size is the portrait orientation.)
+        // PDF user space is 1/72 inch. MediaBox is the paper in
+        // portrait orientation — short × long. The caller's bitmap
+        // is also short × long (portrait-shaped); landscape content
+        // is realised by rotating WITHIN the bitmap, not by swapping
+        // the page dimensions.
         const double PtPerInch = 72.0;
-        const double InchesPerMm = 1.0 / 25.4;
         var mediaWPt = paperShortInches * PtPerInch;
         var mediaHPt = paperLongInches  * PtPerInch;
 
-        // Margins stay aligned with the paper, not the image —
-        // top/bottom always refer to the loaded paper's natural
-        // top/bottom regardless of the image's effective rotation.
-        var mLeftPt   = margins.LeftMm   * InchesPerMm * PtPerInch;
-        var mRightPt  = margins.RightMm  * InchesPerMm * PtPerInch;
-        var mTopPt    = margins.TopMm    * InchesPerMm * PtPerInch;
-        var mBottomPt = margins.BottomMm * InchesPerMm * PtPerInch;
-        var prX = mLeftPt;
-        var prY = mBottomPt;
-        var prW = mediaWPt - mLeftPt - mRightPt;
-        var prH = mediaHPt - mTopPt  - mBottomPt;
-
-        // Image native physical size in pt — the dpi metadata is
-        // authoritative because the upscaling pass (see
-        // PrintPreprocess.ProcessForPrintAsync) keeps it in sync
-        // with pixel count after Lanczos3.
-        var imgWPt = grayImage.Width  * PtPerInch / imageDpi;
-        var imgHPt = grayImage.Height * PtPerInch / imageDpi;
-
-        // Bounding box on paper after rotation — landscape swaps
-        // axes since the image will be drawn 90° CW.
-        double bboxWPt, bboxHPt;
-        if (effectiveOrient == PrintOrientation.Landscape)
-        {
-            bboxWPt = imgHPt;
-            bboxHPt = imgWPt;
-        }
-        else
-        {
-            bboxWPt = imgWPt;
-            bboxHPt = imgHPt;
-        }
-
-        // Scale and centre per Scale mode. 1:1 is centred on the
-        // full media (not the printable rect) — that's the
-        // "place at native physical size" semantics, the printer's
-        // non-printable border may legitimately bisect the image
-        // and the user picked 1:1 knowingly with that risk.
-        double scaleFactor, centreX, centreY;
-        bool clipToPrintable = false;
-        switch (scale)
-        {
-            case PrintScaleMode.OneToOne:
-                scaleFactor = 1.0;
-                centreX = mediaWPt / 2;
-                centreY = mediaHPt / 2;
-                break;
-            case PrintScaleMode.Fill:
-                scaleFactor = Math.Max(prW / bboxWPt, prH / bboxHPt);
-                centreX = prX + prW / 2;
-                centreY = prY + prH / 2;
-                // Fill may overflow the printable rect — clip so the
-                // ink doesn't leak into the non-printable margin
-                // strip that the printer can't reach anyway.
-                clipToPrintable = true;
-                break;
-            default: // Fit
-                scaleFactor = Math.Min(prW / bboxWPt, prH / bboxHPt);
-                centreX = prX + prW / 2;
-                centreY = prY + prH / 2;
-                break;
-        }
-        var finalBboxWPt = bboxWPt * scaleFactor;
-        var finalBboxHPt = bboxHPt * scaleFactor;
-
-        // Build cm — see "PDF Reference 1.7" §8.3 for the matrix
-        // shape. For portrait: pure scale-and-translate so the
-        // image's unit square (0..1 × 0..1) maps to a rectangle of
-        // imgWPt×imgHPt × scaleFactor, lower-left at the chosen
-        // origin. For landscape: rotate 90° CW (a=0,b=-W*s,c=H*s,
-        // d=0) and translate so the rotated bbox is centred at
-        // (centreX, centreY).
-        string cmMatrix;
-        if (effectiveOrient == PrintOrientation.Landscape)
-        {
-            var a = 0.0;
-            var b = -imgWPt * scaleFactor;
-            var c =  imgHPt * scaleFactor;
-            var d = 0.0;
-            // Rotated bbox spans (e .. e + finalBboxWPt) horizontally
-            // and (f - finalBboxHPt .. f) vertically (note: f sits at
-            // the top of the rotated image since b < 0).
-            var e = centreX - finalBboxWPt / 2;
-            var f = centreY + finalBboxHPt / 2;
-            cmMatrix = $"{F(a)} {F(b)} {F(c)} {F(d)} {F(e)} {F(f)}";
-        }
-        else
-        {
-            var e = centreX - finalBboxWPt / 2;
-            var f = centreY - finalBboxHPt / 2;
-            cmMatrix = $"{F(imgWPt * scaleFactor)} 0 0 {F(imgHPt * scaleFactor)} {F(e)} {F(f)}";
-        }
+        // cm matrix: scale-only, no translate. The image's unit
+        // square (0..1 × 0..1) maps to the MediaBox exactly. Pure
+        // integer-friendly scale: grayImage.Width × 72/600 maps to
+        // mediaWPt by construction (and same on H). No sub-pixel
+        // offset for Ghostscript to interpolate around.
+        var cmMatrix = $"{F(mediaWPt)} 0 0 {F(mediaHPt)} 0 0";
 
         // Pixel data: dump the L8 buffer raw, deflate as zlib (PDF's
         // /FlateDecode format = RFC 1950 zlib stream, NOT raw deflate
@@ -171,18 +74,11 @@ public static class PrintPdfWrap
             deflatedPixels = ms.ToArray();
         }
 
-        // Content stream — graphics-state save, optional clip,
-        // cm transform, image draw, restore.
-        var contentBuilder = new StringBuilder();
-        contentBuilder.Append("q\n");
-        if (clipToPrintable)
-        {
-            contentBuilder.Append($"{F(prX)} {F(prY)} {F(prW)} {F(prH)} re W n\n");
-        }
-        contentBuilder.Append($"{cmMatrix} cm\n");
-        contentBuilder.Append("/Im0 Do\n");
-        contentBuilder.Append("Q\n");
-        var contentBytes = Encoding.ASCII.GetBytes(contentBuilder.ToString());
+        // Content stream — graphics-state save, cm transform, image
+        // draw, restore. No clip needed (bitmap fills MediaBox
+        // exactly, no overflow possible).
+        var contentBytes = Encoding.ASCII.GetBytes(
+            $"q\n{cmMatrix} cm\n/Im0 Do\nQ\n");
 
         // Object emission. Order: Catalog, Pages, Page, Image,
         // Contents. We emit in this order so referenced objects

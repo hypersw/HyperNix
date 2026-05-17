@@ -366,16 +366,11 @@ public static class PrintPreprocess
     /// 600-dpi mechanical engine — the rasterizer's output grid will
     /// then map 1:1 to our pixels, so /Interpolate false in the PDF
     /// gives identity passthrough rather than nearest-neighbor jaggies.
-    /// Memory: 600-dpi A4 grayscale = 4960×7016 px = 35 MB raw,
+    /// Memory: 600-dpi A4 grayscale = 4962×7016 px = 35 MB raw,
     /// comfortable on a Pi 4 (4 GB RAM); after FlateDecode in the
     /// PDF, the on-wire size is typically 5–15 MB depending on
     /// content entropy.
     private const int TargetDpi = 600;
-
-    /// Padding factor above 1.0 — only upscale if the gain is >5%.
-    /// Avoids re-encoding 4096×3072 photos that already exceed our
-    /// 600 dpi A4 target on at least one axis.
-    private const double MinUpscaleGain = 1.05;
 
     public sealed record Result(
         byte[] PdfBytes, int Width, int Height, int Dpi,
@@ -419,10 +414,31 @@ public static class PrintPreprocess
         double paperShortInches, double paperLongInches,
         PrintableMargins margins,
         UpscalerChoice upscalerChoice,
-        Func<byte[], string, int, CancellationToken, Task<byte[]?>>? neuralUpscaler,
+        Func<byte[], string, int, double, CancellationToken, Task<byte[]?>>? neuralUpscaler,
         string fileName,
         CancellationToken ct)
     {
+        // Source metadata read (DPI in particular) needs to happen
+        // BEFORE the neural upscale so we can pass it through to the
+        // upscaler client — which uses it to stamp the right pHYs
+        // chunk on the realesrgan-ncnn output. Image.IdentifyAsync
+        // reads metadata without a full pixel decode — cheap.
+        // Distinct from the post-neural `sourceDpi` declared further
+        // down (which reads the working-image's metadata after the
+        // upscale; same value after our stamp, but conceptually the
+        // "input to whatever the Lanczos finish does").
+        var sourceInfo = await Image.IdentifyAsync(
+            new MemoryStream(sourceBytes, writable: false), ct);
+        var origHRes = sourceInfo.Metadata.HorizontalResolution;
+        var origVRes = sourceInfo.Metadata.VerticalResolution;
+        // Fallback to 96 dpi (Windows screenshot default, ImageSharp's
+        // own PNG default) when the source has no pHYs at all. Matches
+        // PendingPrint.NoMetadataFallbackDpi so the "1:1 fits?" badge
+        // in the UI and the preview-pipeline assumption agree.
+        var originalSourceDpi = (origHRes > 0 && origVRes > 0)
+            ? Math.Min(origHRes, origVRes)
+            : 96.0;
+
         // Classifier reads a quick downsampled thumbnail of the
         // source to decide the upscaler route. Disposed before we
         // open the working pipeline image so we don't carry two
@@ -442,101 +458,171 @@ public static class PrintPreprocess
         };
 
         // Source bytes that'll be Lanczos3'd to the final 600 dpi
-        // target. For Graphics: try neural upscale first (4×). For
-        // Photo: skip neural, Lanczos3 directly from source.
+        // target. For Graphics: run Real-ESRGAN ×4 once, Lanczos3
+        // from there. For Photo: skip neural entirely. The next
+        // commit replaces this single attempt with a multi-pass
+        // loop so that a small enough input can be brought up to
+        // the engine grid before the Lanczos finish.
         byte[] workingBytes = sourceBytes;
         UpscalerUsed upscalerUsed = UpscalerUsed.Lanczos3;
         if (effectiveClass == ContentClass.Graphics && neuralUpscaler is not null)
         {
-            var neuralBytes = await neuralUpscaler(sourceBytes, fileName, 4, ct);
-            if (neuralBytes is not null)
+            var passBytes = await neuralUpscaler(
+                sourceBytes, fileName, 4, originalSourceDpi, ct);
+            if (passBytes is null)
             {
-                workingBytes = neuralBytes;
-                upscalerUsed = UpscalerUsed.Neural;
+                upscalerUsed = UpscalerUsed.NeuralFailedFellBackToLanczos;
             }
             else
             {
-                // Renderer failure already logged at Error level by
-                // RendererClient.UpscaleAsync; record the fallback
-                // in the Result so the bot caption surfaces it to
-                // the user.
-                upscalerUsed = UpscalerUsed.NeuralFailedFellBackToLanczos;
+                workingBytes = passBytes;
+                upscalerUsed = UpscalerUsed.Neural;
             }
         }
 
-        // Open the (possibly upscaled) working bytes for the
-        // Lanczos3-finishing + grayscale + PDF-wrap pipeline.
+        // Open the (possibly upscaled) working bytes. After our
+        // RendererClient stamp, this image's metadata has the
+        // correct post-upscale DPI even if realesrgan-ncnn dropped
+        // pHYs from its output.
         using var rgbImage = await Image.LoadAsync<Rgb24>(
             new MemoryStream(workingBytes, writable: false), ct);
         var contentClass = effectiveClass;
 
-        // Source dpi as declared in the file metadata, falling back
-        // to a screen-typical 96 when it's missing (most tg-uploaded
-        // photos / random web images). The fallback only matters for
-        // 1:1 sizing; if a downstream user picks 1:1 on a
-        // dpi-stripped Telegram photo, this is the educated guess
-        // we use as the baseline.
-        var hRes = rgbImage.Metadata.HorizontalResolution;
-        var vRes = rgbImage.Metadata.VerticalResolution;
-        var sourceDpi = (hRes > 0 && vRes > 0) ? Math.Min(hRes, vRes) : 96.0;
+        // DPI on the working image — for Graphics it's
+        // originalSourceDpi × neuralScale (post-stamp); for Photo
+        // it's whatever the source had. Defensive fallback to the
+        // original DPI we measured if the working image's metadata
+        // somehow went missing.
+        var workingHRes = rgbImage.Metadata.HorizontalResolution;
+        var workingVRes = rgbImage.Metadata.VerticalResolution;
+        var workingDpi  = (workingHRes > 0 && workingVRes > 0)
+            ? Math.Min(workingHRes, workingVRes)
+            : originalSourceDpi;
 
-        // Target pixel size: paper at TargetDpi. Pre-upscaling to
-        // this guarantees the rasterizer only ever runs identity-
-        // or down-resample for any Scale mode (Fit fits inside,
-        // 1:1 stays at the engine's grid, Fill crops via clipping
-        // path on already-engine-native pixels).
-        var targetLongPx  = (int)Math.Round(paperLongInches  * TargetDpi);
-        var targetShortPx = (int)Math.Round(paperShortInches * TargetDpi);
-
-        var imgLong  = Math.Max(rgbImage.Width, rgbImage.Height);
-        var imgShort = Math.Min(rgbImage.Width, rgbImage.Height);
-        var scaleByLong  = (double)targetLongPx  / imgLong;
-        var scaleByShort = (double)targetShortPx / imgShort;
-        // Min of the two gives a uniform scale that hits the closer
-        // axis exactly — guarantees both dimensions ≥ target without
-        // overshooting one. (Math.Max would force both axes ≥ target
-        // by overshooting one, doubling pixel cost for no quality
-        // win since the rasterizer will identity-map the surplus
-        // axis anyway.)
-        var scale_ = Math.Min(scaleByLong, scaleByShort);
-
-        int finalW = rgbImage.Width;
-        int finalH = rgbImage.Height;
-        double finalDpi = sourceDpi;
-        if (scale_ > MinUpscaleGain)
+        // Auto-orientation: source's wider-than-tall hint goes to
+        // landscape, else portrait. Resolved once here; the canvas
+        // itself is always portrait-shaped (the printer feeds paper
+        // short-edge-first, regardless of how the content is laid
+        // out within the bitmap).
+        var effectiveOrient = orientation switch
         {
-            finalW = (int)Math.Round(rgbImage.Width  * scale_);
-            finalH = (int)Math.Round(rgbImage.Height * scale_);
-            // dpi scales with the pixel count so physical inches
-            // stay constant — a 300×300 px image at 100 dpi (3"×3")
-            // upscaled to 1800×1800 px must report 600 dpi (still
-            // 3"×3") or 1:1 mode breaks.
-            finalDpi = sourceDpi * scale_;
-            rgbImage.Mutate(c => c
-                .Resize(new ResizeOptions
-                {
-                    Mode = ResizeMode.Stretch,
-                    Size = new Size(finalW, finalH),
-                    Sampler = KnownResamplers.Lanczos3,
-                })
-                .Grayscale());
-        }
-        else
+            PrintOrientation.Auto =>
+                rgbImage.Width > rgbImage.Height
+                    ? PrintOrientation.Landscape
+                    : PrintOrientation.Portrait,
+            var o => o,
+        };
+
+        // Engine pixel grid for the FULL paper. This is the canvas
+        // we'll composite the content into; what CUPS / Ghostscript
+        // / foo2zjs ultimately receive. Note: short × long, in the
+        // paper's natural portrait orientation. Same bitmap shape
+        // whether the user picked portrait or landscape — landscape
+        // is realised by rotating the CONTENT 90° inside the canvas.
+        var canvasW = (int)Math.Round(paperShortInches * TargetDpi);
+        var canvasH = (int)Math.Round(paperLongInches  * TargetDpi);
+
+        // Printable rectangle in engine pixels — used for Fit / Fill
+        // sizing decisions. Output bitmap stays at canvasW × canvasH
+        // regardless (with white-fill in the margin areas); the
+        // printable rect just bounds where content placement is
+        // allowed to land. Sub-px margin shifts (4.23 mm rounds to
+        // 99.92 px; rounded to 100) stay confined to this sizing
+        // math — they never touch the bitmap's pixel grid.
+        var marginLPx = (int)Math.Round(margins.LeftMm   * TargetDpi / 25.4);
+        var marginRPx = (int)Math.Round(margins.RightMm  * TargetDpi / 25.4);
+        var marginTPx = (int)Math.Round(margins.TopMm    * TargetDpi / 25.4);
+        var marginBPx = (int)Math.Round(margins.BottomMm * TargetDpi / 25.4);
+        var printableW = canvasW - marginLPx - marginRPx;
+        var printableH = canvasH - marginTPx - marginBPx;
+
+        // Pre-rotate the working image for landscape so its long axis
+        // ends up across the canvas's long axis. After rotation:
+        //   rgbImage.Width  → was source's height
+        //   rgbImage.Height → was source's width
+        // workingDpi is orientation-invariant (a 300-dpi image is
+        // 300 px/in on either axis regardless of which way is up).
+        if (effectiveOrient == PrintOrientation.Landscape)
+            rgbImage.Mutate(c => c.Rotate(RotateMode.Rotate90));
+
+        var srcW = rgbImage.Width;
+        var srcH = rgbImage.Height;
+
+        // Compute target CONTENT rectangle (in canvas pixels). Each
+        // mode produces integer dimensions — no Math.Round on a
+        // fractional scale-factor, the integers ARE the resize
+        // target. The Lanczos3 step below uses whatever sample ratio
+        // these integers imply.
+        //   - 1:1   : source's declared physical size × engine DPI
+        //   - Fit   : largest rect inside printable, source aspect
+        //   - Fill  : smallest rect covering printable, source aspect
+        int contentW, contentH;
+        switch (scale)
         {
-            rgbImage.Mutate(c => c.Grayscale());
+            case PrintScaleMode.OneToOne:
+                contentW = (int)Math.Round(srcW * (double)TargetDpi / workingDpi);
+                contentH = (int)Math.Round(srcH * (double)TargetDpi / workingDpi);
+                break;
+            case PrintScaleMode.Fill:
+            {
+                // smallest rect covering printable while preserving
+                // source aspect: use the LARGER of the two axis
+                // scales (the one that needs more enlargement wins).
+                var fillScale = Math.Max(
+                    (double)printableW / srcW,
+                    (double)printableH / srcH);
+                contentW = (int)Math.Round(srcW * fillScale);
+                contentH = (int)Math.Round(srcH * fillScale);
+                break;
+            }
+            default: // Fit
+            {
+                var fitScale = Math.Min(
+                    (double)printableW / srcW,
+                    (double)printableH / srcH);
+                contentW = (int)Math.Round(srcW * fitScale);
+                contentH = (int)Math.Round(srcH * fitScale);
+                break;
+            }
         }
 
-        // Convert to genuine 8-bit grayscale pixel format for the
-        // PDF wrap. Cuts the in-memory pixel buffer by 3× before the
-        // raw-pixel-and-deflate dance in PrintPdfWrap.
-        using var grayImage = rgbImage.CloneAs<L8>();
+        // Lanczos3 resize the rotated source to the exact integer
+        // content dimensions, then grayscale in-place. ResizeMode
+        // Stretch because we've already locked the target W×H
+        // ourselves and don't want ImageSharp's own aspect-handling
+        // to second-guess (which it does in Max / Pad modes).
+        rgbImage.Mutate(c => c
+            .Resize(new ResizeOptions
+            {
+                Mode = ResizeMode.Stretch,
+                Size = new Size(contentW, contentH),
+                Sampler = KnownResamplers.Lanczos3,
+            })
+            .Grayscale());
+        using var grayContent = rgbImage.CloneAs<L8>();
 
+        // Engine-grid canvas, white (L8=255). Composite the grayscale
+        // content at centre. DrawImage clips the source where it
+        // exceeds canvas bounds — the 1:1-oversize case becomes a
+        // centre-crop, the Fill-overflow case becomes a clip at
+        // canvas edges (paper edges, beyond non-printable margins).
+        using var canvas = new Image<L8>(canvasW, canvasH, new L8(255));
+        var offsetX = (canvasW - contentW) / 2;
+        var offsetY = (canvasH - contentH) / 2;
+        canvas.Mutate(c =>
+            c.DrawImage(grayContent, new Point(offsetX, offsetY), 1.0f));
+        canvas.Metadata.HorizontalResolution = TargetDpi;
+        canvas.Metadata.VerticalResolution   = TargetDpi;
+        canvas.Metadata.ResolutionUnits =
+            SixLabors.ImageSharp.Metadata.PixelResolutionUnit.PixelsPerInch;
+
+        // PrintPdfWrap now just wraps an already-engine-grid bitmap.
+        // No cm-matrix scaling, no rotation, no clip — the bitmap
+        // has all of that baked in.
         var pdfBytes = PrintPdfWrap.WrapImage(
-            grayImage, finalDpi,
-            scale, orientation,
-            paperShortInches, paperLongInches,
-            margins);
-        return new Result(pdfBytes, finalW, finalH, (int)Math.Round(finalDpi),
+            canvas, paperShortInches, paperLongInches);
+
+        return new Result(pdfBytes, canvasW, canvasH, TargetDpi,
             contentClass, classStats, upscalerUsed);
     }
 }
