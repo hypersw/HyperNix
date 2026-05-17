@@ -458,26 +458,91 @@ public static class PrintPreprocess
         };
 
         // Source bytes that'll be Lanczos3'd to the final 600 dpi
-        // target. For Graphics: run Real-ESRGAN ×4 once, Lanczos3
-        // from there. For Photo: skip neural entirely. The next
-        // commit replaces this single attempt with a multi-pass
-        // loop so that a small enough input can be brought up to
-        // the engine grid before the Lanczos finish.
+        // target. For Graphics: run Real-ESRGAN ×4, and if the result
+        // is still well short of the engine target, run a second
+        // pass to overshoot — Lanczos-DOWN from a slight overshoot
+        // is sharper than Lanczos-UP from a shortfall. For Photo:
+        // skip neural, Lanczos3 directly from source.
         byte[] workingBytes = sourceBytes;
         UpscalerUsed upscalerUsed = UpscalerUsed.Lanczos3;
         if (effectiveClass == ContentClass.Graphics && neuralUpscaler is not null)
         {
-            var passBytes = await neuralUpscaler(
-                sourceBytes, fileName, 4, originalSourceDpi, ct);
-            if (passBytes is null)
+            // Target long-axis pixel count we want to overshoot.
+            // We compare against canvas (paper × 600), not printable
+            // — the canvas is what the Lanczos finish will resize to,
+            // and Fit-mode shrinks within that.
+            var targetLongPx = (int)Math.Round(
+                Math.Max(paperShortInches, paperLongInches) * TargetDpi);
+
+            // Multi-pass loop. State tracked between passes:
+            //   currentBytes   — the latest neural output (PNG with
+            //                    correctly-stamped pHYs).
+            //   currentLong    — long-axis pixel count after the most
+            //                    recent pass.
+            //   currentDpi     — the latest stamped DPI; threaded to
+            //                    the next pass so RendererClient
+            //                    stamps the NEXT result correctly.
+            //   appliedScale   — cumulative neural scale factor
+            //                    (4, 16, … capped at 16 = 2 passes
+            //                    of ×4). Logged at the end so
+            //                    operators can see what ran.
+            //
+            // Cap at 2 passes total. The realesr-animevideov3 model
+            // is the same ×4 variant each pass — composing it twice
+            // is what gives us up to ×16 linear when needed (e.g.
+            // a 500-px screenshot → ×16 = 8000 px, well over the
+            // 7016-px A4 long-axis target). Loops further would risk
+            // amplifying neural artefacts; 2 passes is the sweet spot
+            // for the screenshot/coloring-page class.
+            // Source dims come from `sourceInfo` (identified before
+            // the classifier ran) — we need them BEFORE the first
+            // neural pass, while the (possibly upscaled) rgbImage
+            // isn't opened until after the loop completes.
+            var currentBytes = sourceBytes;
+            var currentLong  = Math.Max(sourceInfo.Width, sourceInfo.Height);
+            var currentDpi   = originalSourceDpi;
+            var appliedScale = 1;
+
+            for (int pass = 0; pass < 2; pass++)
             {
-                upscalerUsed = UpscalerUsed.NeuralFailedFellBackToLanczos;
-            }
-            else
-            {
-                workingBytes = passBytes;
+                // Stop overshooting beyond ~1.1×: if we're already
+                // ≥ 90 % of target on the long axis after the
+                // previous pass, the Lanczos finish handles the
+                // remaining gap. Specifically, we proceed only when
+                // another ×4 would land us comfortably past target.
+                var remainingRatio = (double)targetLongPx / currentLong;
+                if (remainingRatio < 1.5 && pass > 0) break;
+                // First pass always runs (we entered this branch
+                // because the bot routed Graphics → neural); the
+                // ratio check only gates the SECOND pass.
+
+                var passBytes = await neuralUpscaler(
+                    currentBytes, fileName, 4, currentDpi, ct);
+                if (passBytes is null)
+                {
+                    // Neural failed on this pass. If pass 0: signal
+                    // fallback to caller, fall through to Lanczos3
+                    // from source. If pass 1: keep what pass 0 gave
+                    // us (already a valid Neural result).
+                    if (pass == 0)
+                        upscalerUsed = UpscalerUsed.NeuralFailedFellBackToLanczos;
+                    break;
+                }
+                currentBytes = passBytes;
+                currentLong  *= 4;
+                currentDpi   *= 4;
+                appliedScale *= 4;
                 upscalerUsed = UpscalerUsed.Neural;
+
+                // Done if the next pass would clearly overshoot the
+                // overshoot — pass 0 ratio check above handles
+                // pass 1, this is the early-exit when ratio dropped
+                // below the threshold during pass 0.
+                if ((double)targetLongPx / currentLong < 1.5) break;
             }
+
+            if (upscalerUsed == UpscalerUsed.Neural)
+                workingBytes = currentBytes;
         }
 
         // Open the (possibly upscaled) working bytes. After our
