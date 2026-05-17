@@ -1969,17 +1969,68 @@ vulkan-loader vulkan-tools` and explicit `VK_ICD_FILENAMES`):
 Decision: deploy llvmpipe-only ICD via the renderer's systemd
 unit `environment.{VK_ICD_FILENAMES,LD_LIBRARY_PATH}` (no global
 graphics enable; mesa + vulkan-loader pulled in via the renderer
-package's `passthru`). Pass timings imply the multi-pass loop's
-1.5× threshold is fine to keep — but if Pi-side latency turns
-out to feel sluggish in practice, two follow-ups are worth
-investigating:
+package's `passthru`).
 
-  1. Raise the multi-pass threshold from 1.5 to ~3.0 so pass 1
-     only fires when pass 0 leaves us with a > 3× gap. Most
-     graphics inputs at sensible upload sizes already clear that
-     bar after a single pass; the Lanczos finish handles the
-     residual.
-  2. Compare `nixpkgs#waifu2x-converter-cpp` (OpenCL/OpenCV,
-     no Vulkan dep) and `nixpkgs#upscayl-ncnn` (same Vulkan
-     dep — likely same outcome). waifu2x-converter-cpp is the
-     more promising lane if llvmpipe latency is the bottleneck.
+CPU saturation: the ncnn-vulkan backend on llvmpipe spawns one
+worker thread per core (4 on the Pi 5), pinned to PSR 0/1/2/3,
+each running at **~96 % CPU sustained**. Pi 5's four cores are
+already at full utilisation during a pass — C#-side parallel
+upscale jobs would just thrash. Bot is naturally single-job-at-
+a-time (one user, one print at a time), so concurrency at the
+job-orchestration layer isn't needed.
+
+Alternative-upscaler bench, all on the same 500×647 grayscale
+source going to 2000×2588:
+
+| Tool                          | pass 0 wall | model               | notes               |
+|-------------------------------|-------------|---------------------|---------------------|
+| realesrgan-ncnn-vulkan + llvmpipe |  25–30 s | realesr-animevideov3 | current production  |
+| upscayl-ncnn                  | ~25 s       | realesr-animevideov3 | same ncnn backend, rebranded — interchangeable |
+| waifu2x-converter-cpp         |  126 s      | waifu2x CNN          | NEON SIMD, no Vulkan dep, ~4× slower; lower-quality model |
+
+So **ncnn-vulkan-via-llvmpipe wins on both speed and model
+choice**. The waifu2x lane was the most plausible non-Vulkan
+alternative; it's both slower and uses a smaller / older model.
+
+Follow-up worth keeping in mind if Pi-side latency turns out
+to feel sluggish in practice: raise the multi-pass threshold
+from 1.5 to ~3.0 so pass 1 only fires when pass 0 leaves us
+with a > 3× gap. Most graphics inputs at sensible upload sizes
+already clear that bar after a single pass; the Lanczos finish
+handles the residual.
+
+### Deploying renderer/module changes without GitHub round-trip
+
+Standard deploy path (what auto-rebuild does):
+  1. Push to `github:hypersw/HyperNix`.
+  2. `auto-rebuild-github-checker.timer` (~60 s) sees a new rev
+     on the watched branch.
+  3. `auto-rebuild-switch.service` runs:
+        nix flake update upstream --flake /etc/nixos
+        nixos-rebuild switch --flake /etc/nixos#default
+     Only the `upstream` input is updated — nixpkgs / nixos-
+     hardware stay pinned to whatever /etc/nixos/flake.lock had
+     (no surprise kernel rebuild, no surprise dbus impl swap).
+
+When the GitHub push is blocked (e.g. TPM PIN unavailable) and
+the change needs to land NOW:
+
+    rsync -a --exclude='result' /local/HyperNix/ ghosthome:/var/tmp/HyperNix/
+    ssh ghosthome 'sudo nixos-rebuild test --flake /etc/nixos#default \
+        --override-input upstream path:/var/tmp/HyperNix'
+
+`--override-input upstream path:...` keeps the Pi's /etc/nixos
+flake.lock — same nixpkgs pin, same nixos-hardware pin — and
+only swaps the `upstream` source for the local path. `test`
+activates without writing a new boot entry, so a reboot rolls
+back. Use `switch` once you're confident.
+
+DON'T deploy with `--flake /var/tmp/HyperNix#GhostHome` directly:
+that uses the HyperNix repo's own `flake.lock` which can drift
+behind /etc/nixos's. The first time I did this the local lock
+had nixpkgs ~3 weeks older than the Pi's pin, so the build
+wanted to downgrade dbus-broker → vanilla dbus and `switch`
+got blocked by the impl-change inhibitor. The local lock
+divergence comes from /etc/nixos having been manually
+`nix flake update`d at some past point — auto-rebuild itself
+never touches anything but `upstream`.
