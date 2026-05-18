@@ -308,7 +308,13 @@ in
       };
       systemd.services.nixos-upgrade.preStart =
         lib.mkIf cfg.autoUpgrade.enable
-          "nix flake update --flake /etc/nixos";
+          # Advance ONLY the production trio; leave candidate inputs
+          # (nixpkgs-candidate / nixos-hardware-candidate / upstream-
+          # candidate) frozen at whatever rev the operator pinned for
+          # the current major-upgrade probe. `upstream` is excluded
+          # because auto-rebuild-on-push already bumps it on every
+          # GitHub-side push; including it here would just race.
+          "nix flake update nixpkgs nixos-hardware --flake /etc/nixos";
 
       # ── auto-rebuild-on-push ──────────────────────────────────────
       hypersw.services.auto-rebuild-on-push.enable = cfg.autoRebuildOnPush.enable;
@@ -603,7 +609,8 @@ in
           #
           #   nix flake update nixpkgs nixos-hardware
           #     Advance production nixpkgs + nixos-hardware to current
-          #     nixos-unstable HEAD. Manual periodic upgrade.
+          #     nixos-unstable HEAD. Wired as the preStart of
+          #     nixos-upgrade.service (monthly or per-cadence timer).
           #
           #   nix flake update nixpkgs-candidate nixos-hardware-candidate \
           #                    upstream-candidate

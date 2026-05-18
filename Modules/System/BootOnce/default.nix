@@ -140,6 +140,85 @@ let
     '';
   };
 
+  # Lock-level promotion: copy the candidate trio's locked-block
+  # JSON over the production trio's, leaving each main node's
+  # `original` (branch-ref descriptor) untouched. Run after a
+  # successful tryboot of #candidate. Zero rebuild — the production
+  # eval reaches the same store paths the candidate already built.
+  # Lives in BootOnce because the workflow is try-boot-then-promote;
+  # if we ever grow non-tryboot machines that want candidate
+  # trios, this wrapper can move to a more general module.
+  promoteCandidateWrapper = pkgs.buildPackages.writeShellApplication {
+    name = "promote-candidate";
+    runtimeInputs = with pkgs.buildPackages; [ coreutils jq util-linux ];
+    text = ''
+      # promote-candidate — structurally copy `nixpkgs-candidate` and
+      # `nixos-hardware-candidate` locked-blocks over the matching
+      # production nodes in /etc/nixos/flake.lock.
+
+      if [ "$EUID" -ne 0 ]; then
+        echo "error: must be run as root (try: sudo promote-candidate)" >&2
+        exit 1
+      fi
+
+      LOCK=/etc/nixos/flake.lock
+      if [ ! -f "$LOCK" ]; then
+        echo "error: $LOCK not found" >&2
+        exit 1
+      fi
+
+      # Sanity-check the candidate trio is present and locked. An
+      # empty candidate lock would silently null out the production
+      # nodes — guard against running this before #candidate ever
+      # evaluated, in which case the candidate inputs are still
+      # un-locked.
+      for name in nixpkgs-candidate nixos-hardware-candidate; do
+        if ! jq -e --arg n "$name" '.nodes[$n].locked.rev' "$LOCK" >/dev/null; then
+          echo "error: $LOCK has no .nodes.$name.locked.rev — has" >&2
+          echo "       #candidate ever been built? Try:" >&2
+          echo "         sudo nixos-rebuild build --flake /etc/nixos#candidate" >&2
+          exit 1
+        fi
+      done
+
+      # Atomic write: build the new content into a sibling temp file
+      # on the same fs, validate, then rename.
+      NEW=$(mktemp -p "$(dirname "$LOCK")" .flake.lock.XXXXXX)
+      trap 'rm -f "$NEW"' EXIT
+
+      jq '
+        .nodes.nixpkgs.locked
+          = .nodes["nixpkgs-candidate"].locked
+        | .nodes["nixos-hardware"].locked
+          = .nodes["nixos-hardware-candidate"].locked
+      ' "$LOCK" > "$NEW"
+
+      if ! jq -e '
+        .nodes.nixpkgs.locked.rev != null
+        and .nodes["nixos-hardware"].locked.rev != null
+      ' "$NEW" >/dev/null; then
+        echo "error: post-transform lock failed sanity check" >&2
+        exit 1
+      fi
+
+      # Preserve mode + owner; mv replaces atomically on POSIX.
+      chmod --reference="$LOCK" "$NEW"
+      chown --reference="$LOCK" "$NEW"
+      mv -f "$NEW" "$LOCK"
+      trap - EXIT
+
+      NEW_NIXPKGS=$(jq -r '.nodes.nixpkgs.locked.rev' "$LOCK")
+      NEW_NHW=$(jq -r '.nodes["nixos-hardware"].locked.rev' "$LOCK")
+      echo "promoted:"
+      echo "  nixpkgs        -> $NEW_NIXPKGS"
+      echo "  nixos-hardware -> $NEW_NHW"
+      echo
+      echo "next nixos-rebuild switch reuses the local cache —"
+      echo "no kernel rebuild, branch-ref descriptors preserved so"
+      echo "future monthly upgrades continue to advance normally."
+    '';
+  };
+
   piWrapper = pkgs.buildPackages.writeShellApplication {
     name = "nixos-rebuild-boot-once";
     runtimeInputs = with pkgs.buildPackages; [
@@ -356,8 +435,9 @@ let
 in {
   options.hypersw.system.bootOnce = {
     enable = lib.mkEnableOption ''
-      `nixos-rebuild-boot-once` + `reboot-tryboot` — one-shot
-      kernel testing on Pi 5.
+      `nixos-rebuild-boot-once` + `reboot-tryboot` +
+      `promote-candidate` — one-shot kernel testing on Pi 5 plus
+      zero-rebuild lock promotion of a verified candidate.
 
       `nixos-rebuild-boot-once` builds a candidate generation,
       stages it as a sidecar, marks config.txt's [tryboot] section,
@@ -408,7 +488,7 @@ in {
     }
 
     (lib.mkIf isPiKernelBootloader {
-      environment.systemPackages = [ piWrapper rebootTrybootWrapper ];
+      environment.systemPackages = [ piWrapper rebootTrybootWrapper promoteCandidateWrapper ];
 
       # Bumped from nvmd's default of 4 so a staged tryboot candidate
       # has FAT-partition headroom alongside the active default and
