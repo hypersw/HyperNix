@@ -132,15 +132,59 @@ let
     # ${"$"}{emailEnqueue} log "$@" || true       # when configured
   '';
 
+  # Truncate stdin to at most $1 bytes. When the input fits, pass through
+  # unchanged; otherwise emit
+  #   <first ~$1/2 bytes><\n\n  ... [N bytes omitted from middle] ...\n\n><last ~$1/2 bytes>
+  # — preserving both ends of the original. Some log payloads matter most
+  # at the head (an early stack trace), others at the tail (the final
+  # diagnostic line); cutting the middle gives a single behavior that
+  # serves both. The note text is plain ASCII (no &/</>), so it survives
+  # any later HTML-escape or <pre>-wrap stage without becoming a malformed
+  # entity in the rendered Telegram message.
+  smartTruncate = pkgs.writeShellScript "smart-truncate" ''
+    set -u
+    MAX=$1
+    TMP=$(${pkgs.coreutils}/bin/mktemp)
+    trap '${pkgs.coreutils}/bin/rm -f "$TMP"' EXIT
+    ${pkgs.coreutils}/bin/cat > "$TMP"
+    LEN=$(${pkgs.coreutils}/bin/stat -c %s "$TMP")
+
+    if [ "$LEN" -le "$MAX" ]; then
+      ${pkgs.coreutils}/bin/cat "$TMP"
+      exit 0
+    fi
+
+    # Reserve space for the note. The actual rendered length is
+    # bounded by the prefix + 10-digit count + suffix; 42 chars
+    # is the comfortable upper bound (real output may be a few
+    # bytes shorter, which is fine — output stays under MAX).
+    NOTE_OVERHEAD=42
+    HALF=$(( (MAX - NOTE_OVERHEAD) / 2 ))
+
+    if [ "$HALF" -le 0 ]; then
+      # MAX too small for a meaningful split — degrade to tail-cut.
+      ${pkgs.coreutils}/bin/head -c "$MAX" "$TMP"
+      exit 0
+    fi
+
+    DROPPED=$(( LEN - 2 * HALF ))
+    ${pkgs.coreutils}/bin/head -c "$HALF" "$TMP"
+    ${pkgs.coreutils}/bin/printf '\n\n  ... [%d bytes omitted from middle] ...\n\n' "$DROPPED"
+    ${pkgs.coreutils}/bin/tail -c "$HALF" "$TMP"
+  '';
+
   # Prepare multi-line text (typically a journal extract) for inclusion in a
-  # Telegram sendMessage payload. Reads stdin, truncates to 3500 bytes (the
-  # API caps text at 4096; we leave ~600 bytes for the header + wrapper
+  # Telegram sendMessage payload. Reads stdin, smart-truncates to 3500 bytes
+  # (the API caps text at 4096; we leave ~600 bytes for the header + wrapper
   # tags), and HTML-escapes &/</> so the message parses as valid entities
-  # regardless of what the journal happened to contain. Wrap the result in
+  # regardless of what the journal happened to contain. Truncation happens
+  # BEFORE escape so the cut points can't land inside a half-formed `&xxx;`
+  # entity at the head's tail or the tail's head — the entities don't exist
+  # yet when smart-truncate runs. Wrap the result in
   # <blockquote expandable>…</blockquote> in the caller for a collapsible
   # "Show more" section.
   tgEscape = pkgs.writeShellScript "tg-escape" ''
-    ${pkgs.coreutils}/bin/head -c 3500 \
+    ${smartTruncate} 3500 \
       | ${pkgs.gnused}/bin/sed 's/&/\&amp;/g; s/</\&lt;/g; s/>/\&gt;/g'
   '';
 
@@ -281,14 +325,14 @@ let
 
       # Hard size gate: Telegram sendMessage caps text at 4096 chars.
       # Writers (upgrade-failure-notify et al) use tgEscape which already
-      # truncates to 3500 bytes, but we don't fully control every path
-      # that might enqueue a message — enforce the limit HERE as the
-      # final gatekeeper. Byte-truncate to 4080 (leaves a few bytes of
-      # safety). If this cuts an HTML tag mid-way, Telegram will 400 with
-      # "can't parse entities" and the message gets dropped-with-log by
-      # the 4xx branch below. Preferable to a poison message wedging the
-      # queue forever.
-      text=$(${pkgs.coreutils}/bin/printf '%s' "$text" | ${pkgs.coreutils}/bin/head -c 4080)
+      # smart-truncates to 3500 bytes, but we don't fully control every
+      # path that might enqueue a message — enforce the limit HERE as
+      # the final gatekeeper. Smart-truncate (head+tail with a
+      # mid-message "N bytes omitted" note) to 4080 bytes. If the cut
+      # lands inside an HTML tag or entity, Telegram 400s with "can't
+      # parse entities" and the 4xx branch below catches it: strips
+      # tags, smart-truncates again, sends as a plain-text <pre> block.
+      text=$(${pkgs.coreutils}/bin/printf '%s' "$text" | ${smartTruncate} 4080)
 
       # --data-urlencode so message text can contain any chars without
       # breaking the curl command line. We capture BOTH the HTTP status
@@ -322,25 +366,40 @@ let
           break
           ;;
         4*)
-          # Permanent-ish 4xx. Always try once more as stripped plain text
-          # (strip HTML tags, unescape the three meta entities, re-cap to
-          # 4080 bytes, POST without parse_mode). Rescues "too long" and
-          # "can't parse entities" with a single round-trip; harmless for
-          # other 4xx (chat-gone, bot-blocked, text-empty) — they 4xx
-          # again, we drop. Sleep first to not burn our per-chat rate
-          # budget on the retry.
+          # Permanent-ish 4xx. Always try once more as stripped plain
+          # text wrapped in <pre>: strip HTML tags, decode the three
+          # meta entities, smart-truncate the raw text to leave room
+          # for re-escape + <pre>...</pre> wrap, re-escape (so entity
+          # chars inside <pre> stay HTML-safe), wrap, send with
+          # parse_mode=HTML so Telegram renders the block monospaced.
+          # Rescues "too long" / "can't parse entities" in one
+          # round-trip; harmless for other 4xx (chat-gone, bot-
+          # blocked, text-empty) — they 4xx again and we drop.
+          # Sleep first to not burn the per-chat rate budget on the
+          # retry.
+          #
+          # Smart-truncate happens on the DECODED text (no entities
+          # present), so the head's tail and the tail's head can't
+          # land inside a half-formed `&xxx;`. Budget: 3900 bytes of
+          # raw text → at most ~5x expansion in worst case (all `&`
+          # chars; in practice journal logs run < 5% growth) → +11
+          # for <pre></pre> → safely under Telegram's 4096 cap for
+          # any realistic input.
           desc=$(${pkgs.jq}/bin/jq -r '.description // "(no description)"' < "$BODY" 2>/dev/null \
               || ${pkgs.coreutils}/bin/cat "$BODY")
           ${pkgs.coreutils}/bin/sleep 1.1
-          plain=$(${pkgs.coreutils}/bin/printf '%s' "$text" \
+          plain_body=$(${pkgs.coreutils}/bin/printf '%s' "$text" \
               | ${pkgs.gnused}/bin/sed 's|<[^>]*>||g; s|&amp;|\&|g; s|&lt;|<|g; s|&gt;|>|g' \
-              | ${pkgs.coreutils}/bin/head -c 4080)
+              | ${smartTruncate} 3900 \
+              | ${pkgs.gnused}/bin/sed 's/&/\&amp;/g; s/</\&lt;/g; s/>/\&gt;/g')
+          plain="<pre>$plain_body</pre>"
           BODY2=$(${pkgs.coreutils}/bin/mktemp)
           retry_code=$(${pkgs.curl}/bin/curl -sS --max-time 10 -o "$BODY2" \
               -w "%{http_code}" -X POST \
               "https://api.telegram.org/bot$TOKEN/sendMessage" \
               --data-urlencode "chat_id=$chat" \
-              --data-urlencode "text=$plain" 2>&1) || retry_code="000"
+              --data-urlencode "text=$plain" \
+              -d "parse_mode=HTML" 2>&1) || retry_code="000"
           case "$retry_code" in ""|*[!0-9]*) retry_code="000" ;; esac
           case "$retry_code" in
             2*)
