@@ -35,35 +35,53 @@ let
 
     FLAKE_DIR="${cfg.flakeDir}"
     INPUT_NAME="${cfg.inputName}"
+    LOCK="$FLAKE_DIR/flake.lock"
 
-    # Single nix-daemon round-trip: fetch the flake metadata once, parse
-    # both the locked rev and the original input-spec from the same JSON.
-    # Avoids a race where flake.lock could change between two separate
-    # metadata calls, and halves the nix-daemon connections per tick.
-    FLAKE_META=$(${pkgs.nix}/bin/nix flake metadata "$FLAKE_DIR" --json 2>/dev/null)
-    if [ -z "$FLAKE_META" ]; then
-      echo "nix flake metadata failed for $FLAKE_DIR" >&2
-      exit 1
+    # Read straight from flake.lock — don't invoke `nix flake metadata`.
+    #
+    # The natural-feeling choice (`nix flake metadata --json` then jq
+    # `.locks.nodes.X`) has two failure modes that bit us in production:
+    # if any flake input is declared in flake.nix but missing from
+    # flake.lock, nix attempts to lock it on the fly (fetchTree +
+    # lock-file write). The checker runs as an unprivileged user with
+    # NO write perm on /etc/nixos/flake.lock, so the write step fails;
+    # before that, the fetchTree can hit GitHub's anonymous rate limit
+    # (≥30 s wall-clock then exit 1). Both surface as a generic
+    # "metadata failed" and trip the OnFailure notifier. We don't
+    # actually need any input to be fetched — we just want upstream's
+    # already-recorded locked.rev to compare with the GitHub HEAD.
+    # jq on flake.lock gives us exactly that, without nix in the loop:
+    # no network call, no write attempt, no rate limit.
+    #
+    # We deliberately compare against the LOCKED rev (not the activated
+    # rev) because it's self-limiting: on a broken upstream rev we
+    # attempt one switch, nix flake update writes the new rev into the
+    # lock, and the next tick sees "up to date" — no retry storm.
+
+    if [ ! -f "$LOCK" ]; then
+      # Fresh-deploy bootstrap: the activation script writes flake.nix
+      # but the lock can be absent (no upstream pin at image-build time,
+      # or operator wiped it for re-locking). Fire a trigger so the
+      # switcher's `nix flake update upstream` creates the lock from
+      # scratch. Soft-exit either way — this isn't a failure mode.
+      echo "$LOCK missing — firing initial switch to bootstrap lock" >&2
+      ${pkgs.coreutils}/bin/mktemp -p ${triggerDir} trigger.XXXXXX > /dev/null
+      exit 0
     fi
 
-    # Locked rev in the flake we'd activate. We deliberately compare this
-    # to upstream (not the activated rev) because it's self-limiting: on a
-    # broken upstream rev, we attempt one switch, nix flake update writes
-    # the new rev into the lock, and the next tick sees "up to date" —
-    # no retry storm, no wasted CPU / SD on a doomed build.
-    CURRENT_REV=$(${pkgs.coreutils}/bin/printf '%s' "$FLAKE_META" \
-      | ${pkgs.jq}/bin/jq -r ".locks.nodes.\"$INPUT_NAME\".locked.rev // empty")
+    CURRENT_REV=$(${pkgs.jq}/bin/jq -r \
+      ".nodes.\"$INPUT_NAME\".locked.rev // empty" "$LOCK" 2>/dev/null)
 
     if [ -z "$CURRENT_REV" ]; then
-      echo "could not read current locked rev for input '$INPUT_NAME'" >&2
+      echo "could not read .nodes.$INPUT_NAME.locked.rev from $LOCK" >&2
       exit 1
     fi
 
-    # Extract upstream coordinates from the flake metadata. Handles both
-    # the structured input form (type+owner+repo+ref) and the url form
-    # (github:owner/repo/ref).
-    ORIGINAL=$(${pkgs.coreutils}/bin/printf '%s' "$FLAKE_META" \
-      | ${pkgs.jq}/bin/jq -c ".locks.nodes.\"$INPUT_NAME\".original")
+    # Extract upstream coordinates straight from the same lock. Handles
+    # both the structured input form (type+owner+repo+ref) and the url
+    # form (github:owner/repo/ref).
+    ORIGINAL=$(${pkgs.jq}/bin/jq -c \
+      ".nodes.\"$INPUT_NAME\".original" "$LOCK" 2>/dev/null)
 
     UPSTREAM_TYPE=$(echo "$ORIGINAL" | ${pkgs.jq}/bin/jq -r '.type // empty')
     if [ "$UPSTREAM_TYPE" = "github" ]; then
