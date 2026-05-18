@@ -149,15 +149,21 @@ let
   # if we ever grow non-tryboot machines that want candidate
   # trios, this wrapper can move to a more general module.
   promoteCandidateWrapper = pkgs.buildPackages.writeShellApplication {
-    name = "promote-candidate";
-    runtimeInputs = with pkgs.buildPackages; [ coreutils jq util-linux ];
+    name = "nixos-rebuild-promote-candidate";
+    runtimeInputs = with pkgs.buildPackages; [ coreutils jq util-linux systemd ];
     text = ''
-      # promote-candidate — structurally copy `nixpkgs-candidate` and
-      # `nixos-hardware-candidate` locked-blocks over the matching
-      # production nodes in /etc/nixos/flake.lock.
+      # nixos-rebuild-promote-candidate — structurally copy
+      # `nixpkgs-candidate` + `nixos-hardware-candidate` locked-blocks
+      # over the matching production nodes in /etc/nixos/flake.lock,
+      # then optionally apply via nixos-rebuild switch / boot /
+      # boot + reboot. The candidate trio's locks are produced by
+      # `nixos-rebuild build --flake /etc/nixos#candidate` (or the
+      # corresponding -boot-once tryboot build); after promotion the
+      # production eval reaches the same store paths, so any apply
+      # step is a no-op rebuild (full local cache reuse).
 
       if [ "$EUID" -ne 0 ]; then
-        echo "error: must be run as root (try: sudo promote-candidate)" >&2
+        echo "error: must be run as root (try: sudo nixos-rebuild-promote-candidate)" >&2
         exit 1
       fi
 
@@ -213,9 +219,41 @@ let
       echo "  nixpkgs        -> $NEW_NIXPKGS"
       echo "  nixos-hardware -> $NEW_NHW"
       echo
-      echo "next nixos-rebuild switch reuses the local cache —"
-      echo "no kernel rebuild, branch-ref descriptors preserved so"
-      echo "future monthly upgrades continue to advance normally."
+
+      # Non-interactive invocation (CI / agent / cron) defaults to
+      # "nothing" — lock is mutated, operator picks an apply mode
+      # when they're ready. Interactive prompt offers the four
+      # useful next steps so the operator can pick based on what
+      # kind of change just landed: kernel rebuild → 4; userspace-
+      # only → 2; staged for an upcoming planned reboot → 3;
+      # defer → 1.
+      if [ ! -t 0 ]; then
+        echo "apply: skipped (no TTY); next nixos-rebuild switch picks up the new lock."
+        exit 0
+      fi
+
+      cat <<'APPLY'
+      apply options:
+        1) nothing       — exit (default; lock is already updated)
+        2) switch        — nixos-rebuild switch --flake /etc/nixos#default
+                           applies now; userspace units restart immediately
+        3) boot          — nixos-rebuild boot   --flake /etc/nixos#default
+                           stages for next reboot; running system unaffected
+        4) boot + reboot — option 3 then systemctl reboot
+
+      APPLY
+
+      read -r -p "choose [1-4] (default 1): " CHOICE
+      CHOICE=''${CHOICE:-1}
+
+      case "$CHOICE" in
+        1) echo "lock updated; nothing else applied." ;;
+        2) exec nixos-rebuild switch --flake /etc/nixos#default ;;
+        3) exec nixos-rebuild boot   --flake /etc/nixos#default ;;
+        4) nixos-rebuild boot --flake /etc/nixos#default \
+             && systemctl reboot ;;
+        *) echo "unknown choice '$CHOICE'; lock updated, nothing else applied." ;;
+      esac
     '';
   };
 
@@ -436,8 +474,9 @@ in {
   options.hypersw.system.bootOnce = {
     enable = lib.mkEnableOption ''
       `nixos-rebuild-boot-once` + `reboot-tryboot` +
-      `promote-candidate` — one-shot kernel testing on Pi 5 plus
-      zero-rebuild lock promotion of a verified candidate.
+      `nixos-rebuild-promote-candidate` — one-shot kernel testing
+      on Pi 5 plus zero-rebuild lock promotion of a verified
+      candidate.
 
       `nixos-rebuild-boot-once` builds a candidate generation,
       stages it as a sidecar, marks config.txt's [tryboot] section,
