@@ -662,14 +662,43 @@ async Task ClosePrinterSessionAsync(long chatId, CancellationToken ct)
         if (s is not null) printSessions.Remove(chatId);
     }
     if (s is null) return;
+    var text = PrintMessage.RenderTerminated(s);
     try
     {
-        await bot.EditMessageText(chatId, s.StatusMessageId,
-            PrintMessage.RenderTerminated(s),
-            parseMode: ParseMode.Html, replyMarkup: null,
-            cancellationToken: ct);
+        // Dispatch on the live message's StatusKind. The previous
+        // unconditional EditMessageText fails silently against a
+        // Photo / Document live message (Telegram API returns
+        // "Bad Request: there is no text in the message to edit"),
+        // which is exactly the state the session is in after the
+        // user uploaded an image preview or a PDF — i.e., the most
+        // common case at the moment someone taps "end". Caption-
+        // editing leaves the preview itself in place but strips the
+        // keyboard and updates the line under it to the terminated
+        // marker, which is the right UX (the user keeps the file
+        // visible without re-uploading should they re-open).
+        switch (s.StatusKind)
+        {
+            case LiveMessageKind.Text:
+                await bot.EditMessageText(chatId, s.StatusMessageId, text,
+                    parseMode: ParseMode.Html, replyMarkup: null,
+                    cancellationToken: ct);
+                break;
+            case LiveMessageKind.Photo:
+            case LiveMessageKind.Document:
+                await bot.EditMessageCaption(chatId, s.StatusMessageId,
+                    caption: text, parseMode: ParseMode.Html,
+                    replyMarkup: null, cancellationToken: ct);
+                break;
+        }
     }
-    catch (Exception ex) { log.LogDebug("close-render failed: {Err}", ex.Message); }
+    catch (Exception ex)
+    {
+        // Warning, not Debug — silent close-failure was exactly the
+        // class of bug that hid the EditMessageText-on-photo issue.
+        log.LogWarning(
+            "close of printer session {Chat} (msg {Msg}, kind {Kind}) failed: {Err}",
+            chatId, s.StatusMessageId, s.StatusKind, ex.Message);
+    }
 }
 
 async Task RenderPrintSessionAsync(long chatId, CancellationToken ct)
