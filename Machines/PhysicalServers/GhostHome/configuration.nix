@@ -207,6 +207,7 @@
       alertsChatIdFile = config.sops.secrets.MonitoringTelegramAlertsChatId.path;
       logChatIdFile    = config.sops.secrets.MonitoringTelegramLogChatId.path;
     };
+    autoUpgrade.cadence = "weekly";
     localFlake.configurationName = "GhostHome";
   };
 
