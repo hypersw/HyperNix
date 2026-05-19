@@ -173,12 +173,12 @@ let
         exit 1
       fi
 
-      # Sanity-check the candidate trio is present and locked. An
+      # Sanity-check the candidate quartet is present and locked. An
       # empty candidate lock would silently null out the production
       # nodes — guard against running this before #candidate ever
       # evaluated, in which case the candidate inputs are still
       # un-locked.
-      for name in nixpkgs-candidate nixos-hardware-candidate; do
+      for name in nixpkgs-candidate nixos-hardware-candidate nixos-raspberrypi-candidate; do
         if ! jq -e --arg n "$name" '.nodes[$n].locked.rev' "$LOCK" >/dev/null; then
           echo "error: $LOCK has no .nodes.$name.locked.rev — has" >&2
           echo "       #candidate ever been built? Try:" >&2
@@ -197,11 +197,14 @@ let
           = .nodes["nixpkgs-candidate"].locked
         | .nodes["nixos-hardware"].locked
           = .nodes["nixos-hardware-candidate"].locked
+        | .nodes["nixos-raspberrypi"].locked
+          = .nodes["nixos-raspberrypi-candidate"].locked
       ' "$LOCK" > "$NEW"
 
       if ! jq -e '
         .nodes.nixpkgs.locked.rev != null
         and .nodes["nixos-hardware"].locked.rev != null
+        and .nodes["nixos-raspberrypi"].locked.rev != null
       ' "$NEW" >/dev/null; then
         echo "error: post-transform lock failed sanity check" >&2
         exit 1
@@ -215,9 +218,11 @@ let
 
       NEW_NIXPKGS=$(jq -r '.nodes.nixpkgs.locked.rev' "$LOCK")
       NEW_NHW=$(jq -r '.nodes["nixos-hardware"].locked.rev' "$LOCK")
+      NEW_RPI=$(jq -r '.nodes["nixos-raspberrypi"].locked.rev' "$LOCK")
       echo "promoted:"
-      echo "  nixpkgs        -> $NEW_NIXPKGS"
-      echo "  nixos-hardware -> $NEW_NHW"
+      echo "  nixpkgs           -> $NEW_NIXPKGS"
+      echo "  nixos-hardware    -> $NEW_NHW"
+      echo "  nixos-raspberrypi -> $NEW_RPI"
       echo
 
       # Non-interactive invocation (CI / agent / cron) defaults to
