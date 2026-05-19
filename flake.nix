@@ -33,10 +33,17 @@
     # the rebuild cost in exchange for not having to track two
     # nixpkgs versions across the fleet; telemetry alerts on
     # rebuild failure already cover us if a kernel rev breaks.
-    nixos-raspberrypi = {
-      url = "github:nvmd/nixos-raspberrypi";
-      inputs.nixpkgs.follows = "nixpkgs";
-    };
+    # NOTE: we DO NOT follow `nixos-raspberrypi.inputs.nixpkgs` to our
+    # `nixpkgs` — leaving nvmd on its own pinned nixpkgs (nixos-25.11)
+    # is what makes the vendor-kernel derivation hash match nvmd's CI
+    # build and substitutable from https://nixos-raspberrypi.cachix.org.
+    # Each `nixos-raspberrypi.lib.nixosSystem` call below explicitly
+    # passes `nixpkgs = nixpkgs` so the SYSTEM eval (userland) still
+    # comes from our fresh nixos-unstable; only `boot.kernelPackages`
+    # is reached through a separately-built `vendorPkgs` set anchored
+    # to `nixos-raspberrypi.inputs.nixpkgs` (i.e. nvmd's 25.11), which
+    # is the input the cache is keyed on.
+    nixos-raspberrypi.url = "github:nvmd/nixos-raspberrypi";
   };
 
   outputs = { self, nixpkgs, nixos-hardware, microvm, sops-nix, nixos-raspberrypi }:
@@ -221,14 +228,13 @@
         # into the same role via the provisioning image below.
         PrintScanServerPi4 = nixos-raspberrypi.lib.nixosSystem {
           system = "aarch64-linux";
-          # nvmd's `lib.nixosSystem` is a drop-in wrapper around
-          # `nixpkgs.lib.nixosSystem` that injects their Pi-vendor
-          # overlays (kernel, firmware, raspberrypi-utils,
-          # bootloader bits) onto `pkgs` so their modules can
-          # reference packages like `pkgs.raspberrypi-utils`
-          # unconditionally. Defaults to using nvmd's pinned
-          # nixpkgs (currently nixos-25.11), which matches the
-          # builds in their binary cache.
+          # Pass OUR nixpkgs (fresh nixos-unstable) for the system eval
+          # so userland tracks rolling. nvmd's wrapper otherwise defaults
+          # to `self.inputs.nixpkgs` which — now that we don't follows-
+          # redirect it — is nvmd's pinned nixos-25.11 (= autumn-stale).
+          # See the `nixos-raspberrypi` input declaration above for why
+          # the follows directive was removed.
+          nixpkgs = nixpkgs;
           specialArgs = { inherit nixos-raspberrypi; };
           modules = [
             nixos-raspberrypi.nixosModules.raspberry-pi-4.base
@@ -262,14 +268,9 @@
         };
         PrintScanServerPi4-sdImage = nixos-raspberrypi.lib.nixosSystem {
           system = "aarch64-linux";
-          # nvmd's `lib.nixosSystem` is a drop-in wrapper around
-          # `nixpkgs.lib.nixosSystem` that injects their Pi-vendor
-          # overlays (kernel, firmware, raspberrypi-utils,
-          # bootloader bits) onto `pkgs` so their modules can
-          # reference packages like `pkgs.raspberrypi-utils`
-          # unconditionally. Defaults to using nvmd's pinned
-          # nixpkgs (currently nixos-25.11), which matches the
-          # builds in their binary cache.
+          # See PrintScanServerPi4 above for the `nixpkgs = nixpkgs;`
+          # rationale.
+          nixpkgs = nixpkgs;
           specialArgs = { inherit nixos-raspberrypi; };
           modules = [
             nixos-raspberrypi.nixosModules.raspberry-pi-4.base
@@ -301,14 +302,9 @@
           printScanReadyRef = "printscan-ready-${printScanReadySuffix}";
         in nixos-raspberrypi.lib.nixosSystem {
           system = "aarch64-linux";
-          # nvmd's `lib.nixosSystem` is a drop-in wrapper around
-          # `nixpkgs.lib.nixosSystem` that injects their Pi-vendor
-          # overlays (kernel, firmware, raspberrypi-utils,
-          # bootloader bits) onto `pkgs` so their modules can
-          # reference packages like `pkgs.raspberrypi-utils`
-          # unconditionally. Defaults to using nvmd's pinned
-          # nixpkgs (currently nixos-25.11), which matches the
-          # builds in their binary cache.
+          # See PrintScanServerPi4 above for the `nixpkgs = nixpkgs;`
+          # rationale.
+          nixpkgs = nixpkgs;
           specialArgs = { inherit nixos-raspberrypi; };
           modules = [
             nixos-raspberrypi.nixosModules.raspberry-pi-4.base
@@ -357,20 +353,51 @@
         # ── GhostHome — Pi 5 home-automation server. Inherits the
         # print/scan stack as a guest workload until a dedicated
         # home-automation role takes its place as the headline.
-        GhostHome = nixos-raspberrypi.lib.nixosSystem {
+        GhostHome = let
+          # vendorPkgs is built against nvmd's OWN pinned nixpkgs
+          # (= nixos-25.11), with nvmd's overlays applied — exactly
+          # what their CI evaluates when populating
+          # https://nixos-raspberrypi.cachix.org. Reading
+          # `linuxPackages_rpi5` out of this pkgs set therefore lands
+          # on the same store path nvmd's cache holds. `boot.kernel-
+          # Packages` is overridden below to use that, while the rest
+          # of the system (userland, services, every other package)
+          # continues to evaluate against our fresh nixpkgs that
+          # `lib.nixosSystem` is fed via the explicit `nixpkgs = nixpkgs;`
+          # argument. Net effect: kernel substitutes from nvmd's
+          # cache, userland substitutes from cache.nixos.org, only
+          # the HyperNix-private packages still build locally.
+          vendorPkgs = import nixos-raspberrypi.inputs.nixpkgs {
+            system = "aarch64-linux";
+            overlays = [
+              nixos-raspberrypi.overlays.pkgs
+              nixos-raspberrypi.overlays.bootloader
+              nixos-raspberrypi.overlays.vendor-kernel
+              nixos-raspberrypi.overlays.vendor-firmware
+              nixos-raspberrypi.overlays.kernel-and-firmware
+              nixos-raspberrypi.overlays.vendor-pkgs
+            ];
+            config.allowUnfree = true;
+          };
+        in nixos-raspberrypi.lib.nixosSystem {
           system = "aarch64-linux";
-          # nvmd's `lib.nixosSystem` is a drop-in wrapper around
-          # `nixpkgs.lib.nixosSystem` that injects their Pi-vendor
-          # overlays (kernel, firmware, raspberrypi-utils,
-          # bootloader bits) onto `pkgs` so their modules can
-          # reference packages like `pkgs.raspberrypi-utils`
-          # unconditionally. Defaults to using nvmd's pinned
-          # nixpkgs (currently nixos-25.11), which matches the
-          # builds in their binary cache.
+          # System uses our fresh nixos-unstable; kernel is forced
+          # out of vendorPkgs by the module below.
+          nixpkgs = nixpkgs;
           specialArgs = { inherit nixos-raspberrypi; };
           modules = [
             nixos-raspberrypi.nixosModules.raspberry-pi-5.base
             sops-nix.nixosModules.sops
+            # Kernel override — lib.mkForce so we win against any
+            # default nvmd's raspberry-pi-5.base sets. Out-of-tree
+            # kernel modules (boot.extraModulePackages) MUST be built
+            # against the same pkgs as the kernel they bind to, so
+            # they're force-set here too — empty by default; add
+            # vendorPkgs-built modules here if introduced later.
+            ({ lib, ... }: {
+              boot.kernelPackages = lib.mkForce vendorPkgs.linuxPackages_rpi5;
+              boot.extraModulePackages = lib.mkForce [];
+            })
             {
               system.configurationRevision = self.rev or self.dirtyRev or "dirty";
               hypersw.profiles.anyMachineBase.alerts.configRevision =
@@ -392,14 +419,13 @@
         };
         GhostHome-sdImage = nixos-raspberrypi.lib.nixosSystem {
           system = "aarch64-linux";
-          # nvmd's `lib.nixosSystem` is a drop-in wrapper around
-          # `nixpkgs.lib.nixosSystem` that injects their Pi-vendor
-          # overlays (kernel, firmware, raspberrypi-utils,
-          # bootloader bits) onto `pkgs` so their modules can
-          # reference packages like `pkgs.raspberrypi-utils`
-          # unconditionally. Defaults to using nvmd's pinned
-          # nixpkgs (currently nixos-25.11), which matches the
-          # builds in their binary cache.
+          # See PrintScanServerPi4 above for the `nixpkgs = nixpkgs;`
+          # rationale. sd-image variant intentionally NOT given the
+          # GhostHome dual-pkgs kernel override — the SD image carries
+          # the default-system path, and the kernel override applies
+          # at the runtime nixosConfiguration level (GhostHome) which
+          # uses this image only as a seed.
+          nixpkgs = nixpkgs;
           specialArgs = { inherit nixos-raspberrypi; };
           modules = [
             nixos-raspberrypi.nixosModules.raspberry-pi-5.base
@@ -457,14 +483,9 @@
           ghostReadyRef = "ghosthome-ready-${ghostReadySuffix}";
         in nixos-raspberrypi.lib.nixosSystem {
           system = "aarch64-linux";
-          # nvmd's `lib.nixosSystem` is a drop-in wrapper around
-          # `nixpkgs.lib.nixosSystem` that injects their Pi-vendor
-          # overlays (kernel, firmware, raspberrypi-utils,
-          # bootloader bits) onto `pkgs` so their modules can
-          # reference packages like `pkgs.raspberrypi-utils`
-          # unconditionally. Defaults to using nvmd's pinned
-          # nixpkgs (currently nixos-25.11), which matches the
-          # builds in their binary cache.
+          # See PrintScanServerPi4 above for the `nixpkgs = nixpkgs;`
+          # rationale.
+          nixpkgs = nixpkgs;
           specialArgs = { inherit nixos-raspberrypi; };
           modules = [
             nixos-raspberrypi.nixosModules.raspberry-pi-5.base
