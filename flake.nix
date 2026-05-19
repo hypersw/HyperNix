@@ -367,18 +367,15 @@
           # argument. Net effect: kernel substitutes from nvmd's
           # cache, userland substitutes from cache.nixos.org, only
           # the HyperNix-private packages still build locally.
-          vendorPkgs = import nixos-raspberrypi.inputs.nixpkgs {
-            system = "aarch64-linux";
-            overlays = [
-              nixos-raspberrypi.overlays.pkgs
-              nixos-raspberrypi.overlays.bootloader
-              nixos-raspberrypi.overlays.vendor-kernel
-              nixos-raspberrypi.overlays.vendor-firmware
-              nixos-raspberrypi.overlays.kernel-and-firmware
-              nixos-raspberrypi.overlays.vendor-pkgs
-            ];
-            config.allowUnfree = true;
-          };
+          # Going through `legacyPackages.aarch64-linux` (instead of
+          # constructing the pkgs set ourselves via `import nvmd.inputs.
+          # nixpkgs { overlays = …; }`) is what makes the kernel store
+          # path bit-identical to nvmd's CI build. Manual reconstruction
+          # was tried first and produced a different deriv hash — the
+          # subtle difference (config attribute, overlay ordering, or
+          # similar) wasn't worth pinning down when nvmd's flake already
+          # exposes the canonical pkgs set as a flake output.
+          vendorPkgs = nixos-raspberrypi.legacyPackages.aarch64-linux;
         in nixos-raspberrypi.lib.nixosSystem {
           system = "aarch64-linux";
           # System uses our fresh nixos-unstable; kernel is forced
