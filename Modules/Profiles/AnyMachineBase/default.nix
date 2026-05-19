@@ -26,7 +26,15 @@ let
 
   autoUpgradeDates = {
     daily   = "*-*-* 02:00";
-    weekly  = "Sun *-*-* 02:00";
+    # Tuesday, in homage to Microsoft's Patch Tuesday — the de
+    # facto industry-wide "expect updates this day" slot, picked
+    # by MS deliberately to give admins a known weekday window
+    # for vendor rollouts. Same idea on this side: predictable
+    # mid-week tick that's neither a weekend (operator away,
+    # nobody watching the alerts channel) nor a Monday (week's
+    # already loaded). 04:00 base + the existing 6h randomized
+    # delay puts the actual window at Tue 04:00-10:00 local.
+    weekly  = "Tue *-*-* 04:00";
     monthly = "*-*-01 02:00";
   }.${cfg.autoUpgrade.cadence};
 in
