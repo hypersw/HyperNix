@@ -44,6 +44,7 @@
     ./Monitoring/TelegramAlerts
     ./System/AutoRebuildOnPush
     ./System/AvahiPerInterfaceNames
+    ./System/BootOnceRaspberryPi
     ./System/BootStabilityProbe
     ./System/Btm
     # `Hardware/RaspberryPi5SdImage` is NOT in the bundle. It sets
@@ -54,18 +55,18 @@
     # though the module is gated by `enable = false`. Add it
     # explicitly to the sd-image build's modules list when needed.
     #
-    # `System/BootOnce` — same pattern. Sets
-    # `boot.loader.raspberry-pi.configurationLimit` (declared by
-    # nvmd's `nixos-raspberrypi.nixosModules.raspberry-pi-5.base`,
-    # which is only loaded for Pi-5 hosts via the
-    # `nixos-raspberrypi.lib.nixosSystem` call site in flake.nix).
-    # Non-Pi machines that import this bundle would otherwise trip
-    # "the option `boot.loader.raspberry-pi' does not exist" even
-    # with `hypersw.system.bootOnce.enable = false`, because
-    # `lib.mkIf false` only suppresses the merged value — it
-    # doesn't defer the option-existence check on the definition
-    # path. Import explicitly from Pi machines that want the
-    # wrapper.
+    # Note for similar future cases: `System/BootOnceRaspberryPi`
+    # also references platform-specific options (defines
+    # `boot.loader.raspberry-pi.configurationLimit`, declared by
+    # nvmd's `raspberry-pi-5.base` which is only loaded on Pi
+    # hosts) but is in the bundle anyway, because its Pi-only
+    # definition is gated by `lib.optionalAttrs hasRpiLoader` —
+    # the path is never registered with the merger on non-Pi
+    # hosts, so the existence check never fires. When the
+    # platform-option-existence check is the only obstacle, prefer
+    # that gating pattern over bundle-exclusion. RaspberryPi5SdImage
+    # stays excluded because its predicate (sd-image-module loaded)
+    # isn't a clean `options ?` check.
     ./Profiles/AnyMachineBase
     ./Profiles/PrintScanServer
     ./Profiles/MultiHomedNetworking

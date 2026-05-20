@@ -582,7 +582,7 @@ in
           cat > "$FLAKE_TMP" << 'FLAKE'
           {
             description = '''
-          Multi-input shim with parallel main and candidate quartets. Each quartet is `{nixpkgs, nixos-hardware, nixos-raspberrypi, upstream}`. The main quartet drives `nixosConfigurations.default` (production); the candidate quartet drives `nixosConfigurations.candidate` (the try-boot staging slot — see Modules/System/BootOnce/). Every input uses a moving branch-ref URL (nixos-unstable for nixpkgs, the upstream-repo HEAD for HyperNix, the upstream branches for nixos-hardware and nixos-raspberrypi). Each input's `original` block descriptor is identical across the two quartets, but each input locks to a separate rev. Result: main and candidate hold independent revisions of the same branches at the same time.
+          Multi-input shim with parallel main and candidate quartets. Each quartet is `{nixpkgs, nixos-hardware, nixos-raspberrypi, upstream}`. The main quartet drives `nixosConfigurations.default` (production); the candidate quartet drives `nixosConfigurations.candidate` (the try-boot staging slot — see Modules/System/BootOnceRaspberryPi/). Every input uses a moving branch-ref URL (nixos-unstable for nixpkgs, the upstream-repo HEAD for HyperNix, the upstream branches for nixos-hardware and nixos-raspberrypi). Each input's `original` block descriptor is identical across the two quartets, but each input locks to a separate rev. Result: main and candidate hold independent revisions of the same branches at the same time.
 
           nixos-raspberrypi is locally-managed alongside nixpkgs and nixos-hardware (not delegated to whatever HyperNix's flake.lock pinned) so monthly upgrades advance it in lockstep with the rest of userland — that's where the Pi-vendor kernel + its security patches arrive from.
 
@@ -608,7 +608,7 @@ in
 
           sudo nixos-rebuild-promote-candidate
 
-          Structurally copies nodes.nixpkgs-candidate.locked over nodes.nixpkgs.locked (same for nixos-hardware and nixos-raspberrypi) inside /etc/nixos/flake.lock and offers a 1-4 apply prompt (nothing / switch / boot / boot + reboot). See Modules/System/BootOnce/.
+          Structurally copies nodes.nixpkgs-candidate.locked over nodes.nixpkgs.locked (same for nixos-hardware and nixos-raspberrypi) inside /etc/nixos/flake.lock and offers a 1-4 apply prompt (nothing / switch / boot / boot + reboot). See Modules/System/BootOnceRaspberryPi/.
             ''';
 
             inputs = {

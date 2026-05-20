@@ -1,7 +1,7 @@
-{ config, lib, pkgs, ... }:
+{ options, config, lib, pkgs, ... }:
 #
-# BootOnce — `nixos-rebuild-boot-once` wrapper for tryboot-style
-# one-shot kernel testing on Pi 5.
+# BootOnceRaspberryPi — `nixos-rebuild-boot-once` wrapper for
+# tryboot-style one-shot kernel testing on Pi 5.
 #
 # ## Workflow
 #
@@ -88,17 +88,38 @@
 # instead of the inline shell — same external behaviour, drops the
 # divergence-risk surface.
 #
+# ## Safe loading on non-Pi hosts
+#
+# The Pi-specific definition (`boot.loader.raspberry-pi.
+# configurationLimit`) is gated by `lib.optionalAttrs hasRpiLoader`
+# so non-Pi hosts that load this module (via the bundle) never
+# register a definition for the missing option. `mkIf cfg.enable`
+# would not be enough here — `mkIf false` only suppresses the
+# merged value, it still registers the path with the option
+# system, which then fails the existence check on hosts where
+# nvmd's `raspberry-pi-5.base` isn't loaded.
+#
 let
-  cfg = config.hypersw.system.bootOnce;
+  cfg = config.hypersw.system.bootOnceRaspberryPi;
+
+  # True only if some other module (in practice nvmd's
+  # `raspberry-pi-5.base`) has DECLARED `boot.loader.raspberry-pi.*`
+  # in the options tree. Checking `options` (the option-declaration
+  # tree) rather than `config` (the merged values) avoids any
+  # config-eval cycle and gives a deterministic answer at
+  # module-evaluation time.
+  hasRpiLoader = options.boot.loader ? raspberry-pi;
 
   isPiKernelBootloader =
-    (config.boot.loader.raspberry-pi.bootloader or null) == "kernel";
+    hasRpiLoader
+    && (config.boot.loader.raspberry-pi.bootloader or null) == "kernel";
 
   # Future: when nvmd's stageGenCmd option lands upstream + we bump,
   # this branch will pick up the official primitive and the
   # `inlineStage` body below becomes a fallback for older nvmd.
   hasUpstreamStageCmd =
-    (config.boot.loader.raspberry-pi.stageGenCmd or null) != null;
+    hasRpiLoader
+    && (config.boot.loader.raspberry-pi.stageGenCmd or null) != null;
 
   # Companion to nixos-rebuild-boot-once — fires the actual tryboot
   # reboot when invoked manually. Named `reboot-tryboot` (not
@@ -145,7 +166,7 @@ let
   # `original` (branch-ref descriptor) untouched. Run after a
   # successful tryboot of #candidate. Zero rebuild — the production
   # eval reaches the same store paths the candidate already built.
-  # Lives in BootOnce because the workflow is try-boot-then-promote;
+  # Lives in BootOnceRaspberryPi because the workflow is try-boot-then-promote;
   # if we ever grow non-tryboot machines that want candidate
   # trios, this wrapper can move to a more general module.
   promoteCandidateWrapper = pkgs.buildPackages.writeShellApplication {
@@ -476,7 +497,7 @@ let
     '';
   };
 in {
-  options.hypersw.system.bootOnce = {
+  options.hypersw.system.bootOnceRaspberryPi = {
     enable = lib.mkEnableOption ''
       `nixos-rebuild-boot-once` + `reboot-tryboot` +
       `nixos-rebuild-promote-candidate` — one-shot kernel testing
@@ -504,16 +525,24 @@ in {
     '';
   };
 
-  config = lib.mkIf cfg.enable (lib.mkMerge [
-    {
+  config = lib.mkMerge [
+    # Bootloader-agnostic surface — assertions and warnings. These
+    # never reference `boot.loader.raspberry-pi.*` as a definition
+    # target, only as a value (with `or` defaults), so they're safe
+    # to register on every host.
+    (lib.mkIf cfg.enable {
       assertions = [
         {
-          assertion = isPiKernelBootloader;
+          assertion = hasRpiLoader && isPiKernelBootloader;
           message = ''
-            hypersw.system.bootOnce.enable = true currently requires
-            boot.loader.raspberry-pi.bootloader = "kernel" (Pi 5
-            EEPROM direct-kernel-boot). Add systemd-boot or grub
-            branches in Modules/System/BootOnce/default.nix to
+            hypersw.system.bootOnceRaspberryPi.enable = true requires:
+              - nvmd's `nixos-raspberrypi.nixosModules.raspberry-pi-5.base`
+                module loaded (declares `boot.loader.raspberry-pi.*`);
+              - `boot.loader.raspberry-pi.bootloader = "kernel"`
+                (Pi 5 EEPROM direct-kernel-boot, not u-boot or
+                systemd-boot chain-load).
+            Add systemd-boot or grub branches in
+            Modules/System/BootOnceRaspberryPi/default.nix to
             support other bootloaders.
           '';
         }
@@ -524,20 +553,26 @@ in {
       # delegate to it rather than vendoring the file-copy logic.
       warnings = lib.optional hasUpstreamStageCmd ''
         nvmd's `boot.loader.raspberry-pi.stageGenCmd` is now
-        available upstream. The BootOnce module is still using its
-        inline vendored stage; switch the wrapper at
-        Modules/System/BootOnce to delegate to that option instead
-        and drop the inline shell.
+        available upstream. The BootOnceRaspberryPi module is still
+        using its inline vendored stage; switch the wrapper at
+        Modules/System/BootOnceRaspberryPi to delegate to that
+        option instead and drop the inline shell.
       '';
-    }
+    })
 
-    (lib.mkIf isPiKernelBootloader {
+    # Pi-only surface. `lib.optionalAttrs hasRpiLoader` returns `{}`
+    # on hosts that don't load nvmd's module, which means the
+    # `boot.loader.raspberry-pi.configurationLimit` definition path
+    # is never registered with the merger and the option-existence
+    # check never fires. On Pi hosts the inner `mkIf` gates the
+    # actual rollout by the enable flag + bootloader-mode predicate.
+    (lib.optionalAttrs hasRpiLoader (lib.mkIf (cfg.enable && isPiKernelBootloader) {
       environment.systemPackages = [ piWrapper rebootTrybootWrapper promoteCandidateWrapper ];
 
       # Bumped from nvmd's default of 4 so a staged tryboot candidate
       # has FAT-partition headroom alongside the active default and
       # rotated-out gens. Per-host configs can override.
       boot.loader.raspberry-pi.configurationLimit = lib.mkDefault 5;
-    })
-  ]);
+    }))
+  ];
 }

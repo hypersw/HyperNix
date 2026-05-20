@@ -25,16 +25,6 @@
     # below (`hypersw.profiles.X.enable = true`, etc.). See
     # `Modules/default.nix` for the rationale on this shape.
     ../../../Modules
-
-    # `System/BootOnce` is held out of the bundle because it sets
-    # `boot.loader.raspberry-pi.configurationLimit`, which only
-    # exists on hosts that load nvmd's `raspberry-pi-5.base` (i.e.
-    # Pi-5 hosts going through `nixos-raspberrypi.lib.nixosSystem`).
-    # See the comment in `Modules/default.nix`. This is one of those
-    # hosts, so import it explicitly to get
-    # `nixos-rebuild-boot-once` + `reboot-tryboot` +
-    # `nixos-rebuild-promote-candidate`.
-    ../../../Modules/System/BootOnce
   ];
 
   networking.hostName = "GhostHome";
@@ -236,7 +226,7 @@
   # stages a candidate kernel via Pi 5 tryboot, power-cycle reverts.
   # First use will be the mainline-kernel migration; see the module
   # header for the full workflow rationale.
-  hypersw.system.bootOnce.enable = true;
+  hypersw.system.bootOnceRaspberryPi.enable = true;
 
   # ── PrintScanServer (workload, not infrastructure) ─────────
   # Activated in two stages — see commit history for the
