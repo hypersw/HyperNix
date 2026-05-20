@@ -25,6 +25,16 @@
     # below (`hypersw.profiles.X.enable = true`, etc.). See
     # `Modules/default.nix` for the rationale on this shape.
     ../../../Modules
+
+    # `System/BootOnce` is held out of the bundle because it sets
+    # `boot.loader.raspberry-pi.configurationLimit`, which only
+    # exists on hosts that load nvmd's `raspberry-pi-5.base` (i.e.
+    # Pi-5 hosts going through `nixos-raspberrypi.lib.nixosSystem`).
+    # See the comment in `Modules/default.nix`. This is one of those
+    # hosts, so import it explicitly to get
+    # `nixos-rebuild-boot-once` + `reboot-tryboot` +
+    # `nixos-rebuild-promote-candidate`.
+    ../../../Modules/System/BootOnce
   ];
 
   networking.hostName = "GhostHome";

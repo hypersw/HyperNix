@@ -44,7 +44,6 @@
     ./Monitoring/TelegramAlerts
     ./System/AutoRebuildOnPush
     ./System/AvahiPerInterfaceNames
-    ./System/BootOnce
     ./System/BootStabilityProbe
     ./System/Btm
     # `Hardware/RaspberryPi5SdImage` is NOT in the bundle. It sets
@@ -54,6 +53,19 @@
     # would fail with "the option `sdImage' does not exist" even
     # though the module is gated by `enable = false`. Add it
     # explicitly to the sd-image build's modules list when needed.
+    #
+    # `System/BootOnce` — same pattern. Sets
+    # `boot.loader.raspberry-pi.configurationLimit` (declared by
+    # nvmd's `nixos-raspberrypi.nixosModules.raspberry-pi-5.base`,
+    # which is only loaded for Pi-5 hosts via the
+    # `nixos-raspberrypi.lib.nixosSystem` call site in flake.nix).
+    # Non-Pi machines that import this bundle would otherwise trip
+    # "the option `boot.loader.raspberry-pi' does not exist" even
+    # with `hypersw.system.bootOnce.enable = false`, because
+    # `lib.mkIf false` only suppresses the merged value — it
+    # doesn't defer the option-existence check on the definition
+    # path. Import explicitly from Pi machines that want the
+    # wrapper.
     ./Profiles/AnyMachineBase
     ./Profiles/PrintScanServer
     ./Profiles/MultiHomedNetworking
