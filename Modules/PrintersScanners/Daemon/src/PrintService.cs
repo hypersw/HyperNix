@@ -254,8 +254,8 @@ public sealed class PrintService
             await proc.StandardInput.BaseStream.WriteAsync(request.FileData, ct);
             proc.StandardInput.Close();
 
-            var stdoutTask = proc.StandardOutput.ReadToEndAsync(ct).AsTask();
-            var stderrTask = proc.StandardError.ReadToEndAsync(ct).AsTask();
+            var stdoutTask = proc.StandardOutput.ReadToEndAsync(ct);
+            var stderrTask = proc.StandardError.ReadToEndAsync(ct);
             await proc.WaitForExitAsync(ct);
             var stdout = (await stdoutTask).Trim();
             var stderr = (await stderrTask).Trim();
