@@ -38,10 +38,14 @@
 # Startup blackout on interface swap
 # ──────────────────────────────────
 # Switching allow-interfaces requires a full avahi-daemon restart (SIGHUP
-# doesn't pick up server-level options). That's a ~4s gap in mDNS
-# availability — the watcher does an explicit stop, then a 3s pause,
-# then a start (see write_conf below for the why). Interface transitions
-# are rare (cable pull, Wi-Fi AP failure) so this is acceptable.
+# doesn't pick up server-level options). The watcher does an explicit
+# stop, then a 3s pause (to let mDNS goodbyes from the OLD instance
+# propagate before the NEW one probes — see write_conf below), then
+# a start, then polls avahi's D-Bus HostName until it matches the
+# expected `${config.networking.hostName}` or 15s elapse. Happy-path
+# mDNS unavailability ≈4-6s; worst case (the daemon still loses a
+# conflict despite the pause) is logged + bounded at 15s before the
+# watcher moves on. Interface transitions are rare so this is fine.
 #
 # Client side
 # ───────────
@@ -122,15 +126,39 @@ let
         # LAN hosts that cached the old record then echo it back
         # to the new daemon's probe, which mistakes those echoes
         # for a third party owning the name → renames itself to
-        # `GhostHome-2.local` and the original .local goes silent
-        # until the next regen. The 3s pause is empirically enough
-        # for the goodbyes to clear neighbour mDNS caches; the
-        # whole window is still under a typical TCP retransmit
-        # budget so live SSH sessions don't drop.
+        # `${config.networking.hostName}-2.local` and the original
+        # .local goes silent until the next regen. The short pause
+        # below lets goodbyes clear neighbour caches; then we verify
+        # the new instance actually claimed the expected name via
+        # avahi's D-Bus HostName property (which reflects the
+        # post-probing result), rather than trusting a fixed sleep.
         if ${pkgs.systemd}/bin/systemctl is-enabled --quiet avahi-daemon.service; then
           ${pkgs.systemd}/bin/systemctl stop avahi-daemon.service
           ${pkgs.coreutils}/bin/sleep 3
           ${pkgs.systemd}/bin/systemctl start avahi-daemon.service
+
+          # Poll avahi's D-Bus HostName until it matches the expected
+          # name or we hit the deadline. The property is set early
+          # during avahi's startup and updated again if probing
+          # detects a conflict and renames; reading it after probing
+          # completes tells us the truth.
+          deadline=$(( $(${pkgs.coreutils}/bin/date +%s) + 15 ))
+          claimed=""
+          while [ "$(${pkgs.coreutils}/bin/date +%s)" -lt "$deadline" ]; do
+            claimed=$(${pkgs.systemd}/bin/busctl --system get-property \
+                        org.freedesktop.Avahi / org.freedesktop.Avahi.Server \
+                        HostName 2>/dev/null \
+                      | ${pkgs.gnused}/bin/sed -n 's/^s "\(.*\)"$/\1/p')
+            if [ "$claimed" = "${config.networking.hostName}" ]; then
+              echo "avahi-primary-interface: claimed '${config.networking.hostName}.local' on $iface"
+              break
+            fi
+            ${pkgs.coreutils}/bin/sleep 0.5
+          done
+
+          if [ "$claimed" != "${config.networking.hostName}" ]; then
+            echo "avahi-primary-interface: WARNING name '${config.networking.hostName}.local' was NOT claimed within 15s — daemon currently reports '$claimed' (likely lost an mDNS conflict; another regen tick or longer goodbye propagation may recover it)" >&2
+          fi
         fi
       else
         ${pkgs.coreutils}/bin/rm -f "$tmp"
