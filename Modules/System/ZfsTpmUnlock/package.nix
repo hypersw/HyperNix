@@ -102,10 +102,23 @@ Subcommands:
     prompt.
 
   test
-    Unseal NAME.pub/NAME.priv with current PCR state, print the
-    SHA-256 of the unsealed hex string (compare with
-    `sha256sum your-backup.hex` — both hash the same 64 chars)
-    and exit. Doesn't write the key anywhere.
+    Unseal NAME.pub/NAME.priv with current PCR state. Two modes:
+
+    Without --key:
+        Just confirm the unseal works and print the SHA-256 of
+        the 64 unsealed hex bytes. Note: this is NOT `sha256sum
+        file.hex` if the file has a trailing newline (65 bytes
+        != 64). To compute a matching hash from a string or
+        file, see the message printed under the SHA-256.
+
+    With --key FILE (or --key - to paste from stdin):
+        Read the expected key from the file (or paste it silently
+        from the terminal if stdin is a tty), trim leading/
+        trailing whitespace, and compare byte-for-byte with the
+        unsealed key. Prints ✓ match or ✗ mismatch with the
+        position of first difference. This is the right tool
+        to verify a clipboard paste round-trip, no hash
+        arithmetic needed.
 
 Common options:
   --name NAME          Required for seal and test.
@@ -197,16 +210,24 @@ EOF
       pub_new="$tmp/new.pub"
       priv_new="$tmp/new.priv"
 
+      # CRITICAL: every prelim tpm2 command redirects </dev/null.
+      # Without that, some tpm2-tools commands (e.g.
+      # tpm2_createprimary) probe their stdin — for auth/password
+      # fallback paths — and end up consuming the key-bytes pipe
+      # that is supposed to be reserved for tpm2_create's
+      # --sealing-input - below. Result: tpm2_create silently
+      # seals zero bytes (no error), unseal returns the empty
+      # string, SHA-256 is e3b0c44…b855.
       echo "Create primary in hierarchy $hierarchy" >&2
       tpm2_createprimary --hierarchy   "$hierarchy" \
-                         --key-context "$primary" >/dev/null
+                         --key-context "$primary" </dev/null >/dev/null
 
       echo "Compute PCR policy digest ($pcr_list)" >&2
-      tpm2_startauthsession --session "$session" >/dev/null
+      tpm2_startauthsession --session "$session" </dev/null >/dev/null
       tpm2_policypcr        --session  "$session" \
                             --pcr-list "$pcr_list" \
-                            --policy   "$policy" >/dev/null
-      tpm2_flushcontext     "$session" >/dev/null
+                            --policy   "$policy" </dev/null >/dev/null
+      tpm2_flushcontext     "$session" </dev/null >/dev/null
 
       echo "Seal key under that policy (key bytes piped, never on disk)" >&2
       # tpm2_create rejects --key-algorithm (-G) together with
@@ -376,19 +397,86 @@ EOF
       tpm2_policypcr        --session  "$session" \
                             --pcr-list "$pcr_list" >/dev/null
 
-      # Pipe tpm2_unseal stdout straight into sha256sum.
-      # Key bytes never on disk, never in a variable longer than
-      # the pipe's kernel buffer takes to drain.
-      local fingerprint
-      fingerprint=$(tpm2_unseal --object-context "$loaded" \
-                                --auth           "session:$session" \
-                                --output         - \
-                    | sha256sum | cut -d' ' -f1)
+      if [[ -z $key_file ]]; then
+        # ── SHA-only mode ──────────────────────────────────────
+        # Pipe tpm2_unseal stdout straight into sha256sum; key
+        # bytes never on disk and never in a bash variable.
+        # IMPORTANT: tpm2_unseal does NOT treat `--output -` as
+        # "write to stdout" (unlike tpm2_create --sealing-input -);
+        # passing `-` silently produces zero output. Use the
+        # explicit /dev/stdout path instead.
+        local fingerprint
+        fingerprint=$(tpm2_unseal --object-context "$loaded" \
+                                  --auth           "session:$session" \
+                                  --output         /dev/stdout \
+                      | sha256sum | cut -d' ' -f1)
+        tpm2_flushcontext "$session" >/dev/null
+
+        echo "✔ Unseal succeeded for $name (PCR $pcr_list, hierarchy $hierarchy)"
+        echo "  SHA-256 of unsealed 64 hex bytes: $fingerprint"
+        echo "  (to verify your backup: printf '%s' \"\$your_key_hex\" | sha256sum"
+        echo "   — note that 'sha256sum file.hex' will NOT match if the file has"
+        echo "   a trailing newline; either strip it or use 'test --key FILE'"
+        echo "   for direct comparison without hash arithmetic.)"
+        return
+      fi
+
+      # ── Compare mode ──────────────────────────────────────────
+      # Read the unsealed key into a variable so we can compare it
+      # byte-for-byte with the expected key. The variable lives
+      # only for the duration of the comparison; cleared below.
+      # See the SHA-only branch for why /dev/stdout, not -.
+      local unsealed
+      unsealed=$(tpm2_unseal --object-context "$loaded" \
+                              --auth           "session:$session" \
+                              --output         /dev/stdout)
       tpm2_flushcontext "$session" >/dev/null
 
+      # Resolve the expected key from --key (file or stdin).
+      local expected
+      if [[ "$key_file" == "-" ]]; then
+        if [ -t 0 ]; then
+          echo "Paste expected 64-hex-char key (silent — no echo), then Enter:" >&2
+          IFS= read -rs expected
+          echo >&2
+        else
+          expected=$(cat)
+        fi
+      else
+        [[ -f $key_file ]] || die "--key file not found: $key_file"
+        expected=$(< "$key_file")
+      fi
+      # Trim leading + trailing whitespace, same as seal's input
+      # path — so a backup file with a trailing newline still
+      # compares cleanly.
+      expected="''${expected#"''${expected%%[![:space:]]*}"}"
+      expected="''${expected%"''${expected##*[![:space:]]}"}"
+
       echo "✔ Unseal succeeded for $name (PCR $pcr_list, hierarchy $hierarchy)"
-      echo "  SHA-256 of unsealed hex string: $fingerprint"
-      echo "  (verify with: sha256sum <your-backup.hex>)"
+      if [[ "$unsealed" == "$expected" ]]; then
+        echo "✔ Unsealed key matches the expected key from --key (lengths: ''${#unsealed} / ''${#expected})"
+        unsealed=""; expected=""
+        return
+      fi
+
+      # Mismatch — give the user something to diagnose with,
+      # without leaking key bytes.
+      echo "✗ MISMATCH: unsealed key does NOT match the expected key" >&2
+      echo "    unsealed length: ''${#unsealed}" >&2
+      echo "    expected length: ''${#expected}" >&2
+      if [[ "''${#unsealed}" != "''${#expected}" ]]; then
+        echo "    cause: lengths differ (so the paste/file likely has extra or missing chars)" >&2
+      else
+        local i
+        for (( i=0; i<''${#unsealed}; i++ )); do
+          if [[ "''${unsealed:$i:1}" != "''${expected:$i:1}" ]]; then
+            echo "    cause: differ at position $((i+1)) (1-indexed)" >&2
+            break
+          fi
+        done
+      fi
+      unsealed=""; expected=""
+      exit 1
     }
 
     case "$sub" in
