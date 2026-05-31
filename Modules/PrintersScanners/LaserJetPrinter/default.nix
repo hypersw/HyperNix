@@ -101,18 +101,30 @@ in
         # string; %20-escaped because URIs.
         deviceUri = "usb://HP/LaserJet%20P2015%20Series"
           + lib.optionalString (cfg.serial != null) "?serial=${cfg.serial}";
-        # foo2zjs's `foo2xqx` wrapper is the right driver for the
-        # P2015 (same XQX wire format as the P2014, P1005-P1008,
-        # P1505/n, M1132s, M1212nf), but nixpkgs' foo2zjs build
-        # doesn't ship a P2015-named PPD. The P2014n PPD targets
-        # the same foo2xqx pipeline — the next model down in the
-        # same product family, same protocol, same supported
-        # features for plain-paper monochrome printing — and is
-        # the closest match available out of the box. Plain text /
-        # image jobs print fine; if some advanced feature (duplex
-        # quirks, specific paper sizes) misbehaves, pull a real
-        # P2015 PPD from foo2zjs upstream and bake it locally.
-        model = "HP-LaserJet_P2014n.ppd.gz";
+        # CUPS' built-in Generic PostScript driver.
+        #
+        # The "obvious" choice — foo2zjs's `foo2xqx` PPD for the
+        # next model down (P2014n) — produces garbage on the
+        # P2015: the P2015 actually wants the `foo2xqx-z2` wire
+        # protocol variant, slightly different PJL preamble, and
+        # nixpkgs' foo2zjs build doesn't ship any P2015 PPD.
+        #
+        # The P2015n's firmware natively speaks PostScript Level 3
+        # (per HP's datasheet — networked variants of P2015 added
+        # PCL5e/PCL6/PS3, the bare P2015 is host-based only).
+        # Generic-PS bypasses the PJL gymnastics entirely: CUPS'
+        # bundled PostScript filter chain produces standard PS,
+        # the printer's PS interpreter consumes it directly, no
+        # proprietary wrapper needed.
+        #
+        # Trade-off: PS rendering on the printer is slower than
+        # foo2xqx's host-side rasterization (the host pre-rasters
+        # to ZjStream/XQX and ships ready-to-image data). For
+        # plain text / one-off image jobs the difference is
+        # invisible. For high-volume jobs we'd want a real P2015
+        # PPD eventually — vendoring one from foo2zjs upstream is
+        # the upgrade target.
+        model = "drv:///sample.drv/generic.ppd";
         ppdOptions = {
           PageSize = "A4";
         };
