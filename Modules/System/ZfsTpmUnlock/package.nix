@@ -318,13 +318,19 @@ EOF
         # whatever's on stdin.
         key_hex=$(cat)
       fi
-      # Tolerate any surrounding whitespace (newlines from terminal
-      # paste, leading/trailing spaces, internal line wraps).
-      key_hex="''${key_hex//[[:space:]]/}"
-      [[ ''${#key_hex} -eq 64 ]] || \
-        die "expected 64 hex characters after whitespace strip, got ''${#key_hex}"
-      [[ "$key_hex" =~ ^[0-9a-fA-F]{64}$ ]] || \
-        die "key contains non-hex characters"
+      # Trim leading and trailing whitespace, but DO NOT strip
+      # internal whitespace — a solid contiguous 64-char hex block
+      # is what we expect; embedded whitespace means a paste glitch
+      # or wrong-format input and should be rejected, not silently
+      # accepted.
+      key_hex="''${key_hex#"''${key_hex%%[![:space:]]*}"}"   # strip leading WS
+      key_hex="''${key_hex%"''${key_hex##*[![:space:]]}"}"   # strip trailing WS
+
+      if [[ ! "$key_hex" =~ ^[0-9a-fA-F]{64}$ ]]; then
+        die "expected exactly 64 contiguous hex characters (0-9 a-f A-F); \
+got ''${#key_hex} chars after trim — paste may have been truncated, \
+contained embedded whitespace, or had non-hex characters"
+      fi
 
       printf '%s' "$key_hex" | seal_pipe_into_files "$pub" "$priv"
       # Wipe the variable so the hex isn't lingering in the shell's
