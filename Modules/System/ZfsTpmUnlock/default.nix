@@ -38,6 +38,20 @@ let
   # entry can unseal without further config.
   keyTool = import ./package.nix { inherit pkgs; };
 
+  hasKeys = cfg.keys != { };
+  # Tri-state activation: by default ("auto") the module is fully
+  # passive until at least one `keys.<name>` entry exists, in line
+  # with the "all modules always available but passive until
+  # triggered" principle of the HyperNix bundle. The "on" override
+  # exists to break the bootstrap chicken-and-egg — you need the
+  # `zfs-tpm-key` CLI on PATH to seal a *first* key, but with pure
+  # `auto` the CLI only appears once `keys` has an entry that
+  # references blobs you don't have yet. "off" is the escape
+  # hatch: disable everything even when entries are declared.
+  active =
+       cfg.enable == "on"
+    || (cfg.enable == "auto" && hasKeys);
+
   entryType = types.submodule ({ name, config, ... }: {
     options = {
       dataset = mkOption {
@@ -140,10 +154,32 @@ let
 
 in {
   options.hypersw.services.zfs-tpm-unlock = {
-    # No `enable` flag — the module is active iff at least one
-    # entry is defined. An empty `keys = {}` (the default) yields
-    # zero services and zero side effects, so leaving the module
-    # imported but unused is free.
+    enable = mkOption {
+      type = types.enum [ "auto" "on" "off" ];
+      default = "auto";
+      description = ''
+        Activation mode:
+
+        - `"auto"` (default) — the module activates iff `keys` has
+          at least one entry. With no entries, nothing is added to
+          the system (no PATH binary, no services, no target, no
+          assertion). Matches "modules always available but
+          passive until triggered."
+
+        - `"on"` — force activation even with no `keys` entries.
+          Adds the `zfs-tpm-key` CLI to PATH and the
+          `security.tpm2.enable` assertion. Use this to break the
+          bootstrap chicken-and-egg: you need the CLI to seal a
+          first key before declaring the `keys.<name>` entry that
+          references the still-to-be-produced blobs.
+
+        - `"off"` — force-disable everything even when `keys`
+          entries are declared. Escape hatch for temporarily
+          shutting the module down without removing the per-key
+          declarations from your config.
+      '';
+    };
+
     keys = mkOption {
       type = types.attrsOf entryType;
       default = { };
@@ -187,7 +223,7 @@ in {
     };
   };
 
-  config = mkIf (cfg.keys != { }) {
+  config = mkIf active {
     assertions = [
       {
         # The bare `security.tpm2.enable = true` gives us everything
@@ -213,8 +249,14 @@ in {
     ];
 
     # Make the seal/reseal CLI available on activated hosts.
+    # Activation is gated by `active`, so `enable = "on"` brings
+    # the CLI even with no `keys` entries (bootstrap mode), and
+    # `enable = "off"` removes it even with entries declared.
     environment.systemPackages = [ keyTool ];
 
+    # Per-key services materialise from `cfg.keys`; an empty
+    # `keys` (e.g. `enable = "on"` with no entries) yields no
+    # services and no aggregate target — only the CLI surfaces.
     systemd.services = mapAttrs'
       (name: keyCfg: nameValuePair "zfs-tpm-unlock-${name}" {
         description = "Unseal TPM key and zfs load-key for ${keyCfg.dataset}";
@@ -287,12 +329,15 @@ in {
 
     # Aggregate target — consumers wanting "all configured keys
     # loaded" gate on this fixed name (referenced via `targetName`)
-    # instead of enumerating per-entry service names.
-    systemd.targets.zfs-tpm-unlock = {
-      description = "All TPM-sealed ZFS keys loaded";
-      wants    = map (n: "zfs-tpm-unlock-${n}.service") (attrNames cfg.keys);
-      after    = map (n: "zfs-tpm-unlock-${n}.service") (attrNames cfg.keys);
-      wantedBy = [ "multi-user.target" ];
+    # instead of enumerating per-entry service names. Only defined
+    # when there's actually something to aggregate.
+    systemd.targets = mkIf hasKeys {
+      zfs-tpm-unlock = {
+        description = "All TPM-sealed ZFS keys loaded";
+        wants    = map (n: "zfs-tpm-unlock-${n}.service") (attrNames cfg.keys);
+        after    = map (n: "zfs-tpm-unlock-${n}.service") (attrNames cfg.keys);
+        wantedBy = [ "multi-user.target" ];
+      };
     };
   };
 }
