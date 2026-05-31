@@ -57,6 +57,18 @@ in
       requires = [ "printscan-renderer.socket" ];
       after = [ "printscan-renderer.socket" ];
 
+      # `magick` (ImageMagick 7) shells out to `gs` (Ghostscript) when
+      # asked to rasterize PDF/PostScript input — that's the /pdf-preview
+      # path for the bot. ImageMagick's bundled delegates.xml hardcodes
+      # the invocation as a literal `gs` command, so the lookup happens
+      # via the systemd unit's PATH at runtime; without ghostscript in
+      # that PATH the subshell logs `sh: line 1: gs: command not found`
+      # and pdf-preview returns 502. Add ghostscript here rather than
+      # baking a full path into the C# (we don't control IM's internal
+      # invocation). The print path is independent — CUPS has its own
+      # ghostscript via cups-filters — so this only affects bot preview.
+      path = [ pkgs.ghostscript ];
+
       unitConfig = {
         StartLimitIntervalSec = "60s";
         StartLimitBurst = 5;
