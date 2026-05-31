@@ -163,6 +163,18 @@ public sealed class DaemonClient : IDisposable
                 var resp = await _http.SendAsync(req, HttpCompletionOption.ResponseHeadersRead, ct);
                 resp.EnsureSuccessStatusCode();
                 body = await resp.Content.ReadAsStreamAsync(ct);
+                // Log only on STATE TRANSITIONS — first-ever connect,
+                // and reconnects after a prior failure. backoff is
+                // reset to 1s on success; we use the pre-reset value
+                // (still > 1s if we just retried) as the "this was a
+                // reconnect" signal, so successful steady-state
+                // re-establishment shows up as one Info line in
+                // journalctl instead of silent.
+                if (backoff > TimeSpan.FromSeconds(1))
+                    _logger.LogInformation("SSE connected (after reconnect; backoff was {Sec}s)",
+                        backoff.TotalSeconds);
+                else
+                    _logger.LogInformation("SSE connected");
                 backoff = TimeSpan.FromSeconds(1);   // reset on successful connect
             }
             catch (OperationCanceledException) when (ct.IsCancellationRequested)

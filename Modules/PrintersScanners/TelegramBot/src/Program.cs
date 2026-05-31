@@ -767,8 +767,12 @@ async Task RenderPrintSessionAsync(long chatId, CancellationToken ct)
     }
     catch (Exception ex)
     {
+        // "message is not modified" is benign — same payload + same kb,
+        // Telegram refuses to re-send. Everything else is a real Telegram
+        // API error and the user sees stale buttons because of it; surface
+        // at Warning so journalctl shows it without a custom log level.
         if (!ex.Message.Contains("not modified", StringComparison.OrdinalIgnoreCase))
-            log.LogDebug("printer render failed: {Err}", ex.Message);
+            log.LogWarning("printer render failed: {Err}", ex.Message);
     }
 }
 
@@ -2217,9 +2221,12 @@ async Task RerenderAsync(string sessionId, CancellationToken ct,
     }
     catch (Exception ex)
     {
-        // Most common: "message is not modified" — ignore.
+        // Most common: "message is not modified" — same payload + same
+        // kb, Telegram refuses the no-op re-send, benign. Anything else
+        // is a real edit failure that leaves stale UI; surface at Warning
+        // so it's visible in the default journal.
         if (!ex.Message.Contains("not modified", StringComparison.OrdinalIgnoreCase))
-            log.LogDebug("edit failed: {Err}", ex.Message);
+            log.LogWarning("edit failed: {Err}", ex.Message);
     }
 }
 

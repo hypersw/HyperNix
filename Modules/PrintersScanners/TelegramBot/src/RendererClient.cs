@@ -132,7 +132,14 @@ public sealed class RendererClient : IDisposable
         }
         catch (Exception ex)
         {
-            _logger.LogDebug("pdf-preview failed for {File}: {Err}", fileName, ex.Message);
+            // Caller has a fallback (sends the raw PDF as a Document
+            // instead of a preview WebP), so this isn't a user-fatal
+            // error — but it IS a real renderer outage worth seeing
+            // in the default journal. Bumping to Warning so the
+            // operator notices when the preview path silently breaks
+            // (e.g. `gs not found` regression, like the one that hid
+            // this for a deploy cycle).
+            _logger.LogWarning("pdf-preview failed for {File}: {Err}", fileName, ex.Message);
             return null;
         }
     }
@@ -430,7 +437,10 @@ public sealed class RendererClient : IDisposable
         }
         catch (Exception ex)
         {
-            _logger.LogDebug("pdf-info failed for {File}: {Err}", fileName, ex.Message);
+            // Caller falls back to "unknown page count" UX, but a real
+            // renderer outage is worth surfacing — same logic as
+            // GetPdfPreviewAsync above.
+            _logger.LogWarning("pdf-info failed for {File}: {Err}", fileName, ex.Message);
             return null;
         }
     }
