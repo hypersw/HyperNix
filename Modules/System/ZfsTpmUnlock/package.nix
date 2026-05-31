@@ -53,6 +53,17 @@ let
 
     die() { echo "$PROG: $*" >&2; exit 1; }
 
+    # If the user hasn't already pinned a TCTI, default to the
+    # kernel resource manager. Without this, tpm2-tools probes
+    # tabrmd (userspace D-Bus broker) first, which fails noisily
+    # via "GDBus.Error:org.freedesktop.DBus.Error.ServiceUnknown"
+    # on hosts that don't run abrmd — before falling through to
+    # /dev/tpmrm0 anyway. Setting TPM2TOOLS_TCTI short-circuits
+    # the probe; respects an existing setting so hosts that DO
+    # run abrmd aren't overridden.
+    : "''${TPM2TOOLS_TCTI:=device:/dev/tpmrm0}"
+    export TPM2TOOLS_TCTI
+
     usage() {
       cat <<'EOF'
 Usage:
@@ -293,8 +304,18 @@ EOF
       if [[ -n $key_file ]]; then
         [[ -f $key_file ]] || die "--key file not found: $key_file"
         key_hex=$(< "$key_file")
+      elif [ -t 0 ]; then
+        # Interactive paste: read silently so the key doesn't echo
+        # to the terminal (and end up in scrollback or over the
+        # shoulder of whoever's behind you). `read -s` reads one
+        # line, no echo, returns on Enter.
+        echo "Paste 64-hex-char key (silent — no echo), then Enter:" >&2
+        IFS= read -rs key_hex
+        echo >&2   # visual newline after silent read
       else
-        echo "(reading 64-hex-char key from stdin — paste it, then Ctrl+D)" >&2
+        # Stdin is a pipe / redirect — silent-read would block
+        # on /dev/tty that may not be available; just consume
+        # whatever's on stdin.
         key_hex=$(cat)
       fi
       # Tolerate any surrounding whitespace (newlines from terminal

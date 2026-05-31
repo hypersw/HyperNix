@@ -277,6 +277,13 @@ in {
         script = ''
           set -euo pipefail
 
+          # Default TCTI to the kernel resource manager so tpm2-tools
+          # don't waste a probe trying tabrmd (and emit noisy
+          # ServiceUnknown D-Bus errors) on hosts that don't run
+          # abrmd. Respects an existing setting.
+          : "''${TPM2TOOLS_TCTI:=device:/dev/tpmrm0}"
+          export TPM2TOOLS_TCTI
+
           ${optionalString keyCfg.importPoolIfNeeded ''
             echo Import Pool If Needed
             ${pkgs.zfs}/bin/zpool list "${keyCfg.pool}" >/dev/null 2>&1 \
