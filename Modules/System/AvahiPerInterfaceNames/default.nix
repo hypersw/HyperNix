@@ -132,7 +132,25 @@ let
         # the new instance actually claimed the expected name via
         # avahi's D-Bus HostName property (which reflects the
         # post-probing result), rather than trusting a fixed sleep.
-        if ${pkgs.systemd}/bin/systemctl is-enabled --quiet avahi-daemon.service; then
+        # Only do the stop/pause/start dance if avahi is actually
+        # running. On the FIRST regen during system boot, this
+        # watcher is itself still in `activating` (we haven't fired
+        # `systemd-notify --ready` yet — that happens after this
+        # function returns), so avahi-daemon's
+        # `Requires=avahi-primary-interface-watcher.service`
+        # dependency is unmet: avahi-daemon is queued by systemd
+        # but cannot start until WE complete activation. Calling
+        # `systemctl start avahi-daemon` here would then block
+        # waiting for avahi-daemon, which is waiting for us — a
+        # deadlock that trips the watcher's TimeoutStartSec and
+        # leaves both services in a restart loop. When avahi
+        # isn't yet active, just write the conf; the systemd
+        # dependency ordering brings avahi up cleanly the
+        # moment we --ready, with our conf already in place,
+        # and no probe-vs-cache race because nothing on the LAN
+        # has a prior record of us claiming the name on a
+        # different interface.
+        if ${pkgs.systemd}/bin/systemctl is-active --quiet avahi-daemon.service; then
           ${pkgs.systemd}/bin/systemctl stop avahi-daemon.service
           ${pkgs.coreutils}/bin/sleep 3
           ${pkgs.systemd}/bin/systemctl start avahi-daemon.service
