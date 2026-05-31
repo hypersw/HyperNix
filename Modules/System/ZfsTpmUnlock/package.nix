@@ -32,12 +32,13 @@
 
 { pkgs }:
 
-pkgs.writeShellApplication {
-  name = "zfs-tpm-key";
+let
+  app = pkgs.writeShellApplication {
+    name = "zfs-tpm-key";
 
-  runtimeInputs = with pkgs; [ tpm2-tools coreutils ];
+    runtimeInputs = with pkgs; [ tpm2-tools coreutils ];
 
-  text = ''
+    text = ''
     PROG=zfs-tpm-key
 
     die() { echo "$PROG: $*" >&2; exit 1; }
@@ -313,5 +314,20 @@ EOF
       seal)    do_seal ;;
       test)    do_test ;;
     esac
+  '';
+  };
+
+in
+# Wrap the writeShellApplication output so the package also carries
+# the bash-completion file. NixOS auto-sources $out/share/bash-
+# completion/completions/<name> when `programs.bash.completion.enable`
+# is on (the default). far2l delegates to bash for command-line
+# input, so it picks the completion up too.
+pkgs.symlinkJoin {
+  name = "zfs-tpm-key";
+  paths = [ app ];
+  postBuild = ''
+    install -Dm644 ${./completion.bash} \
+      $out/share/bash-completion/completions/zfs-tpm-key
   '';
 }
