@@ -323,9 +323,15 @@ in {
                                                  --pcr-list ${keyCfg.pcrList}
 
           echo Unseal Into Load-Key Pipe
+          # IMPORTANT: --output /dev/stdout, not --output -.
+          # tpm2_unseal does NOT treat `-` as stdout (unlike
+          # tpm2_create --sealing-input -); passing `-` silently
+          # writes zero bytes, and zfs load-key then sees an
+          # empty key and either errors or — worse — loads it,
+          # leaving the dataset locked at next access.
           ${pkgs.tpm2-tools}/bin/tpm2_unseal --object-context "$TMP_CTX_LOADED" \
                                               --auth           "session:$TMP_CTX_SESSION" \
-                                              --output         - \
+                                              --output         /dev/stdout \
             | ${pkgs.zfs}/bin/zfs load-key -L file:///dev/stdin "${keyCfg.dataset}"
 
           echo Flush Context
