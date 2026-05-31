@@ -251,11 +251,9 @@
     };
   };
 
-  # USB serial of the physical HP LaserJet P2015n on this host —
-  # discovered via `lpinfo -v`:
-  #   direct usb://HP/LaserJet%20P2015%20Series?serial=00CNBW79SBWW
-  # Setting it here makes the LaserJetPrinter module declare the
-  # CUPS queue via `hardware.printers.ensurePrinters`, bound by
-  # serial so it survives USB-port shuffles.
-  hypersw.services.laserjet-printer.serial = "00CNBW79SBWW";
+  # No `hypersw.services.laserjet-printer.serial` set — the
+  # CUPS queue binds by model only (HP/LaserJet P2015 Series),
+  # so any P2015 attached via USB on this host just works. Pin
+  # to a serial here if a second identical printer ever joins
+  # the bus and needs disambiguating.
 }
