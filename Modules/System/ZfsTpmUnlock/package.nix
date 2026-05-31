@@ -198,8 +198,10 @@ EOF
       tpm2_flushcontext     "$session" >/dev/null
 
       echo "Seal key under that policy (key bytes piped, never on disk)" >&2
+      # tpm2_create rejects --key-algorithm (-G) together with
+      # --sealing-input (-i); when sealing user data, the object
+      # type is implicitly keyedhash and -G must be omitted.
       tpm2_create --parent-context "$primary" \
-                  --key-algorithm  keyedhash \
                   --hash-algorithm sha256 \
                   --policy         "$policy" \
                   --sealing-input  - \
