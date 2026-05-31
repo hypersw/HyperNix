@@ -155,17 +155,22 @@ let
           ${pkgs.coreutils}/bin/sleep 3
           ${pkgs.systemd}/bin/systemctl start avahi-daemon.service
 
-          # Poll avahi's D-Bus HostName until it matches the expected
-          # name or we hit the deadline. The property is set early
-          # during avahi's startup and updated again if probing
-          # detects a conflict and renames; reading it after probing
-          # completes tells us the truth.
+          # Poll avahi's D-Bus host name until it matches the
+          # expected value or we hit the deadline. Avahi doesn't
+          # expose HostName as a standard `org.freedesktop.DBus.
+          # Properties` property — it's a method on the Server
+          # interface, called via `busctl call … GetHostName`
+          # (NOT `get-property HostName`, which fails with
+          # "Method Get with signature ss doesn't exist"). The
+          # method's return is the post-probing host name, so
+          # reading it after probing completes tells us the truth
+          # (including any `-2` rename on a lost conflict).
           deadline=$(( $(${pkgs.coreutils}/bin/date +%s) + 15 ))
           claimed=""
           while [ "$(${pkgs.coreutils}/bin/date +%s)" -lt "$deadline" ]; do
-            claimed=$(${pkgs.systemd}/bin/busctl --system get-property \
+            claimed=$(${pkgs.systemd}/bin/busctl --system call \
                         org.freedesktop.Avahi / org.freedesktop.Avahi.Server \
-                        HostName 2>/dev/null \
+                        GetHostName 2>/dev/null \
                       | ${pkgs.gnused}/bin/sed -n 's/^s "\(.*\)"$/\1/p')
             if [ "$claimed" = "${config.networking.hostName}" ]; then
               echo "avahi-primary-interface: claimed '${config.networking.hostName}.local' on $iface"
