@@ -69,7 +69,7 @@ let
 Usage:
   zfs-tpm-key gen-key [--to-clip] [--out FILE]
   zfs-tpm-key seal    --name NAME [--key FILE] [--force] [common opts]
-  zfs-tpm-key test    --name NAME [common opts]
+  zfs-tpm-key test    --name NAME [--key FILE | --print-key] [common opts]
 
 Subcommands:
 
@@ -102,23 +102,34 @@ Subcommands:
     prompt.
 
   test
-    Unseal NAME.pub/NAME.priv with current PCR state. Two modes:
+    Unseal NAME.pub/NAME.priv with current PCR state. Three
+    mutually-exclusive modes:
 
-    Without --key:
-        Just confirm the unseal works and print the SHA-256 of
-        the 64 unsealed hex bytes. Note: this is NOT `sha256sum
-        file.hex` if the file has a trailing newline (65 bytes
-        != 64). To compute a matching hash from a string or
-        file, see the message printed under the SHA-256.
+    (default) — confirm the unseal works and print the SHA-256
+        of the 64 unsealed hex bytes. Note: this is NOT
+        `sha256sum file.hex` if the file has a trailing newline
+        (65 bytes != 64). To compute a matching hash from a
+        string or file, see the message printed under the
+        SHA-256.
 
-    With --key FILE (or --key - to paste from stdin):
-        Read the expected key from the file (or paste it silently
-        from the terminal if stdin is a tty), trim leading/
-        trailing whitespace, and compare byte-for-byte with the
-        unsealed key. Prints ✓ match or ✗ mismatch with the
-        position of first difference. This is the right tool
+    --key FILE (or --key - to paste from stdin):
+        Read the expected key from the file (or paste it
+        silently from the terminal if stdin is a tty), trim
+        leading/trailing whitespace, and compare byte-for-byte
+        with the unsealed key. Prints ✓ match or ✗ mismatch
+        with the position of first difference. The right tool
         to verify a clipboard paste round-trip, no hash
         arithmetic needed.
+
+    --print-key:
+        Print the unsealed 64-hex-char key to stdout (with a
+        trailing newline so the prompt returns cleanly). Status
+        messages go to stderr. Use this to recover the key
+        on-screen for visual comparison with your password-
+        manager backup, or to redirect to a file
+        (`> /tmp/recovered.hex`). The key lands in your
+        terminal's scrollback — keep that in mind, but in a
+        normal interactive console nothing writes it to disk.
 
 Common options:
   --name NAME          Required for seal and test.
@@ -141,6 +152,7 @@ EOF
     out_file=""
     to_clip=0
     force=0
+    print_key=0
 
     if [[ $# -lt 1 ]]; then usage; exit 2; fi
     sub="$1"; shift
@@ -160,6 +172,7 @@ EOF
         --out)         out_file="$2";    shift 2 ;;
         --to-clip)     to_clip=1;        shift ;;
         --force)       force=1;          shift ;;
+        --print-key)   print_key=1;      shift ;;
         -h|--help)     usage; exit 0 ;;
         *)             die "unknown option: $1 (try --help)" ;;
       esac
@@ -386,6 +399,11 @@ EOF
       loaded="$tmp/loaded.ctx"
       session="$tmp/policy.session"
 
+      # Mutual exclusion of verification modes.
+      if [[ -n $key_file ]] && [[ $print_key == 1 ]]; then
+        die "--key and --print-key are mutually exclusive — pick one"
+      fi
+
       tpm2_createprimary    --hierarchy   "$hierarchy" \
                             --key-context "$primary" >/dev/null
       tpm2_load             --public         "$pub" \
@@ -396,6 +414,43 @@ EOF
                             --session "$session" >/dev/null
       tpm2_policypcr        --session  "$session" \
                             --pcr-list "$pcr_list" >/dev/null
+
+      if [[ $print_key == 1 ]]; then
+        # ── Print-key mode ────────────────────────────────────
+        # Stdout = the 64-hex-char key, with one trailing newline
+        # (for clean prompt return and parity with `gen-key --out`
+        # output format). Status goes to stderr so redirecting
+        # stdout to a file captures only the key bytes:
+        #   test --name X --print-key > /tmp/recovered.hex
+        # In a regular interactive terminal, the key lands in the
+        # scrollback buffer — that's the entire visibility surface;
+        # nothing is written to disk by the script.
+        #
+        # Implementation note: we capture tpm2_unseal's output via
+        # $() and emit it through bash's own stdout with printf,
+        # rather than letting tpm2_unseal write to /dev/stdout
+        # directly. tpm2_unseal's open("/dev/stdout") gets a new
+        # fd with its own position, so a subsequent `echo` through
+        # bash's fd 1 (still at position 0) would overwrite the
+        # first byte of the key when stdout is redirected to a
+        # regular file. Capture-and-printf writes through fd 1
+        # at its actual position, so the file order stays correct.
+        # The key bytes live in a bash variable for the duration
+        # of one printf — same exposure as the compare mode, and
+        # the data is going to stdout anyway.
+        if [ -t 1 ]; then
+          echo "✔ Unseal succeeded for $name (PCR $pcr_list, hierarchy $hierarchy)" >&2
+          echo "  printing key to stdout — visible in this terminal's scrollback" >&2
+        fi
+        local unsealed
+        unsealed=$(tpm2_unseal --object-context "$loaded" \
+                                --auth           "session:$session" \
+                                --output         /dev/stdout)
+        tpm2_flushcontext "$session" >/dev/null
+        printf '%s\n' "$unsealed"
+        unsealed=""
+        return
+      fi
 
       if [[ -z $key_file ]]; then
         # ── SHA-only mode ──────────────────────────────────────
