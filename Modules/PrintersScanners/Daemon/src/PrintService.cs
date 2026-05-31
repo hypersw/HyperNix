@@ -24,6 +24,14 @@ public sealed class PrintService
     // is the convenient default; pin via PRINTSCAN_PRINTER_NAME for
     // hosts with multiple queues.
     private readonly string? _printerName;
+    // USB vendor:product pairs of the physical printer(s) we manage,
+    // as hex (e.g. "03f0:3817" for the HP LaserJet P2015). When set,
+    // we probe /sys/bus/usb/devices/ before trusting `lpstat`'s
+    // queue-state output, so a powered-off / unplugged printer is
+    // reported offline even when the CUPS queue is `enabled`. Comma-
+    // separated for hosts with multiple printers. Null disables the
+    // probe — daemon falls back to lpstat-only (the old behaviour).
+    private readonly string[] _printerUsbIds;
 
     public PrintService(
         ILogger<PrintService> logger,
@@ -32,7 +40,8 @@ public sealed class PrintService
         bool useStub,
         string lpBin,
         string lpstatBin,
-        string? printerName)
+        string? printerName,
+        string? printerUsbIds)
     {
         _logger = logger;
         _mediaSize = mediaSize;
@@ -41,6 +50,12 @@ public sealed class PrintService
         _lpBin = lpBin;
         _lpstatBin = lpstatBin;
         _printerName = string.IsNullOrWhiteSpace(printerName) ? null : printerName;
+        _printerUsbIds = string.IsNullOrWhiteSpace(printerUsbIds)
+            ? Array.Empty<string>()
+            : printerUsbIds
+                .Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
+                .Select(s => s.ToLowerInvariant())
+                .ToArray();
     }
 
     public PrinterStatus GetStatus() =>
@@ -98,8 +113,68 @@ public sealed class PrintService
 
     // ── CUPS backend ────────────────────────────────────────────────────────
 
+    /// <summary>
+    /// Returns true if any configured USB vendor:product pair is
+    /// currently present under /sys/bus/usb/devices/. When no IDs
+    /// are configured we assume "online" — the caller treats that
+    /// as "skip the USB probe, just trust lpstat".
+    /// </summary>
+    private bool IsConfiguredUsbPrinterConnected()
+    {
+        if (_printerUsbIds.Length == 0) return true;
+        // Each immediate child of /sys/bus/usb/devices/ that has
+        // both idVendor and idProduct files is a USB device (vs an
+        // interface or hub root). Walk them, read the pair, compare.
+        // We don't follow into subdirs — interfaces live there and
+        // their idVendor inheritance would cause spurious matches.
+        const string root = "/sys/bus/usb/devices";
+        IEnumerable<string> dirs;
+        try { dirs = Directory.EnumerateDirectories(root); }
+        catch (Exception ex)
+        {
+            _logger.LogDebug(ex, "USB probe: failed to enumerate {Root}", root);
+            return true;  // /sys unavailable → don't second-guess lpstat
+        }
+        foreach (var dir in dirs)
+        {
+            try
+            {
+                var vidPath = Path.Combine(dir, "idVendor");
+                var pidPath = Path.Combine(dir, "idProduct");
+                if (!File.Exists(vidPath) || !File.Exists(pidPath)) continue;
+                var vid = File.ReadAllText(vidPath).Trim().ToLowerInvariant();
+                var pid = File.ReadAllText(pidPath).Trim().ToLowerInvariant();
+                var pair = $"{vid}:{pid}";
+                if (Array.IndexOf(_printerUsbIds, pair) >= 0)
+                    return true;
+            }
+            catch
+            {
+                // Race with device removal between EnumerateDirectories
+                // and ReadAllText; skip silently.
+            }
+        }
+        return false;
+    }
+
     private PrinterStatus GetCupsStatus()
     {
+        // Short-circuit on USB-absent: CUPS only re-evaluates the
+        // device link when it actually tries to dispatch a job, so a
+        // powered-off / unplugged printer keeps reporting `is idle.
+        // enabled` indefinitely. Probing /sys/bus/usb/devices/ here
+        // lets us report offline immediately when the operator pulls
+        // power, rather than waiting until the next print attempt
+        // fails. Skipped (returns true) when no USB IDs are
+        // configured — falls back to the lpstat-only behaviour.
+        if (!IsConfiguredUsbPrinterConnected())
+        {
+            return new(Online: false,
+                StatusText: $"printer not connected (no USB device matching {string.Join(',', _printerUsbIds)})",
+                MediaSize: _mediaSize,
+                Margins: _margins);
+        }
+
         try
         {
             var psi = new ProcessStartInfo

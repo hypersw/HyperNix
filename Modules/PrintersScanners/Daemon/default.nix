@@ -86,6 +86,32 @@ in
         `printerBackend = "cups"`.
       '';
     };
+
+    printerUsbIds = lib.mkOption {
+      type = lib.types.nullOr lib.types.str;
+      default = null;
+      example = "03f0:3817";
+      description = ''
+        Comma-separated hex USB <literal>vid:pid</literal> pairs of
+        the physical printer(s) attached to this host. When set, the
+        daemon probes <filename>/sys/bus/usb/devices/</filename> on
+        every <literal>/status</literal> call: if no matching device
+        is present, the printer is reported offline immediately, even
+        if the CUPS queue is still <literal>enabled</literal>.
+
+        Why: <literal>lpstat -p</literal> reflects queue state, not
+        device-link state. CUPS only learns the device is gone when
+        it next tries to dispatch a job (and the USB backend fails),
+        so without this probe a powered-off printer keeps reporting
+        <literal>is idle. enabled</literal> indefinitely.
+
+        Wired automatically from per-printer modules (e.g.
+        <option>hypersw.services.laserjet-printer</option> sets this
+        to <literal>03f0:3817</literal> for the HP LaserJet P2015
+        family). Null disables the probe — falls back to lpstat-only
+        for hosts that haven't pinned which USB device to watch.
+      '';
+    };
   };
 
   config = lib.mkIf cfg.enable {
@@ -187,6 +213,13 @@ in
       # system default destination (settable via `lpadmin -d <queue>`).
       // lib.optionalAttrs (cfg.printerName != null) {
         PRINTSCAN_PRINTER_NAME = cfg.printerName;
+      }
+      // lib.optionalAttrs (cfg.printerUsbIds != null) {
+        # Comma-separated hex vid:pid pairs the daemon probes in
+        # /sys/bus/usb/devices/ — see printerUsbIds option above
+        # for why this is needed (lpstat alone can't tell us when
+        # the printer is physically gone).
+        PRINTSCAN_PRINTER_USB_IDS = cfg.printerUsbIds;
       }
       # SANE backend lookup vars (SANE_CONFIG_DIR + LD_LIBRARY_PATH).
       # Must be service-level, not globalEnvironment, to avoid triggering

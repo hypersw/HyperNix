@@ -119,6 +119,13 @@ var useStubBackend = !string.Equals(printBackend, "cups", StringComparison.Ordin
 var lpBin = Environment.GetEnvironmentVariable("PRINTSCAN_LP_BIN") ?? "lp";
 var lpstatBin = Environment.GetEnvironmentVariable("PRINTSCAN_LPSTAT_BIN") ?? "lpstat";
 var printerName = Environment.GetEnvironmentVariable("PRINTSCAN_PRINTER_NAME");
+// Comma-separated hex VID:PID pairs (e.g. "03f0:3817" for the HP
+// LaserJet P2015) that the daemon uses for USB-presence probing in
+// /sys/bus/usb/devices/. Set by the printer-specific NixOS module
+// (LaserJetPrinter for the P2015 family). When unset, the daemon
+// trusts lpstat alone — preserves the previous behaviour for hosts
+// where the operator hasn't pinned which USB device(s) to watch.
+var printerUsbIds = Environment.GetEnvironmentVariable("PRINTSCAN_PRINTER_USB_IDS");
 
 builder.Services.AddSingleton<PrintService>(sp =>
     new PrintService(
@@ -128,7 +135,8 @@ builder.Services.AddSingleton<PrintService>(sp =>
         useStub: useStubBackend,
         lpBin: lpBin,
         lpstatBin: lpstatBin,
-        printerName: printerName));
+        printerName: printerName,
+        printerUsbIds: printerUsbIds));
 builder.Services.AddSingleton<SessionService>();
 
 // ShutdownGate and ScannerMonitor need to be both injectable and hosted.

@@ -79,6 +79,18 @@ in
     boot.blacklistedKernelModules = [ "usblp" ];
     networking.firewall.allowedTCPPorts = [ 631 ];
 
+    # Tell the print-scan daemon which USB device represents this
+    # printer so its /status endpoint can report offline when the
+    # device disappears (powered off, unplugged) — `lpstat -p` alone
+    # only knows about the queue's enabled/disabled state, not the
+    # device-link state. 03f0:3817 is HP / "LaserJet P2015 Series"
+    # (the same product string used in the deviceUri above; vendor
+    # 03f0 is Hewlett-Packard's IEEE assignment). Set with mkDefault
+    # so a host with multiple printers can extend the list:
+    #   hypersw.services.printscan-daemon.printerUsbIds =
+    #     lib.mkForce "03f0:3817,XXXX:YYYY";
+    hypersw.services.printscan-daemon.printerUsbIds = lib.mkDefault "03f0:3817";
+
     # Declarative CUPS queue. Bound to the physical printer by
     # USB model (manufacturer-reported product string) — and
     # optionally pinned to a specific serial when more than one
