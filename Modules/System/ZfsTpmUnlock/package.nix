@@ -1,0 +1,317 @@
+#
+# zfs-tpm-key — CLI paired with the hypersw.services.zfs-tpm-unlock
+# NixOS module.
+#
+# Three subcommands cover the lifecycle without ceremony:
+#
+#   gen-key      generate a fresh 32-byte random key, base64-encoded;
+#                emit to stdout, terminal clipboard (OSC52, works
+#                over SSH and through tmux), and/or a file. Run
+#                once before the very first sealing; back up the
+#                output OFF-MACHINE, then feed it to `seal`.
+#
+#   seal         given a key on stdin (paste) or via --key FILE,
+#                produce NAME.pub/NAME.priv sealed under the
+#                current PCR policy. Same op for first-time seal
+#                and re-seal after a PCR break; if the output
+#                blobs already exist it prompts before overwriting
+#                (since overwriting is correct only on re-seal).
+#
+#   test         unseal the current NAME.pub/NAME.priv against
+#                current PCR state and print the SHA-256 of the
+#                unsealed key. Never writes the key anywhere;
+#                compare with your backup's fingerprint to verify
+#                end-to-end integrity.
+#
+# All key handling avoids disk: the user-side bytes go on stdin,
+# get decoded straight into `tpm2_create --sealing-input -`; the
+# unseal side pipes `tpm2_unseal --output -` straight into
+# sha256sum (test) or zfs load-key via /dev/stdin (the module's
+# unlock service).
+#
+
+{ pkgs }:
+
+pkgs.writeShellApplication {
+  name = "zfs-tpm-key";
+
+  runtimeInputs = with pkgs; [ tpm2-tools coreutils ];
+
+  text = ''
+    PROG=zfs-tpm-key
+
+    die() { echo "$PROG: $*" >&2; exit 1; }
+
+    usage() {
+      cat <<'EOF'
+Usage:
+  zfs-tpm-key gen-key [--to-clip] [--out FILE]
+  zfs-tpm-key seal    --name NAME [--key FILE] [--force] [common opts]
+  zfs-tpm-key test    --name NAME [common opts]
+
+Subcommands:
+
+  gen-key
+    Generate a fresh 32-byte random key, base64-encoded (44 chars).
+    Default: prints to stdout.
+    --to-clip        push to the terminal clipboard via OSC52 and
+                     suppress stdout (works over SSH; tmux-aware
+                     via DCS passthrough). Less shoulder-surfing.
+    --out FILE       also write to FILE (mode 600).
+    Combine flags freely; --to-clip wins on stdout suppression.
+
+  seal
+    Seal a key (read from --key FILE or from stdin as base64; paste
+    + Ctrl+D works) under the current PCR policy, writing
+    <output-dir>/NAME.pub and NAME.priv. The key bytes never touch
+    disk on this host — base64 → decode → tpm2_create stdin.
+
+    If NAME.pub or NAME.priv already exist, prompts before
+    overwriting (correct only when re-sealing after a PCR-policy
+    break, e.g. BIOS/firmware/kernel update). --force skips the
+    prompt.
+
+  test
+    Unseal NAME.pub/NAME.priv with current PCR state, print the
+    SHA-256 of the unsealed key (for comparison with the backup's
+    fingerprint) and exit. Doesn't write the key anywhere.
+
+Common options:
+  --name NAME          Required for seal and test.
+  --pcr-list LIST      Default: sha256:0
+  --hierarchy CHAR     Default: o    (one of: o p e n)
+  --output-dir DIR     Default: /var/lib/volumes  (seal)
+  --input-dir  DIR     Default: /var/lib/volumes  (test)
+
+Most operations need root (TPM device access).
+EOF
+    }
+
+    # ─── arg parsing ──────────────────────────────────────────────
+    pcr_list="sha256:0"
+    hierarchy="o"
+    output_dir="/var/lib/volumes"
+    input_dir="/var/lib/volumes"
+    name=""
+    key_file=""
+    out_file=""
+    to_clip=0
+    force=0
+
+    if [[ $# -lt 1 ]]; then usage; exit 2; fi
+    sub="$1"; shift
+
+    if [[ "$sub" == "help" || "$sub" == "-h" || "$sub" == "--help" ]]; then
+      usage; exit 0
+    fi
+
+    while [[ $# -gt 0 ]]; do
+      case "$1" in
+        --name)        name="$2";        shift 2 ;;
+        --pcr-list)    pcr_list="$2";    shift 2 ;;
+        --hierarchy)   hierarchy="$2";   shift 2 ;;
+        --output-dir)  output_dir="$2";  shift 2 ;;
+        --input-dir)   input_dir="$2";   shift 2 ;;
+        --key)         key_file="$2";    shift 2 ;;
+        --out)         out_file="$2";    shift 2 ;;
+        --to-clip)     to_clip=1;        shift ;;
+        --force)       force=1;          shift ;;
+        -h|--help)     usage; exit 0 ;;
+        *)             die "unknown option: $1 (try --help)" ;;
+      esac
+    done
+
+    case "$sub" in
+      gen-key|seal|test) ;;
+      *) die "unknown subcommand: $sub (try --help)" ;;
+    esac
+    [[ "$hierarchy" =~ ^[open]$ ]] || die "--hierarchy must be o, p, e, or n"
+
+    # ─── OSC52 clipboard helper ───────────────────────────────────
+    # Pushes stdin to the terminal's clipboard via the OSC52 escape
+    # sequence. Wraps in tmux DCS passthrough when running under
+    # tmux. Writes to /dev/tty so the escape reaches the terminal
+    # even when our stdout is redirected.
+    osc52_copy() {
+      local b64
+      b64=$(base64 -w0)
+      if [[ -n "''${TMUX-}" ]]; then
+        # tmux passthrough: ESC P tmux ; <doubled-ESC inner> ESC \
+        # Inner OSC52 uses BEL terminator to minimise ESCs.
+        # shellcheck disable=SC1003 # \\ is printf format syntax, not a quote escape
+        printf '\033Ptmux;\033\033]52;c;%s\a\033\\' "$b64" > /dev/tty
+      else
+        printf '\033]52;c;%s\a' "$b64" > /dev/tty
+      fi
+    }
+
+    # ─── shared sealing routine ───────────────────────────────────
+    # Reads raw key bytes on stdin, writes ($1 pub, $2 priv).
+    # Called via a pipe: `... base64 -d | seal_pipe_into_files ...`,
+    # so tpm2_create's --sealing-input - inherits the same stdin.
+    seal_pipe_into_files() {
+      local pub_dst="$1" priv_dst="$2"
+      local tmp primary session policy pub_new priv_new
+
+      tmp=$(mktemp -d /tmp/zfs-tpm-seal.XXXXXX)
+      # shellcheck disable=SC2064
+      trap "rm -rf '$tmp'" RETURN
+
+      primary="$tmp/primary.ctx"
+      session="$tmp/trial.session"
+      policy="$tmp/policy.digest"
+      pub_new="$tmp/new.pub"
+      priv_new="$tmp/new.priv"
+
+      echo "Create primary in hierarchy $hierarchy" >&2
+      tpm2_createprimary --hierarchy   "$hierarchy" \
+                         --key-context "$primary" >/dev/null
+
+      echo "Compute PCR policy digest ($pcr_list)" >&2
+      tpm2_startauthsession --session "$session" >/dev/null
+      tpm2_policypcr        --session  "$session" \
+                            --pcr-list "$pcr_list" \
+                            --policy   "$policy" >/dev/null
+      tpm2_flushcontext     "$session" >/dev/null
+
+      echo "Seal key under that policy (key bytes piped, never on disk)" >&2
+      tpm2_create --parent-context "$primary" \
+                  --key-algorithm  keyedhash \
+                  --hash-algorithm sha256 \
+                  --policy         "$policy" \
+                  --sealing-input  - \
+                  --public         "$pub_new" \
+                  --private        "$priv_new" >/dev/null
+
+      install -m600 "$pub_new"  "$pub_dst"
+      install -m600 "$priv_new" "$priv_dst"
+    }
+
+    # ─── gen-key ──────────────────────────────────────────────────
+    do_gen_key() {
+      local key_b64
+      key_b64=$(head -c 32 /dev/urandom | base64 -w0)
+
+      if [[ -n $out_file ]]; then
+        printf '%s' "$key_b64" > "$out_file"
+        chmod 600 "$out_file"
+        echo "Wrote key (base64) to $out_file (mode 600)" >&2
+      fi
+
+      if [[ $to_clip == 1 ]]; then
+        printf '%s' "$key_b64" | osc52_copy
+        echo "Key copied to clipboard via OSC52 (not printed to stdout)." >&2
+      elif [[ -z $out_file ]]; then
+        # Neither --to-clip nor --out — emit to stdout.
+        printf '%s\n' "$key_b64"
+      fi
+
+      cat >&2 <<EOF
+
+✔ 32-byte random key generated (base64-encoded, 44 chars).
+
+>>> BACK IT UP OFF-MACHINE NOW (password manager, encrypted USB).
+>>> Nothing on this host remembers it. Lose it and you lose the
+>>> ability to re-seal after any future PCR-policy break.
+
+To seal it:  $PROG seal --name NAME           # paste + Ctrl+D
+       or:  $PROG seal --name NAME --key FILE
+EOF
+    }
+
+    # ─── seal ─────────────────────────────────────────────────────
+    do_seal() {
+      [[ -n $name ]] || die "--name is required"
+      mkdir -p "$output_dir"
+      local pub="$output_dir/$name.pub"
+      local priv="$output_dir/$name.priv"
+
+      if { [[ -e $pub ]] || [[ -e $priv ]]; } && [[ $force != 1 ]]; then
+        cat >&2 <<EOF
+
+About to overwrite:
+  $pub
+  $priv
+
+This is correct ONLY when re-sealing after a PCR-policy change
+(e.g. BIOS / firmware / kernel update broke unattended unlock).
+For a fresh seal on this host, you shouldn't see this prompt —
+either the name is wrong, or a stale seal wasn't cleaned out.
+
+EOF
+        local ans
+        # Prompt via /dev/tty so we don't fight with stdin holding the key.
+        read -r -p "Proceed with overwrite? [y/N] " ans < /dev/tty
+        [[ $ans =~ ^[Yy]$ ]] || die "aborted by user"
+      fi
+
+      # Decode base64 and pipe raw bytes into tpm2_create. No bash
+      # variable holds the cleartext, no temp file is written.
+      if [[ -n $key_file ]]; then
+        [[ -f $key_file ]] || die "--key file not found: $key_file"
+        base64 -d < "$key_file" | seal_pipe_into_files "$pub" "$priv"
+      else
+        echo "(reading base64 key from stdin — paste it, then Ctrl+D)" >&2
+        base64 -d | seal_pipe_into_files "$pub" "$priv"
+      fi
+
+      cat >&2 <<EOF
+
+✔ Sealed under PCR $pcr_list (hierarchy $hierarchy):
+   $pub
+   $priv
+
+To verify:  $PROG test --name $name
+To use:     reboot, or 'systemctl start zfs-tpm-unlock-$name.service'
+EOF
+    }
+
+    # ─── test ─────────────────────────────────────────────────────
+    do_test() {
+      [[ -n $name ]] || die "--name is required"
+      local pub="$input_dir/$name.pub"
+      local priv="$input_dir/$name.priv"
+      [[ -f $pub  ]] || die "no such public blob: $pub"
+      [[ -f $priv ]] || die "no such private blob: $priv"
+
+      local tmp primary loaded session
+      tmp=$(mktemp -d /tmp/zfs-tpm-test.XXXXXX)
+      # shellcheck disable=SC2064
+      trap "rm -rf '$tmp'" EXIT
+      primary="$tmp/primary.ctx"
+      loaded="$tmp/loaded.ctx"
+      session="$tmp/policy.session"
+
+      tpm2_createprimary    --hierarchy   "$hierarchy" \
+                            --key-context "$primary" >/dev/null
+      tpm2_load             --public         "$pub" \
+                            --private        "$priv" \
+                            --parent-context "$primary" \
+                            --key-context    "$loaded" >/dev/null
+      tpm2_startauthsession --policy-session \
+                            --session "$session" >/dev/null
+      tpm2_policypcr        --session  "$session" \
+                            --pcr-list "$pcr_list" >/dev/null
+
+      # Pipe tpm2_unseal stdout straight into sha256sum.
+      # Key bytes never on disk, never in a variable longer than
+      # the pipe's kernel buffer takes to drain.
+      local fingerprint
+      fingerprint=$(tpm2_unseal --object-context "$loaded" \
+                                --auth           "session:$session" \
+                                --output         - \
+                    | sha256sum | cut -d' ' -f1)
+      tpm2_flushcontext "$session" >/dev/null
+
+      echo "✔ Unseal succeeded for $name (PCR $pcr_list, hierarchy $hierarchy)"
+      echo "  SHA-256: $fingerprint"
+      echo "  (compare with your backup's fingerprint to confirm end-to-end)"
+    }
+
+    case "$sub" in
+      gen-key) do_gen_key ;;
+      seal)    do_seal ;;
+      test)    do_test ;;
+    esac
+  '';
+}

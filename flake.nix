@@ -77,6 +77,12 @@
           # NixOS module installs. Run directly via:
           #   nix run github:hypersw/HyperNix#Modules-System-Btm-Fork
           Modules-System-Btm-Fork = import ./Modules/System/Btm/package.nix { inherit pkgs; };
+          # `zfs-tpm-key` — gen-key / seal / test TPM-sealed ZFS keys.
+          # Paired with the `hypersw.services.zfs-tpm-unlock` module:
+          # `seal --name foo` produces blobs that `keys.foo` unseals.
+          # Run directly via:
+          #   nix run github:hypersw/HyperNix#Modules-System-ZfsTpmUnlock-KeyTool -- --help
+          Modules-System-ZfsTpmUnlock-KeyTool = import ./Modules/System/ZfsTpmUnlock/package.nix { inherit pkgs; };
           # Machine runner packages
           Machines-MicroVM-VmSshFront =
             self.nixosConfigurations.VmSshFront.config.microvm.declaredRunner or null;
