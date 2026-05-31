@@ -447,7 +447,14 @@ let
       "https://api.github.com/repos/$OWNER_REPO/commits/$REV" 2>/dev/null) || exit 0
     SHORT=$(echo "$REV" | ${pkgs.coreutils}/bin/cut -c1-7)
     DATE=$(echo "$RESP" | ${pkgs.jq}/bin/jq -r '.commit.committer.date // empty' | ${pkgs.coreutils}/bin/cut -c1-16)
-    MSG=$(echo "$RESP" | ${pkgs.jq}/bin/jq -r '.commit.message // empty' | ${pkgs.coreutils}/bin/head -1 | ${pkgs.coreutils}/bin/cut -c1-60)
+    # Keep the subject line readable. 60 chars (the previous limit)
+    # ate words and PR refs mid-token; 200 fits any reasonable
+    # subject (kernel convention is 72, Conventional Commits ~100,
+    # and our own bodies stretch to ~100). awk does an ellipsis
+    # on the rare overflow so the truncation is visible, not silent.
+    MSG=$(echo "$RESP" | ${pkgs.jq}/bin/jq -r '.commit.message // empty' \
+      | ${pkgs.coreutils}/bin/head -1 \
+      | ${pkgs.gawk}/bin/awk '{ if (length($0) > 200) print substr($0, 1, 199) "…"; else print $0 }')
     [ -n "$DATE" ] && echo "$SHORT $DATE $MSG"
   '';
 
