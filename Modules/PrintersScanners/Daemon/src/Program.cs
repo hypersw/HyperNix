@@ -107,11 +107,28 @@ var margins = new PrintableMargins(
     LeftMm:   ReadMm("PRINTSCAN_MARGIN_LEFT_MM",   4.23),
     RightMm:  ReadMm("PRINTSCAN_MARGIN_RIGHT_MM",  4.23));
 
+// Print backend selection. The nix module pins PRINTSCAN_PRINT_BACKEND
+// to "cups" or "stub"; missing/unknown defaults to "stub" so a
+// misconfigured deploy fails closed (logs the job, doesn't surprise-
+// fire a CUPS subprocess against the wrong queue). PRINTSCAN_LP_BIN /
+// PRINTSCAN_LPSTAT_BIN come from `${pkgs.cups}/bin/{lp,lpstat}` so we
+// don't depend on PATH; PRINTSCAN_PRINTER_NAME is optional (null →
+// CUPS' system default destination).
+var printBackend = Environment.GetEnvironmentVariable("PRINTSCAN_PRINT_BACKEND") ?? "stub";
+var useStubBackend = !string.Equals(printBackend, "cups", StringComparison.OrdinalIgnoreCase);
+var lpBin = Environment.GetEnvironmentVariable("PRINTSCAN_LP_BIN") ?? "lp";
+var lpstatBin = Environment.GetEnvironmentVariable("PRINTSCAN_LPSTAT_BIN") ?? "lpstat";
+var printerName = Environment.GetEnvironmentVariable("PRINTSCAN_PRINTER_NAME");
+
 builder.Services.AddSingleton<PrintService>(sp =>
     new PrintService(
         sp.GetRequiredService<ILogger<PrintService>>(),
         Environment.GetEnvironmentVariable("PRINTSCAN_MEDIA_SIZE") ?? "A4",
-        margins));
+        margins,
+        useStub: useStubBackend,
+        lpBin: lpBin,
+        lpstatBin: lpstatBin,
+        printerName: printerName));
 builder.Services.AddSingleton<SessionService>();
 
 // ShutdownGate and ScannerMonitor need to be both injectable and hosted.

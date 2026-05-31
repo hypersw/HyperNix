@@ -55,6 +55,37 @@ in
         media-source-specific output once a real printer is wired.
       '';
     };
+
+    printerBackend = lib.mkOption {
+      type = lib.types.enum [ "cups" "stub" ];
+      default = "cups";
+      description = ''
+        Which backend the daemon's print path uses.
+          - "cups": shell out to `lp` against a CUPS queue (production).
+            Status comes from `lpstat -p`; jobs are streamed to lp via
+            stdin so format detection (PDF, PostScript, image/*, text)
+            goes through the standard CUPS filter chain.
+          - "stub": log each job + dump the would-have-printed bytes
+            under <STATE_DIRECTORY>/printed/, then succeed after a
+            short delay. End-to-end testing the bot's print UX
+            without burning paper or toner.
+        Flip to "stub" for a printer-less staging host or to validate
+        an unchanged bot UX after a renderer refactor.
+      '';
+    };
+
+    printerName = lib.mkOption {
+      type = lib.types.nullOr lib.types.str;
+      default = null;
+      example = "HP_LaserJet_P2015n";
+      description = ''
+        CUPS queue name passed to `lp -d` and `lpstat -p`. Null →
+        let CUPS pick the system default destination (whatever
+        `lpstat -d` returns; set this server-side once via
+        `lpadmin -d <queue>`). Only consulted when
+        `printerBackend = "cups"`.
+      '';
+    };
   };
 
   config = lib.mkIf cfg.enable {
@@ -106,6 +137,17 @@ in
         PRINTSCAN_MARGIN_BOTTOM_MM = toString cfg.nonPrintableMarginsMm.bottom;
         PRINTSCAN_MARGIN_LEFT_MM   = toString cfg.nonPrintableMarginsMm.left;
         PRINTSCAN_MARGIN_RIGHT_MM  = toString cfg.nonPrintableMarginsMm.right;
+
+        # Print backend selection. The daemon reads this and either
+        # routes /print via `lp` (cups) or via its in-process stub.
+        # Absolute lp/lpstat paths come from cups' store output so we
+        # don't depend on PATH inside the systemd unit (which we
+        # deliberately don't set — see PrivateNetwork = true and the
+        # minimal capability set below; pulling cups into PATH would
+        # also pull a much larger tree we don't want resolved).
+        PRINTSCAN_PRINT_BACKEND = cfg.printerBackend;
+        PRINTSCAN_LP_BIN     = "${pkgs.cups.out}/bin/lp";
+        PRINTSCAN_LPSTAT_BIN = "${pkgs.cups.out}/bin/lpstat";
         # ASPNETCORE_URLS deliberately unset. Kestrel picks up fd 3 from
         # systemd (UseSystemd + ConfigureKestrel.ListenHandle in code).
         # If LISTEN_FDS is missing the daemon now fails fast rather than
@@ -139,6 +181,12 @@ in
         # dotnet-counters, native lldb + SOS (ptrace + DAC — doesn't use
         # any CLR-owned IPC). Upstream bug: coreclr#8844 (open since 2017).
         DOTNET_EnableDiagnostics_Debugger = "0";
+      }
+      # Optional pinned queue name. Only emit when configured — when
+      # null, the daemon leaves -d off the lp argv and CUPS uses its
+      # system default destination (settable via `lpadmin -d <queue>`).
+      // lib.optionalAttrs (cfg.printerName != null) {
+        PRINTSCAN_PRINTER_NAME = cfg.printerName;
       }
       # SANE backend lookup vars (SANE_CONFIG_DIR + LD_LIBRARY_PATH).
       # Must be service-level, not globalEnvironment, to avoid triggering

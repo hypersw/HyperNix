@@ -1,38 +1,63 @@
+using System.Diagnostics;
 using PrintScan.Shared;
 
 namespace PrintScan.Daemon;
 
 /// <summary>
-/// Stub printer — for end-to-end testing of the bot's print UX without
-/// burning paper or toner. Reports the printer as online, accepts every
-/// job, simulates a short processing delay, and logs what would have
-/// gone to <c>lp</c>. Drop-in replacement for the future real
-/// implementation: the public surface (<see cref="GetStatus"/>,
-/// <see cref="PrintAsync"/>) and the request/response shapes are the
-/// same, so swapping in a CUPS-backed version later doesn't ripple.
+/// Print backend. The two implementations live in one class so the
+/// switch is a single flag — useful for "wire the bot up against a
+/// host with no physical printer" (stub) and for production runs
+/// (cups). The public surface and request/response shapes are the
+/// same in either mode, so the bot's print UX exercises identical
+/// code paths regardless of backend.
 /// </summary>
 public sealed class PrintService
 {
     private readonly ILogger<PrintService> _logger;
     private readonly string _mediaSize;
     private readonly PrintableMargins _margins;
+    private readonly bool _useStub;
+    private readonly string _lpBin;
+    private readonly string _lpstatBin;
+    // Null → let CUPS pick the system default destination (set via
+    // `lpadmin -d <queue>`). When the box has exactly one queue this
+    // is the convenient default; pin via PRINTSCAN_PRINTER_NAME for
+    // hosts with multiple queues.
+    private readonly string? _printerName;
+
     public PrintService(
         ILogger<PrintService> logger,
         string mediaSize,
-        PrintableMargins margins)
+        PrintableMargins margins,
+        bool useStub,
+        string lpBin,
+        string lpstatBin,
+        string? printerName)
     {
         _logger = logger;
         _mediaSize = mediaSize;
         _margins = margins;
+        _useStub = useStub;
+        _lpBin = lpBin;
+        _lpstatBin = lpstatBin;
+        _printerName = string.IsNullOrWhiteSpace(printerName) ? null : printerName;
     }
 
     public PrinterStatus GetStatus() =>
+        _useStub ? GetStubStatus() : GetCupsStatus();
+
+    public Task<bool> PrintAsync(PrintRequest request, CancellationToken ct) =>
+        _useStub ? StubPrintAsync(request, ct) : CupsPrintAsync(request, ct);
+
+    // ── Stub backend ────────────────────────────────────────────────────────
+
+    private PrinterStatus GetStubStatus() =>
         new(Online: true,
             StatusText: $"stub printer ({_mediaSize}, no physical device wired up)",
             MediaSize: _mediaSize,
             Margins: _margins);
 
-    public async Task<bool> PrintAsync(PrintRequest request, CancellationToken ct)
+    private async Task<bool> StubPrintAsync(PrintRequest request, CancellationToken ct)
     {
         _logger.LogInformation(
             "STUB PRINT: {File} ({Bytes} bytes), copies={Copies}, " +
@@ -41,12 +66,9 @@ public sealed class PrintService
             request.PageRange ?? "all", request.PageSelection,
             request.Scale, request.Orientation);
 
-        // End-to-end test path: write whatever the bot handed us
-        // verbatim into <STATE_DIRECTORY>/printed/. Lets the user
-        // inspect what would have hit CUPS without burning paper.
-        // When the real lp-driven implementation lands this will
-        // be replaced by a CUPS subprocess; the file output stays
-        // as an audit trail (the lp invocation's tee).
+        // End-to-end test path: dump the would-have-printed bytes under
+        // <STATE_DIRECTORY>/printed/ so the operator can inspect exactly
+        // what would have hit CUPS, without burning paper.
         try
         {
             var stateRoot = Environment.GetEnvironmentVariable("STATE_DIRECTORY")
@@ -65,14 +87,203 @@ public sealed class PrintService
             _logger.LogWarning(ex, "STUB PRINT failed to write output file");
         }
 
-        // Simulated processing time. A real Pi-attached HP LaserJet at
-        // 100-150 ms per page is typical, but for a stub we just want
-        // the bot's "🖨 printing…" intermediate state to be visible
-        // briefly before we flip to "✅ done", not instantaneously.
+        // Simulated processing time so the bot's "🖨 printing…"
+        // intermediate state is visible briefly.
         try { await Task.Delay(TimeSpan.FromSeconds(2), ct); }
         catch (OperationCanceledException) { return false; }
 
         _logger.LogInformation("STUB PRINT done: {File}", request.FileName);
         return true;
+    }
+
+    // ── CUPS backend ────────────────────────────────────────────────────────
+
+    private PrinterStatus GetCupsStatus()
+    {
+        try
+        {
+            var psi = new ProcessStartInfo
+            {
+                FileName = _lpstatBin,
+                RedirectStandardOutput = true,
+                RedirectStandardError = true,
+                UseShellExecute = false,
+            };
+            // `lpstat -p [printer]` prints one line per queue:
+            //   "printer HP_LaserJet_P2015n is idle.  enabled since …"
+            //   "printer HP_LaserJet_P2015n now printing job-N. enabled since …"
+            //   "printer HP_LaserJet_P2015n disabled since … - … reason …"
+            psi.ArgumentList.Add("-p");
+            if (_printerName is not null)
+                psi.ArgumentList.Add(_printerName);
+
+            using var proc = Process.Start(psi)
+                ?? throw new InvalidOperationException($"failed to start {_lpstatBin}");
+            var stdout = proc.StandardOutput.ReadToEnd();
+            var stderr = proc.StandardError.ReadToEnd();
+            proc.WaitForExit();
+
+            if (proc.ExitCode != 0)
+            {
+                var msg = string.IsNullOrWhiteSpace(stderr) ? "(no stderr)" : stderr.Trim();
+                _logger.LogWarning("CUPS lpstat exit {Code}: {Err}", proc.ExitCode, msg);
+                return new(Online: false,
+                    StatusText: $"lpstat failed: {msg}",
+                    MediaSize: _mediaSize,
+                    Margins: _margins);
+            }
+
+            // No queues configured at all → lpstat returns 0 with empty output.
+            // Render that as offline so the bot surfaces the missing-queue
+            // state rather than reporting "online" without a target.
+            if (string.IsNullOrWhiteSpace(stdout))
+                return new(Online: false,
+                    StatusText: $"no CUPS queues configured (lpstat -p {_printerName ?? "(default)"} empty)",
+                    MediaSize: _mediaSize,
+                    Margins: _margins);
+
+            // First line gives "is idle / now printing / disabled". Anything
+            // with the word "disabled" reads as offline; everything else
+            // (idle / now printing) reads as online.
+            var firstLine = stdout.Split('\n', 2)[0].Trim();
+            var online = !firstLine.Contains("disabled", StringComparison.OrdinalIgnoreCase);
+            return new(Online: online,
+                StatusText: firstLine,
+                MediaSize: _mediaSize,
+                Margins: _margins);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "CUPS lpstat error");
+            return new(Online: false,
+                StatusText: $"lpstat error: {ex.Message}",
+                MediaSize: _mediaSize,
+                Margins: _margins);
+        }
+    }
+
+    private async Task<bool> CupsPrintAsync(PrintRequest request, CancellationToken ct)
+    {
+        // Build the lp argv. Order doesn't matter to lp; we group by
+        // "destination" → "metadata" → "job options" for readability
+        // in the log line we emit below.
+        var args = new List<string>();
+
+        if (_printerName is not null)
+        {
+            args.Add("-d");
+            args.Add(_printerName);
+        }
+
+        // Job title — what `lpq` / the CUPS web UI shows. Pass the
+        // original filename so operator-side queue inspection is
+        // self-explanatory.
+        args.Add("-t");
+        args.Add(request.FileName ?? "job");
+
+        if (request.Copies > 1)
+        {
+            args.Add("-n");
+            args.Add(request.Copies.ToString());
+        }
+
+        if (!string.IsNullOrEmpty(request.PageRange))
+        {
+            args.Add("-P");
+            args.Add(request.PageRange);
+        }
+
+        if (request.PageSelection != PageSelection.All)
+        {
+            args.Add("-o");
+            args.Add($"page-set={request.PageSelection.ToString().ToLowerInvariant()}");
+        }
+
+        // CUPS orientation-requested IPP attribute:
+        //   3 = portrait, 4 = landscape (rotate 90° ccw).
+        // For Auto we omit the option entirely and let CUPS / the
+        // PPD pick — the bot pre-rotates raster jobs so this is
+        // mostly a non-issue for image inputs.
+        switch (request.Orientation)
+        {
+            case PrintOrientation.Portrait:
+                args.Add("-o");
+                args.Add("orientation-requested=3");
+                break;
+            case PrintOrientation.Landscape:
+                args.Add("-o");
+                args.Add("orientation-requested=4");
+                break;
+        }
+
+        // Scale handling. The bot is the source of truth for raster
+        // sizing — by the time bytes hit us they're already at the
+        // intended pixel dimensions, so we only need to ask CUPS for
+        // its built-in fit-to-page when the caller flagged Fit. Fill
+        // and OneToOne intentionally don't translate to lp options
+        // (Fill has no native CUPS equivalent for raster; OneToOne
+        // means "respect content's own size").
+        if (request.Scale == PrintScaleMode.Fit)
+        {
+            args.Add("-o");
+            args.Add("fit-to-page");
+        }
+
+        _logger.LogInformation(
+            "CUPS lp {Bin} {Args} ({Bytes} bytes from {File})",
+            _lpBin, string.Join(' ', args), request.FileData.Length, request.FileName);
+
+        var psi = new ProcessStartInfo
+        {
+            FileName = _lpBin,
+            RedirectStandardInput = true,
+            RedirectStandardOutput = true,
+            RedirectStandardError = true,
+            UseShellExecute = false,
+        };
+        foreach (var a in args) psi.ArgumentList.Add(a);
+
+        try
+        {
+            using var proc = Process.Start(psi)
+                ?? throw new InvalidOperationException($"failed to start {_lpBin}");
+
+            // Stream the file bytes into lp's stdin. lp auto-detects
+            // the input format (PDF, PostScript, image/*, text) and
+            // routes it through the appropriate CUPS filter chain.
+            await proc.StandardInput.BaseStream.WriteAsync(request.FileData, ct);
+            proc.StandardInput.Close();
+
+            var stdoutTask = proc.StandardOutput.ReadToEndAsync(ct).AsTask();
+            var stderrTask = proc.StandardError.ReadToEndAsync(ct).AsTask();
+            await proc.WaitForExitAsync(ct);
+            var stdout = (await stdoutTask).Trim();
+            var stderr = (await stderrTask).Trim();
+
+            if (proc.ExitCode == 0)
+            {
+                // lp prints "request id is HP_LaserJet_P2015n-42 (1 file(s))"
+                // on success — surface it so the operator can correlate
+                // with the CUPS job log if anything goes weird.
+                _logger.LogInformation("CUPS lp accepted: {Out}", stdout);
+                return true;
+            }
+
+            _logger.LogError("CUPS lp failed (exit {Code}): {Err}",
+                proc.ExitCode, string.IsNullOrEmpty(stderr) ? stdout : stderr);
+            return false;
+        }
+        catch (OperationCanceledException)
+        {
+            // Shutdown mid-print. Caller (the print endpoint) handles
+            // returning a 5xx; we just need to not crash the daemon.
+            _logger.LogWarning("CUPS lp cancelled mid-flight");
+            return false;
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "CUPS lp threw");
+            return false;
+        }
     }
 }
