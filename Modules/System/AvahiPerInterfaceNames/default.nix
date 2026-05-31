@@ -21,7 +21,7 @@
 # What it does
 # ────────────
 # Only publishes Avahi's main hostname on ONE interface at a time — the
-# current primary default-route interface (usually end0 when up, wlan0
+# current primary default-route interface (usually end0 when up, wld0
 # otherwise). Implemented by:
 #  - Running avahi-daemon with a runtime-generated config file that has
 #    `allow-interfaces=<primary>` set to a single interface.
@@ -124,7 +124,7 @@ let
     regen() {
       local primary
       # Determine the current primary default-route interface. With our
-      # DHCP metrics pinned (end0=1002, wlan0=3003), `head -1` gives us
+      # DHCP metrics pinned (end0=1002, wld0=3003), `head -1` gives us
       # the winner — lowest-metric first.
       primary=$(${pkgs.iproute2}/bin/ip -4 route show default 2>/dev/null \
         | ${pkgs.coreutils}/bin/head -n1 \

@@ -169,7 +169,7 @@ in
         log "stage 2/2 WiFi: letting udev settle"
         ${pkgs.systemd}/bin/udevadm settle --timeout=15 || true
         "$JOURNALCTL" --sync
-        log "stage 2/2 WiFi: kick wpa_supplicant (it gave up when wlan0 didn't appear)"
+        log "stage 2/2 WiFi: kick wpa_supplicant (it gave up when wld0 didn't appear)"
         ${pkgs.systemd}/bin/systemctl restart wpa_supplicant.service || \
           log "stage 2/2 WiFi: wpa_supplicant restart FAILED"
         "$JOURNALCTL" --sync

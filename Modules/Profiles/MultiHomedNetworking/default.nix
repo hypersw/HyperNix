@@ -33,8 +33,13 @@
 #     resolved.
 #
 # The default `interfaces` list matches the Raspberry Pi 4 / Pi 5
-# convention (`end0` Ethernet, `wlan0` WiFi). Override on x86 hosts
-# with predictable interface names like `enpXsY` / `wlpXsY`.
+# convention when running on nvmd's vendor kernel (`linuxPackages_
+# rpi{4,5}`): `end0` for Ethernet, `wld0` for WiFi. The vendor
+# kernel + udev predictable-naming combo registers the brcmfmac
+# interface as `wlan0` at the driver layer and then renames it to
+# `wld0` before any service sees it (dmesg shows
+# `brcmfmac …: renamed from wlan0`). Override on x86 hosts with the
+# usual `enpXsY` / `wlpXsY` predictable names.
 #
 let
   cfg = config.hypersw.profiles.multiHomedNetworking;
@@ -61,8 +66,8 @@ in
         `wlpXsY` for WiFi).
       '';
       default = [
-        { name = "end0";  fwmark = 100; routingTable = 100; routeMetric = 1002; requiredForOnline = true; }
-        { name = "wlan0"; fwmark = 200; routingTable = 200; routeMetric = 3003; requiredForOnline = false; }
+        { name = "end0"; fwmark = 100; routingTable = 100; routeMetric = 1002; requiredForOnline = true;  }
+        { name = "wld0"; fwmark = 200; routingTable = 200; routeMetric = 3003; requiredForOnline = false; }
       ];
       type = lib.types.listOf (lib.types.submodule {
         options = {
