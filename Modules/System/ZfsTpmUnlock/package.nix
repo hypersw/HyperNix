@@ -2,30 +2,40 @@
 # zfs-tpm-key — CLI paired with the hypersw.services.zfs-tpm-unlock
 # NixOS module.
 #
+# Key format: matches ZFS's `keyformat=hex` — 64 hex characters,
+# representing 32 random bytes (the AES-256-GCM key). Text-native
+# end to end: the clipboard / file / sealed blob / unseal pipe
+# / keylocation file all contain the same 64-char hex string,
+# so there's no encoding/decoding step between the user-visible
+# representation and what ZFS reads. Use `keyformat=hex` on the
+# pool/dataset side to match.
+#
 # Three subcommands cover the lifecycle without ceremony:
 #
-#   gen-key      generate a fresh 32-byte random key, base64-encoded;
-#                emit to stdout, terminal clipboard (OSC52, works
-#                over SSH and through tmux), and/or a file. Run
-#                once before the very first sealing; back up the
-#                output OFF-MACHINE, then feed it to `seal`.
+#   gen-key      generate a fresh 32-byte random key, encoded as
+#                64 lowercase hex characters; emit to stdout,
+#                terminal clipboard (OSC52, works over SSH and
+#                through tmux), and/or a file. Run once before
+#                the very first sealing; back up the output
+#                OFF-MACHINE, then feed it to `seal`.
 #
-#   seal         given a key on stdin (paste) or via --key FILE,
-#                produce NAME.pub/NAME.priv sealed under the
-#                current PCR policy. Same op for first-time seal
-#                and re-seal after a PCR break; if the output
-#                blobs already exist it prompts before overwriting
-#                (since overwriting is correct only on re-seal).
+#   seal         given a 64-hex-char key on stdin (paste) or via
+#                --key FILE, produce NAME.pub/NAME.priv sealed
+#                under the current PCR policy. Same op for first-
+#                time seal and re-seal after a PCR break; if the
+#                output blobs already exist it prompts before
+#                overwriting (since overwriting is correct only
+#                on re-seal).
 #
 #   test         unseal the current NAME.pub/NAME.priv against
 #                current PCR state and print the SHA-256 of the
-#                unsealed key. Never writes the key anywhere;
-#                compare with your backup's fingerprint to verify
-#                end-to-end integrity.
+#                unsealed hex string. Never writes the key
+#                anywhere; compare with `sha256sum your-backup.hex`
+#                to verify end-to-end integrity.
 #
-# All key handling avoids disk: the user-side bytes go on stdin,
-# get decoded straight into `tpm2_create --sealing-input -`; the
-# unseal side pipes `tpm2_unseal --output -` straight into
+# All key handling avoids disk: the user-side hex string goes on
+# stdin, gets piped straight into `tpm2_create --sealing-input -`;
+# the unseal side pipes `tpm2_unseal --output -` straight into
 # sha256sum (test) or zfs load-key via /dev/stdin (the module's
 # unlock service).
 #
@@ -53,19 +63,27 @@ Usage:
 Subcommands:
 
   gen-key
-    Generate a fresh 32-byte random key, base64-encoded (44 chars).
+    Generate a fresh 32-byte random key, encoded as 64 lowercase
+    hex characters (matches ZFS's `keyformat=hex`; the file/clip-
+    board content IS the key in the form ZFS reads directly).
     Default: prints to stdout.
     --to-clip        push to the terminal clipboard via OSC52 and
                      suppress stdout (works over SSH; tmux-aware
                      via DCS passthrough). Less shoulder-surfing.
-    --out FILE       also write to FILE (mode 600).
+    --out FILE       also write to FILE (mode 600). Use this file
+                     directly as `keylocation=file://FILE` in
+                     `zpool create -O keyformat=hex`.
     Combine flags freely; --to-clip wins on stdout suppression.
 
   seal
-    Seal a key (read from --key FILE or from stdin as base64; paste
-    + Ctrl+D works) under the current PCR policy, writing
-    <output-dir>/NAME.pub and NAME.priv. The key bytes never touch
-    disk on this host — base64 → decode → tpm2_create stdin.
+    Seal a 64-char hex key (read from --key FILE or from stdin;
+    paste + Ctrl+D works) under the current PCR policy, writing
+    <output-dir>/NAME.pub and NAME.priv. The key never touches
+    disk on this host — input pipes straight into tpm2_create's
+    stdin.
+
+    Whitespace and surrounding newlines in the input are
+    tolerated; the inner 64 hex characters must be valid.
 
     If NAME.pub or NAME.priv already exist, prompts before
     overwriting (correct only when re-sealing after a PCR-policy
@@ -74,8 +92,9 @@ Subcommands:
 
   test
     Unseal NAME.pub/NAME.priv with current PCR state, print the
-    SHA-256 of the unsealed key (for comparison with the backup's
-    fingerprint) and exit. Doesn't write the key anywhere.
+    SHA-256 of the unsealed hex string (compare with
+    `sha256sum your-backup.hex` — both hash the same 64 chars)
+    and exit. Doesn't write the key anywhere.
 
 Common options:
   --name NAME          Required for seal and test.
@@ -147,9 +166,12 @@ EOF
     }
 
     # ─── shared sealing routine ───────────────────────────────────
-    # Reads raw key bytes on stdin, writes ($1 pub, $2 priv).
-    # Called via a pipe: `... base64 -d | seal_pipe_into_files ...`,
+    # Reads the key bytes to seal on stdin, writes ($1 pub, $2 priv).
+    # Called via a pipe: `printf '%s' "$key_hex" | seal_pipe_into_files ...`,
     # so tpm2_create's --sealing-input - inherits the same stdin.
+    # We seal the 64 ASCII hex bytes (not 32 decoded binary bytes)
+    # so the sealed blob, the unsealed stream, and what ZFS reads
+    # under keyformat=hex all stay the same shape.
     seal_pipe_into_files() {
       local pub_dst="$1" priv_dst="$2"
       local tmp primary session policy pub_new priv_new
@@ -190,26 +212,37 @@ EOF
 
     # ─── gen-key ──────────────────────────────────────────────────
     do_gen_key() {
-      local key_b64
-      key_b64=$(head -c 32 /dev/urandom | base64 -w0)
+      local key_hex
+      # od -An (no addresses) -tx1 (1-byte hex) -v (don't dedup zeros)
+      # then strip the column whitespace coreutils inserts → 64 chars.
+      key_hex=$(head -c 32 /dev/urandom | od -An -v -tx1 | tr -d ' \n')
+
+      # Defensive: 32 random bytes → exactly 64 hex chars.
+      [[ ''${#key_hex} -eq 64 ]] || \
+        die "internal: hex generation produced ''${#key_hex} chars, expected 64"
 
       if [[ -n $out_file ]]; then
-        printf '%s' "$key_b64" > "$out_file"
+        # Trailing newline — friendly for `cat keyfile`; ZFS strips
+        # a single trailing newline from a hex keylocation, so this
+        # doesn't break direct use as keylocation=file://...
+        printf '%s\n' "$key_hex" > "$out_file"
         chmod 600 "$out_file"
-        echo "Wrote key (base64) to $out_file (mode 600)" >&2
+        echo "Wrote 64-hex-char key to $out_file (mode 600)" >&2
       fi
 
       if [[ $to_clip == 1 ]]; then
-        printf '%s' "$key_b64" | osc52_copy
+        printf '%s' "$key_hex" | osc52_copy
         echo "Key copied to clipboard via OSC52 (not printed to stdout)." >&2
       elif [[ -z $out_file ]]; then
         # Neither --to-clip nor --out — emit to stdout.
-        printf '%s\n' "$key_b64"
+        printf '%s\n' "$key_hex"
       fi
 
       cat >&2 <<EOF
 
-✔ 32-byte random key generated (base64-encoded, 44 chars).
+✔ 32-byte random key generated (encoded as 64 hex characters,
+  matching ZFS keyformat=hex — the file content IS the key in
+  the form ZFS reads directly).
 
 >>> BACK IT UP OFF-MACHINE NOW (password manager, encrypted USB).
 >>> Nothing on this host remembers it. Lose it and you lose the
@@ -217,6 +250,9 @@ EOF
 
 To seal it:  $PROG seal --name NAME           # paste + Ctrl+D
        or:  $PROG seal --name NAME --key FILE
+
+For zpool create on this same key:
+       zpool create … -O keyformat=hex -O keylocation=file://<path-to-hex-file> …
 EOF
     }
 
@@ -246,15 +282,32 @@ EOF
         [[ $ans =~ ^[Yy]$ ]] || die "aborted by user"
       fi
 
-      # Decode base64 and pipe raw bytes into tpm2_create. No bash
-      # variable holds the cleartext, no temp file is written.
+      # Read the 64-hex-char key from --key FILE or stdin, validate,
+      # then pipe the exact 64 ASCII bytes into tpm2_create. No
+      # decoding step: hex IS the format we seal, the format ZFS
+      # reads on unlock (keyformat=hex), and the format the user's
+      # backup is stored as. End to end consistency.
+      local key_hex
       if [[ -n $key_file ]]; then
         [[ -f $key_file ]] || die "--key file not found: $key_file"
-        base64 -d < "$key_file" | seal_pipe_into_files "$pub" "$priv"
+        key_hex=$(< "$key_file")
       else
-        echo "(reading base64 key from stdin — paste it, then Ctrl+D)" >&2
-        base64 -d | seal_pipe_into_files "$pub" "$priv"
+        echo "(reading 64-hex-char key from stdin — paste it, then Ctrl+D)" >&2
+        key_hex=$(cat)
       fi
+      # Tolerate any surrounding whitespace (newlines from terminal
+      # paste, leading/trailing spaces, internal line wraps).
+      key_hex="''${key_hex//[[:space:]]/}"
+      [[ ''${#key_hex} -eq 64 ]] || \
+        die "expected 64 hex characters after whitespace strip, got ''${#key_hex}"
+      [[ "$key_hex" =~ ^[0-9a-fA-F]{64}$ ]] || \
+        die "key contains non-hex characters"
+
+      printf '%s' "$key_hex" | seal_pipe_into_files "$pub" "$priv"
+      # Wipe the variable so the hex isn't lingering in the shell's
+      # memory longer than needed (defence in depth; bash's memory
+      # is generally not swapped, but no harm).
+      key_hex=""
 
       cat >&2 <<EOF
 
@@ -305,8 +358,8 @@ EOF
       tpm2_flushcontext "$session" >/dev/null
 
       echo "✔ Unseal succeeded for $name (PCR $pcr_list, hierarchy $hierarchy)"
-      echo "  SHA-256: $fingerprint"
-      echo "  (compare with your backup's fingerprint to confirm end-to-end)"
+      echo "  SHA-256 of unsealed hex string: $fingerprint"
+      echo "  (verify with: sha256sum <your-backup.hex>)"
     }
 
     case "$sub" in
