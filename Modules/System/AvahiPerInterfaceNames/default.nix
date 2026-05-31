@@ -38,9 +38,10 @@
 # Startup blackout on interface swap
 # ──────────────────────────────────
 # Switching allow-interfaces requires a full avahi-daemon restart (SIGHUP
-# doesn't pick up server-level options). That's a ~1-2s gap in mDNS
-# availability. Interface transitions are rare (cable pull, Wi-Fi AP
-# failure) so this is acceptable.
+# doesn't pick up server-level options). That's a ~4s gap in mDNS
+# availability — the watcher does an explicit stop, then a 3s pause,
+# then a start (see write_conf below for the why). Interface transitions
+# are rare (cable pull, Wi-Fi AP failure) so this is acceptable.
 #
 # Client side
 # ───────────
@@ -111,10 +112,25 @@ let
         echo "avahi-primary-interface: allow-interfaces='$iface', conf regenerated"
         # Kick avahi. Treat `failed` like `active` — it may have crashed
         # earlier (e.g., tried to start before the initial conf was in
-        # place). systemctl restart works for both states; is-enabled
-        # gates us from trying on a disabled unit.
+        # place). is-enabled gates us from trying on a disabled unit.
+        #
+        # Why stop + pause + start, not `systemctl restart`:
+        # mDNS host-name self-conflict. On a plain back-to-back
+        # restart, the OLD daemon's goodbye announcements (TTL=0)
+        # have ~0 ms to propagate before the NEW daemon starts
+        # probing the same name on a different interface. Other
+        # LAN hosts that cached the old record then echo it back
+        # to the new daemon's probe, which mistakes those echoes
+        # for a third party owning the name → renames itself to
+        # `GhostHome-2.local` and the original .local goes silent
+        # until the next regen. The 3s pause is empirically enough
+        # for the goodbyes to clear neighbour mDNS caches; the
+        # whole window is still under a typical TCP retransmit
+        # budget so live SSH sessions don't drop.
         if ${pkgs.systemd}/bin/systemctl is-enabled --quiet avahi-daemon.service; then
-          ${pkgs.systemd}/bin/systemctl restart avahi-daemon.service &
+          ${pkgs.systemd}/bin/systemctl stop avahi-daemon.service
+          ${pkgs.coreutils}/bin/sleep 3
+          ${pkgs.systemd}/bin/systemctl start avahi-daemon.service
         fi
       else
         ${pkgs.coreutils}/bin/rm -f "$tmp"
