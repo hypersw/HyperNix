@@ -139,24 +139,34 @@ let
   })).overrideAttrs (final: {
     # Upstream epkowa bakes the proprietary x86_64 plugin paths into
     # var/lib/iscan/interpreter at build time — each line maps a USB
-    # VID:PID to a /nix/store/<unshifted-bundle>/lib/esci/lib*.so
+    # VID:PID to a /nix/store/<HASH>-<plugin-bundle-name>/lib/esci/...
     # path. The IPC patch forwards the path verbatim to the x86_64
     # stub, which dlopens it via qemu-x86_64. On a 16K-page kernel
     # the unshifted .so fails to mmap, so we need the path to point
     # at our page-shifted variant.
     #
-    # Rewrite each baked path to its shifted counterpart. Matching by
-    # original store path is robust against differences in upstream
-    # plugin attr names (`v330` vs `perfection-v330` vs the
-    # `iscan-v330-bundle` derivation name in the path).
-    # `--replace-quiet` skips plugins not referenced in the file
-    # (e.g. NT bundle is referenced through a different mechanism).
+    # We can't substitute by exact `passthru.unshifted` outPath —
+    # the plugin set referenced at iscan-build time has a different
+    # hash than `pkgsX86.epkowa.plugins.${name}` resolves to in this
+    # eval (cross-package input churn between when iscan got built
+    # and now). Both point to "the same" iscan-v330-bundle in name
+    # but different store paths.
+    #
+    # Match by derivation NAME instead. The interpreter config has
+    # paths of the form `/nix/store/<32-char-hash>-<bundle-name>`;
+    # rewrite any hash for each known bundle-name to our shifted
+    # variant's outPath. Robust across input-hash churn — and an
+    # unmatched bundle (no scanner of that model deployed here)
+    # just no-ops.
     postFixup = (final.postFixup or "") + ''
       interp=$out/var/lib/iscan/interpreter
       if [ -f "$interp" ]; then
         ${lib.concatMapStringsSep "\n      " (p:
-          ''substituteInPlace "$interp" --replace-quiet "${p.passthru.unshifted}" "${p}"''
-        ) (lib.attrValues shiftedEpkowaPlugins)}
+          let origName = p.passthru.unshifted.name; in
+          ''sed -i 's|/nix/store/[a-z0-9]\{32\}-${origName}|${p}|g' "$interp" '' )
+        (lib.attrValues shiftedEpkowaPlugins)}
+        echo "ElfPageShift: rewrote interpreter config:"
+        cat "$interp"
       fi
     '';
   });
