@@ -1955,25 +1955,111 @@ async Task ExecutePrintAsync(long chatId, string pendingId, CancellationToken ct
 
 async Task ShowStatusAsync(long chatId, CancellationToken ct)
 {
+    // Two-phase render: send a placeholder with ⏳ in both slots first,
+    // then fire the printer and scanner probes in parallel and update
+    // each slot as it completes. Daemon's combined /status would also
+    // be fine perf-wise today (both sides are sysfs reads + lpstat),
+    // but splitting lets the fast slot (scanner: sysfs only) light up
+    // immediately if the slow slot (printer: subprocess spawn) ever
+    // spikes — and gives an obvious UX signal that the daemon's still
+    // working rather than a frozen empty message.
+    //
+    // Each /status tap gets its own message + its own pair of in-flight
+    // tasks. We deliberately don't dedupe / group repeat taps into one
+    // tracking message: that would hide a transient glitch (one tap's
+    // edit racing with another's) behind the surviving message, instead
+    // of the user seeing two visibly-independent status blocks they can
+    // reason about separately.
+
     // Every user-visible top-level reply re-asserts mainKeyboard. Not
     // passing replyMarkup doesn't *remove* a persistent reply keyboard,
     // but some Telegram clients stop showing it after a stretch of
     // replies without one. Cheapest reliable way to keep the keyboard
     // pinned is just to include it on every non-inline reply.
-    var st = await daemon.GetStatusAsync(ct);
-    if (st is null)
+    var initial = new StatusUpdate { ChatId = chatId };
+    Message placeholder;
+    try
     {
-        await bot.SendMessage(chatId, "📊 Daemon unreachable",
-            replyMarkup: mainKeyboard, cancellationToken: ct);
+        placeholder = await bot.SendMessage(
+            chatId, initial.Render(),
+            parseMode: ParseMode.Html,
+            replyMarkup: mainKeyboard,
+            cancellationToken: ct);
+    }
+    catch (Exception ex)
+    {
+        // If we can't even send the placeholder, nothing the async
+        // probes do can recover. Log + give up; HandleUpdateAsync
+        // catches and ignores anyway.
+        log.LogWarning(ex, "status placeholder send failed");
         return;
     }
-    await bot.SendMessage(chatId, $"""
-        📊 <b>Status</b>
+    initial.MessageId = placeholder.MessageId;
 
-        🖨️ Printer: {(st.Printer.Online ? "✅ online" : "⚠️ offline")}
-        📷 Scanner: {(st.Scanner.Online ? "✅ online" : "⚠️ offline")}
-        """, parseMode: ParseMode.Html, replyMarkup: mainKeyboard, cancellationToken: ct);
+    // Fire both probes concurrently. Each commits its result under
+    // the per-message mutex so the two edits can't race a half-rendered
+    // message into Telegram.
+    var pTask = UpdateStatusSlotAsync(initial, isPrinter: true, ct);
+    var sTask = UpdateStatusSlotAsync(initial, isPrinter: false, ct);
+    await Task.WhenAll(pTask, sTask);
 }
+
+async Task UpdateStatusSlotAsync(StatusUpdate s, bool isPrinter, CancellationToken ct)
+{
+    // Fetch outside the mutex — the fetch itself is the slow part,
+    // and holding the mutex over a slow HTTP call would defeat the
+    // whole point of running the two slots in parallel.
+    PrinterStatus? p = null; ScannerStatus? sc = null;
+    try
+    {
+        if (isPrinter) p  = await daemon.GetPrinterStatusAsync(ct);
+        else           sc = await daemon.GetScannerStatusAsync(ct);
+    }
+    catch (OperationCanceledException) when (ct.IsCancellationRequested)
+    {
+        return;
+    }
+    catch (Exception ex)
+    {
+        // DaemonClient already maps transport errors to null; this is
+        // a defensive catch for anything unforeseen so one slot's
+        // failure can't take out the other.
+        log.LogWarning(ex, "status {Slot} probe unexpected error",
+            isPrinter ? "printer" : "scanner");
+    }
+
+    // Edit under the mutex so the rendered string is always consistent
+    // with the in-memory state and a concurrent slot completion can't
+    // overwrite this one's update.
+    await s.EditLock.WaitAsync(ct);
+    try
+    {
+        if (isPrinter) { s.Printer = p;  s.PrinterDone = true; }
+        else           { s.Scanner = sc; s.ScannerDone = true; }
+
+        try
+        {
+            await bot.EditMessageText(
+                s.ChatId, s.MessageId, s.Render(),
+                parseMode: ParseMode.Html,
+                cancellationToken: ct);
+        }
+        catch (Exception ex)
+        {
+            // Per-slot edit failure shouldn't propagate — the other
+            // slot's edit may still land, and the user already has
+            // the placeholder which carries the keyboard.
+            log.LogWarning(ex, "status edit failed for {Slot}",
+                isPrinter ? "printer" : "scanner");
+        }
+    }
+    finally { s.EditLock.Release(); }
+}
+
+// StatusUpdate type lives near the end of this file with the other
+// trailing type declarations — top-level statements must precede any
+// type declaration in a top-level-statements file, so we can't keep
+// it next to ShowStatusAsync.
 
 // ────────────────────────────────────────────────────────────────────────────
 // SSE consumer
@@ -2414,3 +2500,37 @@ static class Retry
 }
 
 record AllowedUser(long Id, string Name);
+
+/// <summary>
+/// In-memory state for one async-rendered status message. Tracks
+/// per-slot completion + value, plus an edit-serialising mutex so the
+/// printer-probe and scanner-probe tasks can't race a half-rendered
+/// message into Telegram. One instance per /status tap — taps don't
+/// share state or messages, by design.
+/// </summary>
+sealed class StatusUpdate
+{
+    public long ChatId;
+    public int MessageId;
+    public bool PrinterDone;
+    public PrinterStatus? Printer;
+    public bool ScannerDone;
+    public ScannerStatus? Scanner;
+    public readonly SemaphoreSlim EditLock = new(1, 1);
+
+    // Three-state per slot:
+    //   not yet completed         → ⏳
+    //   completed, value null     → ❓ unreachable (daemon transport fail)
+    //   completed, value present  → ✅ / ⚠️ based on Online
+    private static string FormatSlot(bool done, bool? online) =>
+        !done ? "⏳"
+        : online is null ? "❓ unreachable"
+        : online.Value ? "✅ online" : "⚠️ offline";
+
+    public string Render() => $"""
+        📊 <b>Status</b>
+
+        🖨️ Printer: {FormatSlot(PrinterDone, Printer?.Online)}
+        📷 Scanner: {FormatSlot(ScannerDone, Scanner?.Online)}
+        """;
+}

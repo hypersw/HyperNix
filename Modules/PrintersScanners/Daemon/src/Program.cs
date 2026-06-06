@@ -152,11 +152,22 @@ var app = builder.Build();
 BootLog(_bootSw, "builder.Build() done");
 
 // ── Status ──────────────────────────────────────────────────────────────────
+//
+// Two granularities: the legacy /status returns both halves at once; the
+// per-device endpoints exist so clients (currently the Telegram bot) can
+// query them in parallel and update their UI as each completes, instead
+// of blocking on the slower of the two.
 
 app.MapGet("/status", (PrintService print, ScannerMonitor mon) =>
     Results.Ok(new DeviceStatus(
         print.GetStatus(),
         new ScannerStatus(mon.IsOnline()))));
+
+app.MapGet("/status/printer", (PrintService print) =>
+    Results.Ok(print.GetStatus()));
+
+app.MapGet("/status/scanner", (ScannerMonitor mon) =>
+    Results.Ok(new ScannerStatus(mon.IsOnline())));
 
 // ── Print (unchanged shape) ─────────────────────────────────────────────────
 

@@ -145,6 +145,41 @@ public sealed class DaemonClient : IDisposable
     }
 
     /// <summary>
+    /// Fetches just the printer half of the device status. Lets the
+    /// caller parallelise printer and scanner probes and update its
+    /// UI as each completes, instead of waiting on the slower of the
+    /// two. Returns null on transport failure — caller should render
+    /// that as a "couldn't reach the daemon" state, distinct from
+    /// a real online/offline answer.
+    /// </summary>
+    public async Task<PrinterStatus?> GetPrinterStatusAsync(CancellationToken ct)
+    {
+        try
+        {
+            return await _http.GetFromJsonAsync<PrinterStatus>("/status/printer", Json, ct);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning("printer status fetch failed: {Err}", ex.Message);
+            return null;
+        }
+    }
+
+    /// <inheritdoc cref="GetPrinterStatusAsync"/>
+    public async Task<ScannerStatus?> GetScannerStatusAsync(CancellationToken ct)
+    {
+        try
+        {
+            return await _http.GetFromJsonAsync<ScannerStatus>("/status/scanner", Json, ct);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning("scanner status fetch failed: {Err}", ex.Message);
+            return null;
+        }
+    }
+
+    /// <summary>
     /// Long-lived SSE subscription. Yields events as they arrive. On
     /// connection loss, reconnects with exponential backoff until the
     /// caller's <paramref name="ct"/> cancels.
