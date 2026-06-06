@@ -129,13 +129,36 @@ let
   # autoreconfHook regenerates configure/Makefile.in after our patch
   # touches configure.ac and Makefile.am.
 
-  iscanWithIpcProxy = pkgs.epkowa.overrideAttrs (old: {
+  iscanWithIpcProxy = (pkgs.epkowa.overrideAttrs (old: {
     patches = (old.patches or []) ++ [ ../EpkowaStubX64/iscan-ipc-proxy.patch ];
     nativeBuildInputs = (old.nativeBuildInputs or []) ++ [ pkgs.autoreconfHook ];
     configureFlags = (old.configureFlags or []) ++ [
       "--enable-ipc-proxy"
       "--with-ipc-stub=${stubWrapper}/bin/epkowa-stub-x64"
     ];
+  })).overrideAttrs (final: {
+    # Upstream epkowa bakes the proprietary x86_64 plugin paths into
+    # var/lib/iscan/interpreter at build time — each line maps a USB
+    # VID:PID to a /nix/store/<unshifted-bundle>/lib/esci/lib*.so
+    # path. The IPC patch forwards the path verbatim to the x86_64
+    # stub, which dlopens it via qemu-x86_64. On a 16K-page kernel
+    # the unshifted .so fails to mmap, so we need the path to point
+    # at our page-shifted variant.
+    #
+    # Rewrite each baked path to its shifted counterpart. Matching by
+    # original store path is robust against differences in upstream
+    # plugin attr names (`v330` vs `perfection-v330` vs the
+    # `iscan-v330-bundle` derivation name in the path).
+    # `--replace-quiet` skips plugins not referenced in the file
+    # (e.g. NT bundle is referenced through a different mechanism).
+    postFixup = (final.postFixup or "") + ''
+      interp=$out/var/lib/iscan/interpreter
+      if [ -f "$interp" ]; then
+        ${lib.concatMapStringsSep "\n      " (p:
+          ''substituteInPlace "$interp" --replace-quiet "${p.passthru.unshifted}" "${p}"''
+        ) (lib.attrValues shiftedEpkowaPlugins)}
+      fi
+    '';
   });
 in
 {
