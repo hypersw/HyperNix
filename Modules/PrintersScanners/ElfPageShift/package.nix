@@ -1,4 +1,4 @@
-{ lib, writers, python3Packages }:
+{ lib, stdenvNoCC, python3, python3Packages, makeWrapper }:
 
 # Standalone, build-time tool — page-shift an ELF64 .so so it loads
 # under a kernel with a larger page size than the .so was linked for.
@@ -14,19 +14,35 @@
 # building it. See ../../../ELF-PAGE-SHIFT.md at the flake root for
 # the long-form story.
 #
-# Implementation note: writers.writePython3Bin produces a runnable
-# script with pyelftools pre-injected into PYTHONPATH and the
-# shebang patched to the chosen python3 interpreter — no setuptools
-# / metadata overhead, which buildPythonApplication would impose.
-(writers.writePython3Bin "elf-page-shift" {
-  libraries = [ python3Packages.pyelftools ];
-  # We deliberately don't lint here — the script lives in its own
-  # source file, gets checked in, and any nitpicks should go through
-  # code review on that file, not block builds.
-  flakeIgnore = [ "E501" "E302" "E305" "W504" ];
-} (builtins.readFile ./elf-page-shift.py))
-.overrideAttrs (old: {
-  meta = (old.meta or {}) // {
+# Implementation note: deliberately avoids nixpkgs `writers.write*`
+# (which auto-lints) and `buildPythonApplication` (which expects
+# setup.py metadata). The script's aligned-column layout is
+# intentional for readability and not worth contorting for flake8;
+# a plain stdenv wrapper around `makeWrapper` gives us a clean
+# PYTHONPATH injection with zero policy decisions.
+stdenvNoCC.mkDerivation (finalAttrs: {
+  pname = "elf-page-shift";
+  version = "0.1.0";
+
+  src = ./.;
+
+  nativeBuildInputs = [ makeWrapper ];
+  buildInputs = [ python3 python3Packages.pyelftools ];
+
+  dontConfigure = true;
+  dontBuild = true;
+
+  installPhase = ''
+    runHook preInstall
+    mkdir -p $out/libexec $out/bin
+    install -m 0755 $src/elf-page-shift.py $out/libexec/elf-page-shift
+    makeWrapper ${python3}/bin/python3 $out/bin/elf-page-shift \
+      --add-flags $out/libexec/elf-page-shift \
+      --prefix PYTHONPATH : ${python3Packages.pyelftools}/${python3.sitePackages}
+    runHook postInstall
+  '';
+
+  meta = {
     description = "Re-align ELF64 PT_LOAD segments to a larger page size by shifting all VAs in lockstep";
     longDescription = ''
       Rewrites a closed-source ELF64 shared object so its PT_LOAD
