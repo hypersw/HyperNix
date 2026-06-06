@@ -81,9 +81,35 @@ let
   # (C++ runtime — the proprietary blob is compiled from C++). Those aren't
   # the interpreter's problem to find, they're ld.so's — add the x86_64 gcc
   # cc.lib/lib path so the linker resolves the transitive deps.
+  #
+  # ── PAGE-SHIFT WRAPPER ──
+  # Epson's libesci-interpreter-*.so plugins were linked with
+  # -z max-page-size=4096. On hosts running a 16 KiB-page kernel
+  # (Pi 5 vendor kernel, Asahi on Apple Silicon, etc.) `dlopen`
+  # fails with "failed to map segment from shared object" because
+  # PT_LOAD#2's file offset (0x4a000 in v330) isn't 16K-aligned.
+  # The ElfPageShift package (sibling dir) ships a tool that
+  # rewrites every absolute VA in the ELF and inserts padding so
+  # all segments end up 16K-aligned. Output is BACKWARDS-COMPATIBLE
+  # with 4K-page kernels (16K-aligned ⇒ 4K-aligned), so we apply
+  # the shift unconditionally on every plugin bundle, regardless
+  # of the host's actual page size — no need to gate on
+  # `getconf PAGESIZE`.
+  # See ../../../ELF-PAGE-SHIFT.md for the full background and the
+  # eight-layer ELF surgery checklist.
+  # Run the shifter on the BUILD host (aarch64 / native pkgs) rather
+  # than under qemu-x86_64. The tool is pure Python — it only reads
+  # and writes bytes — so host arch doesn't matter for correctness.
+  # Native pkgs avoids dragging an emulated python3 + pyelftools
+  # closure into the build, which would noticeably slow the switch
+  # on a Pi.
+  pageShift = import ../ElfPageShift/lib.nix { inherit pkgs; };
+  shiftedEpkowaPlugins = lib.mapAttrs
+    (_: p: pageShift.pageShiftElfBundle { src = p; })
+    (lib.filterAttrs (_: lib.isDerivation) pkgsX86.epkowa.plugins);
   esciPluginLibs = lib.concatMapStringsSep ":"
     (p: "${p}/lib/esci")
-    (lib.attrValues (lib.filterAttrs (_: lib.isDerivation) pkgsX86.epkowa.plugins));
+    (lib.attrValues shiftedEpkowaPlugins);
 
   ccRuntimeX86 = "${pkgsX86.stdenv.cc.cc.lib}/lib";
 
