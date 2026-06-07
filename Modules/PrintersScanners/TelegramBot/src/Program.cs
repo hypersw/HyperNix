@@ -1994,7 +1994,7 @@ async Task ShowStatusAsync(long chatId, CancellationToken ct)
         log.LogWarning(ex, "status placeholder send failed");
         return;
     }
-    initial.MessageId = placeholder.MessageId;
+    initial.MessageId = placeholder.Id;
 
     // Fire both probes concurrently. Each commits its result under
     // the per-message mutex so the two edits can't race a half-rendered
