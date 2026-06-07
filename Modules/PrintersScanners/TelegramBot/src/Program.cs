@@ -1971,11 +1971,20 @@ async Task ShowStatusAsync(long chatId, CancellationToken ct)
     // of the user seeing two visibly-independent status blocks they can
     // reason about separately.
 
-    // Every user-visible top-level reply re-asserts mainKeyboard. Not
-    // passing replyMarkup doesn't *remove* a persistent reply keyboard,
-    // but some Telegram clients stop showing it after a stretch of
-    // replies without one. Cheapest reliable way to keep the keyboard
-    // pinned is just to include it on every non-inline reply.
+    // NOTE: deliberately NOT passing replyMarkup here. Telegram refuses
+    // to editMessageText on a message that was originally sent with a
+    // ReplyKeyboardMarkup (the persistent bottom-of-screen keyboard) —
+    // the error surfaces as "Bad Request: message can't be edited"
+    // and the placeholder stays ⏳⏳ forever. The other send-then-edit
+    // sites in this bot (the session placeholder around line 494, the
+    // printer-session placeholder around line 640) all use bare
+    // SendMessage for the same reason.
+    //
+    // The persistent reply keyboard is already active in the chat from
+    // the user's previous interactions, so omitting replyMarkup here
+    // doesn't make it disappear. If a client ever does forget the
+    // keyboard after a long stretch without one, the very next non-
+    // status reply re-asserts it.
     var initial = new StatusUpdate { ChatId = chatId };
     Message placeholder;
     try
@@ -1983,7 +1992,6 @@ async Task ShowStatusAsync(long chatId, CancellationToken ct)
         placeholder = await bot.SendMessage(
             chatId, initial.Render(),
             parseMode: ParseMode.Html,
-            replyMarkup: mainKeyboard,
             cancellationToken: ct);
     }
     catch (Exception ex)
