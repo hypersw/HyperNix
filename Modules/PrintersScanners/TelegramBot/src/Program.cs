@@ -38,7 +38,40 @@ using var loggerFactory = LoggerFactory.Create(b => b.AddSimpleConsole(o =>
 var log = loggerFactory.CreateLogger("bot");
 
 var token = (await File.ReadAllTextAsync(tokenFile)).Trim();
-var bot = new TelegramBotClient(token);
+
+// HttpClient shared by the Telegram client. Configured to detect a
+// silently-dead long-poll connection within seconds rather than minutes:
+//
+//   - HTTP/2 keepalive pings every 15s of stream idle catch a connection
+//     that's gone dark — typical cause here is the upstream router's
+//     NAT eviction of the idle entry after its idle-timeout (commonly
+//     5-15 min on residential gateways). The pings also keep the NAT
+//     entry refreshed so the connection is less likely to be evicted
+//     in the first place.
+//   - PooledConnectionIdleTimeout=5min recycles connections locally
+//     before NAT typically evicts them, as belt-and-braces.
+//   - Total request timeout of 45s: just above our 30s long-poll
+//     timeout (line ~155). HttpClient's default of 100s meant that
+//     when a long-poll silently died — TG sends "no updates", reply
+//     never makes it back to us — the bot waited nearly two minutes
+//     before bailing and re-issuing GetUpdates, during which incoming
+//     user messages queued at Telegram with no response from us.
+//     Symptom from journalctl was recurring 100s "Bot API Request
+//     timed out" errors every 10-30 min of low chat activity, which
+//     manifests as ~half-a-minute-to-respond on the user's first
+//     tap after a quiet period.
+var botHttpHandler = new SocketsHttpHandler
+{
+    KeepAlivePingDelay = TimeSpan.FromSeconds(15),
+    KeepAlivePingTimeout = TimeSpan.FromSeconds(5),
+    KeepAlivePingPolicy = System.Net.Http.HttpKeepAlivePingPolicy.Always,
+    PooledConnectionIdleTimeout = TimeSpan.FromMinutes(5),
+};
+var botHttp = new HttpClient(botHttpHandler, disposeHandler: true)
+{
+    Timeout = TimeSpan.FromSeconds(45),
+};
+var bot = new TelegramBotClient(token, botHttp);
 using var daemon = new DaemonClient(socketPath, loggerFactory.CreateLogger<DaemonClient>());
 var pipeline = new ImagePipeline(loggerFactory.CreateLogger<ImagePipeline>());
 
