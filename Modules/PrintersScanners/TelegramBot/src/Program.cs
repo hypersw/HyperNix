@@ -1971,20 +1971,44 @@ async Task ShowStatusAsync(long chatId, CancellationToken ct)
     // of the user seeing two visibly-independent status blocks they can
     // reason about separately.
 
-    // NOTE: deliberately NOT passing replyMarkup here. Telegram refuses
-    // to editMessageText on a message that was originally sent with a
-    // ReplyKeyboardMarkup (the persistent bottom-of-screen keyboard) —
-    // the error surfaces as "Bad Request: message can't be edited"
-    // and the placeholder stays ⏳⏳ forever. The other send-then-edit
-    // sites in this bot (the session placeholder around line 494, the
-    // printer-session placeholder around line 640) all use bare
-    // SendMessage for the same reason.
+    // TWO MESSAGES per status tap:
     //
-    // The persistent reply keyboard is already active in the chat from
-    // the user's previous interactions, so omitting replyMarkup here
-    // doesn't make it disappear. If a client ever does forget the
-    // keyboard after a long stretch without one, the very next non-
-    // status reply re-asserts it.
+    //   1. An ANCHOR message carrying the section header AND the
+    //      mainKeyboard replyMarkup. Never edited. Its only jobs are
+    //      to (re-)assert the persistent reply keyboard in the chat
+    //      and provide a visible heading for the dynamic block below
+    //      it.
+    //   2. A DYNAMIC placeholder with the printer/scanner slots.
+    //      Sent without replyMarkup, so it remains editable as the
+    //      probes complete.
+    //
+    // Why split: Telegram refuses to editMessageText on a message
+    // that was originally sent with a ReplyKeyboardMarkup attached —
+    // returns "Bad Request: message can't be edited", the edit
+    // silently fails and the placeholder freezes at ⏳⏳. So the
+    // keyboard-bearing send and the editable send have to be
+    // different messages. We can't send the keyboard alone (Telegram
+    // requires message text), so the anchor doubles as the header.
+    //
+    // Anchor-first ordering: assert the keyboard before the user
+    // sees the dynamic block, so even on a fresh chat where this is
+    // the first interaction (no /start), the keyboard is up by the
+    // time they're looking at the status. Anchor failure is logged
+    // but not fatal — we still try to render the dynamic block; the
+    // user just doesn't get a keyboard refresh from this turn.
+    try
+    {
+        await bot.SendMessage(
+            chatId, StatusUpdate.AnchorText,
+            parseMode: ParseMode.Html,
+            replyMarkup: mainKeyboard,
+            cancellationToken: ct);
+    }
+    catch (Exception ex)
+    {
+        log.LogWarning(ex, "status anchor send failed; continuing without keyboard refresh");
+    }
+
     var initial = new StatusUpdate { ChatId = chatId };
     Message placeholder;
     try
@@ -1996,9 +2020,10 @@ async Task ShowStatusAsync(long chatId, CancellationToken ct)
     }
     catch (Exception ex)
     {
-        // If we can't even send the placeholder, nothing the async
-        // probes do can recover. Log + give up; HandleUpdateAsync
-        // catches and ignores anyway.
+        // Without the dynamic placeholder there's nothing to update,
+        // so the async probes have nowhere to land their results.
+        // The anchor (if it sent) already gave the user something to
+        // read; we just don't get a live status block. Log and bail.
         log.LogWarning(ex, "status placeholder send failed");
         return;
     }
@@ -2510,7 +2535,9 @@ static class Retry
 record AllowedUser(long Id, string Name);
 
 /// <summary>
-/// In-memory state for one async-rendered status message. Tracks
+/// In-memory state for the dynamic half of one async-rendered status
+/// reply (the editable message; see ShowStatusAsync for the anchor +
+/// dynamic two-message scheme and why it has to be that way). Tracks
 /// per-slot completion + value, plus an edit-serialising mutex so the
 /// printer-probe and scanner-probe tasks can't race a half-rendered
 /// message into Telegram. One instance per /status tap — taps don't
@@ -2518,6 +2545,11 @@ record AllowedUser(long Id, string Name);
 /// </summary>
 sealed class StatusUpdate
 {
+    /// Header text on the anchor message — the one that carries the
+    /// reply keyboard. Lives here next to <see cref="Render"/> so the
+    /// two pieces of the user-facing status block stay co-located.
+    public const string AnchorText = "📊 <b>Status</b>";
+
     public long ChatId;
     public int MessageId;
     public bool PrinterDone;
@@ -2535,9 +2567,9 @@ sealed class StatusUpdate
         : online is null ? "❓ unreachable"
         : online.Value ? "✅ online" : "⚠️ offline";
 
+    // Rendered body for the dynamic placeholder message. No header
+    // here — that lives on the anchor sent immediately before.
     public string Render() => $"""
-        📊 <b>Status</b>
-
         🖨️ Printer: {FormatSlot(PrinterDone, Printer?.Online)}
         📷 Scanner: {FormatSlot(ScannerDone, Scanner?.Online)}
         """;
