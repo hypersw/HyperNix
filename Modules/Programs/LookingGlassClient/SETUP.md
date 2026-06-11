@@ -461,6 +461,71 @@ canonical source.
 
 ---
 
+## WARP-only guests (no real or passed-through GPU)
+
+Out of the box, the LG SERVER refuses to capture from
+`Microsoft Basic Render Driver` (the WDDM name for WARP, Windows'
+software D3D renderer used when no real GPU driver is loaded). The
+log line is `Not using unsupported adapter: Microsoft Basic Render
+Driver`, and there is no LG config option to disable the check. The
+refusal is a UX choice — DXGI Output Duplication does work against
+WARP, just at lower throughput because rendering is CPU-bound — and
+for a desktop-testing VM (Mica, acrylic, IDE work) the throughput is
+fine, comparable to what RDP delivers at AVC444.
+
+The filter is a single `wcscmp`-style guard in the LG host source.
+The way to remove it without rebuilding is a one-byte binary patch
+on the installed `looking-glass-host.exe`: flip the first byte of
+the UTF-16 LE literal `Microsoft Basic Render Driver` (so the
+comparison can never match a real adapter description). The
+`Template/Patch-LookingGlassServer.ps1` script in this directory
+automates that:
+
+1. Copy `Patch-LookingGlassServer.ps1` into the guest.
+2. Open an elevated PowerShell (right-click → "Run as administrator").
+3. Allow the script for this session:
+   ```
+   Set-ExecutionPolicy -Scope Process Bypass
+   ```
+4. Run it:
+   ```
+   .\Patch-LookingGlassServer.ps1
+   ```
+5. Verify in Event Viewer → Application logs (source "Looking Glass")
+   that capture now starts on the WARP adapter, e.g.
+   `capture method D12 started, output: \\.\DISPLAY1`.
+
+The script is **idempotent** (skips if already patched), **safe**
+(backs up the original EXE under
+`looking-glass-host.exe.unpatched.<timestamp>.bak` before writing),
+and **service-aware** (stops the LG service before patching, restarts
+it after, if it was running). Re-apply after every LG version
+upgrade — the installer overwrites the patched EXE with a fresh
+unpatched one. To revert, rename one of the `.bak` files back over
+the EXE.
+
+Caveats with the WARP path:
+
+- WARP rendering is on the CPU; expect 30–60 fps for desktop content
+  with one core pegged.
+- No GPU video acceleration in the guest — YouTube playback is
+  choppy and CPU-heavy.
+- Acrylic blur can stutter under window movement; static Mica is
+  fine. Mostly OK for "I want to see Mica" testing.
+- Skip GPU-specific settings entirely: no NVIDIA Control Panel
+  step, no VDD needed (the WARP adapter is itself the rendering
+  target so there's nothing displayless to compensate for).
+
+Alternative if you find yourself maintaining the patch across many
+guests: deploy Sunshine + Moonlight instead of LG for the WARP fleet
+— Sunshine doesn't filter MBRD and works out of the box on
+WARP-only guests. You lose the IVSHMEM zero-copy path but the
+latency floor is already dominated by software rendering on the
+WARP side, so it's a wash. LG keeps making sense for the kvmfr+real-
+GPU path.
+
+---
+
 ## Companion files in this directory
 
 - `default.nix` — the NixOS module that writes
@@ -474,3 +539,8 @@ canonical source.
   `C:\ProgramData\Looking Glass (host)\looking-glass-host.ini`
   (filename matches; no rename needed) and fill in the `adapter=`
   substring.
+- `Template/Patch-LookingGlassServer.ps1` — idempotent binary
+  patcher for the LG SERVER EXE that disables its hardcoded
+  refusal of the WARP/MBRD adapter. Required only on guests with
+  no real or passed-through GPU; see the "WARP-only guests"
+  section above for usage.
