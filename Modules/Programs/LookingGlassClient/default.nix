@@ -118,17 +118,23 @@ let
     app = { framePollInterval = 500; };
   };
 
-  # Opt-in: replaces LG's default "manual toggle" grab model with an
-  # auto-grab-on-focus / release-on-focus-loss model. Better when
-  # you're using the VM as a desktop and tabbing between it and host
-  # apps frequently; worse for exclusive gaming where any focus loss
-  # would steal input mid-action.
-  # `releaseKeysOnFocusLoss` defaults to yes upstream but we set it
-  # explicitly here for completeness — without it you can get a
-  # "stuck Alt" state on tab-out.
+  # Opt-in: replaces LG's default "manual toggle" grab model with a
+  # focus-based grab model. Capture engages on window focus, releases
+  # on focus loss, held keys are released cleanly so you don't get a
+  # "stuck Alt" state. Better when the VM is a desktop and you tab
+  # between it and host apps frequently; worse for exclusive gaming
+  # where any focus loss would steal input mid-action.
+  #
+  # IMPORTANT: we deliberately do NOT set LG's `input:autoCapture=yes`
+  # here, despite the user-facing option being called `enableAutoCapture`.
+  # That LG flag is documented as "Try to keep the mouse captured" and
+  # in practice fights any attempt to release: Scroll Lock releases
+  # capture, autoCapture immediately re-grabs as soon as the cursor
+  # re-enters the window. The combination of `captureOnFocus` +
+  # `grabKeyboardOnFocus` + manual Scroll Lock release gives a
+  # deterministic flow without the runaway re-grab.
   autoCaptureSettings = {
     input = {
-      autoCapture = true;
       captureOnFocus = true;
       grabKeyboardOnFocus = true;
       releaseKeysOnFocusLoss = true;
@@ -242,10 +248,18 @@ in {
       type = lib.types.bool;
       default = false;
       description = ''
-        Replace LG's default "manual toggle" grab model with
-        auto-grab-on-focus + release-on-focus-loss
-        (`autoCapture=yes`, `captureOnFocus=yes`,
-        `grabKeyboardOnFocus=yes`, `releaseKeysOnFocusLoss=yes`).
+        Replace LG's default "manual toggle" grab model with a
+        focus-based grab model: capture engages on window focus,
+        releases on focus loss, held keys are released cleanly
+        (`captureOnFocus=yes`, `grabKeyboardOnFocus=yes`,
+        `releaseKeysOnFocusLoss=yes`).
+
+        Note: deliberately does NOT enable LG's `input:autoCapture`
+        flag despite the name — that flag is documented as "Try to
+        keep the mouse captured" and aggressively re-grabs whenever
+        the cursor re-enters the window, making Scroll Lock release
+        ineffective. The settings applied here give a deterministic
+        focus-based flow without the runaway re-grab.
 
         Better when the VM is a desktop and you tab in/out of it
         frequently; worse for exclusive-fullscreen gaming where any
