@@ -118,25 +118,32 @@ let
     app = { framePollInterval = 500; };
   };
 
-  # Opt-in: replaces LG's default "manual toggle" grab model with a
-  # focus-based grab model. Capture engages on window focus, releases
-  # on focus loss, held keys are released cleanly so you don't get a
-  # "stuck Alt" state. Better when the VM is a desktop and you tab
-  # between it and host apps frequently; worse for exclusive gaming
-  # where any focus loss would steal input mid-action.
+  # Opt-in: focus-based capture flow (mstsc model). Click/tab into the
+  # LG window → capture engages and keyboard grabs (via the LG default
+  # `grabKeyboard=yes` which kicks in *in capture mode*). Press Scroll
+  # Lock → capture exits and the keyboard ungrabs; window keeps focus
+  # but the WM can see Alt+Tab again. `releaseKeysOnFocusLoss` is the
+  # safety net: tabbing away with held keys (Alt+Tab itself, for one)
+  # sends key-up events to the guest so nothing stays "stuck pressed."
   #
-  # IMPORTANT: we deliberately do NOT set LG's `input:autoCapture=yes`
-  # here, despite the user-facing option being called `enableAutoCapture`.
-  # That LG flag is documented as "Try to keep the mouse captured" and
-  # in practice fights any attempt to release: Scroll Lock releases
-  # capture, autoCapture immediately re-grabs as soon as the cursor
-  # re-enters the window. The combination of `captureOnFocus` +
-  # `grabKeyboardOnFocus` + manual Scroll Lock release gives a
-  # deterministic flow without the runaway re-grab.
+  # IMPORTANT — two LG flags we deliberately do NOT set despite the
+  # user-facing option being called `enableAutoCapture`:
+  #
+  #   * `input:autoCapture=yes` — documented as "Try to keep the mouse
+  #     captured." In practice fights any release: Scroll Lock releases
+  #     capture, autoCapture immediately re-grabs as soon as the
+  #     cursor re-enters the window.
+  #   * `input:grabKeyboardOnFocus=yes` — documented as "Grab the
+  #     keyboard when focused" (i.e., regardless of capture mode).
+  #     Defeats Scroll Lock release: capture exits but the keyboard
+  #     stays grabbed because the window still has focus, so Alt+Tab
+  #     still goes to the guest.
+  #
+  # The combination kept (`captureOnFocus` + `releaseKeysOnFocusLoss`
+  # + LG's default `grabKeyboard`) is the mstsc-equivalent flow.
   autoCaptureSettings = {
     input = {
       captureOnFocus = true;
-      grabKeyboardOnFocus = true;
       releaseKeysOnFocusLoss = true;
     };
   };
@@ -248,18 +255,23 @@ in {
       type = lib.types.bool;
       default = false;
       description = ''
-        Replace LG's default "manual toggle" grab model with a
-        focus-based grab model: capture engages on window focus,
-        releases on focus loss, held keys are released cleanly
-        (`captureOnFocus=yes`, `grabKeyboardOnFocus=yes`,
-        `releaseKeysOnFocusLoss=yes`).
+        Replace LG's default "manual toggle" grab model with the
+        mstsc-equivalent flow: focus the LG window (click or tab to
+        it) → capture engages, keyboard grabs. Press Scroll Lock →
+        capture exits, keyboard ungrabs, window stays focused, the
+        WM sees Alt+Tab again. Tabbing back into LG re-engages
+        capture. Held keys are released cleanly on focus loss so
+        nothing stays "stuck pressed" on the guest side.
 
         Note: deliberately does NOT enable LG's `input:autoCapture`
-        flag despite the name — that flag is documented as "Try to
-        keep the mouse captured" and aggressively re-grabs whenever
-        the cursor re-enters the window, making Scroll Lock release
-        ineffective. The settings applied here give a deterministic
-        focus-based flow without the runaway re-grab.
+        or `input:grabKeyboardOnFocus` flags despite the name —
+        both fight against releasing the keyboard via Scroll Lock
+        (the first re-grabs the mouse aggressively; the second
+        keeps the keyboard grabbed as long as the window has focus,
+        regardless of capture mode). The applied set is
+        `captureOnFocus=yes` + `releaseKeysOnFocusLoss=yes`, with
+        the keyboard grabbed by LG's default `grabKeyboard=yes`
+        which is gated on capture mode.
 
         Better when the VM is a desktop and you tab in/out of it
         frequently; worse for exclusive-fullscreen gaming where any
@@ -413,6 +425,7 @@ in {
       default = {
         mouseFix = ./Template/MouseFix.reg;
         serverIni = ./Template/looking-glass-host.ini;
+        patchServerForWarp = ./Template/Patch-LookingGlassServer.ps1;
       };
       description = ''
         Paths to template files that go into the Windows guest:
@@ -423,7 +436,14 @@ in {
             to the guest at
             `C:\ProgramData\Looking Glass (host)\looking-glass-host.ini`.
             Filename matches the destination — no rename needed.
-        See SETUP.md in this module's directory for usage.
+          - `patchServerForWarp`: idempotent PowerShell binary
+            patcher that disables LG server's hardcoded refusal of
+            the "Microsoft Basic Render Driver" (WARP) adapter.
+            Needed only on guests with no real or passed-through
+            GPU; the standard kvmfr+passthrough path doesn't need it.
+            See SETUP.md "WARP-only guests" for usage.
+        See SETUP.md in this module's directory for the full guest
+        setup walkthrough.
       '';
     };
 
