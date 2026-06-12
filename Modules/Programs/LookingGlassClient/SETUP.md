@@ -111,6 +111,17 @@ native element:
 </shmem>
 ```
 
+Verify if virt-manager wipes shmem device on apply (might not be understanding it). If so, use the raw commandline approach just as with kvmfr:
+
+```xml
+<qemu:commandline xmlns:qemu="http://libvirt.org/schemas/domain/qemu/1.0">
+  <qemu:arg value='-device'/>
+  <qemu:arg value='{"driver":"ivshmem-plain","id":"shmem0","memdev":"looking-glass"}'/>
+  <qemu:arg value='-object'/>
+  <qemu:arg value='{"qom-type":"memory-backend-file","id":"looking-glass","mem-path":"/dev/shm/lg-warp","size":67108864,"share":true}'/>
+</qemu:commandline>
+```
+
 libvirt creates `/dev/shm/lg-warp` automatically, no cgroup ACL
 entry needed (libvirt allows access to files it created in
 `/dev/shm`). The `name=` attribute and the shm filename are

@@ -168,12 +168,22 @@ let
     };
   };
 
+  # evdev capture: requires master client. CSV of device paths becomes
+  # `input:evdev`; `evdevExclusiveOnCapture` becomes `input:evdevExclusive`.
+  evdevSettings = {
+    input = {
+      evdev = lib.concatStringsSep "," cfg.evdevDevices;
+      evdevExclusive = cfg.evdevExclusiveOnCapture;
+    };
+  };
+
   # ── Compose the final settings dictionary ─────────────────────────
 
   baseSettings = lib.foldl' mergeSettings {} (
     (lib.optional (!cfg.dontApplyMouseFixes) mouseFixSettings)
     ++ (lib.optional (!cfg.dontApplyLowLatencyDefaults) lowLatencySettings)
     ++ (lib.optional cfg.enableAutoCapture autoCaptureSettings)
+    ++ (lib.optional (cfg.evdevDevices != []) evdevSettings)
   );
 
   finalSettings = mergeSettings baseSettings cfg.extraSettings;
@@ -422,11 +432,65 @@ in {
       example = [ "alice" "bob" ];
       description = ''
         Local users who will run `looking-glass-client`. Each is added
-        to the `kvm` group so they can mmap `/dev/kvmfr*`.
+        to the `kvm` group so they can mmap `/dev/kvmfr*`, and to the
+        `input` group when `evdevDevices` is non-empty so they can
+        open `/dev/input/event*`.
 
         At least one entry is REQUIRED when `dontSetupKvmfr = false`
         (the default); the assertion fires at eval time if the list
         is empty. Leave `[]` only when kvmfr setup is being skipped.
+      '';
+    };
+
+    # ── evdev keyboard/mouse capture (master only) ──────────────────
+
+    evdevDevices = lib.mkOption {
+      type = lib.types.listOf lib.types.str;
+      default = [];
+      example = [ "/dev/input/by-id/usb-Logitech_K810-event-kbd" ];
+      description = ''
+        List of `/dev/input/` device paths LG should read directly via
+        the kernel evdev interface, bypassing the X11/Wayland keyboard
+        path entirely. Becomes the comma-joined `input:evdev=...`
+        setting in the generated .ini. There is no auto-discovery; if
+        you want multiple keyboards or a mouse covered, list each path
+        explicitly. Use the stable `/dev/input/by-id/...` names —
+        `/dev/input/eventN` numbers shuffle on hotplug.
+
+        Purpose: the bare Super key isn't deliverable through standard
+        X11/Wayland grabs on most Linux compositors (Mutter, KWin and
+        friends reserve it for overlay/launcher actions above the
+        application's keyboard grab). Reading evdev raw bypasses that
+        entirely — the WM never sees the keys at all while LG holds
+        them. See `evdevExclusiveOnCapture` for the strict-grab toggle.
+
+        REQUIRES the master client build (`master.enable = true`); the
+        B7 release doesn't include the evdev backend. When this list
+        is non-empty, `interactiveUsers` are automatically added to
+        the `input` group.
+
+        Setting empty (default) keeps LG on the standard keyboard
+        path. No partial behavior — there's no "evdev for all
+        keyboards" mode upstream.
+      '';
+    };
+
+    evdevExclusiveOnCapture = lib.mkOption {
+      type = lib.types.bool;
+      default = true;
+      description = ''
+        While in capture mode, take EVIOCGRAB-exclusive ownership of
+        each device in `evdevDevices` — the keyboard/mouse stops
+        emitting any events to the host (no Super to the WM, no
+        Ctrl+C anywhere local) until capture is released. That's the
+        point: it's what makes bare Super reach the guest reliably.
+
+        Set to false to keep events shared between host and guest
+        (LG reads evdev but doesn't grab — the WM still sees the same
+        events). Useful only as a diagnostic; capture-mode exclusivity
+        is the intended mode of operation.
+
+        No effect when `evdevDevices = []`.
       '';
     };
 
@@ -526,16 +590,28 @@ in {
       environment.etc."looking-glass-client.ini".text = iniText;
       environment.systemPackages = [ cfg.package ] ++ profilePackages;
 
-      assertions = [{
-        assertion = cfg.dontSetupKvmfr || (lib.length cfg.interactiveUsers > 0);
-        message = ''
-          hypersw.programs.lookingGlassClient.interactiveUsers must list
-          at least one user when dontSetupKvmfr is false (the default).
-          Each listed user is added to the "kvm" group so they can open
-          /dev/kvmfr*. Alternatively set dontSetupKvmfr = true if you're
-          managing kvmfr externally.
-        '';
-      }];
+      assertions = [
+        {
+          assertion = cfg.dontSetupKvmfr || (lib.length cfg.interactiveUsers > 0);
+          message = ''
+            hypersw.programs.lookingGlassClient.interactiveUsers must list
+            at least one user when dontSetupKvmfr is false (the default).
+            Each listed user is added to the "kvm" group so they can open
+            /dev/kvmfr*. Alternatively set dontSetupKvmfr = true if you're
+            managing kvmfr externally.
+          '';
+        }
+        {
+          assertion = cfg.evdevDevices == [] || (lib.length cfg.interactiveUsers > 0);
+          message = ''
+            hypersw.programs.lookingGlassClient.evdevDevices is set, but
+            interactiveUsers is empty. Each listed user is added to the
+            "input" group so they can open /dev/input/event*. Add the
+            user who will run looking-glass-client to interactiveUsers,
+            or clear evdevDevices.
+          '';
+        }
+      ];
     }
 
     # ── Hypervisor: kvmfr kernel module + udev + group ──────────────
@@ -552,6 +628,12 @@ in {
       '';
       users.users = lib.genAttrs cfg.interactiveUsers
         (_: { extraGroups = [ "kvm" ]; });
+    })
+
+    # ── Hypervisor: input group when evdev capture is enabled ───────
+    (lib.mkIf (cfg.evdevDevices != []) {
+      users.users = lib.genAttrs cfg.interactiveUsers
+        (_: { extraGroups = [ "input" ]; });
     })
 
     # ── Hypervisor: libvirt cgroup_device_acl extension ─────────────
