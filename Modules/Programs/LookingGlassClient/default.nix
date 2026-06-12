@@ -35,6 +35,26 @@
 let
   cfg = config.hypersw.programs.lookingGlassClient;
 
+  # ── Master-branch source pin ──────────────────────────────────────
+  # Default source for `master.enable = true`. Bump rev+hash to pull
+  # later master fixes; reproduce the hash with:
+  #   nix-prefetch-github gnif LookingGlass --rev <sha> --fetch-submodules
+  # LG uses submodules (lgmp etc.), so fetchSubmodules MUST be true.
+  defaultMasterSrc = pkgs.fetchFromGitHub {
+    owner = "gnif";
+    repo = "LookingGlass";
+    rev = "4bb2c58fb6d0df9e863ad45924dd4decc7e9cf4e"; # 2026-06-09 master tip
+    hash = "sha256-Dc0sFnJVM0xJ0FfIQqGQKxFUj6mhp3qgB772h3Dgowc=";
+    fetchSubmodules = true;
+  };
+
+  # Master build: reuse the nixpkgs derivation (which carries all the
+  # buildInputs / cmake flags), just swap the source.
+  masterPackage = pkgs.looking-glass-client.overrideAttrs (old: {
+    version = "git-master";
+    src = cfg.master.src;
+  });
+
   # ── Helpers ───────────────────────────────────────────────────────
 
   # LG accepts "yes"/"no" for booleans (not "true"/"false"). Numbers
@@ -206,13 +226,64 @@ in {
 
     package = lib.mkOption {
       type = lib.types.package;
-      default = pkgs.looking-glass-client;
-      defaultText = lib.literalExpression "pkgs.looking-glass-client";
+      default = if cfg.master.enable then masterPackage else pkgs.looking-glass-client;
+      defaultText = lib.literalExpression
+        "if master.enable then (pkgs.looking-glass-client built from master.src) else pkgs.looking-glass-client";
       description = ''
-        The looking-glass-client package to install. Override if you've
-        built a patched binary (e.g. with the MBRD-filter removed for
-        WARP-only guests, see SETUP.md).
+        The looking-glass-client package to install. Defaults to the
+        nixpkgs B7 release, or to a master-built variant when
+        `master.enable = true`. Override explicitly if you need a
+        patched binary that's neither (e.g. the MBRD-filter-removed
+        WARP build).
       '';
+    };
+
+    master = {
+      enable = lib.mkOption {
+        type = lib.types.bool;
+        default = false;
+        description = ''
+          Build the LG client from upstream master instead of the
+          nixpkgs B7 release. Needed for features added since B7 —
+          notably `input:evdev` keyboard capture (forwards bare
+          Super past WM grabs, since LG bypasses the X11/Wayland
+          input layer entirely), Wayland fractional-scale support,
+          and a handful of IDD helper improvements.
+
+          B7 server and master client share `KVMFR_VERSION = 20` at
+          the time of writing, so they pair without changes to the
+          in-guest server. The version check is a strict equality
+          on both sides — if upstream ever bumps `KVMFR_VERSION` in
+          master (B8 prep), this option becomes incompatible until
+          the guest server is upgraded too. Track with:
+            curl -sS https://raw.githubusercontent.com/gnif/LookingGlass/master/common/include/common/KVMFR.h \
+              | grep KVMFR_VERSION
+        '';
+      };
+
+      src = lib.mkOption {
+        type = lib.types.path;
+        default = defaultMasterSrc;
+        defaultText = lib.literalExpression ''
+          pkgs.fetchFromGitHub {
+            owner = "gnif"; repo = "LookingGlass";
+            rev = "<pinned tip of master>";
+            hash = "<pinned hash>";
+            fetchSubmodules = true;
+          }
+        '';
+        description = ''
+          Source used when `master.enable = true`. Defaults to a
+          pinned `fetchFromGitHub`. Override with a local path
+          (e.g. `/home/work/Projects/External/LookingGlass`) while
+          iterating locally, or with your own `fetchFromGitHub`
+          pinning a different commit. Reproduce the hash for a new
+          rev with:
+
+            nix-prefetch-github gnif LookingGlass \
+              --rev <sha> --fetch-submodules
+        '';
+      };
     };
 
     # ── Default-ON behaviours: skip them with `dontXxx = true` ─────
