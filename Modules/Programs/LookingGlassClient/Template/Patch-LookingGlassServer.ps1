@@ -239,3 +239,237 @@ if ($wasRunning) {
 } else {
     Write-Host "Done. Start '$ServiceName' yourself when ready."
 }
+
+<#
+═══════════════════════════════════════════════════════════════════════════════
+ HANDOVER  ―  Extend this script with a second patch step
+═══════════════════════════════════════════════════════════════════════════════
+
+You are running on the Windows guest VM where looking-glass-host.exe lives
+and you have access to disassembly tools (dumpbin, Ghidra, IDA, radare2,
+llvm-objdump, whatever the box has — install one if not). This script in
+its current form patches the MBRD adapter filter (numeric PCI VendorId
+0x1414 → 0x1415, one byte each at validated sites). That bypasses the
+"Not using unsupported adapter" rejection — but a *second* gate then
+fires: D3D11CreateDevice itself refuses the WARP adapter, because LG
+asks for the D3D11_CREATE_DEVICE_VIDEO_SUPPORT capability and WARP has
+no hardware video decoder. The observed runtime symptom is:
+
+    Failed to create the D3D11Device: 0x887a0004
+      (The specified device interface or feature level is not supported
+       on this system.)
+
+YOUR TASK
+─────────
+Extend this script with a second patch pass that zeroes out the
+D3D11_CREATE_DEVICE_VIDEO_SUPPORT bit (0x800) at every D3D11CreateDevice
+call site in looking-glass-host.exe, so D3D11 device creation succeeds
+on WARP. Stick to the conventions already established here:
+
+  - Idempotent: classify candidate sites into `$toPatch` vs
+    `$alreadyPatched` and exit cleanly when nothing's left to do.
+  - Pre-flight validation: do NOT edit a byte you can't prove is a
+    real call site. The existing MBRD detector uses an opcode-prefix
+    check AND a proximity check for the DeviceId 0x008c. Apply the
+    same idea with an oracle appropriate to D3D11CreateDevice (see
+    "Validation oracles" below).
+  - One-byte change per site, same instruction length, no branch-
+    target reflow.
+  - Fold both passes into one flow: shared service-stop / shared
+    backup / shared single ReadAllBytes + WriteAllBytes. Don't write
+    the file twice.
+  - Update .SYNOPSIS / .DESCRIPTION / .NOTES at the top of this
+    script to describe the extended scope.
+
+SOURCE CONTEXT
+──────────────
+Both D3D11CreateDevice call sites (in dxgi.c and D12/backend/dd.c)
+have identical shape:
+
+    D3D11CreateDevice(
+      adapter,                                // 1st: rcx
+      D3D_DRIVER_TYPE_UNKNOWN,                // 2nd: edx
+      NULL,                                   // 3rd: r8
+      D3D11_CREATE_DEVICE_VIDEO_SUPPORT |     // 4th: r9d  ← patch HERE
+        (debug ? D3D11_CREATE_DEVICE_DEBUG : 0),
+      featureLevels,                          // 5th: stack
+      ARRAY_LENGTH(featureLevels),            // 6th: stack
+      D3D11_SDK_VERSION,                      // 7th: stack ← oracle candidate
+      &d11device,
+      &featureLevel,
+      &d11context);
+
+Relevant constants:
+  D3D11_CREATE_DEVICE_VIDEO_SUPPORT = 0x00000800
+  D3D11_CREATE_DEVICE_DEBUG         = 0x00000002
+  D3D11_SDK_VERSION                 = 7
+
+Goal: make the Flags arg evaluate to a value that does NOT include the
+0x800 bit. Easiest is "patch the immediate so it's 0 instead of 0x800";
+the surrounding instruction stays the same length, and LG still passes
+*some* value (just without VIDEO_SUPPORT). Downstream LG code that tries
+to use a D3D11VideoDevice on WARP would fail, but those paths are unused
+on a pure-WARP guest anyway, so they don't fire.
+
+`debug` is `option_get("d12", "debug")` — runtime, default false. Two
+compilation shapes are likely:
+
+  PATTERN A — debug provably/constant-folded false (release, no debug):
+      41 B9 00 08 00 00      mov  r9d, 0x800
+                             ↑ patch byte at offset+2 (the 0x08)
+    Patched form:   41 B9 00 00 00 00      mov  r9d, 0
+
+  PATTERN B — runtime OR / ADD against `debug<<1`:
+      0F B6 ??               movzx eax, byte ptr [debug-field]
+      D1 E0                  shl   eax, 1
+      0D 00 08 00 00         or    eax, 0x800
+                             ↑ patch byte at offset+2 (the 0x08)
+      41 89 C1               mov   r9d, eax
+    Patched form:   0D 00 00 00 00      or    eax, 0
+    (Variant — `add eax, 0x800`: 05 00 08 00 00, same patch at offset+2.)
+
+Single-byte change in both patterns. No length change. Mirror the
+MBRD pass's `foreach ($offset in $toPatch) { $bytes[$offset] = 0x00 }`
+style — but using the actual immediate-byte offset for whichever
+pattern matches.
+
+INVESTIGATION STEPS
+───────────────────
+1. Locate the D3D11CreateDevice IAT entry:
+       dumpbin /imports "$ExePath" | findstr /C:"D3D11CreateDevice"
+   Or via PowerShell + Get-PEHeader / ImportTable parsing if dumpbin
+   isn't on PATH. Note the IAT slot's RVA.
+
+2. Disassemble a window around every `call qword ptr [<IAT RVA>]` site.
+   Whatever tool you've got — dumpbin /disasm, Ghidra headless, an
+   `objdump -d -M intel` build, ndisasm-with-PE-offsets, etc. You're
+   looking at the 10-30 instructions preceding each indirect call,
+   specifically the loading of `r9d` (4th arg).
+
+3. Identify which Pattern (A or B) this build emits. B7's host is a
+   MinGW/GCC build; expect A in release. If you see Pattern B,
+   document the variant in your output for posterity.
+
+4. Confirm site count = 2 (one per backend: dxgi.c, D12/backend/dd.c).
+   If you find ≠ 2, widen the search; if still ≠ 2, abort cleanly
+   — do NOT speculatively patch. Better to report "could not find
+   N sites in this build, here's what I saw" than to corrupt
+   unrelated 0x800 immediates.
+
+VALIDATION ORACLES
+──────────────────
+Per-site validation similar to Test-MbrdSite. Choose one or two
+oracles cheap to check in PowerShell:
+
+  - **IAT call proximity** (strongest signal): within ~80 bytes
+    after the candidate immediate, look for `FF 15` followed by a
+    4-byte RIP-relative displacement pointing at the D3D11CreateDevice
+    IAT slot. This is the indirect call to the function whose 4th arg
+    we're setting. If you've resolved the IAT slot's address in step 1
+    above, you can compute the expected disp32 exactly. Strongest
+    possible oracle; almost no false positives.
+
+  - **D3D11_SDK_VERSION** (literal 7 as 4-byte immediate): within
+    ~40 bytes of the candidate, find an instruction loading or
+    storing the literal 7. Likely shapes:
+        BF 07 00 00 00                   mov edi, 7
+        BE 07 00 00 00                   mov esi, 7
+        C7 44 24 ?? 07 00 00 00          mov dword ptr [rsp+??], 7
+    Weaker than the IAT oracle (literal 7 is more common) but easy
+    to grep.
+
+  - **Feature-level array LEA**: an `lea r-, [rip+disp32]` whose
+    target hits a .rdata block containing the constants
+        00 C1 00 00     (D3D_FEATURE_LEVEL_12_1)
+        00 C0 00 00     (D3D_FEATURE_LEVEL_12_0)
+        00 B1 00 00     (D3D_FEATURE_LEVEL_11_1)
+        00 B0 00 00     (D3D_FEATURE_LEVEL_11_0)
+        ... down to 91 00 00 00 (D3D_FEATURE_LEVEL_9_1)
+    in sequence. Hardest to validate cheaply but unambiguous.
+
+The MBRD pass got away with a single proximity-based oracle because
+the DeviceId 0x008c paired with VendorId 0x1414 is itself a near-unique
+combination. The 0x800 immediate doesn't have that natural pairing in
+the LG binary, so use the IAT-call oracle as the primary check.
+
+WHAT TO ADD TO THIS SCRIPT
+──────────────────────────
+  - A `Find-VideoSupportSite` (or similar) validator that takes a
+    candidate offset and returns true iff it sits in a real call
+    setup as described above.
+  - A second pass mirroring the existing classify-then-patch shape:
+        $toPatchVideo        = ...
+        $alreadyPatchedVideo = ...
+    populated from the appropriate byte-pattern search.
+  - One unified backup + write. The current flow:
+        $bytes = ReadAllBytes
+        ...classify & validate MBRD...
+        ...classify & validate VIDEO_SUPPORT...     ← add here
+        stop service (if needed, once)
+        Copy-Item backup (once)
+        foreach ($o in $mbrdToPatch)  { $bytes[$o]   = 0x15 }
+        foreach ($o in $videoToPatch) { $bytes[$o+2] = 0x00 }  ← or whatever the actual offset is
+        WriteAllBytes
+        start service (if needed)
+  - Idempotency for the unified flow: "nothing to do" iff both passes
+    found zero `toPatch` AND their `alreadyPatched` sets are
+    non-empty (or both empty *and* MBRD's "no MBRD site found"
+    abort fires).
+  - Update the script header (.SYNOPSIS / .DESCRIPTION / .NOTES /
+    "Verified against B7") to document the second pass, the byte
+    signature(s) you matched against in this specific binary, and
+    the disassembly snippet of one patched site (before / after) so
+    a future reader can verify the patch shape at a glance.
+
+ANTI-PATTERNS
+─────────────
+  - Don't patch every occurrence of `00 08 00 00` in the binary —
+    0x800 appears all over .rdata and elsewhere.
+  - Don't change instruction lengths. Bytes match in / bytes match
+    out, only the immediate-payload byte(s) differ.
+  - Don't touch the DEBUG bit. Only the VIDEO_SUPPORT bit (0x800)
+    matters. If you find a `0x802` immediate (debug-on builds), the
+    same patch — clear the 0x800 bit — applies, but you'd write
+    0x002 instead of 0x000 at offset+2. (Unlikely; this script
+    targets release builds.)
+  - Don't skip validation. False positives are silent — a misplaced
+    patch on an unrelated 0x800 immediate produces subtle runtime
+    bugs, not clear errors.
+  - Don't write the file twice (once for MBRD, once for VIDEO_SUPPORT).
+    Single read, both patches applied to the in-memory byte array,
+    single write. Halves the I/O and means a partial-failure leaves
+    the file untouched.
+
+VERIFICATION AFTER RUNNING THE EXTENDED SCRIPT
+──────────────────────────────────────────────
+1. Restart the LG service.
+2. Tail %ProgramData%\Looking Glass (host)\looking-glass-host.txt
+3. Expected log progression (success):
+       Trying           : D12
+       Device Name       : \\.\DISPLAY1
+       Device Description: Microsoft Basic Render Driver
+       Device Vendor ID  : 0x1414                  ← MBRD reaches enum
+       Device Device ID  : 0x8c
+       Feature Level     : 0xb100 (or 0xa100/0xb000 — depends on WARP cap)
+       ==== [ Capture Start ] ====                  ← VIDEO_SUPPORT past
+4. From the hypervisor: looking-glass-client connects, shows the
+   guest desktop rendered by WARP. Expect ~30-60 fps on desktop
+   content with one core busy on the guest side; that's WARP, not
+   LG. Mica / acrylic / animations should all be visible.
+
+DELIVERABLE
+───────────
+Replace this .ps1 with your extended version. In the script's header
+.NOTES section, paste:
+  - The exact byte signature(s) you matched on this binary.
+  - A 5-10 line disassembly snippet of one patched site, before
+    and after.
+  - The count of VIDEO_SUPPORT sites found (should be 2).
+  - Which Pattern (A or B) this build uses.
+
+That way the next time someone has to update the patch (LG B8, a
+recompile, a different toolchain), the necessary disassembly context
+is right there in the file.
+
+═══════════════════════════════════════════════════════════════════════════════
+#>
