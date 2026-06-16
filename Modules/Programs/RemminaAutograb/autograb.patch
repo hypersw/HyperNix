@@ -19,31 +19,64 @@
  	if (cnnwin->priv->pointer_captured) {
  #if DEBUG_KB_GRABBING
  		printf("DEBUG_KB_GRABBING: pointer_captured is true, it should not\n");
-@@ -564,6 +569,13 @@
+@@ -564,6 +569,14 @@
  	GdkGrabStatus ggs;
  	GdkDevice *keyboard = NULL;
  
 +	/* remmina-autograb: do not (re)grab while the user has pressed the
-+	 * escape/grab key and the window still has focus. Cleared on
-+	 * focus-out, or on deliberate interaction (typing / re-tapping the
-+	 * grab key), so mere pointer hover does not fight the release. */
++	 * escape/grab key and the window still has focus. Cleared on a
++	 * genuine focus change, or on deliberate interaction (typing /
++	 * re-tapping the grab key), so neither pointer hover nor the
++	 * spurious focus churn that grab/ungrab itself emits re-grabs. */
 +	if (cnnwin->priv->autograb_suppressed)
 +		return;
 +
  	if (cnnwin->priv->kbcaptured) {
  #if DEBUG_KB_GRABBING
  		printf("DEBUG_KB_GRABBING: %s not grabbing because already grabbed.\n", __func__);
-@@ -3123,6 +3135,9 @@
- 	rcw_kp_ungrab(cnnwin);
+@@ -3396,7 +3409,12 @@
+ 		if (event->new_window_state & GDK_WINDOW_STATE_FOCUSED)
+ 			rcw_focus_in((RemminaConnectionWindow *)widget);
+ 		else
++		{
++			/* remmina-autograb: genuine focus loss -> drop the transient
++			 * escape so returning focus re-grabs (focus == capture). */
++			((RemminaConnectionWindow *)widget)->priv->autograb_suppressed = FALSE;
+ 			rcw_focus_out((RemminaConnectionWindow *)widget);
++		}
+ 	}
  
- 	cnnwin->priv->hostkey_activated = FALSE;
-+	/* remmina-autograb: focus lost -> clear the transient escape so the
-+	 * next focus-in re-grabs (focus == capture). */
-+	cnnwin->priv->autograb_suppressed = FALSE;
- 	if (!(cnnobj = rcw_get_visible_cnnobj(cnnwin))) return;
+ 	return FALSE;
+@@ -4318,6 +4336,28 @@
+ 	const RemminaProtocolFeature *feature;
+ 	gint i;
  
- 	if (REMMINA_IS_SCROLLED_VIEWPORT(cnnobj->scrolled_container))
-@@ -4342,6 +4357,13 @@
++	/* remmina-autograb: Ctrl+Alt+Home -> release, regardless of the
++	 * configured grab key. */
++	if (!release && keyval == GDK_KEY_Home) {
++		GdkKeymap *_ag_km = gdk_keymap_get_for_display(
++			gtk_widget_get_display(GTK_WIDGET(cnnobj->cnnwin)));
++		GdkModifierType _ag_m = gdk_keymap_get_modifier_state(_ag_km);
++		if ((_ag_m & (GDK_CONTROL_MASK | GDK_MOD1_MASK))
++		    == (GDK_CONTROL_MASK | GDK_MOD1_MASK)) {
++			if (priv->kbcaptured || priv->pointer_captured) {
++				priv->autograb_suppressed = TRUE;
++				rcw_kp_ungrab(cnnobj->cnnwin);
++				rcw_pointer_ungrab(cnnobj->cnnwin);
++				/* Flush held keys (incl. the Ctrl+Alt being held) to the
++				 * guest so they don't stick, the way focus-out does. */
++				remmina_protocol_widget_call_feature_by_type(
++					REMMINA_PROTOCOL_WIDGET(cnnobj->proto),
++					REMMINA_PROTOCOL_FEATURE_TYPE_UNFOCUS, 0);
++				rcw_floating_toolbar_show(cnnobj->cnnwin, TRUE);
++			}
++			return TRUE;
++		}
++	}
+ 	if (release) {
+ 		if (remmina_pref.hostkey && keyval == remmina_pref.hostkey) {
+ 			priv->hostkey_activated = FALSE;
+@@ -4342,6 +4382,13 @@
  		priv->hostkey_used = FALSE;
  		return TRUE;
  	} else if (!priv->hostkey_activated) {
@@ -57,7 +90,7 @@
  		/* Any key pressed, no hostkey */
  		return FALSE;
  	}
-@@ -4444,11 +4466,27 @@
+@@ -4444,11 +4491,18 @@
  						priv->toolitem_scale)));
  		}
  	} else if (keyval == remmina_pref.shortcutkey_grab && !extrahardening) {
@@ -66,19 +99,10 @@
 -			!gtk_toggle_tool_button_get_active(
 -				GTK_TOGGLE_TOOL_BUTTON(
 -					priv->toolitem_grab)));
-+		/* remmina-autograb: transient grab toggle. Upstream flips the
-+		 * persistent per-profile "keyboard_grab" via the toolbar
-+		 * button, which stops focus-in from re-grabbing. Here we only
-+		 * grab/ungrab *now* and leave the persistent intent untouched,
-+		 * so re-focusing the window re-captures automatically
-+		 * (Looking-Glass / mstsc model). autograb_suppressed gates
-+		 * enter-notify re-grab while the window keeps focus. */
 +		if (priv->kbcaptured || priv->pointer_captured) {
 +			priv->autograb_suppressed = TRUE;
 +			rcw_kp_ungrab(cnnobj->cnnwin);
 +			rcw_pointer_ungrab(cnnobj->cnnwin);
-+			/* Reveal the floating toolbar as a visible "released"
-+			 * cue, the way mstsc drops its connection bar. */
 +			rcw_floating_toolbar_show(cnnobj->cnnwin, TRUE);
 +		} else {
 +			priv->autograb_suppressed = FALSE;

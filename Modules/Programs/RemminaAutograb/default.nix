@@ -33,10 +33,14 @@
 #      enter-notify while the window keeps focus after you escaped (so
 #      escaping doesn't immediately re-grab the instant the pointer
 #      re-enters the window).
-#   3. focus-out clears `autograb_suppressed`, so the next focus-in
-#      re-grabs. Capture follows focus — exactly the LG model, and the
-#      hidden modality is gone: if Remmina is the focused window and the
-#      profile wants grab, you are captured; tab away and you are not.
+#   3. a GENUINE focus loss (WM `window-state-event`, not the spurious
+#      FocusOut/FocusIn pair that `gdk_seat_ungrab` itself emits) clears
+#      `autograb_suppressed`, so the next focus-in re-grabs. Capture
+#      follows focus — exactly the LG model, and the hidden modality is
+#      gone: if Remmina is the focused window and the profile wants grab,
+#      you are captured; tab away and you are not. (Clearing on the raw
+#      focus-out-event instead would let the escape's own ungrab churn
+#      re-grab immediately — the "tapping the grab key re-grabs" bug.)
 #   4. "changed my mind" re-grab: while escaped-but-still-focused,
 #      typing into the session (or tapping the grab key again) clears
 #      the suppression and re-captures — mstsc re-grabs the keyboard
@@ -50,6 +54,12 @@
 #      revealed, the way mstsc drops its connection bar when capture is
 #      released; it hides again on re-grab. Addresses "in fullscreen you
 #      can't tell whether you're captured."
+#   6. Ctrl+Alt+Home is a hardcoded extra "release" chord, in addition to
+#      the configured grab key (shared muscle memory). Because Remmina's
+#      hostkey dispatch is keyval-only and strips modifiers, it is matched
+#      against the live modifier state and always consumed; on release it
+#      flushes held keys (incl. the Ctrl+Alt you're holding) to the guest
+#      so they don't stick.
 #
 # Stuck-key safety is already upstream and untouched: focus-out fires
 # REMMINA_PROTOCOL_FEATURE_TYPE_UNFOCUS -> remmina_rdp_event_unfocus ->
@@ -82,32 +92,14 @@
 let
   cfg = config.hypersw.programs.remminaAutograb;
 
-  # The "grab everywhere" default flip. The four call sites that read
-  # the per-profile flag all use the identical
-  #   remmina_file_get_int(cnnobj->remmina_file, "keyboard_grab", FALSE)
-  # text; we only touch the *reads* (default when the key is absent) and
-  # deliberately leave the set_int(...) calls alone, so a profile that
-  # explicitly disabled grab still ungrabs. --replace-fail makes a
-  # Remmina version bump that moves this code fail the build loudly
-  # instead of silently dropping the behaviour.
-  grabDefaultPostPatch = ''
-    substituteInPlace src/rcw.c \
-      --replace-fail 'remmina_file_get_int(cnnobj->remmina_file, "keyboard_grab", FALSE)' \
-                     'remmina_file_get_int(cnnobj->remmina_file, "keyboard_grab", TRUE)'
-  '';
-
-  autograbPackage = cfg.basePackage.overrideAttrs (old: {
-    # Keep pname/sources untouched; just tag the version so the store
-    # path is identifiable as the patched build. We deliberately change
-    # version without changing src, so opt out of nixpkgs' warning.
-    version = "${old.version}-autograb";
-    __intentionallyOverridingVersion = true;
-
-    patches = (old.patches or []) ++ [ ./autograb.patch ];
-
-    postPatch = (old.postPatch or "")
-      + lib.optionalString cfg.grabByDefault grabDefaultPostPatch;
-  });
+  # Single source of truth for the patched derivation — same file the
+  # flake's packages.<system>.Modules-Programs-RemminaAutograb output
+  # imports, so `nix run` and the installed package are identical.
+  autograbPackage = import ./package.nix {
+    inherit pkgs;
+    base = cfg.basePackage;
+    inherit (cfg) grabByDefault;
+  };
 
 in {
 

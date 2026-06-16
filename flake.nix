@@ -91,6 +91,13 @@
           # Run directly via:
           #   nix run github:hypersw/HyperNix#Modules-System-ZfsTpmUnlock-KeyTool -- --help
           Modules-System-ZfsTpmUnlock-KeyTool = import ./Modules/System/ZfsTpmUnlock/package.nix { inherit pkgs; };
+          # Remmina patched for Looking-Glass / mstsc-style focus-driven
+          # keyboard capture (transient grab toggle, type-to-regrab,
+          # Ctrl+Alt+Home release chord, floating-toolbar cue). Same
+          # derivation the hypersw.programs.remminaAutograb module installs.
+          # Run directly via:
+          #   nix run github:hypersw/HyperNix#Modules-Programs-RemminaAutograb
+          Modules-Programs-RemminaAutograb = import ./Modules/Programs/RemminaAutograb/package.nix { inherit pkgs; };
           # Machine runner packages
           Machines-MicroVM-VmSshFront =
             self.nixosConfigurations.VmSshFront.config.microvm.declaredRunner or null;
