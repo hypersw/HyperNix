@@ -17,17 +17,7 @@
  static GtkWidget *rcw_append_new_page(RemminaConnectionWindow *cnnwin, RemminaConnectionObject *cnnobj);
  static void rcw_ftb_multimon_move_toolbar(RemminaConnectionWindowPriv *priv);
  
-@@ -465,6 +468,9 @@
- 	keyboard = gdk_device_manager_get_client_pointer(manager);
- #endif
- 
-+	if (g_getenv("AUTOGRAB_DEBUG"))
-+		g_printerr("AUTOGRAB: kp_ungrab() kbcaptured=%d pointer_captured=%d\n",
-+			cnnwin->priv->kbcaptured, cnnwin->priv->pointer_captured);
- 	if (!cnnwin->priv->kbcaptured && !cnnwin->priv->pointer_captured)
- 		return;
- 
-@@ -529,6 +535,10 @@
+@@ -529,6 +532,10 @@
  	GdkGrabStatus ggs;
  
  
@@ -38,50 +28,21 @@
  	if (cnnwin->priv->pointer_captured) {
  #if DEBUG_KB_GRABBING
  		printf("DEBUG_KB_GRABBING: pointer_captured is true, it should not\n");
-@@ -564,6 +574,20 @@
+@@ -564,6 +571,13 @@
  	GdkGrabStatus ggs;
  	GdkDevice *keyboard = NULL;
  
 +	if (cnnwin->priv->autograb_suppressed) {
-+		gint64 _ag_since = g_get_monotonic_time() - cnnwin->priv->autograb_escape_time;
-+		if (g_getenv("AUTOGRAB_DEBUG"))
-+			g_printerr("AUTOGRAB: keyboard_grab() suppressed since_escape=%ldms -> %s\n",
-+				(long)(_ag_since / 1000), _ag_since < 500000 ? "BLOCK" : "resume");
-+		if (_ag_since < 500000)  /* 500 ms grace: swallow the ungrab churn */
-+			return;
++		if (g_get_monotonic_time() - cnnwin->priv->autograb_escape_time < 500000)
++			return;  /* 500 ms grace: swallow the ungrab focus churn */
 +		cnnwin->priv->autograb_suppressed = FALSE;  /* genuine return */
-+		rcw_floating_toolbar_show(cnnwin, FALSE);  /* hide the released-state cue */
-+	} else if (g_getenv("AUTOGRAB_DEBUG")) {
-+		g_printerr("AUTOGRAB: keyboard_grab() suppressed=0 kbcaptured=%d\n",
-+			cnnwin->priv->kbcaptured);
++		rcw_floating_toolbar_show(cnnwin, FALSE);
 +	}
 +
  	if (cnnwin->priv->kbcaptured) {
  #if DEBUG_KB_GRABBING
  		printf("DEBUG_KB_GRABBING: %s not grabbing because already grabbed.\n", __func__);
-@@ -3366,6 +3390,10 @@
- #if DEBUG_KB_GRABBING
- 	printf("DEBUG_KB_GRABBING: RCW focus-in-event received\n");
- #endif
-+	if (g_getenv("AUTOGRAB_DEBUG"))
-+		g_printerr("AUTOGRAB: focus-in-event since_escape=%ldms suppressed=%d\n",
-+			(long)((g_get_monotonic_time() - ((RemminaConnectionWindow *)widget)->priv->autograb_escape_time) / 1000),
-+			((RemminaConnectionWindow *)widget)->priv->autograb_suppressed);
- 	rcw_focus_in((RemminaConnectionWindow *)widget);
- 	return FALSE;
- }
-@@ -3376,6 +3404,10 @@
- #if DEBUG_KB_GRABBING
- 	printf("DEBUG_KB_GRABBING: RCW focus-out-event received\n");
- #endif
-+	if (g_getenv("AUTOGRAB_DEBUG"))
-+		g_printerr("AUTOGRAB: focus-out-event since_escape=%ldms suppressed=%d\n",
-+			(long)((g_get_monotonic_time() - ((RemminaConnectionWindow *)widget)->priv->autograb_escape_time) / 1000),
-+			((RemminaConnectionWindow *)widget)->priv->autograb_suppressed);
- 	rcw_focus_out((RemminaConnectionWindow *)widget);
- 	return FALSE;
- }
-@@ -4318,6 +4350,34 @@
+@@ -4318,6 +4332,22 @@
  	const RemminaProtocolFeature *feature;
  	gint i;
  
@@ -91,9 +52,6 @@
 +		GdkModifierType _ag_m = gdk_keymap_get_modifier_state(_ag_km);
 +		if ((_ag_m & (GDK_CONTROL_MASK | GDK_MOD1_MASK))
 +		    == (GDK_CONTROL_MASK | GDK_MOD1_MASK)) {
-+			if (g_getenv("AUTOGRAB_DEBUG"))
-+				g_printerr("AUTOGRAB: Ctrl+Alt+Home kbcaptured=%d -> release\n",
-+					priv->kbcaptured);
 +			if (priv->kbcaptured || priv->pointer_captured) {
 +				priv->autograb_suppressed = TRUE;
 +				priv->autograb_escape_time = g_get_monotonic_time();
@@ -101,22 +59,13 @@
 +				rcw_pointer_ungrab(cnnobj->cnnwin);
 +				rcw_floating_toolbar_show(cnnobj->cnnwin, TRUE);
 +			}
-+			/* Forward Home (return FALSE), do NOT consume it, and do not
-+			 * flush here. The Ctrl+Alt of this chord were already sent
-+			 * to the guest while grabbed; releasing them with no other
-+			 * key in between leaves Alt alone -> Windows activates the
-+			 * menu bar. Letting Home reach the guest puts a non-modifier
-+			 * into the pressed-keys during the Alt hold, which breaks
-+			 * that pattern; the eventual release (physical, or the
-+			 * focus-out UNFOCUS flush) then includes Home so Alt is
-+			 * never released alone. */
-+			return FALSE;
++			return FALSE;  /* forward Home; see note above */
 +		}
 +	}
  	if (release) {
  		if (remmina_pref.hostkey && keyval == remmina_pref.hostkey) {
  			priv->hostkey_activated = FALSE;
-@@ -4342,6 +4402,25 @@
+@@ -4342,6 +4372,22 @@
  		priv->hostkey_used = FALSE;
  		return TRUE;
  	} else if (!priv->hostkey_activated) {
@@ -129,9 +78,6 @@
 +			|| keyval == GDK_KEY_ISO_Level3_Shift || keyval == GDK_KEY_ISO_Level5_Shift
 +			|| keyval == GDK_KEY_Caps_Lock || keyval == GDK_KEY_Num_Lock
 +			|| keyval == GDK_KEY_Scroll_Lock);
-+		if (g_getenv("AUTOGRAB_DEBUG"))
-+			g_printerr("AUTOGRAB: keypress keyval=0x%x suppressed=%d ismod=%d\n",
-+				keyval, priv->autograb_suppressed, _ag_ismod);
 +		if (priv->autograb_suppressed && !_ag_ismod) {
 +			priv->autograb_suppressed = FALSE;
 +			rcw_floating_toolbar_show(cnnobj->cnnwin, FALSE);
@@ -142,7 +88,7 @@
  		/* Any key pressed, no hostkey */
  		return FALSE;
  	}
-@@ -4444,11 +4523,23 @@
+@@ -4444,11 +4490,19 @@
  						priv->toolitem_scale)));
  		}
  	} else if (keyval == remmina_pref.shortcutkey_grab && !extrahardening) {
@@ -151,10 +97,6 @@
 -			!gtk_toggle_tool_button_get_active(
 -				GTK_TOGGLE_TOOL_BUTTON(
 -					priv->toolitem_grab)));
-+		if (g_getenv("AUTOGRAB_DEBUG"))
-+			g_printerr("AUTOGRAB: grab-key kbcaptured=%d pointer_captured=%d -> %s\n",
-+				priv->kbcaptured, priv->pointer_captured,
-+				(priv->kbcaptured || priv->pointer_captured) ? "release" : "grab");
 +		if (priv->kbcaptured || priv->pointer_captured) {
 +			priv->autograb_suppressed = TRUE;
 +			priv->autograb_escape_time = g_get_monotonic_time();
