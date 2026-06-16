@@ -894,6 +894,14 @@ async Task HandoverPrintSessionAsync(long chatId, CancellationToken ct)
         {
             using var ms = new MemoryStream(webp);
             var previewName = Path.GetFileNameWithoutExtension(pd.FileName) + ".preview.webp";
+            // NB: deliberately NOT disabling content-type detection
+            // here (cf. the scan-delivery SendDocument that does).
+            // This is a print-preview for one-glance confirmation,
+            // not a file the user wants to keep — inline rendering
+            // (even via the sticker viewer on mobile) is the whole
+            // point. Disabling detection would force tap-to-download
+            // just to see the preview, which is worse UX than the
+            // sticker-frame quirk.
             sent = await bot.SendDocument(chatId,
                 document: new InputFileStream(ms, previewName),
                 caption: html, parseMode: ParseMode.Html,
@@ -2416,11 +2424,25 @@ async Task DeliverScanAsync(string sessionId, int seq, BotSession bs, Cancellati
         {
             // Single format → SendDocument. Thumbnail name doesn't need
             // to be unique here because there's only one attach.
+            //
+            // disableContentTypeDetection for WEBP: WEBP is Telegram's
+            // native sticker format, and mobile clients route any
+            // document whose MIME parses as image/webp into the sticker
+            // viewer (no save-to-gallery, sticker-style framing) — even
+            // on non-512x512 images. Setting the flag tells the server
+            // not to surface a MIME type to clients, and clients then
+            // fall back to "generic file" rendering: the user sees a
+            // plain attachment row and taps to download/view in the
+            // OS image viewer, which handles WEBP correctly. Tradeoff
+            // is loss of inline preview. JPEG/PNG don't have this
+            // issue so we leave their rendering alone.
             var v = variants[0];
+            var isWebp = v.ContentType == "image/webp";
             await bot.SendDocument(bs.ChatId,
                 new InputFileStream(v.Data, v.FileName),
                 caption: caption,
                 thumbnail: new InputFileStream(v.Thumbnail, "thumb.jpg"),
+                disableContentTypeDetection: isWebp,
                 cancellationToken: ct);
         }
         else
