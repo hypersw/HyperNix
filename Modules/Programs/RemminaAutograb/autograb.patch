@@ -1,14 +1,15 @@
 --- a/src/rcw.c
 +++ b/src/rcw.c
-@@ -155,6 +155,7 @@
+@@ -155,6 +155,8 @@
  	gboolean					ss_maximized;
  
  	gboolean					kbcaptured;
 +	gboolean					autograb_suppressed;	/* remmina-autograb */
++	gint64						autograb_escape_time;	/* remmina-autograb: monotonic us */
  	gboolean					pointer_captured;
  	gboolean					hostkey_activated;
  	gboolean					hostkey_used;
-@@ -465,6 +466,9 @@
+@@ -465,6 +467,9 @@
  	keyboard = gdk_device_manager_get_client_pointer(manager);
  #endif
  
@@ -18,37 +19,60 @@
  	if (!cnnwin->priv->kbcaptured && !cnnwin->priv->pointer_captured)
  		return;
  
-@@ -529,6 +533,10 @@
+@@ -529,6 +534,10 @@
  	GdkGrabStatus ggs;
  
  
-+	/* remmina-autograb: see rcw_keyboard_grab. */
-+	if (cnnwin->priv->autograb_suppressed)
++	if (cnnwin->priv->autograb_suppressed
++	    && g_get_monotonic_time() - cnnwin->priv->autograb_escape_time < 500000)
 +		return;
 +
  	if (cnnwin->priv->pointer_captured) {
  #if DEBUG_KB_GRABBING
  		printf("DEBUG_KB_GRABBING: pointer_captured is true, it should not\n");
-@@ -564,6 +572,18 @@
+@@ -564,6 +573,19 @@
  	GdkGrabStatus ggs;
  	GdkDevice *keyboard = NULL;
  
-+	if (g_getenv("AUTOGRAB_DEBUG"))
-+		g_printerr("AUTOGRAB: keyboard_grab() suppressed=%d kbcaptured=%d\n",
-+			cnnwin->priv->autograb_suppressed, cnnwin->priv->kbcaptured);
-+	/* remmina-autograb: do not (re)grab while the user has pressed the
-+	 * escape/grab key. Cleared ONLY by deliberate interaction (typing a
-+	 * non-modifier key, or re-tapping the grab key) -- never by focus
-+	 * events, because gdk_seat_ungrab() itself churns focus (and, on
-+	 * Wayland, even window-state focus) and would otherwise re-grab
-+	 * the instant we release. */
-+	if (cnnwin->priv->autograb_suppressed)
-+		return;
++	if (cnnwin->priv->autograb_suppressed) {
++		gint64 _ag_since = g_get_monotonic_time() - cnnwin->priv->autograb_escape_time;
++		if (g_getenv("AUTOGRAB_DEBUG"))
++			g_printerr("AUTOGRAB: keyboard_grab() suppressed since_escape=%ldms -> %s\n",
++				(long)(_ag_since / 1000), _ag_since < 500000 ? "BLOCK" : "resume");
++		if (_ag_since < 500000)  /* 500 ms grace: swallow the ungrab churn */
++			return;
++		cnnwin->priv->autograb_suppressed = FALSE;  /* genuine return */
++	} else if (g_getenv("AUTOGRAB_DEBUG")) {
++		g_printerr("AUTOGRAB: keyboard_grab() suppressed=0 kbcaptured=%d\n",
++			cnnwin->priv->kbcaptured);
++	}
 +
  	if (cnnwin->priv->kbcaptured) {
  #if DEBUG_KB_GRABBING
  		printf("DEBUG_KB_GRABBING: %s not grabbing because already grabbed.\n", __func__);
-@@ -4318,6 +4338,29 @@
+@@ -3366,6 +3388,10 @@
+ #if DEBUG_KB_GRABBING
+ 	printf("DEBUG_KB_GRABBING: RCW focus-in-event received\n");
+ #endif
++	if (g_getenv("AUTOGRAB_DEBUG"))
++		g_printerr("AUTOGRAB: focus-in-event since_escape=%ldms suppressed=%d\n",
++			(long)((g_get_monotonic_time() - ((RemminaConnectionWindow *)widget)->priv->autograb_escape_time) / 1000),
++			((RemminaConnectionWindow *)widget)->priv->autograb_suppressed);
+ 	rcw_focus_in((RemminaConnectionWindow *)widget);
+ 	return FALSE;
+ }
+@@ -3376,6 +3402,10 @@
+ #if DEBUG_KB_GRABBING
+ 	printf("DEBUG_KB_GRABBING: RCW focus-out-event received\n");
+ #endif
++	if (g_getenv("AUTOGRAB_DEBUG"))
++		g_printerr("AUTOGRAB: focus-out-event since_escape=%ldms suppressed=%d\n",
++			(long)((g_get_monotonic_time() - ((RemminaConnectionWindow *)widget)->priv->autograb_escape_time) / 1000),
++			((RemminaConnectionWindow *)widget)->priv->autograb_suppressed);
+ 	rcw_focus_out((RemminaConnectionWindow *)widget);
+ 	return FALSE;
+ }
+@@ -4318,6 +4348,30 @@
  	const RemminaProtocolFeature *feature;
  	gint i;
  
@@ -63,6 +87,7 @@
 +					priv->kbcaptured);
 +			if (priv->kbcaptured || priv->pointer_captured) {
 +				priv->autograb_suppressed = TRUE;
++				priv->autograb_escape_time = g_get_monotonic_time();
 +				rcw_kp_ungrab(cnnobj->cnnwin);
 +				rcw_pointer_ungrab(cnnobj->cnnwin);
 +				/* Flush held keys (incl. the Ctrl+Alt being held) to the
@@ -78,7 +103,7 @@
  	if (release) {
  		if (remmina_pref.hostkey && keyval == remmina_pref.hostkey) {
  			priv->hostkey_activated = FALSE;
-@@ -4342,6 +4385,25 @@
+@@ -4342,6 +4396,25 @@
  		priv->hostkey_used = FALSE;
  		return TRUE;
  	} else if (!priv->hostkey_activated) {
@@ -104,7 +129,7 @@
  		/* Any key pressed, no hostkey */
  		return FALSE;
  	}
-@@ -4444,11 +4506,22 @@
+@@ -4444,11 +4517,23 @@
  						priv->toolitem_scale)));
  		}
  	} else if (keyval == remmina_pref.shortcutkey_grab && !extrahardening) {
@@ -119,6 +144,7 @@
 +				(priv->kbcaptured || priv->pointer_captured) ? "release" : "grab");
 +		if (priv->kbcaptured || priv->pointer_captured) {
 +			priv->autograb_suppressed = TRUE;
++			priv->autograb_escape_time = g_get_monotonic_time();
 +			rcw_kp_ungrab(cnnobj->cnnwin);
 +			rcw_pointer_ungrab(cnnobj->cnnwin);
 +			rcw_floating_toolbar_show(cnnobj->cnnwin, TRUE);

@@ -29,27 +29,25 @@
 #      `shortcutkey_grab` is set to) becomes a TRANSIENT toggle:
 #      grab/ungrab *now* without touching the persistent per-profile
 #      `keyboard_grab` flag.
-#   2. A new transient `autograb_suppressed` flag gates re-grab from
-#      enter-notify while the window keeps focus after you escaped (so
-#      escaping doesn't immediately re-grab the instant the pointer
-#      re-enters the window).
-#   3. a GENUINE focus loss (WM `window-state-event`, not the spurious
-#      FocusOut/FocusIn pair that `gdk_seat_ungrab` itself emits) clears
-#      `autograb_suppressed`, so the next focus-in re-grabs. Capture
-#      follows focus — exactly the LG model, and the hidden modality is
-#      gone: if Remmina is the focused window and the profile wants grab,
-#      you are captured; tab away and you are not. (Clearing on the raw
-#      focus-out-event instead would let the escape's own ungrab churn
-#      re-grab immediately — the "tapping the grab key re-grabs" bug.)
-#   4. "changed my mind" re-grab: while escaped-but-still-focused,
-#      typing into the session (or tapping the grab key again) clears
-#      the suppression and re-captures — mstsc re-grabs the keyboard
-#      when you interact with the window instead of leaving it. (Mere
-#      pointer hover does NOT re-grab; that is LG's `autoCapture`
-#      anti-pattern, which fights the release. Mouse-CLICK re-grab is
-#      not wired: the RDP plugin's drawing area consumes button events
-#      directly, with no connection-window-level hook — typing, the
-#      grab key, or tabbing back all re-capture instead.)
+#   2. A transient `autograb_suppressed` flag + `autograb_escape_time`
+#      (monotonic) gate re-grab. THE PROBLEM on Wayland: gdk_seat_ungrab()
+#      drives a real focus-loss/focus-gain churn that reaches even the WM
+#      `window-state-event`, so focus events cannot distinguish "the user
+#      genuinely came back" from "we just released." There is no clean
+#      focus event to key off — only timing separates them.
+#   3. So rcw_keyboard_grab (the single grab chokepoint) blocks grabs that
+#      arrive within a GRACE WINDOW (500 ms) after the escape — that is
+#      the churn. A grab attempt AFTER the grace window means the user
+#      genuinely returned (Alt+Tab back / pointer re-entry), so it resumes
+#      autograb automatically. Capture follows focus again, just debounced
+#      past the self-inflicted churn.
+#   4. deliberate re-grab is immediate, ignoring the grace window: typing
+#      a non-modifier key into the session, or re-tapping the grab key.
+#      Bare modifiers are skipped so the Alt of an Alt+Tab used to leave
+#      can't re-grab. (Mouse-CLICK is not a separate trigger — the RDP
+#      plugin's drawing area consumes button events with no
+#      connection-window hook — but returning the pointer into the window
+#      re-grabs via the grace path, so clicking-back effectively does.)
 #   5. visible cue: on escape the auto-hidden floating toolbar is
 #      revealed, the way mstsc drops its connection bar when capture is
 #      released; it hides again on re-grab. Addresses "in fullscreen you
