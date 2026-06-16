@@ -49,6 +49,7 @@
     ./System/Btm
     ./System/ZfsTpmUnlock
     ./Programs/LookingGlassClient
+    ./Programs/RemminaAutograb
     # `Hardware/RaspberryPi5SdImage` is NOT in the bundle. It sets
     # `sdImage.populateFirmwareCommands` in its `config`, and that
     # option only exists when an sd-image module is loaded. Live
