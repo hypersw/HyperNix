@@ -43,7 +43,15 @@
     # is reached through a separately-built `vendorPkgs` set anchored
     # to `nixos-raspberrypi.inputs.nixpkgs` (i.e. nvmd's 25.11), which
     # is the input the cache is keyed on.
-    nixos-raspberrypi.url = "github:nvmd/nixos-raspberrypi";
+    # PINNED — nvmd's master is broken against rolling nixpkgs as of
+    # commit a5e10257 (2026-06-14): its raspberrypi boot-loader module
+    # references `config.boot.kernelPackages.kernel.target`, which the
+    # rolling nixpkgs >= 9ae611a (2026-06-10) removed from the kernel
+    # derivation. Eval fails with `attribute 'target' missing` during
+    # nixos-upgrade and the switch never lands. Pinning to the last
+    # commit before that breakage; unpin once nvmd lands a fix that
+    # handles the new kernel-package shape.
+    nixos-raspberrypi.url = "github:nvmd/nixos-raspberrypi/74a01a667c79dc90e917edf2a6264d34a423336e";
   };
 
   outputs = { self, nixpkgs, nixos-hardware, microvm, sops-nix, nixos-raspberrypi }:
