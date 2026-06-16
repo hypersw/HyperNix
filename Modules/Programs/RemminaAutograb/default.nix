@@ -50,14 +50,21 @@
 #      re-grabs via the grace path, so clicking-back effectively does.)
 #   5. visible cue: on escape the auto-hidden floating toolbar is
 #      revealed, the way mstsc drops its connection bar when capture is
-#      released; it hides again on re-grab. Addresses "in fullscreen you
-#      can't tell whether you're captured."
+#      released; it hides again on re-grab — including the grace-path
+#      auto-regrab on return (rcw_keyboard_grab), not just the deliberate
+#      key/grab-key paths. Addresses "in fullscreen you can't tell whether
+#      you're captured."
 #   6. Ctrl+Alt+Home is a hardcoded extra "release" chord, in addition to
-#      the configured grab key (shared muscle memory). Because Remmina's
-#      hostkey dispatch is keyval-only and strips modifiers, it is matched
-#      against the live modifier state and always consumed; on release it
-#      flushes held keys (incl. the Ctrl+Alt you're holding) to the guest
-#      so they don't stick.
+#      the configured grab key (shared muscle memory). Matched against the
+#      live modifier state (the hostkey dispatch is keyval-only and strips
+#      modifiers). Unlike the grab key, it FORWARDS Home to the guest
+#      rather than consuming it: while grabbed, the Ctrl+Alt were already
+#      sent to the guest, and releasing them with Alt last/alone activates
+#      the Windows menu bar — letting Home reach the guest puts a
+#      non-modifier into the Alt hold and breaks that pattern. (Side
+#      effect: the guest app sees Ctrl+Alt+Home, usually harmless; for a
+#      fully silent escape use the grab key, which is a single non-Alt key
+#      and is never forwarded.)
 #
 # Stuck-key safety is already upstream and untouched: focus-out fires
 # REMMINA_PROTOCOL_FEATURE_TYPE_UNFOCUS -> remmina_rdp_event_unfocus ->
