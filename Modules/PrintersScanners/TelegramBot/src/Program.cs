@@ -2416,82 +2416,211 @@ async Task DeliverScanAsync(string sessionId, int seq, BotSession bs, Cancellati
     //    disposes them all when we leave.
     var variants = await pipeline.ProcessAsync(
         tiffMs, bs.Params.Dpi, seq, bs.Format, ct);
+    var caption = $"📷 {bs.Params.Dpi} dpi · scan #{seq}";
+
+    // Two-tier delivery with a textual-error backstop:
+    //
+    //   Tier A — try the nice path first (album for multi-format,
+    //   single SendDocument for one-format). Album lets Telegram
+    //   group the variants visually under one caption.
+    //
+    //   Tier B — if Tier A throws (album "Wrong file identifier"
+    //   semantic errors, transient network errors, anything else),
+    //   fall back to sending each variant as its own SendDocument
+    //   with per-call retry on transient failures and stream-rewind
+    //   between attempts. This is the "dumbest safest" path: no
+    //   grouping, no shared multipart references, just one upload
+    //   per variant. Whatever made the nice path fail is unlikely
+    //   to also fail every single-document send.
+    //
+    //   Tier C — if BOTH tiers fail for some variant, post a plain
+    //   text message in the chat so the user sees "scan #N failed:
+    //   <reason>" instead of total silence. Without this the user
+    //   has no signal at all that anything went wrong — they just
+    //   see the daemon's "scan complete" with no follow-up.
+    //
+    // Observed failure modes that drove this shape, in journalctl
+    // on 2026-06-17:
+    //   - Album: 400 Bad Request "Wrong file identifier/HTTP URL
+    //     specified for message #1" from SendMediaGroup. Not a
+    //     network error and not retry-able — falls to Tier B.
+    //   - Single: HttpRequestException → SocketException "Connection
+    //     reset by peer" mid-upload. Transient — Tier B's retry
+    //     loop recovers.
+
+    var deliveryFailed = false;
+    Exception? lastFailure = null;
     try
     {
-        var caption = $"📷 {bs.Params.Dpi} dpi · scan #{seq}";
-
+        // Tier A
         if (variants.Count == 1)
         {
-            // Single format → SendDocument. Thumbnail name doesn't need
-            // to be unique here because there's only one attach.
-            //
-            // disableContentTypeDetection for WEBP: WEBP is Telegram's
-            // native sticker format, and mobile clients route any
-            // document whose MIME parses as image/webp into the sticker
-            // viewer (no save-to-gallery, sticker-style framing) — even
-            // on non-512x512 images. Setting the flag tells the server
-            // not to surface a MIME type to clients, and clients then
-            // fall back to "generic file" rendering: the user sees a
-            // plain attachment row and taps to download/view in the
-            // OS image viewer, which handles WEBP correctly. Tradeoff
-            // is loss of inline preview. JPEG/PNG don't have this
-            // issue so we leave their rendering alone.
-            var v = variants[0];
-            var isWebp = v.ContentType == "image/webp";
-            await bot.SendDocument(bs.ChatId,
-                new InputFileStream(v.Data, v.FileName),
-                caption: caption,
-                thumbnail: new InputFileStream(v.Thumbnail, "thumb.jpg"),
-                disableContentTypeDetection: isWebp,
-                cancellationToken: ct);
+            await SendOneWithRetryAsync(bs.ChatId, variants[0], caption, ct);
         }
         else
         {
-            // Multi-format → media group (album). Crucial correctness
-            // note: Telegram.Bot derives the multipart `attach://`
-            // reference from each InputFileStream's FileName, so two
-            // streams named "thumb.jpg" collide and the API surfaces
-            // "Wrong file identifier" on every item past the first.
-            // Variant-suffixed thumbnail names avoid that.
+            // Album path. Crucial correctness note: Telegram.Bot
+            // derives the multipart `attach://` reference from each
+            // InputFileStream's FileName, so two streams named the
+            // same collide. Variant-suffixed thumbnail and document
+            // names avoid that.
             var medias = new List<IAlbumInputMedia>(variants.Count);
             for (int i = 0; i < variants.Count; i++)
             {
                 var v = variants[i];
+                v.Data.Position = 0;
+                v.Thumbnail.Position = 0;
                 medias.Add(new InputMediaDocument(
-                    new InputFileStream(v.Data, v.FileName))
+                    new InputFileStream(v.Data, $"{i:D2}.{v.FileName}"))
                 {
                     Thumbnail = new InputFileStream(
                         v.Thumbnail, $"thumb-{i}.jpg"),
-                    // Only the first item's caption is shown above the
-                    // album — the rest are hidden, so put the summary
-                    // on slot 0.
                     Caption = i == 0 ? caption : null,
                 });
             }
             await bot.SendMediaGroup(bs.ChatId, medias, cancellationToken: ct);
         }
-        log.LogInformation("delivered {Session}#{Seq} ({N} formats)",
-            sessionId, seq, variants.Count);
-
-        // 4. Tell the daemon to drop its TIFF copy. Done last so that
-        //    a Telegram-upload failure leaves the daemon's blob intact
-        //    for a retry. Idempotent — best-effort, doesn't fail the
-        //    delivery if the daemon round-trip glitches.
+    }
+    catch (Exception exA)
+    {
+        log.LogWarning(exA,
+            "scan {Session}#{Seq}: Tier A delivery failed, falling back to per-variant sends",
+            sessionId, seq);
         try
         {
-            await daemon.DeleteScanAsync(sessionId, seq, ct);
+            // Tier B — per-variant sends. Use the same retry helper
+            // as the single-variant Tier A path so transient network
+            // errors don't trip us here either.
+            for (int i = 0; i < variants.Count; i++)
+            {
+                await SendOneWithRetryAsync(
+                    bs.ChatId, variants[i],
+                    i == 0 ? caption : null,
+                    ct);
+            }
         }
-        catch (Exception ex)
+        catch (Exception exB)
         {
-            log.LogDebug(
-                "DELETE scan {Session}#{Seq} failed (will be reaped at session-end): {Err}",
-                sessionId, seq, ex.Message);
+            deliveryFailed = true;
+            lastFailure = exB;
+            log.LogError(exB,
+                "scan {Session}#{Seq}: Tier B per-variant fallback also failed",
+                sessionId, seq);
+        }
+    }
+
+    try
+    {
+        if (deliveryFailed)
+        {
+            // Tier C — last-ditch text notice. If even SendMessage
+            // throws here there's nothing more we can do; log and
+            // move on. Don't ct-cancel this so the user gets the
+            // notice even on shutdown.
+            var reason = lastFailure?.Message ?? "unknown error";
+            // Telegram caption/text limit is 4096 chars; failure
+            // messages are usually short but include defensively.
+            if (reason.Length > 500) reason = reason[..500] + "…";
+            try
+            {
+                await bot.SendMessage(bs.ChatId,
+                    $"❌ Scan #{seq} couldn't be delivered: {reason}",
+                    cancellationToken: ct);
+            }
+            catch (Exception exC)
+            {
+                log.LogError(exC,
+                    "scan {Session}#{Seq}: even the failure notice send failed",
+                    sessionId, seq);
+            }
+        }
+        else
+        {
+            log.LogInformation("delivered {Session}#{Seq} ({N} formats)",
+                sessionId, seq, variants.Count);
+
+            // Tell the daemon to drop its TIFF copy. Done last so
+            // that a Telegram-upload failure leaves the daemon's
+            // blob intact for a manual retry. Idempotent. Only on
+            // success: if Tier C fired the user can re-trigger the
+            // scan-delivery via the existing daemon machinery
+            // because we leave the TIFF in place.
+            try
+            {
+                await daemon.DeleteScanAsync(sessionId, seq, ct);
+            }
+            catch (Exception ex)
+            {
+                log.LogDebug(
+                    "DELETE scan {Session}#{Seq} failed (will be reaped at session-end): {Err}",
+                    sessionId, seq, ex.Message);
+            }
         }
     }
     finally
     {
         foreach (var v in variants) v.Dispose();
     }
+}
+
+// Send one EncodedVariant as a SendDocument with up to 3 attempts on
+// transient network failures (HttpRequestException, SocketException,
+// IOException, TaskCanceledException — anything our Retry.IsTransient
+// helper recognises). Stream positions are rewound before each
+// attempt so a partial mid-upload failure on attempt N doesn't
+// produce a truncated send on attempt N+1.
+//
+// We deliberately do NOT retry "Bad Request" RequestException from
+// Telegram (semantic errors, malformed args) — retrying those would
+// fail identically. Those propagate up to DeliverScanAsync's Tier B
+// catch and become a Tier C user-visible error.
+async Task SendOneWithRetryAsync(
+    long chatId, EncodedVariant v, string? caption, CancellationToken ct)
+{
+    var isWebp = v.ContentType == "image/webp";
+    Exception? lastTransient = null;
+    for (int attempt = 1; attempt <= 3; attempt++)
+    {
+        if (attempt > 1)
+        {
+            var delay = TimeSpan.FromSeconds(Math.Pow(2, attempt - 1)); // 2s, 4s
+            log.LogWarning(
+                "retrying SendDocument attempt {N}/3 for {Format} after {Sec}s",
+                attempt, v.ContentType, (int)delay.TotalSeconds);
+            try { await Task.Delay(delay, ct); }
+            catch (OperationCanceledException) { throw; }
+        }
+
+        // Rewind both streams. RecyclableMemoryStream is seekable;
+        // after a half-uploaded request the position may be mid-
+        // stream and a retry would send garbage tail bytes only.
+        v.Data.Position = 0;
+        v.Thumbnail.Position = 0;
+
+        try
+        {
+            await bot.SendDocument(chatId,
+                new InputFileStream(v.Data, v.FileName),
+                caption: caption,
+                thumbnail: new InputFileStream(v.Thumbnail, "thumb.jpg"),
+                disableContentTypeDetection: isWebp,
+                cancellationToken: ct);
+            return;
+        }
+        catch (Exception ex) when (IsTransientUpload(ex))
+        {
+            lastTransient = ex;
+            // loop to next attempt
+        }
+    }
+    throw lastTransient ?? new Exception("transient retry loop exited without exception");
+
+    static bool IsTransientUpload(Exception ex) =>
+        ex is System.Net.Http.HttpRequestException
+        || ex is System.Net.Sockets.SocketException
+        || ex is System.IO.IOException
+        || ex is TaskCanceledException
+        || (ex.InnerException is Exception inner && IsTransientUpload(inner));
 }
 
 // Light-weight printer-status sync. The scanner has a full SSE feed
