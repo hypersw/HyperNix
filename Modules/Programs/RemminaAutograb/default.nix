@@ -43,8 +43,11 @@
 #      past the self-inflicted churn.
 #   4. deliberate re-grab is immediate, ignoring the grace window: typing
 #      a non-modifier key into the session, or re-tapping the grab key.
-#      Bare modifiers are skipped so the Alt of an Alt+Tab used to leave
-#      can't re-grab. (Mouse-CLICK is not a separate trigger — the RDP
+#      While escaped, bare modifiers are SWALLOWED (consumed, return TRUE)
+#      rather than forwarded: otherwise the Alt of an Alt+Tab-to-leave
+#      leaks to the guest and is later released as a lone-Alt tap, popping
+#      the Windows menu bar. So modifiers neither re-grab nor leak; only a
+#      real key re-grabs. (Mouse-CLICK is not a separate trigger — the RDP
 #      plugin's drawing area consumes button events with no
 #      connection-window hook — but returning the pointer into the window
 #      re-grabs via the grace path, so clicking-back effectively does.)
@@ -57,14 +60,16 @@
 #   6. Ctrl+Alt+Home is a hardcoded extra "release" chord, in addition to
 #      the configured grab key (shared muscle memory). Matched against the
 #      live modifier state (the hostkey dispatch is keyval-only and strips
-#      modifiers). Unlike the grab key, it FORWARDS Home to the guest
-#      rather than consuming it: while grabbed, the Ctrl+Alt were already
-#      sent to the guest, and releasing them with Alt last/alone activates
-#      the Windows menu bar — letting Home reach the guest puts a
-#      non-modifier into the Alt hold and breaks that pattern. (Side
-#      effect: the guest app sees Ctrl+Alt+Home, usually harmless; for a
-#      fully silent escape use the grab key, which is a single non-Alt key
-#      and is never forwarded.)
+#      modifiers). It mirrors mstsc, where Ctrl+Alt+Home is a CLIENT-side
+#      shortcut: Home is CONSUMED (not sent to the guest — so apps like
+#      ConEmu/FAR that bind Ctrl+Alt+Home don't fire it), and the held
+#      Ctrl+Alt are released cleanly by their physical key-ups (the escape
+#      does NOT flush). A clean Ctrl+Alt down/up does not trigger the
+#      Windows menu; only a malformed lone-Alt does, which (4) prevents by
+#      swallowing stray modifiers while escaped. An earlier revision
+#      flushed on the chord, which released Ctrl+Alt as one synchronous
+#      batch that Windows read as a lone-Alt tap (menu); that flush is
+#      gone.
 #
 # Stuck-key safety is already upstream and untouched: focus-out fires
 # REMMINA_PROTOCOL_FEATURE_TYPE_UNFOCUS -> remmina_rdp_event_unfocus ->

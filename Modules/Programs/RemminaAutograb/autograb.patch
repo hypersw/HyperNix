@@ -59,13 +59,13 @@
 +				rcw_pointer_ungrab(cnnobj->cnnwin);
 +				rcw_floating_toolbar_show(cnnobj->cnnwin, TRUE);
 +			}
-+			return FALSE;  /* forward Home; see note above */
++			return TRUE;  /* consume Home (client-side, like mstsc) */
 +		}
 +	}
  	if (release) {
  		if (remmina_pref.hostkey && keyval == remmina_pref.hostkey) {
  			priv->hostkey_activated = FALSE;
-@@ -4342,6 +4372,22 @@
+@@ -4342,6 +4372,29 @@
  		priv->hostkey_used = FALSE;
  		return TRUE;
  	} else if (!priv->hostkey_activated) {
@@ -78,7 +78,14 @@
 +			|| keyval == GDK_KEY_ISO_Level3_Shift || keyval == GDK_KEY_ISO_Level5_Shift
 +			|| keyval == GDK_KEY_Caps_Lock || keyval == GDK_KEY_Num_Lock
 +			|| keyval == GDK_KEY_Scroll_Lock);
-+		if (priv->autograb_suppressed && !_ag_ismod) {
++		if (priv->autograb_suppressed) {
++			/* While escaped, swallow bare modifiers so they never reach
++			 * the guest: a stray Alt forwarded here (e.g. the Alt of an
++			 * Alt+Tab used to leave) ends up released as a lone-Alt tap
++			 * and pops the Windows menu bar. A real (non-modifier) key
++			 * is instead the deliberate type-to-regrab. */
++			if (_ag_ismod)
++				return TRUE;
 +			priv->autograb_suppressed = FALSE;
 +			rcw_floating_toolbar_show(cnnobj->cnnwin, FALSE);
 +			rcw_keyboard_grab(cnnobj->cnnwin);
@@ -88,7 +95,7 @@
  		/* Any key pressed, no hostkey */
  		return FALSE;
  	}
-@@ -4444,11 +4490,19 @@
+@@ -4444,11 +4497,19 @@
  						priv->toolitem_scale)));
  		}
  	} else if (keyval == remmina_pref.shortcutkey_grab && !extrahardening) {
