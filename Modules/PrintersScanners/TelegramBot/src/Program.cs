@@ -2398,6 +2398,41 @@ async Task RerenderAsync(string sessionId, CancellationToken ct,
 
 async Task DeliverScanAsync(string sessionId, int seq, BotSession bs, CancellationToken ct)
 {
+    // 0. Placeholder. WEBP encoding of a 600 DPI page on the Pi takes
+    //    ~100 s of CPU work before the upload even begins; without a
+    //    visible signal during that window the user is left wondering
+    //    whether anything is happening at all (the daemon already
+    //    posted "scan complete" but the document is nowhere to be
+    //    seen). Posting a "📷 Scan #N processing…" message gives
+    //    immediate feedback and acts as the hook we either delete
+    //    (on success) or edit into a failure notice (Tier C). Edit
+    //    is preferable to "delete + new send" because it preserves
+    //    the user's scroll position on long chats and keeps the
+    //    chat tidy.
+    //
+    //    Telegram has no way to morph a text message into a document
+    //    message (editMessageMedia replaces media on document
+    //    messages, not text). So success path is: send placeholder,
+    //    send document, then delete placeholder.
+    int? placeholderId = null;
+    try
+    {
+        var msg = await bot.SendMessage(bs.ChatId,
+            $"📷 Scan #{seq} processing… (encode + upload, ~2 min at 600 DPI)",
+            cancellationToken: ct);
+        placeholderId = msg.Id;
+    }
+    catch (Exception ex)
+    {
+        // Placeholder send is best-effort. If TG is misbehaving here
+        // the actual document send below will probably also fail and
+        // Tier C catches it. Just log and continue without the
+        // placeholder.
+        log.LogWarning(ex,
+            "scan {Session}#{Seq}: placeholder send failed; continuing without it",
+            sessionId, seq);
+    }
+
     // 1. Fetch the raw TIFF from the daemon. The daemon keeps its
     //    copy until we DELETE (step 4) — the 10-min session-idle
     //    window is the TTL backstop if we never get there. That
@@ -2513,24 +2548,33 @@ async Task DeliverScanAsync(string sessionId, int seq, BotSession bs, Cancellati
     {
         if (deliveryFailed)
         {
-            // Tier C — last-ditch text notice. If even SendMessage
-            // throws here there's nothing more we can do; log and
-            // move on. Don't ct-cancel this so the user gets the
-            // notice even on shutdown.
+            // Tier C — last-ditch failure notice. Reuse the placeholder
+            // message if we have one (edit it into the error text);
+            // otherwise post a fresh SendMessage. Either way the user
+            // ends up with a single message that started as "processing…"
+            // and ended as "❌ couldn't be delivered: …", preserving
+            // chat tidyness.
             var reason = lastFailure?.Message ?? "unknown error";
-            // Telegram caption/text limit is 4096 chars; failure
-            // messages are usually short but include defensively.
             if (reason.Length > 500) reason = reason[..500] + "…";
+            var errorText = $"❌ Scan #{seq} couldn't be delivered: {reason}";
             try
             {
-                await bot.SendMessage(bs.ChatId,
-                    $"❌ Scan #{seq} couldn't be delivered: {reason}",
-                    cancellationToken: ct);
+                if (placeholderId is int pidErr)
+                {
+                    await bot.EditMessageText(bs.ChatId, pidErr, errorText,
+                        cancellationToken: ct);
+                    placeholderId = null;  // consumed; don't try to delete below
+                }
+                else
+                {
+                    await bot.SendMessage(bs.ChatId, errorText,
+                        cancellationToken: ct);
+                }
             }
             catch (Exception exC)
             {
                 log.LogError(exC,
-                    "scan {Session}#{Seq}: even the failure notice send failed",
+                    "scan {Session}#{Seq}: even the failure notice send/edit failed",
                     sessionId, seq);
             }
         }
@@ -2538,6 +2582,25 @@ async Task DeliverScanAsync(string sessionId, int seq, BotSession bs, Cancellati
         {
             log.LogInformation("delivered {Session}#{Seq} ({N} formats)",
                 sessionId, seq, variants.Count);
+
+            // Document is in the chat now — delete the placeholder so
+            // we're not leaving "processing…" stale-pointing into the
+            // void. Best-effort; if the delete fails the placeholder
+            // just lingers as a cosmetic artifact, the scan itself
+            // is delivered fine.
+            if (placeholderId is int pidOk)
+            {
+                try
+                {
+                    await bot.DeleteMessage(bs.ChatId, pidOk, ct);
+                }
+                catch (Exception ex)
+                {
+                    log.LogDebug(
+                        "scan {Session}#{Seq}: placeholder delete failed (cosmetic): {Err}",
+                        sessionId, seq, ex.Message);
+                }
+            }
 
             // Tell the daemon to drop its TIFF copy. Done last so
             // that a Telegram-upload failure leaves the daemon's
