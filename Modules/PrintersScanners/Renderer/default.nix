@@ -80,6 +80,24 @@ in
         # comment in ../Daemon/default.nix for the full story.
         DOTNET_EnableDiagnostics_Debugger = "0";
 
+        # soffice (LibreOffice headless) tries to set up an XDG user-
+        # runtime dir at startup. The standard /run/user/<uid> only
+        # exists for interactive (logind-managed) users; a systemd
+        # service running as `printscan-renderer` has no such dir
+        # and soffice's bootstrap falls back to `mkdir /run/user`,
+        # which fails with EACCES because /run is system-owned.
+        # Symptom (journalctl): "mkdir: cannot create directory
+        # '/run/user': Permission denied" and soffice exits 1 in
+        # ~0 ms, surfacing as a 502 from /render and an "❌ Rendering
+        # failed: soffice exited with code 1" message to the bot user.
+        #
+        # Point XDG_RUNTIME_DIR at a service-private dir under /run
+        # that systemd creates+owns via RuntimeDirectory= below.
+        # Using a name distinct from the socket's runtime dir
+        # (`printscan-renderer`, root-owned with mode 0755) so we
+        # don't conflict on ownership/permissions.
+        XDG_RUNTIME_DIR = "%t/printscan-renderer-soffice";
+
         # Vulkan wiring for Real-ESRGAN-ncnn-vulkan.
         #
         # The binary calls vkCreateInstance unconditionally at startup,
@@ -132,6 +150,14 @@ in
         # at the end of each request.
         StateDirectory = "printscan-renderer";
         StateDirectoryMode = "0750";
+
+        # Writable XDG runtime dir for soffice's startup bootstrap.
+        # See the XDG_RUNTIME_DIR comment in environment{} above for
+        # why this is needed. Owned by the service User, mode 0700
+        # so nothing else on the system can poke at soffice's
+        # internal state.
+        RuntimeDirectory = "printscan-renderer-soffice";
+        RuntimeDirectoryMode = "0700";
 
         # Pin CWD to a guaranteed-empty read-only dir so any accidental
         # CWD-relative write fails immediately. Same pattern as the
