@@ -54,6 +54,16 @@
   boot.loader.raspberry-pi.bootloader = lib.mkForce "kernel";
   boot.loader.raspberry-pi.configurationLimit = 3;
 
+  # Workaround for an upstream nixpkgs + nvmd interaction — see the
+  # matching block in ../GhostHome/configuration.nix for the full
+  # explanation. TL;DR: nixpkgs's hardware/device-tree.nix reads
+  # `config.boot.kernelPackages.kernel.buildDTBs` without a fallback,
+  # nvmd's vendor kernel doesn't define that attribute, eval blows up
+  # every nixos-rebuild. Setting the option explicitly makes Nix skip
+  # the default expression; value `false` matches the historical
+  # resolved-default and Pi firmware handles DTB loading directly.
+  hardware.deviceTree.enable = false;
+
   # Kernel: nvmd's linuxPackages_rpi4 (Pi-Foundation patch
   # series) — set by raspberry-pi-4.base in flake.nix. Prebuilt
   # in their binary cache at nixos-raspberrypi.cachix.org so we

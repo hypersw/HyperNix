@@ -61,6 +61,28 @@
   boot.loader.raspberry-pi.bootloader = "kernel";
   boot.loader.raspberry-pi.configurationLimit = 3;
 
+  # Workaround for an upstream nixpkgs + nvmd interaction: nixpkgs's
+  # nixos/modules/hardware/device-tree.nix sets
+  #     hardware.deviceTree.enable's default =
+  #       config.boot.kernelPackages.kernel.buildDTBs
+  # unconditionally (recent nixpkgs commit dropped the previous
+  # `or false` fallback). nvmd's Pi vendor kernel derivation
+  # doesn't set a .buildDTBs passthru, so evaluating the option
+  # blows up with `attribute 'buildDTBs' missing` and every
+  # nixos-rebuild / nixos-upgrade fails at eval time.
+  #
+  # Setting the option explicitly here means Nix never evaluates
+  # the default expression. Value `false` matches what the older
+  # nixpkgs used to resolve to (via the missing `or false`), and
+  # the Pi firmware loads the DTB directly from /boot/firmware —
+  # nothing on NixOS's side has to install one.
+  #
+  # Applies to both Pi machines (search "buildDTBs" in
+  # PrintScanServerPi4/configuration.nix for the mirror).
+  # Remove when nvmd's kernel derivation grows a .buildDTBs
+  # passthru OR when nixpkgs restores the `or false` fallback.
+  hardware.deviceTree.enable = false;
+
   # Kernel comes from nvmd's Pi-5-vendor package
   # (linuxPackages_rpi5, Foundation patch series) — set by
   # raspberry-pi-5.base in flake.nix. Their binary cache at
