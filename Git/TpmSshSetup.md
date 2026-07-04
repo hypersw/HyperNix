@@ -142,7 +142,11 @@ tpm2_ptool addtoken --pid=1 --label=github --sopin=<so-pin> --userpin=<user-pin>
 ### 2. Create the key
 
 ```bash
-tpm2_ptool addkey --label=github --userpin=<user-pin> --algorithm=ecc256 --key-label=<repo-name>
+tpm2_ptool addkey --label=github --userpin="$userpin" --algorithm=ecc256 --key-label="$key_label"
+
+; or
+
+userpin="$(nix run nixpkgs#zenity -- --password --title userpin)" || exit; key_label="$(nix run nixpkgs#zenity -- --entry --title 'Key Label')" || exit; tpm2_ptool addkey --label=github --userpin="$userpin" --algorithm=ecc256 --key-label="$key_label"
 ```
 
 Verify:
