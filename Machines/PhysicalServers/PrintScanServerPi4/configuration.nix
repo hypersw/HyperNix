@@ -64,6 +64,15 @@
   # resolved-default and Pi firmware handles DTB loading directly.
   hardware.deviceTree.enable = false;
 
+  # SECOND workaround, mirror of the block in ../GhostHome/configuration.nix.
+  # nvmd's Pi loader sets boot.loader.kernelFile from
+  # pkgs.stdenv.hostPlatform.linux-kernel.target which is missing
+  # on current nixpkgs. mkForce "Image" — correct target for both
+  # Pi 4 and Pi 5 aarch64 vendor kernels. `system.` prefix
+  # matches nvmd's own set location (inside a `system = { … }`
+  # config block).
+  system.boot.loader.kernelFile = lib.mkForce "Image";
+
   # Kernel: nvmd's linuxPackages_rpi4 (Pi-Foundation patch
   # series) — set by raspberry-pi-4.base in flake.nix. Prebuilt
   # in their binary cache at nixos-raspberrypi.cachix.org so we

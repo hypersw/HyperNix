@@ -83,6 +83,29 @@
   # passthru OR when nixpkgs restores the `or false` fallback.
   hardware.deviceTree.enable = false;
 
+  # SECOND workaround, same class of interaction — nvmd's Pi loader
+  # (modules/system/boot/loader/raspberrypi/default.nix:535) sets
+  #     boot.loader.kernelFile =
+  #       pkgs.stdenv.hostPlatform.linux-kernel.target
+  # unconditionally on our pinned rev. Current nixpkgs no longer
+  # exposes `hostPlatform.linux-kernel` (or removed `.target` from
+  # it) on the platform we build for, so eval fails with
+  # `attribute 'linux-kernel' missing`. Nvmd's develop HEAD wraps
+  # this in the same `versionAtLeast "26.11"` gate we hit before,
+  # which now resolves to `config.boot.kernelPackages.kernel.target`
+  # — also missing. So neither the pin nor unpin works; we override.
+  #
+  # `Image` is the correct arm64 kernel target for both Pi 4 and
+  # Pi 5 vendor kernels (bcm27{11,12}-defconfig, uncompressed).
+  # mkForce because nvmd's setter is at normal priority.
+  #
+  # Note the `system.` prefix — nvmd sets this inside a `system =
+  # { ... }` config block, so the fully-qualified option path is
+  # `system.boot.loader.kernelFile`, not top-level `boot.loader.*`.
+  # (There's a separate `system.boot.loader.*` namespace in nixpkgs
+  # distinct from `boot.loader.*`.)
+  system.boot.loader.kernelFile = lib.mkForce "Image";
+
   # Kernel comes from nvmd's Pi-5-vendor package
   # (linuxPackages_rpi5, Foundation patch series) — set by
   # raspberry-pi-5.base in flake.nix. Their binary cache at
