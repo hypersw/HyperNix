@@ -192,17 +192,20 @@
   # zram, swap, /tmp on tmpfs, noatime on /. The container-only
   # gate means it imports cleanly into nspawn configs too;
   # everything below the gate auto-skips for them.
-  hypersw.profiles.anyMachineBase = {
+  hypersw.profiles.anyMachineBase = 
+  {
     enable = true;
-    administrator = {
+    administrator =
+    {
       name = "administrator";
-      authorizedKeys = [
-        # Same key as the Pi 4 administrator — same human, same
-        # device — until you provision a fresh GhostHome key.
-        "ecdsa-sha2-nistp256 AAAAE2VjZHNhLXNoYTItbmlzdHAyNTYAAAAIbmlzdHAyNTYAAABBBLESV1KGuOruuV5JdUr8wS8iQyIfEeYdJz2MC5zNCOjoTqzJpA3j5e3kdXbyFczRK25o5bFlThHzK2kmwmCE4zE= printscan-administrator"
+      authorizedKeys =
+      [
+        "ecdsa-sha2-nistp256 AAAAE2VjZHNhLXNoYTItbmlzdHAyNTYAAAAIbmlzdHAyNTYAAABBBLESV1KGuOruuV5JdUr8wS8iQyIfEeYdJz2MC5zNCOjoTqzJpA3j5e3kdXbyFczRK25o5bFlThHzK2kmwmCE4zE= HyperJetHv/Work/GhostPrint"
+        "ecdsa-sha2-nistp256 AAAAE2VjZHNhLXNoYTItbmlzdHAyNTYAAAAIbmlzdHAyNTYAAABBBG5/SEdsatV3BOqKozTva77onboIdrQpd5RNZrIqZx07ax3i5sisPs12B0CmjCrbfVrRS6Oomr3MUi06hVpCIgU= HyperJetHv/Home"
       ];
     };
-    alerts = {
+    alerts =
+    {
       tokenFile        = config.sops.secrets.MonitoringTelegramBotToken.path;
       alertsChatIdFile = config.sops.secrets.MonitoringTelegramAlertsChatId.path;
       logChatIdFile    = config.sops.secrets.MonitoringTelegramLogChatId.path;
