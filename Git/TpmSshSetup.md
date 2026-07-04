@@ -136,17 +136,20 @@ You can mix: multiple tokens, multiple keys per token, single-key tokens.
 If the token doesn't exist yet:
 
 ```bash
-tpm2_ptool addtoken --pid=1 --label=github --sopin=<so-pin> --userpin=<user-pin>
+pid=1 \
+tokenlabel="$(nix run nixpkgs#zenity -- --entry --title 'Token Label: Label for the New Token')" || exit; \
+userpin="$(nix run nixpkgs#zenity -- --password --title 'Token User Pin')" || exit; \
+sopin="$(nix run nixpkgs#zenity -- --password --title 'Token So Pin')" || exit; \
+tpm2_ptool addtoken --pid=$pid --label="$tokenlabel" --sopin="$sopin" --userpin="$userpin"
 ```
 
 ### 2. Create the key
 
 ```bash
-tpm2_ptool addkey --label=github --userpin="$userpin" --algorithm=ecc256 --key-label="$key_label"
-
-; or
-
-userpin="$(nix run nixpkgs#zenity -- --password --title userpin)" || exit; key_label="$(nix run nixpkgs#zenity -- --entry --title 'Key Label')" || exit; tpm2_ptool addkey --label=github --userpin="$userpin" --algorithm=ecc256 --key-label="$key_label"
+tokenlabel="$(nix run nixpkgs#zenity -- --entry --title 'Token Label: Choose Token to Create Object In')" || exit; \
+userpin="$(nix run nixpkgs#zenity -- --password --title 'Token User Pin')" || exit; \
+keylabel="$(nix run nixpkgs#zenity -- --entry --title 'Key Label: Label for the New Key')" || exit; \
+tpm2_ptool addkey --label="$tokenlabel" --userpin="$userpin" --algorithm=ecc256 --key-label="$keylabel"
 ```
 
 Verify:
