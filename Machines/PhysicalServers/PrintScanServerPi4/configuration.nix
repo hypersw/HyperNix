@@ -215,6 +215,11 @@
 
   hypersw.profiles.multiHomedNetworking.enable = true;
 
+  # Weekly upgrade uses the sandbox-first transactional flow — mirror
+  # of the enable line in ../GhostHome/configuration.nix. See the
+  # module docstring for the failure-mode analysis.
+  hypersw.system.autoUpgradeTransactional.enable = true;
+
   hypersw.profiles.printScanServer = {
     enable = true;
     bot = {

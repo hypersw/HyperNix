@@ -43,6 +43,7 @@
     ./PrintersScanners/TelegramBot
     ./Monitoring/TelegramAlerts
     ./System/AutoRebuildOnPush
+    ./System/AutoUpgradeTransactional
     ./System/AvahiPerInterfaceNames
     ./System/BootOnceRaspberryPi
     ./System/BootStabilityProbe

@@ -261,6 +261,13 @@
   # header for the full workflow rationale.
   hypersw.system.bootOnceRaspberryPi.enable = true;
 
+  # Weekly upgrade uses the sandbox-first transactional flow — never
+  # advances /etc/nixos/flake.lock unless the sandbox actually builds.
+  # Replaces stock nixos-upgrade. See the module docstring for the
+  # full failure-mode analysis + why we don't reuse the candidate
+  # quartet (operator-owned).
+  hypersw.system.autoUpgradeTransactional.enable = true;
+
   # ── PrintScanServer (workload, not infrastructure) ─────────
   # Activated in two stages — see commit history for the
   # rationale, but in short: the EpkowaScanner module pulls in

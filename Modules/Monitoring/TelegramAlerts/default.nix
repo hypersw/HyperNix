@@ -1207,6 +1207,28 @@ Last failing boot ended with:
       };
     };
 
+    # Sibling of auto-rebuild-switch-failure-notify, wired to the
+    # transactional weekly upgrade in
+    # Modules/System/AutoUpgradeTransactional/. The sandbox-first flow
+    # is designed so most failures land in Step 1 or 2 (network / nix
+    # eval / nix build) BEFORE any live state is touched — those cases
+    # produce a benign upgrade skip and this alert. Step 3/4 failures
+    # (splice, activation) are rarer but potentially more urgent and
+    # get the same alert.
+    systemd.services.nixos-upgrade-failure-notify = {
+      description = "Notify Telegram on transactional nixos-upgrade failure";
+      serviceConfig = {
+        WorkingDirectory = "/var/empty";
+        Type = "oneshot";
+        ExecStart = pkgs.writeShellScript "nixos-upgrade-failure-notify" ''
+          HOST=$(${pkgs.hostname}/bin/hostname)
+          LOG=$(${pkgs.systemd}/bin/journalctl -u nixos-upgrade --no-pager -n 40 -q 2>/dev/null | ${tgEscape})
+          ${sendAlert} "❌ <b>$HOST</b>: transactional nixos-upgrade FAILED
+<blockquote expandable><pre>$LOG</pre></blockquote>"
+        '';
+      };
+    };
+
     systemd.services.auto-rebuild-checker-failure-notify = {
       description = "Notify Telegram on auto-rebuild-github-checker hard failure";
       serviceConfig = {
