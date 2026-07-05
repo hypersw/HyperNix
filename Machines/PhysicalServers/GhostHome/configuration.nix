@@ -83,58 +83,13 @@
   # passthru OR when nixpkgs restores the `or false` fallback.
   hardware.deviceTree.enable = false;
 
-  # SECOND workaround, same class of interaction — nvmd's Pi loader
-  # (modules/system/boot/loader/raspberrypi/default.nix:535) sets
-  #     boot.loader.kernelFile =
-  #       pkgs.stdenv.hostPlatform.linux-kernel.target
-  # unconditionally on our pinned rev. Current nixpkgs no longer
-  # exposes `hostPlatform.linux-kernel` (or removed `.target` from
-  # it) on the platform we build for, so eval fails with
-  # `attribute 'linux-kernel' missing`. Nvmd's develop HEAD wraps
-  # this in the same `versionAtLeast "26.11"` gate we hit before,
-  # which now resolves to `config.boot.kernelPackages.kernel.target`
-  # — also missing. So neither the pin nor unpin works; we override.
-  #
-  # `Image` is the correct arm64 kernel target for both Pi 4 and
-  # Pi 5 vendor kernels (bcm27{11,12}-defconfig, uncompressed).
-  # mkForce because nvmd's setter is at normal priority.
-  #
-  # Note the `system.` prefix — nvmd sets this inside a `system =
-  # { ... }` config block, so the fully-qualified option path is
-  # `system.boot.loader.kernelFile`, not top-level `boot.loader.*`.
-  # (There's a separate `system.boot.loader.*` namespace in nixpkgs
-  # distinct from `boot.loader.*`.)
-  system.boot.loader.kernelFile = lib.mkForce "Image";
-
-  # …and an overlay to make the losing definition actually evaluable.
-  # mkForce filters priority for the FINAL value merge, but nixpkgs's
-  # module system still forces evaluation of every scalar-option
-  # definition (type validation runs before priority filtering for
-  # this option path). So nvmd's plain-priority setter — reading
-  # `pkgs.stdenv.hostPlatform.linux-kernel.target` — still gets
-  # evaluated even though our mkForce would have won the merge, and
-  # throws `attribute 'linux-kernel' missing` before mkForce ever
-  # gets to speak.
-  #
-  # Overlay: graft `.linux-kernel.target = "Image"` onto stdenv's
-  # hostPlatform so nvmd's expression resolves to "Image" (the same
-  # value our mkForce sets). Both sides now yield "Image", eval
-  # succeeds, priority filter isn't needed but stays as a belt-
-  # and-braces defence in case nvmd's rev changes what they read.
-  nixpkgs.overlays = [
-    (final: prev: {
-      stdenv = prev.stdenv // {
-        hostPlatform = lib.recursiveUpdate prev.stdenv.hostPlatform {
-          # recursiveUpdate handles null / missing gracefully: if the
-          # left already has `linux-kernel` as an attrset it merges
-          # in `target`; if left has it as null or missing it takes
-          # the right side wholesale. Avoids the null-crash of plain
-          # `//` on the potentially-null attribute.
-          linux-kernel.target = "Image";
-        };
-      };
-    })
-  ];
+  # (Second workaround for nvmd's linux-kernel.target read at
+  # loader/raspberrypi/default.nix:535 was reverted — attempts via
+  # mkForce and via stdenv-hostPlatform overlay both surfaced a
+  # downstream "expected a set but found null" error in the module
+  # system. Reverting for now to isolate whether that null error
+  # was ours or was already latent; the linux-kernel error will
+  # re-surface on the next eval and we can chase it fresh.)
 
   # Kernel comes from nvmd's Pi-5-vendor package
   # (linuxPackages_rpi5, Foundation patch series) — set by
