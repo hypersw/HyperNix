@@ -273,6 +273,18 @@ in
       serviceConfig = {
         Type = "oneshot";
         ExecStart = "${upgradeScript}";
+        # Clear the stock `system.autoUpgrade` module's ExecStartPre,
+        # which runs `nix flake update --flake /etc/nixos` on live
+        # state before ExecStart runs. That would UPDATE PRODUCTION
+        # INPUTS UNCONDITIONALLY — the exact contamination this
+        # module is designed to prevent. mkForce empties the list
+        # even though we also set `system.autoUpgrade.enable = false`
+        # elsewhere, because the systemd-unit merge appears to keep
+        # the ExecStartPre alive from the stock definition regardless
+        # of the enable option.
+        # Verified by inspecting `systemctl cat nixos-upgrade.service`
+        # on the device before this line was added.
+        ExecStartPre = lib.mkForce [];
         # RuntimeDirectory would auto-clean between runs; we use an
         # explicit path in /run so the shell can rm -rf defensively.
       };
