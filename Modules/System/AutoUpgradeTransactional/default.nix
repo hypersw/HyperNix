@@ -124,6 +124,24 @@ let
     "upstream"
   ];
 
+  # KNOWN FOLLOW-UP (observed during first manual test invocation):
+  # The splice replaces `.nodes.<name>` from sandbox into live, but
+  # the observed effect was that the live lock's `nixpkgs.original`
+  # ended up as `type: tarball` after Step 3 while the shim's
+  # flake.nix declares `github:NixOS/nixpkgs/nixos-unstable`. Result:
+  # Step 4's `nixos-rebuild switch` may resolve to a different eval
+  # than Step 2's `nix build` — safe (system stays on last-known-good
+  # rev instead of contaminating with a new one) but wastes the
+  # candidate build. To debug: run Step 1 in isolation on the device,
+  # `jq .nodes.nixpkgs.original sandbox/flake.lock` before and after,
+  # verify the sandbox's `original` reflects the shim's github URL.
+  # Suspect: seed copies live's stale `original` (tarball from an old
+  # shim state), and `nix flake update <name>` doesn't re-resolve
+  # `original` when the URL in flake.nix has changed since the last
+  # lock. If confirmed, an explicit `nix flake lock --recreate-lock-file`
+  # or a `nix flake lock --override-input nixpkgs github:.../nixos-unstable`
+  # before Step 1 would freshen the sandbox's `original`.
+
   sandboxDir = "/run/nixos-upgrade-transactional-sandbox";
   lockFile = "/run/nixos-upgrade-transactional.lock";
   liveDir = "/etc/nixos";
