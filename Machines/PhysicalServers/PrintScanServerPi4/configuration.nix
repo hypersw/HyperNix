@@ -73,6 +73,23 @@
   # config block).
   system.boot.loader.kernelFile = lib.mkForce "Image";
 
+  # Overlay mirror of the block in ../GhostHome/configuration.nix —
+  # mkForce alone doesn't prevent evaluation of nvmd's losing
+  # `pkgs.stdenv.hostPlatform.linux-kernel.target` read, so we
+  # graft `.linux-kernel.target` back onto stdenv.hostPlatform.
+  # See GhostHome for the full explanation.
+  nixpkgs.overlays = [
+    (final: prev: {
+      stdenv = prev.stdenv // {
+        hostPlatform = prev.stdenv.hostPlatform // {
+          linux-kernel = (prev.stdenv.hostPlatform.linux-kernel or {}) // {
+            target = "Image";
+          };
+        };
+      };
+    })
+  ];
+
   # Kernel: nvmd's linuxPackages_rpi4 (Pi-Foundation patch
   # series) — set by raspberry-pi-4.base in flake.nix. Prebuilt
   # in their binary cache at nixos-raspberrypi.cachix.org so we

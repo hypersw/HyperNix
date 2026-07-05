@@ -106,6 +106,33 @@
   # distinct from `boot.loader.*`.)
   system.boot.loader.kernelFile = lib.mkForce "Image";
 
+  # …and an overlay to make the losing definition actually evaluable.
+  # mkForce filters priority for the FINAL value merge, but nixpkgs's
+  # module system still forces evaluation of every scalar-option
+  # definition (type validation runs before priority filtering for
+  # this option path). So nvmd's plain-priority setter — reading
+  # `pkgs.stdenv.hostPlatform.linux-kernel.target` — still gets
+  # evaluated even though our mkForce would have won the merge, and
+  # throws `attribute 'linux-kernel' missing` before mkForce ever
+  # gets to speak.
+  #
+  # Overlay: graft `.linux-kernel.target = "Image"` onto stdenv's
+  # hostPlatform so nvmd's expression resolves to "Image" (the same
+  # value our mkForce sets). Both sides now yield "Image", eval
+  # succeeds, priority filter isn't needed but stays as a belt-
+  # and-braces defence in case nvmd's rev changes what they read.
+  nixpkgs.overlays = [
+    (final: prev: {
+      stdenv = prev.stdenv // {
+        hostPlatform = prev.stdenv.hostPlatform // {
+          linux-kernel = (prev.stdenv.hostPlatform.linux-kernel or {}) // {
+            target = "Image";
+          };
+        };
+      };
+    })
+  ];
+
   # Kernel comes from nvmd's Pi-5-vendor package
   # (linuxPackages_rpi5, Foundation patch series) — set by
   # raspberry-pi-5.base in flake.nix. Their binary cache at
