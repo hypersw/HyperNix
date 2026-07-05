@@ -43,15 +43,22 @@
     # is reached through a separately-built `vendorPkgs` set anchored
     # to `nixos-raspberrypi.inputs.nixpkgs` (i.e. nvmd's 25.11), which
     # is the input the cache is keyed on.
-    # PINNED — nvmd's master is broken against rolling nixpkgs as of
-    # commit a5e10257 (2026-06-14): its raspberrypi boot-loader module
-    # references `config.boot.kernelPackages.kernel.target`, which the
-    # rolling nixpkgs >= 9ae611a (2026-06-10) removed from the kernel
-    # derivation. Eval fails with `attribute 'target' missing` during
-    # nixos-upgrade and the switch never lands. Pinning to the last
-    # commit before that breakage; unpin once nvmd lands a fix that
-    # handles the new kernel-package shape.
-    nixos-raspberrypi.url = "github:nvmd/nixos-raspberrypi/74a01a667c79dc90e917edf2a6264d34a423336e";
+    # FORKED to hypersw/nixos-raspberrypi (develop branch). The
+    # upstream nvmd flake carries a `boot.loader.kernelFile` setter
+    # in modules/system/boot/loader/raspberrypi/default.nix that
+    # reads either `config.boot.kernelPackages.kernel.target` (on
+    # release >= 26.11) or `pkgs.stdenv.hostPlatform.linux-kernel.target`
+    # (older) — both attribute paths have been unstable across
+    # rolling nixpkgs revs. Our fork just hardcodes `"Image"` in
+    # that setter, which is correct for the entire bcm27{11,12}
+    # fleet. See the fork's commit for full context.
+    #
+    # Unpin path: watch for nvmd landing their own fix on develop
+    # (or accepting an override option), rebase our fork onto it,
+    # then either delete the fork and point back at
+    # `github:nvmd/nixos-raspberrypi/develop`, or ff-forward the
+    # fork silently.
+    nixos-raspberrypi.url = "github:hypersw/nixos-raspberrypi/develop";
   };
 
   outputs = { self, nixpkgs, nixos-hardware, microvm, sops-nix, nixos-raspberrypi }:

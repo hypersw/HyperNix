@@ -614,15 +614,14 @@ in
             inputs = {
               nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
               nixos-hardware.url = "github:NixOS/nixos-hardware";
-              # PINNED — see commit pinning nvmd to 74a01a667 (2026-06-08)
-              # for the breakage rationale. Production stays here until
-              # nvmd lands a fix that works on rolling nixpkgs. The
-              # candidate quartet below stays on branch HEAD so we can
-              # spot a working upstream rev via the try-boot workflow.
-              # Unpin once nvmd's HEAD evaluates cleanly against our
-              # current nixpkgs (verify by `nixos-rebuild-boot-once
-              # --flake /etc/nixos#candidate` succeeding).
-              nixos-raspberrypi.url = "github:nvmd/nixos-raspberrypi/74a01a667c79dc90e917edf2a6264d34a423336e";
+              # FORKED to hypersw/nixos-raspberrypi (develop branch).
+              # Fork carries a single-line patch to the raspberrypi
+              # boot-loader module that hardcodes kernelFile="Image"
+              # instead of reading fragile nvmd/nixpkgs attribute
+              # paths. See HyperNix's flake.nix for the full story
+              # and the unpin path (fork can be dropped once nvmd
+              # accepts an equivalent upstream fix).
+              nixos-raspberrypi.url = "github:hypersw/nixos-raspberrypi/develop";
               upstream = {
                 url = "${cfg.localFlake.upstreamUrl}";
                 inputs.nixpkgs.follows = "nixpkgs";
