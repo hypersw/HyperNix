@@ -124,14 +124,13 @@
   nixpkgs.overlays = [
     (final: prev: {
       stdenv = prev.stdenv // {
-        hostPlatform = prev.stdenv.hostPlatform // {
-          # linux-kernel may exist AS null (a deliberate absent-marker
-          # on some platforms) or be missing entirely. `attr or {}`
-          # only handles missing, not null; guard both.
-          linux-kernel =
-            let cur = prev.stdenv.hostPlatform.linux-kernel or null;
-                base = if cur == null then {} else cur;
-            in base // { target = "Image"; };
+        hostPlatform = lib.recursiveUpdate prev.stdenv.hostPlatform {
+          # recursiveUpdate handles null / missing gracefully: if the
+          # left already has `linux-kernel` as an attrset it merges
+          # in `target`; if left has it as null or missing it takes
+          # the right side wholesale. Avoids the null-crash of plain
+          # `//` on the potentially-null attribute.
+          linux-kernel.target = "Image";
         };
       };
     })

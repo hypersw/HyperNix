@@ -81,11 +81,8 @@
   nixpkgs.overlays = [
     (final: prev: {
       stdenv = prev.stdenv // {
-        hostPlatform = prev.stdenv.hostPlatform // {
-          linux-kernel =
-            let cur = prev.stdenv.hostPlatform.linux-kernel or null;
-                base = if cur == null then {} else cur;
-            in base // { target = "Image"; };
+        hostPlatform = lib.recursiveUpdate prev.stdenv.hostPlatform {
+          linux-kernel.target = "Image";
         };
       };
     })
