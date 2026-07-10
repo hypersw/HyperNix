@@ -151,6 +151,27 @@ public sealed class SessionService : IAsyncDisposable
         }
     }
 
+    public SessionRecord UpdateOwnerStatusMessage(string sessionId, int ownerStatusMessageId)
+    {
+        lock (_lock)
+        {
+            var current = _store.Current
+                ?? throw new InvalidOperationException("No active session");
+            if (current.Id != sessionId)
+                throw new InvalidOperationException("Session ID mismatch");
+            var updated = _store.Mutate(s => s with
+            {
+                OwnerStatusMessageId = ownerStatusMessageId
+            });
+            _broker.Publish(new SessionEvent(
+                SessionEventType.SessionOpened,
+                SessionId: updated.Id, Session: updated));
+            _logger.LogInformation("session {Id} owner status message moved to {MessageId}",
+                updated.Id, ownerStatusMessageId);
+            return updated;
+        }
+    }
+
     public bool Close(string sessionId, SessionTerminationReason reason)
     {
         SessionRecord? current;
@@ -376,14 +397,14 @@ public sealed class SessionService : IAsyncDisposable
     /// disposes any survivors at session end (idle timeout / explicit
     /// close / takeover).
     /// </summary>
-    public RecyclableMemoryStream? GetScan(string sessionId, int seq)
+    public byte[]? GetScanSnapshot(string sessionId, int seq)
     {
         lock (_lock)
         {
             if (!_scans.TryGetValue((sessionId, seq), out var stream))
                 return null;
             stream.Position = 0;
-            return stream;
+            return stream.ToArray();
         }
     }
 
@@ -425,4 +446,3 @@ public sealed class SessionService : IAsyncDisposable
         _logger.LogInformation("SessionService.DisposeAsync: done");
     }
 }
-

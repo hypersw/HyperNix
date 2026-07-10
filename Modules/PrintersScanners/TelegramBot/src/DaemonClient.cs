@@ -86,6 +86,16 @@ public sealed class DaemonClient : IDisposable
         return await resp.Content.ReadFromJsonAsync<SessionRecord>(Json, ct);
     }
 
+    public async Task<SessionRecord?> MoveOwnerStatusMessageAsync(
+        string sessionId, int ownerStatusMessageId, CancellationToken ct)
+    {
+        using var resp = await _http.PutAsJsonAsync(
+            $"/sessions/{sessionId}/owner-status-message",
+            new OwnerStatusMessageUpdate(ownerStatusMessageId), Json, ct);
+        resp.EnsureSuccessStatusCode();
+        return await resp.Content.ReadFromJsonAsync<SessionRecord>(Json, ct);
+    }
+
     public async Task CloseSessionAsync(string sessionId, CancellationToken ct)
     {
         using var resp = await _http.DeleteAsync($"/sessions/{sessionId}", ct);

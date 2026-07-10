@@ -555,31 +555,14 @@ async Task OpenScannerSessionAsync(
     if (outcome == DaemonClient.OpenResult.Conflict && conflict is not null)
     {
         // Self-conflict: the "conflicting" session is this user's own.
-        // Offering to "take over your own session" is nonsense; send a
-        // reply that points at the existing session message instead.
-        // Telegram renders a reply-chip the user taps to jump to the
-        // referenced message — solves the "session scrolled far back
-        // after many scans" problem without us needing to re-render
-        // or move the session header.
+        // Offering to "take over your own session" is nonsense. Treat
+        // this as a handoff instead: the just-created placeholder
+        // becomes the live session head, and the old head is reduced to
+        // a pointer. This makes /scanner a recovery path when the
+        // original "Opening session..." -> full session edit was lost.
         if (conflict.Current.OwnerChatId == chatId)
         {
-            await bot.DeleteMessage(chatId, msgId, ct);   // placeholder isn't needed
-            try
-            {
-                await bot.SendMessage(chatId,
-                    "📷 You already have an active scanner session — tap the reply above to jump to it.",
-                    replyParameters: new() { MessageId = conflict.Current.OwnerStatusMessageId },
-                    cancellationToken: ct);
-            }
-            catch (Exception ex)
-            {
-                // If the original session message was deleted, replying
-                // fails; fall back to a plain message.
-                log.LogDebug("self-conflict reply-to failed, falling back: {Err}", ex.Message);
-                await bot.SendMessage(chatId,
-                    "📷 You already have an active scanner session.",
-                    cancellationToken: ct);
-            }
+            await HandoverScannerSessionAsync(conflict.Current, msgId, ct);
             return;
         }
         var kb = new InlineKeyboardMarkup(
@@ -616,6 +599,56 @@ async Task OpenScannerSessionAsync(
         };
     }
     await RerenderAsync(session.Id, ct);
+}
+
+async Task HandoverScannerSessionAsync(
+    SessionRecord current, int newStatusMessageId, CancellationToken ct)
+{
+    try
+    {
+        var moved = (await daemon.MoveOwnerStatusMessageAsync(
+            current.Id, newStatusMessageId, ct)) ?? current with
+            {
+                OwnerStatusMessageId = newStatusMessageId
+            };
+
+        lock (sessionsLock)
+        {
+            sessions[moved.Id] = new BotSession
+            {
+                DaemonSessionId = moved.Id,
+                ChatId = moved.OwnerChatId,
+                StatusMessageId = moved.OwnerStatusMessageId,
+                Params = moved.Params,
+                Format = ParseFormatFromMetadata(moved.Metadata),
+                ExpiresAt = moved.ExpiresAt,
+                ScanCount = moved.ScanCount,
+                Scanning = moved.InFlightScan,
+            };
+        }
+
+        await RerenderAsync(moved.Id, ct);
+    }
+    catch (Exception ex)
+    {
+        log.LogError(ex, "scanner session handoff failed");
+        await bot.EditMessageText(current.OwnerChatId, newStatusMessageId,
+            $"❌ Couldn't move active session here.\n<code>{ex.Message}</code>",
+            parseMode: ParseMode.Html, cancellationToken: ct);
+        return;
+    }
+
+    try
+    {
+        await bot.EditMessageText(current.OwnerChatId, current.OwnerStatusMessageId,
+            "📷 <i>Session continued below ↓</i>",
+            parseMode: ParseMode.Html, replyMarkup: null,
+            cancellationToken: ct);
+    }
+    catch (Exception ex)
+    {
+        log.LogDebug("scanner handoff annotate-old failed: {Err}", ex.Message);
+    }
 }
 
 // Decode the bot's format selection out of the daemon's opaque metadata
@@ -2500,20 +2533,31 @@ async Task DeliverScanAsync(string sessionId, int seq, BotSession bs, Cancellati
             // same collide. Variant-suffixed thumbnail and document
             // names avoid that.
             var medias = new List<IAlbumInputMedia>(variants.Count);
+            var uploadStreams = new List<Stream>(variants.Count * 2);
             for (int i = 0; i < variants.Count; i++)
             {
                 var v = variants[i];
                 v.Data.Position = 0;
                 v.Thumbnail.Position = 0;
+                var data = new MemoryStream(v.Data.ToArray(), writable: false);
+                var thumb = new MemoryStream(v.Thumbnail.ToArray(), writable: false);
+                uploadStreams.Add(data);
+                uploadStreams.Add(thumb);
                 medias.Add(new InputMediaDocument(
-                    new InputFileStream(v.Data, $"{i:D2}.{v.FileName}"))
+                    new InputFileStream(data, $"{i:D2}.{v.FileName}"))
                 {
-                    Thumbnail = new InputFileStream(
-                        v.Thumbnail, $"thumb-{i}.jpg"),
+                    Thumbnail = new InputFileStream(thumb, $"thumb-{i}.jpg"),
                     Caption = i == 0 ? caption : null,
                 });
             }
-            await bot.SendMediaGroup(bs.ChatId, medias, cancellationToken: ct);
+            try
+            {
+                await bot.SendMediaGroup(bs.ChatId, medias, cancellationToken: ct);
+            }
+            finally
+            {
+                foreach (var s in uploadStreams) s.Dispose();
+            }
         }
     }
     catch (Exception exA)
@@ -2641,6 +2685,10 @@ async Task SendOneWithRetryAsync(
     long chatId, EncodedVariant v, string? caption, CancellationToken ct)
 {
     var isWebp = v.ContentType == "image/webp";
+    v.Data.Position = 0;
+    v.Thumbnail.Position = 0;
+    var dataBytes = v.Data.ToArray();
+    var thumbBytes = v.Thumbnail.ToArray();
     Exception? lastTransient = null;
     for (int attempt = 1; attempt <= 3; attempt++)
     {
@@ -2654,18 +2702,14 @@ async Task SendOneWithRetryAsync(
             catch (OperationCanceledException) { throw; }
         }
 
-        // Rewind both streams. RecyclableMemoryStream is seekable;
-        // after a half-uploaded request the position may be mid-
-        // stream and a retry would send garbage tail bytes only.
-        v.Data.Position = 0;
-        v.Thumbnail.Position = 0;
-
         try
         {
+            using var data = new MemoryStream(dataBytes, writable: false);
+            using var thumb = new MemoryStream(thumbBytes, writable: false);
             await bot.SendDocument(chatId,
-                new InputFileStream(v.Data, v.FileName),
+                new InputFileStream(data, v.FileName),
                 caption: caption,
-                thumbnail: new InputFileStream(v.Thumbnail, "thumb.jpg"),
+                thumbnail: new InputFileStream(thumb, "thumb.jpg"),
                 disableContentTypeDetection: isWebp,
                 cancellationToken: ct);
             return;

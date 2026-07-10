@@ -123,6 +123,10 @@ public record OpenSessionRequest(
     Dictionary<string, string>? Metadata = null
 );
 
+public record OwnerStatusMessageUpdate(
+    int OwnerStatusMessageId
+);
+
 /// <summary>
 /// Durable session record, persisted to disk on every mutation. Single source
 /// of truth — bots reconstruct their view from events on startup.
