@@ -498,7 +498,9 @@ daemon events on startup.
   live head: it calls `PUT /sessions/{id}/owner-status-message`, renders the
   full session controls there, and edits the old head into a keyboard-less
   "session continued below" stub. This is the recovery path for Telegram edit
-  loss on the original session-opening message.
+  loss on the original session-opening message. Active scanner and printer
+  session heads are pinned while active; handoff, close, timeout, takeover, and
+  `/status` reconcile bot-owned pins so inactive heads do not stay pinned.
 - **Takeover** — daemon waits for any `inFlightScan` on the existing session
   to complete delivery first (hard-cut is bad UX), then emits
   `session.terminated { reason: takeover, newOwner: … }`, creates the new
@@ -1190,7 +1192,9 @@ formats / UX bits since the 04-25 snapshot.
     handle mutable; every new file upload abandons the previous
     message ("→ session continued below ↓") and sends a fresh
     one immediately under the user's upload, so the active session
-    UI stays in view through a sequence of files. Toggles use
+    UI stays in view through a sequence of files. The bot moves the
+    active-session pin to the fresh live message and unpins the old
+    continued stub. Toggles use
     editMessageMedia to swap the preview in place — the user sees
     Scale / Orientation / Pages choices reshape the rendered page
     as they pick.
@@ -1543,6 +1547,9 @@ Live in production code, working unless flagged otherwise:
   the live control message to the new placeholder and demotes the previous
   head. This mirrors the print-session live-preview handoff pattern and gives
   users a recovery route if a Telegram edit is dropped.
+* **Active-session pin invariant**: bot-owned print/scanner live heads are
+  pinned while active and unpinned when closed, timed out, taken over, or
+  demoted by a handoff. `/status` also reconciles known bot-owned pins.
 * **Scan delivery stream ownership**: daemon image GETs write byte snapshots;
   bot upload tiers clone encoded streams for each Telegram request. This fixes
   the June 23 `ObjectDisposedException` path where album failure disposed a

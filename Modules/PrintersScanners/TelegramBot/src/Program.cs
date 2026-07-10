@@ -85,6 +85,8 @@ using var renderer = new RendererClient(
 // in-memory bot-side session state, keyed by daemon's session id
 var sessions = new Dictionary<string, BotSession>();
 var sessionsLock = new Lock();
+var sessionPins = new Dictionary<long, HashSet<int>>();
+var sessionPinsLock = new Lock();
 
 // Per-chat printer-session state. Lives entirely on the bot (printing
 // has no exclusive-resource model the way scanning does — multiple
@@ -344,7 +346,10 @@ async Task HandleMessageAsync(string userName, Message msg, CancellationToken ct
              || slash is "/printer" or "/print")
         await OpenPrinterSessionAsync(msg.Chat.Id, ct);
     else if (text == "📊 Status" || slash == "/status")
+    {
+        await ReconcileSessionPinsAsync(msg.Chat.Id, ct);
         await ShowStatusAsync(msg.Chat.Id, ct);
+    }
     else if (slash is "/help" or "/start")
         await bot.SendMessage(msg.Chat.Id, """
             🖨️ <b>PrintScan Bot</b>
@@ -599,6 +604,7 @@ async Task OpenScannerSessionAsync(
         };
     }
     await RerenderAsync(session.Id, ct);
+    await ReconcileSessionPinsAsync(chatId, ct);
 }
 
 async Task HandoverScannerSessionAsync(
@@ -628,6 +634,7 @@ async Task HandoverScannerSessionAsync(
         }
 
         await RerenderAsync(moved.Id, ct);
+        await ReconcileSessionPinsAsync(moved.OwnerChatId, ct);
     }
     catch (Exception ex)
     {
@@ -648,6 +655,115 @@ async Task HandoverScannerSessionAsync(
     catch (Exception ex)
     {
         log.LogDebug("scanner handoff annotate-old failed: {Err}", ex.Message);
+    }
+    await ReconcileSessionPinsAsync(current.OwnerChatId, ct);
+}
+
+async Task ReconcileSessionPinsAsync(long chatId, CancellationToken ct)
+{
+    HashSet<int> active = [];
+    lock (sessionsLock)
+    {
+        foreach (var s in sessions.Values)
+        {
+            if (s.ChatId == chatId) active.Add(s.StatusMessageId);
+        }
+    }
+    lock (printSessionsLock)
+    {
+        if (printSessions.TryGetValue(chatId, out var ps))
+            active.Add(ps.StatusMessageId);
+    }
+
+    HashSet<int> known;
+    lock (sessionPinsLock)
+    {
+        known = sessionPins.TryGetValue(chatId, out var ids)
+            ? [.. ids]
+            : [];
+    }
+
+    try
+    {
+        var chat = await bot.GetChat(chatId, cancellationToken: ct);
+        if (chat.PinnedMessage is { } pinned &&
+            pinned.From?.Id == me.Id &&
+            !active.Contains(pinned.Id))
+        {
+            known.Add(pinned.Id);
+        }
+    }
+    catch (Exception ex)
+    {
+        log.LogDebug("getChat pinned-message check for {Chat} failed: {Err}",
+            chatId, ex.Message);
+    }
+
+    foreach (var staleId in known.Except(active).ToArray())
+        await UnpinSessionMessageAsync(chatId, staleId, active: false, ct);
+
+    // Re-pin active messages even if our local set says they are pinned:
+    // a human may have unpinned them, the bot may have restarted, or
+    // Telegram may have replaced the pin while we were offline.
+    foreach (var activeId in active)
+        await PinSessionMessageAsync(chatId, activeId, ct);
+
+    lock (sessionPinsLock)
+    {
+        if (active.Count == 0) sessionPins.Remove(chatId);
+        else sessionPins[chatId] = active;
+    }
+}
+
+async Task PinSessionMessageAsync(long chatId, int messageId, CancellationToken ct)
+{
+    try
+    {
+        await bot.PinChatMessage(chatId, messageId,
+            disableNotification: true, cancellationToken: ct);
+    }
+    catch (Exception ex) when (
+        ex.Message.Contains("not modified", StringComparison.OrdinalIgnoreCase) ||
+        ex.Message.Contains("already pinned", StringComparison.OrdinalIgnoreCase))
+    {
+    }
+    catch (Exception ex)
+    {
+        log.LogDebug("pin session message {Chat}/{Msg} failed: {Err}",
+            chatId, messageId, ex.Message);
+    }
+}
+
+async Task UnpinSessionMessageAsync(
+    long chatId, int messageId, bool active, CancellationToken ct)
+{
+    try
+    {
+        await bot.UnpinChatMessage(chatId, messageId, cancellationToken: ct);
+    }
+    catch (Exception ex) when (
+        ex.Message.Contains("not found", StringComparison.OrdinalIgnoreCase) ||
+        ex.Message.Contains("message to unpin", StringComparison.OrdinalIgnoreCase) ||
+        ex.Message.Contains("message can't be unpinned", StringComparison.OrdinalIgnoreCase))
+    {
+    }
+    catch (Exception ex)
+    {
+        log.LogDebug("unpin session message {Chat}/{Msg} failed: {Err}",
+            chatId, messageId, ex.Message);
+        if (active) return;
+    }
+
+    if (!active)
+    {
+        lock (sessionPinsLock)
+        {
+            if (sessionPins.TryGetValue(chatId, out var ids))
+            {
+                ids.Remove(messageId);
+                if (ids.Count == 0) sessionPins.Remove(chatId);
+            }
+        }
     }
 }
 
@@ -680,6 +796,7 @@ async Task OpenPrinterSessionAsync(long chatId, CancellationToken ct)
     lock (printSessionsLock) { printSessions.TryGetValue(chatId, out existing); }
     if (existing is not null)
     {
+        await ReconcileSessionPinsAsync(chatId, ct);
         // Already-open session for this chat — point the user at the
         // existing status message via Telegram's reply-chip rather
         // than spawning a second session message that'd just clutter.
@@ -717,6 +834,7 @@ async Task OpenPrinterSessionAsync(long chatId, CancellationToken ct)
     };
     lock (printSessionsLock) { printSessions[chatId] = session; }
     await RenderPrintSessionAsync(chatId, ct);
+    await ReconcileSessionPinsAsync(chatId, ct);
 }
 
 async Task ClosePrinterSessionAsync(long chatId, CancellationToken ct)
@@ -765,6 +883,7 @@ async Task ClosePrinterSessionAsync(long chatId, CancellationToken ct)
             "close of printer session {Chat} (msg {Msg}, kind {Kind}) failed: {Err}",
             chatId, s.StatusMessageId, s.StatusKind, ex.Message);
     }
+    await ReconcileSessionPinsAsync(chatId, ct);
 }
 
 async Task RenderPrintSessionAsync(long chatId, CancellationToken ct)
@@ -973,6 +1092,7 @@ async Task HandoverPrintSessionAsync(long chatId, CancellationToken ct)
             }
         }
     }
+    await ReconcileSessionPinsAsync(chatId, ct);
 }
 
 async Task StageDocumentForPrintAsync(long chatId, Document doc, CancellationToken ct)
@@ -2224,6 +2344,7 @@ async Task HandleEventAsync(SessionEvent ev, CancellationToken ct)
                 }
             }
             await RerenderAsync(s.Id, ct);
+            await ReconcileSessionPinsAsync(s.OwnerChatId, ct);
             break;
         }
         case SessionEventType.SessionExtended when ev.Session is not null:
@@ -2386,6 +2507,7 @@ async Task HandleEventAsync(SessionEvent ev, CancellationToken ct)
                         cancellationToken: ct);
                 }
                 catch { /* message may have been deleted */ }
+                await ReconcileSessionPinsAsync(s.ChatId, ct);
             }
             break;
         }
