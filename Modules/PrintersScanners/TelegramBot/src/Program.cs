@@ -2487,7 +2487,8 @@ async Task DeliverScanAsync(string sessionId, int seq, BotSession bs, Cancellati
     var variants = await pipeline.ProcessAsync(
         tiffMs, bs.Params.Dpi, seq, bs.Format, ct);
     var caption = $"📷 {bs.Params.Dpi} dpi · scan #{seq}";
-    var uploadBytes = variants.Sum(v => v.Data.Length);
+    var uploadBytes = variants.Sum(v => v.Data.Length + v.Thumbnail.Length);
+    var uploadProgress = new UploadProgress(uploadBytes);
 
     await UpdateScanPlaceholderAsync(bs.ChatId, placeholderId,
         $"📷 Scan #{seq}: uploading {variants.Count} file(s), {HumanBytes(uploadBytes)}…",
@@ -2525,12 +2526,16 @@ async Task DeliverScanAsync(string sessionId, int seq, BotSession bs, Cancellati
 
     var deliveryFailed = false;
     Exception? lastFailure = null;
+    using var uploadPulseCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+    var uploadPulseTask = PulseScanUploadProgressAsync(
+        bs.ChatId, placeholderId, seq, uploadProgress, uploadPulseCts.Token);
     try
     {
         // Tier A
         if (variants.Count == 1)
         {
-            await SendOneWithRetryAsync(bs.ChatId, variants[0], caption, ct);
+            await SendOneWithRetryAsync(
+                bs.ChatId, variants[0], caption, uploadProgress, ct);
         }
         else
         {
@@ -2546,8 +2551,12 @@ async Task DeliverScanAsync(string sessionId, int seq, BotSession bs, Cancellati
                 var v = variants[i];
                 v.Data.Position = 0;
                 v.Thumbnail.Position = 0;
-                var data = new MemoryStream(v.Data.ToArray(), writable: false);
-                var thumb = new MemoryStream(v.Thumbnail.ToArray(), writable: false);
+                var data = new CountingReadStream(
+                    new MemoryStream(v.Data.ToArray(), writable: false),
+                    uploadProgress.Add);
+                var thumb = new CountingReadStream(
+                    new MemoryStream(v.Thumbnail.ToArray(), writable: false),
+                    uploadProgress.Add);
                 uploadStreams.Add(data);
                 uploadStreams.Add(thumb);
                 medias.Add(new InputMediaDocument(
@@ -2576,6 +2585,7 @@ async Task DeliverScanAsync(string sessionId, int seq, BotSession bs, Cancellati
             $"📷 Scan #{seq}: upload retrying one file at a time…", ct);
         try
         {
+            uploadProgress.Reset(uploadBytes);
             // Tier B — per-variant sends. Use the same retry helper
             // as the single-variant Tier A path so transient network
             // errors don't trip us here either.
@@ -2584,6 +2594,7 @@ async Task DeliverScanAsync(string sessionId, int seq, BotSession bs, Cancellati
                 await SendOneWithRetryAsync(
                     bs.ChatId, variants[i],
                     i == 0 ? caption : null,
+                    uploadProgress,
                     ct);
             }
         }
@@ -2599,6 +2610,10 @@ async Task DeliverScanAsync(string sessionId, int seq, BotSession bs, Cancellati
 
     try
     {
+        uploadPulseCts.Cancel();
+        try { await uploadPulseTask; }
+        catch (OperationCanceledException) { }
+
         if (deliveryFailed)
         {
             // Tier C — last-ditch failure notice. Reuse the placeholder
@@ -2679,6 +2694,29 @@ async Task DeliverScanAsync(string sessionId, int seq, BotSession bs, Cancellati
     }
 }
 
+async Task PulseScanUploadProgressAsync(
+    long chatId,
+    int? messageId,
+    int seq,
+    UploadProgress progress,
+    CancellationToken ct)
+{
+    long lastShown = -1;
+    while (true)
+    {
+        await Task.Delay(TimeSpan.FromSeconds(3), ct);
+
+        var sent = progress.Sent;
+        if (sent <= 0 || sent == lastShown) continue;
+        lastShown = sent;
+
+        var shown = Math.Min(sent, progress.Total);
+        await UpdateScanPlaceholderAsync(chatId, messageId,
+            $"📷 Scan #{seq}: uploading {HumanBytes(shown)} / {HumanBytes(progress.Total)}…",
+            ct);
+    }
+}
+
 async Task UpdateScanPlaceholderAsync(
     long chatId, int? messageId, string text, CancellationToken ct)
 {
@@ -2719,7 +2757,11 @@ static string HumanBytes(long bytes)
 // fail identically. Those propagate up to DeliverScanAsync's Tier B
 // catch and become a Tier C user-visible error.
 async Task SendOneWithRetryAsync(
-    long chatId, EncodedVariant v, string? caption, CancellationToken ct)
+    long chatId,
+    EncodedVariant v,
+    string? caption,
+    UploadProgress uploadProgress,
+    CancellationToken ct)
 {
     var isWebp = v.ContentType == "image/webp";
     v.Data.Position = 0;
@@ -2741,8 +2783,12 @@ async Task SendOneWithRetryAsync(
 
         try
         {
-            using var data = new MemoryStream(dataBytes, writable: false);
-            using var thumb = new MemoryStream(thumbBytes, writable: false);
+            using var data = new CountingReadStream(
+                new MemoryStream(dataBytes, writable: false),
+                uploadProgress.Add);
+            using var thumb = new CountingReadStream(
+                new MemoryStream(thumbBytes, writable: false),
+                uploadProgress.Add);
             await bot.SendDocument(chatId,
                 new InputFileStream(data, v.FileName),
                 caption: caption,
@@ -2901,4 +2947,85 @@ sealed class StatusUpdate
         🖨️ Printer: {FormatSlot(PrinterDone, Printer?.Online)}
         📷 Scanner: {FormatSlot(ScannerDone, Scanner?.Online)}
         """;
+}
+
+sealed class UploadProgress(long totalBytes)
+{
+    long sent;
+
+    public long Total { get; private set; } = totalBytes;
+
+    public long Sent => Interlocked.Read(ref sent);
+
+    public void Add(long bytes)
+    {
+        if (bytes <= 0) return;
+        Interlocked.Add(ref sent, bytes);
+    }
+
+    public void Reset(long totalBytes)
+    {
+        Total = totalBytes;
+        Interlocked.Exchange(ref sent, 0);
+    }
+}
+
+sealed class CountingReadStream(Stream inner, Action<long> onBytesRead) : Stream
+{
+    public override bool CanRead => inner.CanRead;
+    public override bool CanSeek => inner.CanSeek;
+    public override bool CanWrite => false;
+    public override long Length => inner.Length;
+    public override long Position
+    {
+        get => inner.Position;
+        set => inner.Position = value;
+    }
+
+    public override void Flush() => inner.Flush();
+
+    public override int Read(byte[] buffer, int offset, int count)
+    {
+        var read = inner.Read(buffer, offset, count);
+        onBytesRead(read);
+        return read;
+    }
+
+    public override int Read(Span<byte> buffer)
+    {
+        var read = inner.Read(buffer);
+        onBytesRead(read);
+        return read;
+    }
+
+    public override async ValueTask<int> ReadAsync(
+        Memory<byte> buffer, CancellationToken cancellationToken = default)
+    {
+        var read = await inner.ReadAsync(buffer, cancellationToken);
+        onBytesRead(read);
+        return read;
+    }
+
+    public override async Task<int> ReadAsync(
+        byte[] buffer, int offset, int count, CancellationToken cancellationToken)
+    {
+        var read = await inner.ReadAsync(buffer, offset, count, cancellationToken);
+        onBytesRead(read);
+        return read;
+    }
+
+    public override long Seek(long offset, SeekOrigin origin) =>
+        inner.Seek(offset, origin);
+
+    public override void SetLength(long value) =>
+        throw new NotSupportedException();
+
+    public override void Write(byte[] buffer, int offset, int count) =>
+        throw new NotSupportedException();
+
+    protected override void Dispose(bool disposing)
+    {
+        if (disposing) inner.Dispose();
+        base.Dispose(disposing);
+    }
 }

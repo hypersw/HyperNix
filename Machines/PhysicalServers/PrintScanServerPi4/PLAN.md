@@ -549,9 +549,12 @@ variant streams alive until the delivery pipeline's final cleanup.
 The scan delivery placeholder is stage-based rather than time-based: it moves
 through receiving the daemon TIFF, processing/encoding, uploading the number of
 selected output files plus their total byte size, and retrying per-file if the
-album path fails. Telegram.Bot does not expose meaningful byte-level upload
-progress through the high-level send APIs, so the bot reports stages and the
-known upload payload size instead of pretending to know remaining time.
+album path fails. Telegram.Bot does not expose an explicit upload-progress
+callback through the high-level send APIs, so the bot wraps the per-request
+upload streams and reports bytes consumed by HttpClient. This is client-side
+stream-read progress rather than Telegram-server acceptance, so HTTP buffering
+can make it lead the real network transfer, but it is still a useful liveness
+signal for large scan deliveries.
 
 **Media group delivery.** Telegram's `sendMediaGroup` is atomic — up to 10
 items per call, cannot edit to add more. Default UX: each scan streamed to
