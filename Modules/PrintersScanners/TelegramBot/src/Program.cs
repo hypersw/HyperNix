@@ -2431,17 +2431,13 @@ async Task RerenderAsync(string sessionId, CancellationToken ct,
 
 async Task DeliverScanAsync(string sessionId, int seq, BotSession bs, CancellationToken ct)
 {
-    // 0. Placeholder. WEBP encoding of a 600 DPI page on the Pi takes
-    //    ~100 s of CPU work before the upload even begins; without a
-    //    visible signal during that window the user is left wondering
-    //    whether anything is happening at all (the daemon already
-    //    posted "scan complete" but the document is nowhere to be
-    //    seen). Posting a "📷 Scan #N processing…" message gives
-    //    immediate feedback and acts as the hook we either delete
-    //    (on success) or edit into a failure notice (Tier C). Edit
-    //    is preferable to "delete + new send" because it preserves
-    //    the user's scroll position on long chats and keeps the
-    //    chat tidy.
+    // 0. Placeholder. Encoding and Telegram upload can be slow enough
+    //    that "scan complete" looks like a dead end. This message gives
+    //    immediate feedback and acts as the hook we either delete on
+    //    success, edit through coarse delivery stages, or turn into a
+    //    failure notice. Edit is preferable to "delete + new send"
+    //    because it preserves the user's scroll position on long chats
+    //    and keeps the chat tidy.
     //
     //    Telegram has no way to morph a text message into a document
     //    message (editMessageMedia replaces media on document
@@ -2451,7 +2447,7 @@ async Task DeliverScanAsync(string sessionId, int seq, BotSession bs, Cancellati
     try
     {
         var msg = await bot.SendMessage(bs.ChatId,
-            $"📷 Scan #{seq} processing… (encode + upload, ~2 min at 600 DPI)",
+            $"📷 Scan #{seq}: preparing delivery…",
             cancellationToken: ct);
         placeholderId = msg.Id;
     }
@@ -2466,6 +2462,9 @@ async Task DeliverScanAsync(string sessionId, int seq, BotSession bs, Cancellati
             sessionId, seq);
     }
 
+    await UpdateScanPlaceholderAsync(bs.ChatId, placeholderId,
+        $"📷 Scan #{seq}: receiving image from scanner…", ct);
+
     // 1. Fetch the raw TIFF from the daemon. The daemon keeps its
     //    copy until we DELETE (step 4) — the 10-min session-idle
     //    window is the TTL backstop if we never get there. That
@@ -2478,6 +2477,9 @@ async Task DeliverScanAsync(string sessionId, int seq, BotSession bs, Cancellati
     }
     tiffMs.Position = 0;
 
+    await UpdateScanPlaceholderAsync(bs.ChatId, placeholderId,
+        $"📷 Scan #{seq}: processing image…", ct);
+
     // 2. Decode once, encode each requested format, build per-variant
     //    overlay thumbnails. ImagePipeline owns the disposal contract:
     //    each EncodedVariant holds two streams; the using-scope below
@@ -2485,6 +2487,11 @@ async Task DeliverScanAsync(string sessionId, int seq, BotSession bs, Cancellati
     var variants = await pipeline.ProcessAsync(
         tiffMs, bs.Params.Dpi, seq, bs.Format, ct);
     var caption = $"📷 {bs.Params.Dpi} dpi · scan #{seq}";
+    var uploadBytes = variants.Sum(v => v.Data.Length);
+
+    await UpdateScanPlaceholderAsync(bs.ChatId, placeholderId,
+        $"📷 Scan #{seq}: uploading {variants.Count} file(s), {HumanBytes(uploadBytes)}…",
+        ct);
 
     // Two-tier delivery with a textual-error backstop:
     //
@@ -2565,6 +2572,8 @@ async Task DeliverScanAsync(string sessionId, int seq, BotSession bs, Cancellati
         log.LogWarning(exA,
             "scan {Session}#{Seq}: Tier A delivery failed, falling back to per-variant sends",
             sessionId, seq);
+        await UpdateScanPlaceholderAsync(bs.ChatId, placeholderId,
+            $"📷 Scan #{seq}: upload retrying one file at a time…", ct);
         try
         {
             // Tier B — per-variant sends. Use the same retry helper
@@ -2668,6 +2677,34 @@ async Task DeliverScanAsync(string sessionId, int seq, BotSession bs, Cancellati
     {
         foreach (var v in variants) v.Dispose();
     }
+}
+
+async Task UpdateScanPlaceholderAsync(
+    long chatId, int? messageId, string text, CancellationToken ct)
+{
+    if (messageId is not int mid) return;
+
+    try
+    {
+        await bot.EditMessageText(chatId, mid, text, cancellationToken: ct);
+    }
+    catch (Exception ex) when (
+        ex.Message.Contains("message is not modified", StringComparison.OrdinalIgnoreCase))
+    {
+    }
+    catch (Exception ex)
+    {
+        log.LogDebug("scan placeholder edit failed (cosmetic): {Err}", ex.Message);
+    }
+}
+
+static string HumanBytes(long bytes)
+{
+    const double KiB = 1024;
+    const double MiB = KiB * 1024;
+    if (bytes >= MiB) return $"{bytes / MiB:F1} MiB";
+    if (bytes >= KiB) return $"{bytes / KiB:F0} KiB";
+    return $"{bytes} B";
 }
 
 // Send one EncodedVariant as a SendDocument with up to 3 attempts on
