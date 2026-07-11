@@ -4,7 +4,11 @@ let
   switchCfg = cfg.SelfSwitch;
   rebuildCommand = "/run/current-system/sw/bin/systemctl start hypersw-container-rebuild.service";
   logCommand = "/run/current-system/sw/bin/journalctl -u hypersw-container-rebuild.service";
-  hasAutoRebuildOnPush = lib.hasAttrByPath [ "hypersw" "services" "auto-rebuild-on-push" "activationCommand" ] options;
+  hasAutoRebuildOnPush =
+    options ? hypersw
+    && options.hypersw ? services
+    && options.hypersw.services ? "auto-rebuild-on-push"
+    && options.hypersw.services."auto-rebuild-on-push" ? activationCommand;
 
   containerRebuild = pkgs.writeShellScriptBin "container-rebuild" ''
     set -euo pipefail
@@ -97,7 +101,7 @@ in
     ];
     }
 
-    (lib.mkIf hasAutoRebuildOnPush {
+    (lib.optionalAttrs hasAutoRebuildOnPush {
       hypersw.services.auto-rebuild-on-push.activationCommand =
         "${containerRebuild}/bin/container-rebuild ${lib.escapeShellArg switchCfg.DefaultMode}";
     })

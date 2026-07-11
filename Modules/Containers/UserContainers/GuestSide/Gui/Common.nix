@@ -14,7 +14,7 @@ in
       pkgs.libGL
       pkgs.mesa-demos
       pkgs.fontconfig
-      pkgs.xorg.xcbutilcursor
+      pkgs.libxcb-cursor
       pkgs.adwaita-icon-theme
       pkgs.hicolor-icon-theme
       pkgs.gnome-themes-extra

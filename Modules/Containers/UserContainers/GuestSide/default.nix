@@ -4,6 +4,7 @@ let
 in
 {
   imports = [
+    ../../../Git/SshAskpassCredentialHelper
     ./Base.nix
     ./SelfSwitch.nix
     ./Tpm.nix
