@@ -1,0 +1,107 @@
+{ config, lib, pkgs, ... }:
+let
+  cfg = config.hypersw.containers.UserContainers.Guest;
+  hasGui = cfg.Gui.Mode != "None";
+  pipeWireSocketName = "pipewire-0";
+  pulseBridgeSocketName = "pulse_native";
+  pulseRuntimeSocket = "pulse/native";
+in
+{
+  config = lib.mkIf (cfg.Enable && hasGui) {
+    environment.systemPackages = [
+      pkgs.mesa
+      pkgs.libGLU
+      pkgs.libGL
+      pkgs.mesa-demos
+      pkgs.fontconfig
+      pkgs.adwaita-icon-theme
+      pkgs.hicolor-icon-theme
+      pkgs.gnome-themes-extra
+      pkgs.gsettings-desktop-schemas
+    ] ++ lib.optionals cfg.Gui.Gpu [
+      pkgs.libva
+      pkgs.libva-utils
+    ] ++ lib.optionals cfg.Gui.Audio [
+      pkgs.alsa-plugins
+    ];
+
+    fonts = {
+      packages = cfg.Gui.FontPackages;
+      enableDefaultPackages = true;
+      fontDir.enable = true;
+      fontconfig.enable = true;
+    };
+
+    hardware.graphics.enable = lib.mkIf cfg.Gui.Gpu true;
+    programs.dconf.enable = true;
+    services.dbus.enable = true;
+    services.gnome.gnome-keyring.enable = true;
+
+    xdg.portal = {
+      enable = true;
+      extraPortals = [ pkgs.xdg-desktop-portal-gtk ];
+      config.common.default = [ "gtk" ];
+    };
+
+    security.pam.services = {
+      kwallet = {
+        name = "kwallet";
+        enableKwallet = true;
+      };
+      login.enableGnomeKeyring = true;
+    };
+
+    users = lib.mkIf (cfg.User != null) {
+      users."${cfg.User}".extraGroups = lib.optionals cfg.Gui.Gpu [ "video" "render" ];
+      groups = lib.mkIf cfg.Gui.Gpu {
+        video = {};
+        render = {};
+      };
+    };
+
+    systemd.user.services.gnome-keyring-unlock = {
+      description = "Start and unlock the empty-password gnome-keyring (secrets)";
+      wantedBy = [ "default.target" ];
+      after = [ "dbus.socket" ];
+      serviceConfig = {
+        Type = "oneshot";
+        RemainAfterExit = true;
+        ExecStart = pkgs.writeShellScript "gnome-keyring-unlock" ''
+          set -eu
+          /run/wrappers/bin/gnome-keyring-daemon --start --unlock --components=secrets </dev/null || true
+        '';
+      };
+    };
+
+    environment.sessionVariables = lib.mkIf cfg.Gui.Audio {
+      PULSE_SERVER = "unix:${cfg.HostBridgeDir}/${pulseBridgeSocketName}";
+    };
+
+    environment.etc."asound.conf".text = lib.mkIf cfg.Gui.Audio ''
+      pcm.default pulse
+      ctl.default pulse
+    '';
+
+    systemd.user.services.audio-socket-links = lib.mkIf cfg.Gui.Audio {
+      description = "Symlink host audio sockets into XDG_RUNTIME_DIR";
+      wantedBy = [ "default.target" ];
+      serviceConfig = {
+        Type = "oneshot";
+        RemainAfterExit = true;
+        ExecStart = pkgs.writeShellScript "audio-socket-links" ''
+          set -euo pipefail
+          RTDIR="/run/user/$(id -u)"
+          mkdir -p "$RTDIR/pulse"
+          # Host audio sockets are bind-mounted under ${cfg.HostBridgeDir} to keep
+          # host/container crossings visible. Many clients probe the conventional
+          # XDG_RUNTIME_DIR names directly, so create links there as compatibility
+          # shims while keeping the host bridge path stable and explicit.
+          [ ! -L "$RTDIR/${pipeWireSocketName}" ] && \
+            ln -s ${cfg.HostBridgeDir}/${pipeWireSocketName} "$RTDIR/${pipeWireSocketName}"
+          [ ! -L "$RTDIR/${pulseRuntimeSocket}" ] && \
+            ln -s ${cfg.HostBridgeDir}/${pulseBridgeSocketName} "$RTDIR/${pulseRuntimeSocket}"
+        '';
+      };
+    };
+  };
+}

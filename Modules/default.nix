@@ -48,6 +48,7 @@
     ./System/BootStabilityProbe
     ./System/Btm
     ./System/ZfsTpmUnlock
+    ./Containers/UserContainers
     ./Programs/LookingGlassClient
     ./Programs/RemminaAutograb
     # `Hardware/RaspberryPi5SdImage` is NOT in the bundle. It sets
