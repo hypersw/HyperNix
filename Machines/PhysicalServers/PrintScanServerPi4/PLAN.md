@@ -446,8 +446,15 @@ Exposes a local API consumed by bots, web UI, or any future client.
 - `POST /sessions` — open a scan session with DPI/format/chatId; returns session ID, or 409 if one is already open (takeover via `?takeover=true`)
 - `DELETE /sessions/{id}` — close a session explicitly
 - `GET /sessions/{id}` — inspect session state (params, scans-so-far, expires-at)
+- `PUT /sessions/{id}/owner-status-message` — move the bot-owned live status
+  message to a new Telegram message id. Used by the Telegram bot as a
+  self-conflict recovery/handoff path when the user runs `/scanner` while their
+  own session is already active.
 - `POST /sessions/{id}/scan` — ask for one scan now (not waiting for the button)
-- `GET /sessions/{id}/image/{seq}` — stream an already-captured image (octet-stream, chunked; bot uses this on restart-retry)
+- `GET /sessions/{id}/image/{seq}` — return an already-captured TIFF image.
+  The daemon writes a point-in-time byte snapshot to the response so later
+  daemon-side deletion/disposal of the retained scan cannot race the HTTP body
+  writer.
 - `GET /status` — printer/scanner instantaneous status
 - `GET /events` — SSE stream: `scanner.online`, `scanner.offline`, `scanner.button`, `session.opened`, `session.scanning`, `session.image-ready { sessionId, seq, bytes, contentType }`, `session.terminated { reason: timeout|takeover|closed, newOwner? }`, `session.extended`
 - `GET /jobs` — list recent print jobs (scan jobs are session-scoped now)
@@ -485,7 +492,13 @@ daemon events on startup.
 **Lifecycle:**
 - **Open** — bot `POST /sessions` with `params + chatId + statusMessageId`.
   Returns `409 Conflict` with the current session summary if one exists. Bot
-  shows user a confirmation; on confirm, bot retries with `?takeover=true`.
+  shows user a confirmation for someone else's session; on confirm, bot retries
+  with `?takeover=true`. If the conflict is the same chat/user's own session,
+  the bot treats the newly posted "Opening session..." placeholder as a fresh
+  live head: it calls `PUT /sessions/{id}/owner-status-message`, renders the
+  full session controls there, and edits the old head into a keyboard-less
+  "session continued below" stub. This is the recovery path for Telegram edit
+  loss on the original session-opening message.
 - **Takeover** — daemon waits for any `inFlightScan` on the existing session
   to complete delivery first (hard-cut is bad UX), then emits
   `session.terminated { reason: takeover, newOwner: … }`, creates the new
@@ -510,21 +523,28 @@ Hard-kill/power-loss loses the in-flight scan; bot shows
 
 **Dataflow (happy path):**
 ```
-scanimage stdout → daemon RecyclableMemoryStream → SSE chunked → bot
-   → bot writes /var/lib/printscan-bot/<session>/<seq>.<ext>
-   → bot.SendDocument(InputFileStream) → Telegram
-   → on 200 OK: delete staged file; emit bot-side log
+scanimage stdout → daemon RecyclableMemoryStream
+   → session.image-ready SSE
+   → bot GET /sessions/<id>/image/<seq> into MemoryStream
+   → bot decodes once, encodes selected variants in memory
+   → bot.SendDocument / SendMediaGroup → Telegram
+   → on 200 OK: bot DELETEs the daemon's retained TIFF
 ```
 
 The daemon end uses `Microsoft.IO.RecyclableMemoryStream` — chunked pool-backed,
-no LOH pressure, swap-friendly. The bot end stages to disk *before* attempting
-the TG upload so an upload failure (network, TG rate-limit, bot crash) leaves
-the scan recoverable.
+no LOH pressure, swap-friendly. The daemon retains the raw TIFF until the bot
+explicitly deletes it after successful Telegram delivery, or until session
+termination reaps leftovers. `GET /image` snapshots the retained stream to a
+byte array before writing the HTTP response; the response writer never borrows
+the retained stream object.
 
-**On bot startup**, scan directory is swept: any files still present are
-uncommitted uploads to retry. Small per-session metadata file (`manifest.json`)
-captures `seq → { chatId, filename, caption, contentType }` so retries don't
-need session-server coordination.
+The bot keeps encoded variants in memory. Telegram upload calls receive fresh
+`MemoryStream` clones for each album item, fallback send, and retry attempt.
+This is intentional: Telegram.Bot may dispose streams passed into multipart
+requests, and June 23 production logs showed Tier A album failure followed by
+Tier B fallback failing with `ObjectDisposedException` on the reused
+`scan-encoded` stream. The clone-per-attempt rule keeps the canonical encoded
+variant streams alive until the delivery pipeline's final cleanup.
 
 **Media group delivery.** Telegram's `sendMediaGroup` is atomic — up to 10
 items per call, cannot edit to add more. Default UX: each scan streamed to
@@ -942,6 +962,12 @@ nothing on the failure path.
   - Queued-ago decoration on delayed messages: `<i>⏱ queued Nm ago</i>`
     on a separate italicised line at the END of the message (not the
     start) so real-time siblings in the chat stay column-aligned.
+  - Running `/scanner` while your own scanner session is active now performs a
+    live-message handoff: a new session head is posted at the bottom of the
+    chat, the daemon's stored `OwnerStatusMessageId` moves to it, and the old
+    head is edited into a dummy "continued below" message. This makes the
+    command a failsafe when Telegram loses the initial edit from "Opening
+    session..." to the full control message.
 
 ### Implementation Order
 
@@ -1503,6 +1529,14 @@ Live in production code, working unless flagged otherwise:
 * **Daemon stub**: writes received bytes to
   `/var/lib/printscan-daemon/printed/<ts>-<filename>` for
   end-to-end inspection without paper.
+* **Scanner session handoff**: `/scanner` during your own active session moves
+  the live control message to the new placeholder and demotes the previous
+  head. This mirrors the print-session live-preview handoff pattern and gives
+  users a recovery route if a Telegram edit is dropped.
+* **Scan delivery stream ownership**: daemon image GETs write byte snapshots;
+  bot upload tiers clone encoded streams for each Telegram request. This fixes
+  the June 23 `ObjectDisposedException` path where album failure disposed a
+  `scan-encoded` stream before per-variant fallback reused it.
 
 ### Renderer toolchain (binaries it spawns)
 

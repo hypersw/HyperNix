@@ -256,6 +256,20 @@ app.MapPut("/sessions/{id}/metadata",
     }
 });
 
+app.MapPut("/sessions/{id}/owner-status-message",
+    (string id, OwnerStatusMessageUpdate update, SessionService svc) =>
+{
+    try
+    {
+        var updated = svc.UpdateOwnerStatusMessage(id, update.OwnerStatusMessageId);
+        return Results.Ok(updated);
+    }
+    catch (InvalidOperationException ex)
+    {
+        return Results.BadRequest(ex.Message);
+    }
+});
+
 app.MapDelete("/sessions/{id}", (string id, SessionService svc) =>
 {
     var ok = svc.Close(id, SessionTerminationReason.Closed);
@@ -290,10 +304,10 @@ app.MapPost("/sessions/{id}/scan", async (string id, SessionService svc, Cancell
 app.MapGet("/sessions/{id}/image/{seq:int}",
     async (string id, int seq, SessionService svc, HttpResponse response, CancellationToken ct) =>
 {
-    var tiff = svc.GetScan(id, seq);
+    var tiff = svc.GetScanSnapshot(id, seq);
     if (tiff is null) return Results.NotFound();
     response.ContentType = "image/tiff";
-    await tiff.CopyToAsync(response.Body, ct);
+    await response.Body.WriteAsync(tiff, ct);
     return Results.Empty;
 });
 
