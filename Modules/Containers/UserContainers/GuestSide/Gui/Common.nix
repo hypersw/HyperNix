@@ -14,6 +14,7 @@ in
       pkgs.libGL
       pkgs.mesa-demos
       pkgs.fontconfig
+      pkgs.xorg.xcbutilcursor
       pkgs.adwaita-icon-theme
       pkgs.hicolor-icon-theme
       pkgs.gnome-themes-extra
@@ -23,6 +24,7 @@ in
       pkgs.libva-utils
     ] ++ lib.optionals cfg.Gui.Audio [
       pkgs.alsa-plugins
+      pkgs.pipewire
     ];
 
     fonts = {
