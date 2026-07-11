@@ -56,6 +56,8 @@ let
   instanceDefaults = name: {
     Enable = false;
     User = name;
+    UserUid = null;
+    HostWaylandSocketAccessUid = null;
     StateVersion = null;
     AutoStart = false;
     BuildMode = "HostEvaluated";
@@ -143,6 +145,12 @@ let
               assertion = !(decl.Copybox.Enable) || decl.Copybox.HostPath != null;
               message = "Managed container ${name} has Copybox.Enable, but Copybox.HostPath is not set by the machine config.";
             }
+            {
+              assertion =
+                !(decl.Gui.Mode == "SharedWayland" || decl.Gui.Mode == "IsolatedWayland")
+                || decl.HostWaylandSocketAccessUid != null;
+              message = "Managed Wayland container ${name} requires HostWaylandSocketAccessUid, the host-visible UID allowed to connect to the host compositor socket.";
+            }
           ])
           enabledDeclarations
       );
@@ -190,6 +198,12 @@ let
       hasGui = decl.Gui.Mode != "None";
       needsX11 = decl.Gui.Mode == "SharedX11";
       needsHostWayland = decl.Gui.Mode == "SharedWayland" || decl.Gui.Mode == "IsolatedWayland";
+      hostWaylandSocket = "${hostGraphicalUser.RuntimeDir}/${hostGraphicalUser.WaylandDisplay}";
+      waylandAclUnit = "hypersw-managed-container-wayland-acl-${name}";
+      waylandSocketAccessUid =
+        if decl.HostWaylandSocketAccessUid != null
+        then decl.HostWaylandSocketAccessUid
+        else 0;
       containerPath =
         if decl.Path != null
         then decl.Path
@@ -214,6 +228,7 @@ let
               Enable = true;
               Name = name;
               User = decl.User;
+              UserUid = decl.UserUid;
               HostBridgeDir = containerBindMountDir;
               StateVersion = decl.StateVersion;
               Gui.Mode = decl.Gui.Mode;
@@ -307,6 +322,43 @@ let
       # Applies to this container's host systemd unit only.
       (lib.mkIf (serviceConfig != {}) {
         systemd.services.${unitName name}.serviceConfig = serviceConfig;
+      })
+
+      # Applies to Wayland-backed GUI containers. The host compositor socket is
+      # owned by the host graphical user; grant only this container's declared
+      # host-visible UID access to that one socket instead of making guest and
+      # host user identities identical.
+      (lib.mkIf needsHostWayland {
+        systemd.paths.${waylandAclUnit} = {
+          description = "Watch host Wayland socket ACL for managed container ${name}";
+          wantedBy = [ "multi-user.target" ];
+          pathConfig = {
+            PathExists = hostWaylandSocket;
+            PathChanged = hostWaylandSocket;
+          };
+        };
+
+        systemd.services.${waylandAclUnit} = {
+          description = "Allow managed container ${name} to connect to the host Wayland socket";
+          serviceConfig.Type = "oneshot";
+          path = [ pkgs.acl pkgs.coreutils ];
+          script = ''
+            set -euo pipefail
+
+            socket=${lib.escapeShellArg hostWaylandSocket}
+            if [ ! -S "$socket" ]; then
+              echo "Host Wayland socket for ${name} is not present yet: $socket" >&2
+              exit 0
+            fi
+
+            setfacl -m u:${toString waylandSocketAccessUid}:rw "$socket"
+          '';
+        };
+
+        systemd.services.${unitName name} = {
+          requires = [ "${waylandAclUnit}.service" ];
+          after = [ "${waylandAclUnit}.service" ];
+        };
       })
 
       # Applies to FlakePath managed containers. `container-rebuild boot` in the

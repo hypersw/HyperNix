@@ -25,6 +25,15 @@ in
       type = lib.types.nullOr lib.types.str;
       default = null;
     };
+    UserUid = lib.mkOption {
+      type = lib.types.nullOr lib.types.int;
+      default = null;
+      description = ''
+        Optional numeric UID for the primary guest user. This is kept
+        independent from the host graphical user, but HostSide may need
+        the host-visible value to grant ACL access to selected sockets.
+      '';
+    };
     HostBridgeDir = lib.mkOption {
       type = lib.types.str;
       default = "/run/ContainerBindMounts";

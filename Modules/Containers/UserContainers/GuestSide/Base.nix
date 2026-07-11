@@ -49,6 +49,7 @@ in
       "${cfg.User}" = {
         isNormalUser = true;
         description = cfg.User;
+        uid = lib.mkIf (cfg.UserUid != null) cfg.UserUid;
       };
     };
   };
