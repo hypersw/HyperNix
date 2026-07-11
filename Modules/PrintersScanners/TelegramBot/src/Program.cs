@@ -382,10 +382,11 @@ async Task HandleCallbackAsync(string userName, CallbackQuery cb, CancellationTo
         return;
     }
 
-    // Format: pick:<fmt|dpi>:<sessionId>  — open a picker view
-    //         set:<fmt|dpi>:<sessionId>:<value>  — apply change + back to main
+    // Format: pick:<fmt|dpi|cont>:<sessionId>  — open a picker view
+    //         set:<fmt|dpi|contdelay>:<sessionId>:<value>  — apply change + back to main
     //         cancel:<sessionId>  — back to main (abandon picker)
-    //         scan:<sessionId>  — trigger a scan
+    //         scan:<sessionId>  — trigger a scan / start continuous loop
+    //         stop:<sessionId>  — stop continuous loop
     //         end:<sessionId>  — close the session
     //         takeover:yes|no  — response to takeover confirmation
     if (data.StartsWith("pick:"))
@@ -398,6 +399,7 @@ async Task HandleCallbackAsync(string userName, CallbackQuery cb, CancellationTo
         {
             "fmt" => PickerView.Format,
             "dpi" => PickerView.Dpi,
+            "cont" => PickerView.Continuous,
             _     => PickerView.Main,
         };
         await RerenderAsync(sid, ct, view);
@@ -406,8 +408,10 @@ async Task HandleCallbackAsync(string userName, CallbackQuery cb, CancellationTo
     {
         // set:fmt:<sid>:jpeg        (legacy, used by dpi)
         // set:dpi:<sid>:300
+        // set:contdelay:<sid>:10
         // toggle:fmt:<sid>:jpeg     (checkbox — XORs the bit; refuses to
         //                            unset the last set bit)
+        // toggle:cont:<sid>:enabled (continuous scan on/off checkbox)
         var parts = data.Split(':');
         if (parts.Length != 4) return;
         var verb = parts[0];
@@ -476,6 +480,31 @@ async Task HandleCallbackAsync(string userName, CallbackQuery cb, CancellationTo
             }
             await RerenderAsync(sid, ct, PickerView.Main);
         }
+        else if (verb == "toggle" && what == "cont" && value == "enabled")
+        {
+            bool enabled;
+            lock (sessionsLock)
+            {
+                if (!sessions.TryGetValue(sid, out var bs)) return;
+                bs.ContinuousEnabled = !bs.ContinuousEnabled;
+                enabled = bs.ContinuousEnabled;
+                if (!enabled) StopContinuousScanLocked(bs);
+            }
+            await PersistContinuousSettingsAsync(sid, ct);
+            await RerenderAsync(sid, ct, PickerView.Continuous);
+        }
+        else if (verb == "set" && what == "contdelay" &&
+                 int.TryParse(value, out var delay) &&
+                 StatusMessage.ContinuousDelays.Contains(delay))
+        {
+            lock (sessionsLock)
+            {
+                if (sessions.TryGetValue(sid, out var bs))
+                    bs.ContinuousDelaySeconds = delay;
+            }
+            await PersistContinuousSettingsAsync(sid, ct);
+            await RerenderAsync(sid, ct, PickerView.Continuous);
+        }
         else
         {
             await RerenderAsync(sid, ct, PickerView.Main);
@@ -489,14 +518,28 @@ async Task HandleCallbackAsync(string userName, CallbackQuery cb, CancellationTo
     else if (data.StartsWith("scan:"))
     {
         var sid = data["scan:".Length..];
-        try
+        BotSession? s;
+        lock (sessionsLock) { sessions.TryGetValue(sid, out s); }
+        if (s?.ContinuousEnabled == true)
         {
-            await daemon.RequestScanAsync(sid, ct);
+            await StartContinuousScanAsync(sid, ct);
         }
-        catch (Exception ex)
+        else
         {
-            await bot.SendMessage(chatId, $"❌ {ex.Message}", cancellationToken: ct);
+            try
+            {
+                await daemon.RequestScanAsync(sid, ct);
+            }
+            catch (Exception ex)
+            {
+                await bot.SendMessage(chatId, $"❌ {ex.Message}", cancellationToken: ct);
+            }
         }
+    }
+    else if (data.StartsWith("stop:"))
+    {
+        var sid = data["stop:".Length..];
+        await StopContinuousScanAsync(sid, ct);
     }
     else if (data.StartsWith("end:"))
     {
@@ -540,7 +583,13 @@ async Task OpenScannerSessionAsync(
         OwnerStatusMessageId: msgId,
         OwnerDisplayName: "@" + userName,
         Params: StatusMessage.DefaultParams(),
-        Metadata: new() { [MetadataKeys.Format] = ((int)StatusMessage.DefaultFormat).ToString() });
+        Metadata: new()
+        {
+            [MetadataKeys.Format] = ((int)StatusMessage.DefaultFormat).ToString(),
+            [MetadataKeys.ContinuousEnabled] = "false",
+            [MetadataKeys.ContinuousDelaySeconds] =
+                StatusMessage.DefaultContinuousDelaySeconds.ToString(),
+        });
 
     DaemonClient.OpenResult outcome;
     SessionRecord? session;
@@ -599,6 +648,8 @@ async Task OpenScannerSessionAsync(
             StatusMessageId = msgId,
             Params = session.Params,
             Format = ParseFormatFromMetadata(session.Metadata),
+            ContinuousEnabled = ParseContinuousEnabledFromMetadata(session.Metadata),
+            ContinuousDelaySeconds = ParseContinuousDelayFromMetadata(session.Metadata),
             ExpiresAt = session.ExpiresAt,
             ScanCount = session.ScanCount,
         };
@@ -627,6 +678,8 @@ async Task HandoverScannerSessionAsync(
                 StatusMessageId = moved.OwnerStatusMessageId,
                 Params = moved.Params,
                 Format = ParseFormatFromMetadata(moved.Metadata),
+                ContinuousEnabled = ParseContinuousEnabledFromMetadata(moved.Metadata),
+                ContinuousDelaySeconds = ParseContinuousDelayFromMetadata(moved.Metadata),
                 ExpiresAt = moved.ExpiresAt,
                 ScanCount = moved.ScanCount,
                 Scanning = moved.InFlightScan,
@@ -777,6 +830,207 @@ static ScanFormat ParseFormatFromMetadata(Dictionary<string, string>? meta)
     if (int.TryParse(s, out var n) && Enum.IsDefined(typeof(ScanFormat), n))
         return (ScanFormat)n;
     return StatusMessage.DefaultFormat;
+}
+
+static bool ParseContinuousEnabledFromMetadata(Dictionary<string, string>? meta) =>
+    meta is not null &&
+    meta.TryGetValue(MetadataKeys.ContinuousEnabled, out var s) &&
+    bool.TryParse(s, out var enabled) &&
+    enabled;
+
+static int ParseContinuousDelayFromMetadata(Dictionary<string, string>? meta)
+{
+    if (meta is not null &&
+        meta.TryGetValue(MetadataKeys.ContinuousDelaySeconds, out var s) &&
+        int.TryParse(s, out var delay) &&
+        StatusMessage.ContinuousDelays.Contains(delay))
+        return delay;
+    return StatusMessage.DefaultContinuousDelaySeconds;
+}
+
+async Task PersistContinuousSettingsAsync(string sessionId, CancellationToken ct)
+{
+    bool enabled;
+    int delay;
+    lock (sessionsLock)
+    {
+        if (!sessions.TryGetValue(sessionId, out var s)) return;
+        enabled = s.ContinuousEnabled;
+        delay = s.ContinuousDelaySeconds;
+    }
+
+    try
+    {
+        await daemon.PutMetadataAsync(sessionId, new()
+        {
+            [MetadataKeys.ContinuousEnabled] = enabled.ToString().ToLowerInvariant(),
+            [MetadataKeys.ContinuousDelaySeconds] = delay.ToString(),
+        }, ct);
+    }
+    catch (Exception ex)
+    {
+        log.LogWarning("PUT continuous metadata failed: {Err}", ex.Message);
+    }
+}
+
+async Task StartContinuousScanAsync(string sessionId, CancellationToken ct)
+{
+    BotSession? snapshot;
+    CancellationToken loopToken;
+    bool requestNow;
+    lock (sessionsLock)
+    {
+        if (!sessions.TryGetValue(sessionId, out var s)) return;
+        if (!s.ContinuousEnabled) s.ContinuousEnabled = true;
+        if (s.ContinuousActive && (s.Scanning || s.ContinuousWaiting)) return;
+
+        s.ContinuousCts?.Cancel();
+        s.ContinuousCts = CancellationTokenSource.CreateLinkedTokenSource(appCts.Token);
+        s.ContinuousActive = true;
+        s.ContinuousWaiting = false;
+        s.ContinuousNextScanAt = null;
+        s.View = PickerView.Main;
+        snapshot = s;
+        loopToken = s.ContinuousCts.Token;
+        requestNow = !s.Scanning;
+    }
+
+    await PersistContinuousSettingsAsync(sessionId, ct);
+    await RerenderAsync(sessionId, ct);
+    if (requestNow)
+        await RequestContinuousScanAsync(sessionId, snapshot.ChatId, loopToken);
+}
+
+async Task StopContinuousScanAsync(string sessionId, CancellationToken ct)
+{
+    lock (sessionsLock)
+    {
+        if (sessions.TryGetValue(sessionId, out var s))
+            StopContinuousScanLocked(s);
+    }
+    await RerenderAsync(sessionId, ct);
+}
+
+static void StopContinuousScanLocked(BotSession s)
+{
+    s.ContinuousCts?.Cancel();
+    s.ContinuousCts = null;
+    s.ContinuousActive = false;
+    s.ContinuousWaiting = false;
+    s.ContinuousNextScanAt = null;
+}
+
+void ScheduleNextContinuousScan(string sessionId)
+{
+    BotSession? snapshot;
+    CancellationToken token;
+    lock (sessionsLock)
+    {
+        if (!sessions.TryGetValue(sessionId, out var s) ||
+            !s.ContinuousActive ||
+            !s.ContinuousEnabled ||
+            s.Scanning ||
+            s.QueuedScans > 0)
+            return;
+
+        s.ContinuousWaiting = true;
+        s.ContinuousNextScanAt =
+            DateTimeOffset.UtcNow.AddSeconds(s.ContinuousDelaySeconds);
+        snapshot = s;
+        token = s.ContinuousCts?.Token ?? appCts.Token;
+    }
+
+    _ = Task.Run(() => ContinuousWaitThenScanAsync(
+        sessionId, snapshot.ChatId, snapshot.ContinuousDelaySeconds, token));
+}
+
+async Task ContinuousWaitThenScanAsync(
+    string sessionId, long chatId, int delaySeconds, CancellationToken ct)
+{
+    try
+    {
+        if (delaySeconds == 0)
+        {
+            // Let the daemon's just-finished scan loop fully unwind before
+            // posting a new /scan. User-visible delay is still "0s".
+            await Task.Delay(TimeSpan.FromMilliseconds(250), ct);
+        }
+        else
+        {
+            while (true)
+            {
+                DateTimeOffset? nextAt;
+                lock (sessionsLock)
+                {
+                    if (!sessions.TryGetValue(sessionId, out var s) ||
+                        !s.ContinuousActive ||
+                        !s.ContinuousWaiting)
+                        return;
+                    nextAt = s.ContinuousNextScanAt;
+                }
+
+                var remaining = nextAt is { } at
+                    ? at - DateTimeOffset.UtcNow
+                    : TimeSpan.Zero;
+                if (remaining <= TimeSpan.Zero) break;
+
+                await RerenderAsync(sessionId, ct);
+                await Task.Delay(
+                    remaining > TimeSpan.FromSeconds(1)
+                        ? TimeSpan.FromSeconds(1)
+                        : remaining,
+                    ct);
+            }
+        }
+
+        lock (sessionsLock)
+        {
+            if (!sessions.TryGetValue(sessionId, out var s) ||
+                !s.ContinuousActive ||
+                s.Scanning ||
+                s.QueuedScans > 0)
+                return;
+            s.ContinuousWaiting = false;
+            s.ContinuousNextScanAt = null;
+            s.ScanProgress = 0;
+        }
+        await RerenderAsync(sessionId, ct);
+        await RequestContinuousScanAsync(sessionId, chatId, ct);
+    }
+    catch (OperationCanceledException)
+    {
+    }
+}
+
+async Task RequestContinuousScanAsync(
+    string sessionId, long chatId, CancellationToken ct)
+{
+    try
+    {
+        await daemon.RequestScanAsync(sessionId, ct);
+    }
+    catch (OperationCanceledException) when (ct.IsCancellationRequested)
+    {
+    }
+    catch (Exception ex)
+    {
+        lock (sessionsLock)
+        {
+            if (sessions.TryGetValue(sessionId, out var s))
+                StopContinuousScanLocked(s);
+        }
+        try
+        {
+            await bot.SendMessage(chatId,
+                $"❌ Continuous scan stopped: {ex.Message}",
+                cancellationToken: appCts.Token);
+        }
+        catch (Exception sendEx)
+        {
+            log.LogDebug("continuous scan stop notice failed: {Err}", sendEx.Message);
+        }
+        try { await RerenderAsync(sessionId, appCts.Token); } catch { }
+    }
 }
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -2323,6 +2577,8 @@ async Task HandleEventAsync(SessionEvent ev, CancellationToken ct)
                         StatusMessageId = s.OwnerStatusMessageId,
                         Params = s.Params,
                         Format = ParseFormatFromMetadata(s.Metadata),
+                        ContinuousEnabled = ParseContinuousEnabledFromMetadata(s.Metadata),
+                        ContinuousDelaySeconds = ParseContinuousDelayFromMetadata(s.Metadata),
                         ExpiresAt = s.ExpiresAt,
                         ScanCount = s.ScanCount,
                     };
@@ -2365,6 +2621,8 @@ async Task HandleEventAsync(SessionEvent ev, CancellationToken ct)
                 {
                     bs.Scanning = true;
                     bs.ScanProgress = 0;
+                    bs.ContinuousWaiting = false;
+                    bs.ContinuousNextScanAt = null;
                     // QueuedCount (if present) = scans queued BEHIND the
                     // scan that's just starting. Sync from daemon truth;
                     // fall back to 0 on older daemons that don't emit it.
@@ -2433,6 +2691,7 @@ async Task HandleEventAsync(SessionEvent ev, CancellationToken ct)
                 }
             }
             await RerenderAsync(ev.SessionId, ct);
+            ScheduleNextContinuousScan(ev.SessionId);
             break;
         }
         case SessionEventType.SessionScanFailed when ev.SessionId is not null:
@@ -2442,6 +2701,7 @@ async Task HandleEventAsync(SessionEvent ev, CancellationToken ct)
                 if (sessions.TryGetValue(ev.SessionId, out var bs))
                 {
                     bs.Scanning = false;
+                    StopContinuousScanLocked(bs);
                 }
             }
             if (sessions.TryGetValue(ev.SessionId, out var s0))
@@ -2495,6 +2755,7 @@ async Task HandleEventAsync(SessionEvent ev, CancellationToken ct)
             lock (sessionsLock)
             {
                 sessions.TryGetValue(ev.SessionId, out s);
+                if (s is not null) StopContinuousScanLocked(s);
                 sessions.Remove(ev.SessionId);
             }
             if (s is not null)

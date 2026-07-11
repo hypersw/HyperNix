@@ -31,6 +31,8 @@ public enum ScanFormat
 public static class MetadataKeys
 {
     public const string Format = "tg.format";
+    public const string ContinuousEnabled = "tg.continuous.enabled";
+    public const string ContinuousDelaySeconds = "tg.continuous.delaySeconds";
 }
 
 /// <summary>
@@ -63,6 +65,12 @@ public sealed class BotSession
     // scan starts. Drives the "+N queued" badge on the Scan button.
     public int QueuedScans { get; set; }
     public int LastUploadedSeq { get; set; }
+    public bool ContinuousEnabled { get; set; }
+    public int ContinuousDelaySeconds { get; set; } = StatusMessage.DefaultContinuousDelaySeconds;
+    public bool ContinuousActive { get; set; }
+    public bool ContinuousWaiting { get; set; }
+    public DateTimeOffset? ContinuousNextScanAt { get; set; }
+    public CancellationTokenSource? ContinuousCts { get; set; }
 }
 
 /// <summary>
@@ -75,13 +83,16 @@ public enum PickerView
     Main,       // [Fmt] [DPI] / [Scan] / [End]
     Format,     // JPG / PNG / TIFF / [back]
     Dpi,        // 100 / 200 / 300 / 600 / 1200 / [back]
+    Continuous, // on/off + delay picker
 }
 
 public static class StatusMessage
 {
     public static readonly int[] NativeDpis = [100, 200, 300, 600, 1200];
+    public static readonly int[] ContinuousDelays = [0, 5, 10, 15, 30];
     public const int DefaultDpi = 200;
     public const ScanFormat DefaultFormat = ScanFormat.Jpeg;
+    public const int DefaultContinuousDelaySeconds = 5;
 
     public static ScanParams DefaultParams() => new(Dpi: DefaultDpi);
 
@@ -93,6 +104,7 @@ public static class StatusMessage
         {
             PickerView.Format => RenderFormatPicker(s),
             PickerView.Dpi    => RenderDpiPicker(s),
+            PickerView.Continuous => RenderContinuousPicker(s),
             _                 => RenderMain(s),
         };
         return (html, keyboard);
@@ -134,12 +146,26 @@ public static class StatusMessage
         // and deletes the user's /start message to keep the chat clean.
         // Keeps the Scan button big and alone on its row.
         var endLink = $"<a href=\"https://t.me/{botUsername}?start=end_{s.DaemonSessionId}\">end</a>";
+        var continuousLine = RenderContinuousLine(s);
 
         return $"""
             📷 <b>Scanner session</b> · {mins} min left · {endLink}
             {scannerLine}
+            {continuousLine}
             📑 Scans delivered: <b>{s.ScanCount}</b>
             """;
+    }
+
+    private static string RenderContinuousLine(BotSession s)
+    {
+        if (!s.ContinuousActive) return $"🔁 Continuous: {(s.ContinuousEnabled ? $"ready · {DelayLabel(s.ContinuousDelaySeconds)} delay" : "off")}";
+        if (s.ContinuousWaiting && s.ContinuousNextScanAt is { } nextAt)
+        {
+            var remaining = Math.Max(0,
+                (int)Math.Ceiling((nextAt - DateTimeOffset.UtcNow).TotalSeconds));
+            return $"🔁 Continuous: waiting · next scan in <b>{remaining}s</b>";
+        }
+        return "🔁 Continuous: <b>running</b>";
     }
 
     // ─── Keyboards ─────────────────────────────────────────────────────────
@@ -166,6 +192,12 @@ public static class StatusMessage
             InlineKeyboardButton.WithCallbackData($"📄 Format: {fmt}",              $"pick:fmt:{sid}"),
             InlineKeyboardButton.WithCallbackData($"📏 Resolution: {s.Params.Dpi} dpi", $"pick:dpi:{sid}"),
         });
+        rows.Add(new[]
+        {
+            InlineKeyboardButton.WithCallbackData(
+                $"🔁 Continuous: {(s.ContinuousEnabled ? DelayLabel(s.ContinuousDelaySeconds) : "off")}",
+                $"pick:cont:{sid}"),
+        });
         // Row 2: primary-action button. Always present, always using
         // the "scan:{sid}" callback — daemon handles start-vs-enqueue
         // based on its own state. Label encodes current state:
@@ -177,9 +209,13 @@ public static class StatusMessage
         // was accepted. Queue caps at 1 server-side; extra taps are
         // silently ignored.
         string scanLabel;
-        if (!s.Scanning)
+        if (s.ContinuousActive)
         {
-            scanLabel = "📷 SCAN NOW!";
+            scanLabel = ContinuousStatusLabel(s);
+        }
+        else if (!s.Scanning)
+        {
+            scanLabel = s.ContinuousEnabled ? "🔁 START LOOP" : "📷 SCAN NOW!";
         }
         else
         {
@@ -187,7 +223,26 @@ public static class StatusMessage
             scanLabel = s.QueuedScans > 0 ? $"{bar} +{s.QueuedScans}" : bar;
         }
         rows.Add(new[] { InlineKeyboardButton.WithCallbackData(scanLabel, $"scan:{sid}") });
+        if (s.ContinuousActive)
+            rows.Add(new[] { InlineKeyboardButton.WithCallbackData("⏹ STOP LOOP", $"stop:{sid}") });
         return new InlineKeyboardMarkup(rows);
+    }
+
+    private static string ContinuousStatusLabel(BotSession s)
+    {
+        if (s.Scanning)
+            return $"🔁 {BotUiBits.ProgressBar(s.ScanProgress)} {s.ScanProgress}%";
+        if (s.ContinuousWaiting && s.ContinuousNextScanAt is { } nextAt)
+        {
+            var remaining = Math.Max(0,
+                (int)Math.Ceiling((nextAt - DateTimeOffset.UtcNow).TotalSeconds));
+            var total = Math.Max(1, s.ContinuousDelaySeconds);
+            var pctRemaining = s.ContinuousDelaySeconds == 0
+                ? 0
+                : Math.Clamp((int)Math.Ceiling(remaining * 100.0 / total), 0, 100);
+            return $"⏳ {BotUiBits.ProgressBar(pctRemaining)} {remaining}s";
+        }
+        return "🔁 LOOP RUNNING";
     }
 
     // Radio-button emojis for current-selection indication in the
@@ -246,4 +301,25 @@ public static class StatusMessage
             new[] { InlineKeyboardButton.WithCallbackData("↩ back", $"cancel:{sid}") },
         });
     }
+
+    private static InlineKeyboardMarkup RenderContinuousPicker(BotSession s)
+    {
+        var sid = s.DaemonSessionId;
+        string enabled = s.ContinuousEnabled ? $"{CheckedMark}On" : $"{UncheckedMark}Off";
+        string delay(int sec) =>
+            sec == s.ContinuousDelaySeconds
+                ? $"{SelectedMark}{DelayLabel(sec)}"
+                : $"{UnselectedMark}{DelayLabel(sec)}";
+
+        return new InlineKeyboardMarkup(new[]
+        {
+            new[] { InlineKeyboardButton.WithCallbackData(enabled, $"toggle:cont:{sid}:enabled") },
+            ContinuousDelays.Select(sec =>
+                InlineKeyboardButton.WithCallbackData(delay(sec), $"set:contdelay:{sid}:{sec}")).ToArray(),
+            new[] { InlineKeyboardButton.WithCallbackData("↩ back", $"cancel:{sid}") },
+        });
+    }
+
+    private static string DelayLabel(int seconds) =>
+        seconds == 0 ? "0s" : $"{seconds}s";
 }

@@ -514,6 +514,13 @@ daemon events on startup.
   `sessions.json`, re-emits current `session.opened` state on first SSE
   subscription, bot-side status messages still work because `chatId +
   messageId` live in Telegram forever.
+- **Continuous scan mode** — Telegram bot persists the user's on/off choice
+  and delay (`0/5/10/15/30s`) in session metadata. The active loop itself is
+  bot runtime state: pressing Start Loop requests one scan, then each
+  `session.image-ready` event schedules the next scan after the configured
+  delay. `image-ready` is deliberately the handoff point because the daemon has
+  already marked the scanner idle there; image encode/upload continues in the
+  bot worker and does not block the next physical scan.
 
 **In-flight scans do not survive daemon restart** — they're active process
 state, not persisted. If the daemon is SIGTERMed mid-scan the shutdown
@@ -1550,6 +1557,10 @@ Live in production code, working unless flagged otherwise:
 * **Active-session pin invariant**: bot-owned print/scanner live heads are
   pinned while active and unpinned when closed, timed out, taken over, or
   demoted by a handoff. `/status` also reconciles known bot-owned pins.
+* **Continuous scan mode**: scanner session has a Continuous picker with on/off
+  checkbox and delay radio buttons (`0/5/10/15/30s`). When enabled, the main
+  button starts a loop; the session message shows scan progress, wait countdown
+  progress, and a full-row Stop Loop button.
 * **Scan delivery stream ownership**: daemon image GETs write byte snapshots;
   bot upload tiers clone encoded streams for each Telegram request. This fixes
   the June 23 `ObjectDisposedException` path where album failure disposed a
