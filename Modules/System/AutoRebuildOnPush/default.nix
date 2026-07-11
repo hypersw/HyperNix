@@ -125,15 +125,21 @@ let
     ${pkgs.coreutils}/bin/mktemp -p ${triggerDir} trigger.XXXXXX > /dev/null
   '';
 
+  activationCommand =
+    if cfg.activationCommand != null then
+      cfg.activationCommand
+    else
+      "${config.system.build.nixos-rebuild}/bin/nixos-rebuild ${cfg.activationMode} --flake ${cfg.flakeDir}#${cfg.configName}";
+
   switchScript = pkgs.writeShellScript "auto-rebuild-switch" ''
     set -euo pipefail
     # Update the lock for the watched input, then activate. Both steps run
-    # as root (nixos-rebuild switch requires it), but the service takes no
+    # as root (NixOS activation requires it), but the service takes no
     # parameters — its entire behavior is determined by the flake.nix at
     # ${cfg.flakeDir}, which only root can modify. A compromised checker
     # cannot alter what this does beyond "run it now".
     ${pkgs.nix}/bin/nix flake update ${cfg.inputName} --flake ${cfg.flakeDir}
-    ${config.system.build.nixos-rebuild}/bin/nixos-rebuild switch --flake ${cfg.flakeDir}#${cfg.configName}
+    ${activationCommand}
   '';
 in
 {
@@ -162,6 +168,32 @@ in
       type = lib.types.str;
       default = "upstream";
       description = "Name of the flake input to watch for changes";
+    };
+
+    activationMode = lib.mkOption {
+      type = lib.types.enum [ "switch" "test" "boot" ];
+      default = "switch";
+      description = ''
+        NixOS rebuild action used when activationCommand is null.
+        Hosts generally use switch or boot; managed containers can
+        override activationCommand to route boot/test/switch through
+        their container-specific lifecycle wrapper while reusing this
+        module's checker and trigger machinery.
+      '';
+    };
+
+    activationCommand = lib.mkOption {
+      type = lib.types.nullOr lib.types.str;
+      default = null;
+      description = ''
+        Explicit root command to run after updating the watched flake
+        input. When null, the module runs nixos-rebuild
+        activationMode against flakeDir#configName. This hook exists
+        for environments whose activation is not ordinary host
+        nixos-rebuild, such as managed containers where "boot" means
+        "build a guest system and ask the host to use that path next
+        time the container starts".
+      '';
     };
   };
 
