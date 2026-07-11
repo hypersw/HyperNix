@@ -79,10 +79,12 @@ in
       PULSE_SERVER = "unix:${cfg.HostBridgeDir}/${pulseBridgeSocketName}";
     };
 
-    environment.etc."asound.conf".text = lib.mkIf cfg.Gui.Audio ''
-      pcm.default pulse
-      ctl.default pulse
-    '';
+    environment.etc = lib.optionalAttrs cfg.Gui.Audio {
+      "asound.conf".text = ''
+        pcm.default pulse
+        ctl.default pulse
+      '';
+    };
 
     systemd.user.services.audio-socket-links = lib.mkIf cfg.Gui.Audio {
       description = "Symlink host audio sockets into XDG_RUNTIME_DIR";
