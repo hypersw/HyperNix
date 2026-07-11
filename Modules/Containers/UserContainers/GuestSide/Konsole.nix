@@ -25,6 +25,8 @@ in
     systemd.user.services.auto-konsole = {
       description = "Start Konsole on user login";
       wantedBy = [ "default.target" ];
+      wants = lib.optionals (cfg.Gui.Mode == "IsolatedWayland") [ "nested-wayland-compositor.service" ];
+      after = lib.optionals (cfg.Gui.Mode == "IsolatedWayland") [ "nested-wayland-compositor.service" ];
       serviceConfig = {
         Type = "simple";
         ExecStart = "${pkgs.kdePackages.konsole}/bin/konsole -name konsole-${cfg.User}";
