@@ -10,9 +10,21 @@ in
 
     environment.sessionVariables = {
       WAYLAND_DISPLAY = cfg.Gui.IsolatedWaylandSocketName;
-      GDK_BACKEND = "wayland,x11";
-      QT_QPA_PLATFORM = "wayland;xcb";
-      SDL_VIDEODRIVER = "wayland,x11";
+
+      # IsolatedWayland intentionally has no X11 socket. Prefer loud Wayland
+      # failures over silent X11 probing so Electron, GTK, Qt, SDL, GLFW, and
+      # browser wrappers do not wander toward a display server that is absent by
+      # design.
+      NIXOS_OZONE_WL = "1";
+      OZONE_PLATFORM = "wayland";
+      ELECTRON_OZONE_PLATFORM_HINT = "wayland";
+      GDK_BACKEND = "wayland";
+      QT_QPA_PLATFORM = "wayland";
+      SDL_VIDEODRIVER = "wayland";
+      GLFW_PLATFORM = "wayland";
+      CLUTTER_BACKEND = "wayland";
+      XDG_SESSION_TYPE = "wayland";
+      WINIT_UNIX_BACKEND = "wayland";
       MOZ_ENABLE_WAYLAND = "1";
       NO_AT_BRIDGE = "1";
       GTK_A11Y = "none";
