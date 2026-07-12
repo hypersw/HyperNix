@@ -106,6 +106,7 @@ let
         Enable = false;
         Name = "Copybox";
         HostPath = null;
+        HostSubdir = null;
       } // decl.Copybox;
       Konsole = {
         Enable = false;
@@ -144,6 +145,15 @@ let
             {
               assertion = !(decl.Copybox.Enable) || decl.Copybox.HostPath != null;
               message = "Managed container ${name} has Copybox.Enable, but Copybox.HostPath is not set by the machine config.";
+            }
+            {
+              assertion =
+                !(decl.Copybox.Enable && decl.Copybox.HostSubdir != null)
+                || (
+                  !(lib.hasPrefix "/" decl.Copybox.HostSubdir)
+                  && !(lib.hasInfix "/../" "/${decl.Copybox.HostSubdir}/")
+                );
+              message = "Managed container ${name} Copybox.HostSubdir must be a relative path without '..' components.";
             }
             {
               assertion =
@@ -199,6 +209,10 @@ let
       needsX11 = decl.Gui.Mode == "SharedX11";
       needsHostWayland = decl.Gui.Mode == "SharedWayland" || decl.Gui.Mode == "IsolatedWayland";
       hostWaylandSocket = "${hostGraphicalUser.RuntimeDir}/${hostGraphicalUser.WaylandDisplay}";
+      copyboxHostPath =
+        if decl.Copybox.HostSubdir == null
+        then decl.Copybox.HostPath
+        else "${decl.Copybox.HostPath}/${decl.Copybox.HostSubdir}";
       waylandAclUnit = "hypersw-managed-container-wayland-acl-${name}";
       waylandSocketAccessUid =
         if decl.HostWaylandSocketAccessUid != null
@@ -297,7 +311,7 @@ let
             } //
             lib.optionalAttrs decl.Copybox.Enable {
               "/home/${decl.User}/${decl.Copybox.Name}" = {
-                hostPath = decl.Copybox.HostPath;
+                hostPath = copyboxHostPath;
                 isReadOnly = false;
               };
             } //
