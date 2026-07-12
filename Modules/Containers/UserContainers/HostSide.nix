@@ -329,15 +329,6 @@ let
       # host-visible UID access to that one socket instead of making guest and
       # host user identities identical.
       (lib.mkIf needsHostWayland {
-        systemd.paths.${waylandAclUnit} = {
-          description = "Watch host Wayland socket ACL for managed container ${name}";
-          wantedBy = [ "multi-user.target" ];
-          pathConfig = {
-            PathExists = hostWaylandSocket;
-            PathChanged = hostWaylandSocket;
-          };
-        };
-
         systemd.services.${waylandAclUnit} = {
           description = "Allow managed container ${name} to connect to the host Wayland socket";
           serviceConfig.Type = "oneshot";
@@ -346,10 +337,15 @@ let
             set -euo pipefail
 
             socket=${lib.escapeShellArg hostWaylandSocket}
-            if [ ! -S "$socket" ]; then
-              echo "Host Wayland socket for ${name} is not present yet: $socket" >&2
-              exit 0
-            fi
+            for attempt in $(seq 1 50); do
+              [ -S "$socket" ] && break
+              sleep 0.1
+            done
+
+            [ -S "$socket" ] || {
+              echo "Host Wayland socket for ${name} is not present: $socket" >&2
+              exit 1
+            }
 
             setfacl -m u:${toString waylandSocketAccessUid}:rw "$socket"
           '';
