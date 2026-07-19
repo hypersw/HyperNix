@@ -1,6 +1,12 @@
 { config, lib, pkgs, ... }:
 let
   cfg = config.hypersw.containers.UserContainers.Guest;
+  isolatedCompositorUnit =
+    if cfg.Gui.Mode == "IsolatedWayland"
+    then "nested-wayland-compositor.service"
+    else if cfg.Gui.Mode == "IsolatedRdpWayland"
+    then "isolated-rdp-wayland-compositor.service"
+    else null;
 in
 {
   config = lib.mkIf (cfg.Enable && cfg.Konsole.Enable) {
@@ -25,11 +31,13 @@ in
     systemd.user.services.auto-konsole = {
       description = "Start Konsole on user login";
       wantedBy = [ "default.target" ];
-      wants = lib.optionals (cfg.Gui.Mode == "IsolatedWayland") [ "nested-wayland-compositor.service" ];
-      after = lib.optionals (cfg.Gui.Mode == "IsolatedWayland") [ "nested-wayland-compositor.service" ];
+      wants = lib.optionals (isolatedCompositorUnit != null) [ isolatedCompositorUnit ];
+      after = lib.optionals (isolatedCompositorUnit != null) [ isolatedCompositorUnit ];
       serviceConfig = {
         Type = "simple";
-        ExecStart = "${pkgs.kdePackages.konsole}/bin/konsole -name konsole-${cfg.User}";
+        # The old -name argument was only used for X11 wmctrl matching and is
+        # no longer accepted by current Konsole. Wayland does not need it.
+        ExecStart = "${pkgs.kdePackages.konsole}/bin/konsole";
         Restart = "on-failure";
       } // lib.optionalAttrs (cfg.Gui.Mode == "SharedX11") {
         ExecStartPost = pkgs.writeShellScript "move-konsole-window" ''
