@@ -6,7 +6,7 @@ in
   # RDP is a separate isolated mode. It creates its own compositor and does not
   # mount, link, or ACL the host Wayland socket at all.
   config = lib.mkIf (cfg.Enable && cfg.Gui.Mode == "IsolatedRdpWayland") {
-    environment.systemPackages = [ pkgs.weston pkgs.freerdp ];
+    environment.systemPackages = [ pkgs.weston pkgs.openssl ];
 
     environment.sessionVariables = {
       WAYLAND_DISPLAY = cfg.Gui.IsolatedWaylandSocketName;
@@ -36,11 +36,16 @@ in
           state="$HOME/.local/state/hypersw/isolated-rdp-wayland"
           mkdir -p "$state"
 
-          # RDP security is needed for a TCP listener when TLS is disabled.
-          # Keep the private key in user state, never in the Nix store.
-          if [ ! -s "$state/rdp-security.key" ]; then
-            cd "$state"
-            ${pkgs.freerdp}/bin/winpr-makecert -rdp -silent -n rdp-security
+          # Weston 15 requires security material for every TCP RDP listener.
+          # FreeRDP 3 no longer creates legacy RDP4 keys, so use a local TLS
+          # pair even when SSH is the outer transport. Keep it out of the Nix
+          # store because the private key belongs to this guest instance.
+          if [ ! -s "$state/tls.key" ] || [ ! -s "$state/tls.crt" ]; then
+            ${pkgs.openssl}/bin/openssl req -x509 -newkey rsa:2048 -nodes \
+              -keyout "$state/tls.key" \
+              -out "$state/tls.crt" \
+              -days 3650 \
+              -subj ${lib.escapeShellArg "/CN=${cfg.Name}-rdp"}
           fi
 
           exec ${pkgs.weston}/bin/weston \
@@ -48,7 +53,8 @@ in
             --shell=desktop-shell.so \
             --address=${lib.escapeShellArg cfg.Gui.RdpListenAddress} \
             --port=${toString cfg.Gui.RdpPort} \
-            --rdp4-key="$state/rdp-security.key" \
+            --rdp-tls-key="$state/tls.key" \
+            --rdp-tls-cert="$state/tls.crt" \
             --socket=${lib.escapeShellArg cfg.Gui.IsolatedWaylandSocketName}
         '';
       };
