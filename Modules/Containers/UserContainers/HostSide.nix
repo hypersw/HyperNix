@@ -9,7 +9,7 @@
 }:
 { lib, pkgs, ... }:
 let
-  guiModes = [ "None" "SharedX11" "SharedWayland" "IsolatedWayland" ];
+  guiModes = [ "None" "SharedX11" "SharedWayland" "IsolatedWayland" "IsolatedRdpWayland" ];
   buildModes = [ "HostEvaluated" "FlakePath" ];
   rebuildModes = [ "switch" "test" "boot" ];
 
@@ -87,6 +87,8 @@ let
         FontPackages = [];
         HostWaylandSocketName = "wayland-host";
         IsolatedWaylandSocketName = "wayland-isolated";
+        RdpListenAddress = "127.0.0.1";
+        RdpPort = 33398;
       } // rawGui;
     in
     gui // {
@@ -253,6 +255,8 @@ let
               Gui.FontPackages = decl.Gui.FontPackages;
               Gui.HostWaylandSocketName = decl.Gui.HostWaylandSocketName;
               Gui.IsolatedWaylandSocketName = decl.Gui.IsolatedWaylandSocketName;
+              Gui.RdpListenAddress = decl.Gui.RdpListenAddress;
+              Gui.RdpPort = decl.Gui.RdpPort;
               Tpm.Enable = decl.Tpm.Enable;
               Konsole.Enable = decl.Konsole.Enable;
               Konsole.WorkspaceId = decl.Konsole.WorkspaceId;

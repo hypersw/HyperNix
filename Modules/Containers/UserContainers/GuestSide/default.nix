@@ -13,6 +13,7 @@ in
     ./Gui/SharedX11.nix
     ./Gui/SharedWayland.nix
     ./Gui/IsolatedWayland.nix
+    ./Gui/IsolatedRdpWayland.nix
   ];
 
   options.hypersw.containers.UserContainers.Guest = {
@@ -52,7 +53,7 @@ in
 
     Gui = {
       Mode = lib.mkOption {
-        type = lib.types.enum [ "None" "SharedX11" "SharedWayland" "IsolatedWayland" ];
+        type = lib.types.enum [ "None" "SharedX11" "SharedWayland" "IsolatedWayland" "IsolatedRdpWayland" ];
         default = "None";
       };
       Gpu = lib.mkOption { type = lib.types.bool; default = false; };
@@ -85,6 +86,16 @@ in
           In IsolatedWayland mode, normal apps use this socket while
           only the compositor uses HostWaylandSocketName.
         '';
+      };
+      RdpListenAddress = lib.mkOption {
+        type = lib.types.str;
+        default = "127.0.0.1";
+        description = "Address where IsolatedRdpWayland exposes its RDP listener.";
+      };
+      RdpPort = lib.mkOption {
+        type = lib.types.port;
+        default = 33398;
+        description = "TCP port where IsolatedRdpWayland exposes its RDP listener.";
       };
       FontPackages = lib.mkOption {
         type = lib.types.listOf lib.types.package;
