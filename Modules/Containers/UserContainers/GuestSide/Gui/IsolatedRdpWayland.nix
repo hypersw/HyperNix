@@ -1,6 +1,12 @@
 { config, lib, pkgs, ... }:
 let
   cfg = config.hypersw.containers.UserContainers.Guest;
+  westonConfig = pkgs.writeText "isolated-rdp-wayland.ini" ''
+    [shell]
+    # Makes the built-in interactive Weston window switcher Alt+Tab, which is
+    # natural in an RDP session. The panel itself remains launcher-only.
+    binding-modifier=alt
+  '';
 in
 {
   # RDP is a separate isolated mode. It creates its own compositor and does not
@@ -51,6 +57,7 @@ in
           exec ${pkgs.weston}/bin/weston \
             --backend=rdp-backend.so \
             --shell=desktop-shell.so \
+            --config=${westonConfig} \
             --address=${lib.escapeShellArg cfg.Gui.RdpListenAddress} \
             --port=${toString cfg.Gui.RdpPort} \
             --rdp-tls-key="$state/tls.key" \
