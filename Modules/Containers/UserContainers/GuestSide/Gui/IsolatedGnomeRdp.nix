@@ -5,6 +5,17 @@ in {
   config = lib.mkIf (cfg.Enable && cfg.Gui.Mode == "IsolatedGnomeRdp") {
     services.desktopManager.gnome.enable = true;
     services.pipewire.enable = true;
+
+    # nspawn guests share the host network namespace and have no physical NIC
+    # to configure. GNOME pulls in NetworkManager by default; in turn it starts
+    # wpa_supplicant and defaults ModemManager on. None is meaningful here.
+    networking = {
+      networkmanager.enable = lib.mkForce false;
+      wireless.enable = lib.mkForce false;
+      modemmanager.enable = lib.mkForce false;
+      useDHCP = lib.mkForce false;
+      dhcpcd.enable = lib.mkForce false;
+    };
     environment.systemPackages = [ pkgs.gnome-remote-desktop pkgs.openssl ];
     environment.sessionVariables = {
       XDG_SESSION_TYPE = "wayland";
