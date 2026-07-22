@@ -14,6 +14,7 @@ in
     ./Gui/SharedWayland.nix
     ./Gui/IsolatedWayland.nix
     ./Gui/IsolatedRdpWayland.nix
+    ./Gui/IsolatedGnomeRdp.nix
   ];
 
   options.hypersw.containers.UserContainers.Guest = {
@@ -53,7 +54,7 @@ in
 
     Gui = {
       Mode = lib.mkOption {
-        type = lib.types.enum [ "None" "SharedX11" "SharedWayland" "IsolatedWayland" "IsolatedRdpWayland" ];
+        type = lib.types.enum [ "None" "SharedX11" "SharedWayland" "IsolatedWayland" "IsolatedRdpWayland" "IsolatedGnomeRdp" ];
         default = "None";
       };
       Gpu = lib.mkOption { type = lib.types.bool; default = false; };
@@ -95,7 +96,22 @@ in
       RdpPort = lib.mkOption {
         type = lib.types.port;
         default = 33398;
-        description = "TCP port where IsolatedRdpWayland exposes its RDP listener.";
+        description = "TCP port where an isolated RDP GUI mode exposes its RDP listener.";
+      };
+      RdpUsername = lib.mkOption {
+        type = lib.types.str;
+        default = cfg.User or "container";
+        description = "RDP username for generated IsolatedGnomeRdp credentials.";
+      };
+      RdpCredentialsFile = lib.mkOption {
+        type = lib.types.str;
+        default = "";
+        description = "Optional guest file with RDP username then password, one per line.";
+      };
+      RdpPassword = lib.mkOption {
+        type = lib.types.nullOr lib.types.str;
+        default = null;
+        description = "Optional direct RDP password override; an empty string is intentional.";
       };
       FontPackages = lib.mkOption {
         type = lib.types.listOf lib.types.package;

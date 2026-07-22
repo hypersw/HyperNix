@@ -6,6 +6,8 @@ let
     then "nested-wayland-compositor.service"
     else if cfg.Gui.Mode == "IsolatedRdpWayland"
     then "isolated-rdp-wayland-compositor.service"
+    else if cfg.Gui.Mode == "IsolatedGnomeRdp"
+    then "gnome-remote-desktop-headless.service"
     else null;
 in
 {
