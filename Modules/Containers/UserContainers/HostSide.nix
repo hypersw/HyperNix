@@ -77,7 +77,7 @@ let
     ExtraAllowedDevices = [];
   };
 
-  normalizeGui = rawGui:
+  normalizeGui = name: rawGui:
     let
       gui = {
         Mode = "None";
@@ -105,7 +105,7 @@ let
       decl = instanceDefaults name // raw;
     in
     decl // {
-      Gui = normalizeGui decl.Gui;
+      Gui = normalizeGui name decl.Gui;
       Tpm = { Enable = false; } // decl.Tpm;
       Copybox = {
         Enable = false;
