@@ -56,28 +56,28 @@ in {
         credentials="$state/credentials"
         certificate="$state/tls.crt"
         key="$state/tls.key"
-        mkdir -p "$state"
+        ${pkgs.coreutils}/bin/mkdir -p "$state"
         if [ -n ${lib.escapeShellArg cfg.Gui.RdpCredentialsFile} ]; then
-          install -m 600 ${lib.escapeShellArg cfg.Gui.RdpCredentialsFile} "$credentials"
+          ${pkgs.coreutils}/bin/install -m 600 ${lib.escapeShellArg cfg.Gui.RdpCredentialsFile} "$credentials"
         elif ${if cfg.Gui.RdpPassword == null then "false" else "true"}; then
           printf '%s\n%s\n' ${lib.escapeShellArg cfg.Gui.RdpUsername} ${lib.escapeShellArg (if cfg.Gui.RdpPassword == null then "" else cfg.Gui.RdpPassword)} > "$credentials"
         elif [ ! -s "$credentials" ]; then
-          password="$(${pkgs.openssl}/bin/openssl rand -base64 33 | tr -d '\n')"
+          password="$(${pkgs.openssl}/bin/openssl rand -base64 33 | ${pkgs.coreutils}/bin/tr -d '\n')"
           printf '%s\n%s\n' ${lib.escapeShellArg cfg.Gui.RdpUsername} "$password" > "$credentials"
         fi
-        username=$(sed -n '1p' "$credentials")
-        password=$(sed -n '2p' "$credentials")
+        username=$(${pkgs.gnused}/bin/sed -n '1p' "$credentials")
+        password=$(${pkgs.gnused}/bin/sed -n '2p' "$credentials")
         [ -n "$username" ] || { echo "GNOME RDP credentials need a username" >&2; exit 1; }
         if [ ! -s "$key" ] || [ ! -s "$certificate" ]; then
           ${pkgs.openssl}/bin/openssl req -x509 -newkey rsa:3072 -nodes -keyout "$key" -out "$certificate" -days 3650 -subj ${lib.escapeShellArg "/CN=${cfg.Name}-gnome-rdp"}
         fi
-        grdctl --headless rdp set-port ${toString cfg.Gui.RdpPort}
-        grdctl --headless rdp disable-port-negotiation
-        grdctl --headless rdp set-auth-methods credentials
-        grdctl --headless rdp set-credentials "$username" "$password"
-        grdctl --headless rdp set-tls-key "$key"
-        grdctl --headless rdp set-tls-cert "$certificate"
-        grdctl --headless rdp enable
+        ${pkgs.gnome-remote-desktop}/bin/grdctl --headless rdp set-port ${toString cfg.Gui.RdpPort}
+        ${pkgs.gnome-remote-desktop}/bin/grdctl --headless rdp disable-port-negotiation
+        ${pkgs.gnome-remote-desktop}/bin/grdctl --headless rdp set-auth-methods credentials
+        ${pkgs.gnome-remote-desktop}/bin/grdctl --headless rdp set-credentials "$username" "$password"
+        ${pkgs.gnome-remote-desktop}/bin/grdctl --headless rdp set-tls-key "$key"
+        ${pkgs.gnome-remote-desktop}/bin/grdctl --headless rdp set-tls-cert "$certificate"
+        ${pkgs.gnome-remote-desktop}/bin/grdctl --headless rdp enable
       '';
     };
     # Upstream starts this from gnome-session.target. Managed containers have no

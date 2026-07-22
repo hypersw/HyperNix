@@ -11,7 +11,10 @@ let
     else null;
 in
 {
-  config = lib.mkIf (cfg.Enable && cfg.Konsole.Enable) {
+  # GNOME's headless RDP service owns and starts its Wayland session. A
+  # standalone Konsole user unit races it and has no display before a client
+  # connects, so this legacy console launcher is inapplicable to that mode.
+  config = lib.mkIf (cfg.Enable && cfg.Konsole.Enable && cfg.Gui.Mode != "IsolatedGnomeRdp") {
     environment.systemPackages = [ pkgs.kdePackages.konsole ];
 
     systemd.services.AutoLogin = {
