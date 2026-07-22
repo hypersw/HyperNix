@@ -28,7 +28,6 @@ in {
     # host's network namespace and would create a second mDNS responder.
     services = {
       avahi.enable = lib.mkForce false;
-      nscd.enable = lib.mkForce false;
     };
     systemd.services = {
       AutoLogin.enable = lib.mkForce false;
