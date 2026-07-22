@@ -16,6 +16,24 @@ in {
       useDHCP = lib.mkForce false;
       dhcpcd.enable = lib.mkForce false;
     };
+
+    # A headless RDP desktop is owned by cfg.User, never by a console login.
+    # Linger starts its user manager at boot, which starts the RDP user units.
+    users.users = lib.mkIf (cfg.User != null) {
+      "${cfg.User}".linger = true;
+    };
+
+    # No physical console or local service discovery belongs in this remote-only
+    # guest. Avahi is especially harmful here because the guest shares the
+    # host's network namespace and would create a second mDNS responder.
+    services = {
+      avahi.enable = lib.mkForce false;
+      nscd.enable = lib.mkForce false;
+    };
+    systemd.services = {
+      AutoLogin.enable = lib.mkForce false;
+      console-getty.enable = lib.mkForce false;
+    };
     environment.systemPackages = [ pkgs.gnome-remote-desktop pkgs.openssl ];
     environment.sessionVariables = {
       XDG_SESSION_TYPE = "wayland";
