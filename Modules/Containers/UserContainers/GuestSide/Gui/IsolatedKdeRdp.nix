@@ -99,7 +99,7 @@ in {
       '';
     };
 
-    systemd.user.services.app-org.kde.krdpserver = {
+    systemd.user.services."app-org.kde.krdpserver" = {
       description = "KRdp server for the managed Plasma Wayland session";
       wantedBy = [ "default.target" ];
       requires = [ "hypersw-kde-rdp-setup.service" "hypersw-plasma-wayland.service" ];
