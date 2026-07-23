@@ -102,8 +102,23 @@ in {
     systemd.user.services."app-org.kde.krdpserver" = {
       description = "KRdp server for the managed Plasma Wayland session";
       wantedBy = [ "default.target" ];
-      requires = [ "hypersw-kde-rdp-setup.service" "hypersw-plasma-wayland.service" ];
-      after = [ "hypersw-kde-rdp-setup.service" "hypersw-plasma-wayland.service" ];
+      # KRdp probes the Screenshot portal during its own startup, before it
+      # calls listen(2).  Starting it merely after KWin's Wayland socket exists
+      # can deadlock it behind the still-booting Plasma portal backend.
+      requires = [
+        "hypersw-kde-rdp-setup.service"
+        "hypersw-plasma-wayland.service"
+        "plasma-core.target"
+        "plasma-xdg-desktop-portal-kde.service"
+        "xdg-desktop-portal.service"
+      ];
+      after = [
+        "hypersw-kde-rdp-setup.service"
+        "hypersw-plasma-wayland.service"
+        "plasma-core.target"
+        "plasma-xdg-desktop-portal-kde.service"
+        "xdg-desktop-portal.service"
+      ];
       serviceConfig = {
         Type = "simple";
         Restart = "on-failure";
