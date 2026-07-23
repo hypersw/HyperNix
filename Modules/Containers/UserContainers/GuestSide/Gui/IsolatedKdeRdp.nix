@@ -117,8 +117,13 @@ in {
         state="$HOME/.local/state/hypersw/kde-rdp"
         username=$(${pkgs.gnused}/bin/sed -n '1p' "$state/credentials")
         password=$(${pkgs.gnused}/bin/sed -n '2p' "$state/credentials")
+        # This is a remote-only container: no DRM/physical output exists for
+        # KRdp's ordinary Plasma capture mode. Ask KWin to create the first
+        # output, then KRdp can capture it and open its TCP listener. This is
+        # currently the persistent session's fixed initial canvas.
         exec ${pkgs.kdePackages.krdp}/bin/krdpserver \
           --plasma \
+          --virtual-monitor 1920x1080@1 \
           --address ${lib.escapeShellArg cfg.Gui.RdpListenAddress} \
           --port ${toString cfg.Gui.RdpPort} \
           --username "$username" \
