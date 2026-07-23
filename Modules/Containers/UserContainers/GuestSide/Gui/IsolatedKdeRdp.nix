@@ -10,7 +10,7 @@ in {
     xdg.portal = {
       enable = true;
       extraPortals = [ pkgs.kdePackages.xdg-desktop-portal-kde ];
-      config.common.default = [ "kde" ];
+      config.common.default = lib.mkForce [ "kde" ];
     };
 
     networking = {
