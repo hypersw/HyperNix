@@ -51,7 +51,9 @@ to a nested compositor. The nested compositor is the only client of the host
 compositor. Optional resources such as GPU, audio, clipboard, and shared folders
 should be enabled explicitly.
 
-`IsolatedGnomeRdp` is a remote-only Wayland desktop. GNOME Remote Desktop retains an independent headless GNOME/Mutter session inside the container; it does not mount the host display or Wayland socket. It uses Mutter virtual monitors, PipeWire, libei and FreeRDP, so the RDP client determines virtual display size when connecting. TLS material and credentials persist in the guest home directory. GNOME Remote Desktop binds its configured port on all guest interfaces, but the managed unit admits only guest-loopback traffic; use an SSH tunnel or VPN endpoint on the host to reach it.
+`IsolatedGnomeRdp` is a remote-only Wayland desktop. GNOME Remote Desktop retains an independent headless GNOME/Mutter session inside the container; it does not mount the host display or Wayland socket. It uses Mutter virtual monitors, PipeWire, libei and FreeRDP, so the RDP client determines virtual display size when connecting. TLS material and credentials persist in the guest home directory. Upstream GNOME RDP has a port setting but no listen-address setting, so this mode cannot provide a self-contained loopback-only bind.
+
+`IsolatedKdeRdp` is a remote-only Plasma Wayland desktop. A lingering user manager starts `startplasma-wayland`, then runs KRdp against that persistent session. KRdp supports `--address`, so the managed server binds `Gui.RdpListenAddress` (localhost by default) directly; it does not mount a host display or Wayland socket. TLS and RDP credentials persist in the guest home directory.
 
 `None` means no GUI integration.
 

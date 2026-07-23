@@ -80,6 +80,21 @@ in {
         ${pkgs.gnome-remote-desktop}/bin/grdctl --headless rdp enable
       '';
     };
+    # GNOME RDP binds a wildcard socket and offers no listen-address setting.
+    # The loopback-only cgroup policy below safely rejects that bind, which means
+    # this mode cannot currently expose an RDP port. Keep the explicit warning
+    # visible in the lingered user manager instead of failing silently.
+    systemd.user.services.hypersw-gnome-rdp-bind-warning = {
+      description = "Explain the IsolatedGnomeRdp loopback bind limitation";
+      wantedBy = [ "default.target" ];
+      after = [ "gnome-remote-desktop-headless.service" ];
+      serviceConfig.Type = "oneshot";
+      script = ''
+        echo "WARNING: IsolatedGnomeRdp is prevented from opening its RDP port by its loopback-only network policy." >&2
+        echo "GNOME Remote Desktop binds a wildcard address and has no listen-address setting." >&2
+        echo "Use IsolatedKdeRdp for an actual localhost-only listener, or explicitly change this mode's network policy." >&2
+      '';
+    };
     # Upstream starts this from gnome-session.target. Managed containers have no
     # local display manager, so retain it from the long-lived user manager.
     systemd.user.services.gnome-remote-desktop-headless = {

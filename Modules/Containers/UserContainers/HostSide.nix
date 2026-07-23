@@ -9,7 +9,7 @@
 }:
 { lib, pkgs, ... }:
 let
-  guiModes = [ "None" "SharedX11" "SharedWayland" "IsolatedWayland" "IsolatedRdpWayland" "IsolatedGnomeRdp" ];
+  guiModes = [ "None" "SharedX11" "SharedWayland" "IsolatedWayland" "IsolatedRdpWayland" "IsolatedGnomeRdp" "IsolatedKdeRdp" ];
   buildModes = [ "HostEvaluated" "FlakePath" ];
   rebuildModes = [ "switch" "test" "boot" ];
 

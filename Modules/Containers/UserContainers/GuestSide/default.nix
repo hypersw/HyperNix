@@ -15,6 +15,7 @@ in
     ./Gui/IsolatedWayland.nix
     ./Gui/IsolatedRdpWayland.nix
     ./Gui/IsolatedGnomeRdp.nix
+    ./Gui/IsolatedKdeRdp.nix
   ];
 
   options.hypersw.containers.UserContainers.Guest = {
@@ -54,7 +55,7 @@ in
 
     Gui = {
       Mode = lib.mkOption {
-        type = lib.types.enum [ "None" "SharedX11" "SharedWayland" "IsolatedWayland" "IsolatedRdpWayland" "IsolatedGnomeRdp" ];
+        type = lib.types.enum [ "None" "SharedX11" "SharedWayland" "IsolatedWayland" "IsolatedRdpWayland" "IsolatedGnomeRdp" "IsolatedKdeRdp" ];
         default = "None";
       };
       Gpu = lib.mkOption { type = lib.types.bool; default = false; };
@@ -101,7 +102,7 @@ in
       RdpUsername = lib.mkOption {
         type = lib.types.str;
         default = cfg.User or "container";
-        description = "RDP username for generated IsolatedGnomeRdp credentials.";
+        description = "RDP username for generated isolated RDP credentials.";
       };
       RdpCredentialsFile = lib.mkOption {
         type = lib.types.str;
