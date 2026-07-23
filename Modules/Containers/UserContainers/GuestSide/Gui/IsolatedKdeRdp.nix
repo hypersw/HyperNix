@@ -71,6 +71,10 @@ in {
         credentials="$state/credentials"
         certificate="$state/tls.crt"
         key="$state/tls.key"
+        # A previous IsolatedGnomeRdp generation can have enabled this user unit
+        # persistently through grdctl. It is invalid in the KRdp mode and must
+        # not survive a managed mode switch.
+        ${pkgs.systemd}/bin/systemctl --user disable --now gnome-remote-desktop-headless.service || true
         ${pkgs.coreutils}/bin/mkdir -p "$state"
         if [ -n ${lib.escapeShellArg cfg.Gui.RdpCredentialsFile} ]; then
           ${pkgs.coreutils}/bin/install -m 600 ${lib.escapeShellArg cfg.Gui.RdpCredentialsFile} "$credentials"
@@ -101,6 +105,15 @@ in {
       };
       script = ''
         set -euo pipefail
+        # startplasma-wayland imports WAYLAND_DISPLAY into the user manager
+        # only after KWin has created its socket. Do not launch Qt/KRdp before
+        # then: Qt would abort rather than waiting for a compositor.
+        wayland_display="$(${pkgs.systemd}/bin/systemctl --user show-environment | ${pkgs.gnused}/bin/sed -n 's/^WAYLAND_DISPLAY=//p')"
+        if [ -z "$wayland_display" ] || [ ! -S "$XDG_RUNTIME_DIR/$wayland_display" ]; then
+          echo "Waiting for Plasma Wayland socket before starting KRdp" >&2
+          exit 1
+        fi
+        export WAYLAND_DISPLAY="$wayland_display"
         state="$HOME/.local/state/hypersw/kde-rdp"
         username=$(${pkgs.gnused}/bin/sed -n '1p' "$state/credentials")
         password=$(${pkgs.gnused}/bin/sed -n '2p' "$state/credentials")

@@ -78,6 +78,10 @@ in {
         ${pkgs.gnome-remote-desktop}/bin/grdctl --headless rdp set-tls-key "$key"
         ${pkgs.gnome-remote-desktop}/bin/grdctl --headless rdp set-tls-cert "$certificate"
         ${pkgs.gnome-remote-desktop}/bin/grdctl --headless rdp enable
+        # grdctl also imperatively enables the user unit under ~/.config.
+        # Remove that user-owned symlink: wantedBy below is the declarative,
+        # generation-retractable owner of this unit's lifecycle.
+        ${pkgs.systemd}/bin/systemctl --user disable gnome-remote-desktop-headless.service || true
       '';
     };
     # GNOME RDP binds a wildcard socket and offers no listen-address setting.
