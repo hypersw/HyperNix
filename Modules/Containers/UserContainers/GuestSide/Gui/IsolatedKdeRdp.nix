@@ -62,7 +62,8 @@ in {
     systemd.user.services.hypersw-kde-rdp-setup = {
       description = "Configure KRdp credentials and TLS for this managed container";
       wantedBy = [ "default.target" ];
-      before = [ "hypersw-kde-rdp.service" ];
+      before = [ "app-org.kde.krdpserver.service" ];
+      after = [ "dbus.service" ];
       serviceConfig = { Type = "oneshot"; RemainAfterExit = true; };
       script = ''
         set -euo pipefail
@@ -75,6 +76,11 @@ in {
         # persistently through grdctl. It is invalid in the KRdp mode and must
         # not survive a managed mode switch.
         ${pkgs.systemd}/bin/systemctl --user disable --now gnome-remote-desktop-headless.service || true
+        # A remote-only session cannot answer the portal's approval dialog.  KDE
+        # identifies a systemd-managed host app from its unit name; authorize that
+        # stable app-id before KRdp asks the Remote Desktop portal for the virtual
+        # output and input injection.
+        ${pkgs.flatpak}/bin/flatpak permission-set kde-authorized remote-desktop org.kde.krdpserver yes
         ${pkgs.coreutils}/bin/mkdir -p "$state"
         if [ -n ${lib.escapeShellArg cfg.Gui.RdpCredentialsFile} ]; then
           ${pkgs.coreutils}/bin/install -m 600 ${lib.escapeShellArg cfg.Gui.RdpCredentialsFile} "$credentials"
@@ -93,7 +99,7 @@ in {
       '';
     };
 
-    systemd.user.services.hypersw-kde-rdp = {
+    systemd.user.services.app-org.kde.krdpserver = {
       description = "KRdp server for the managed Plasma Wayland session";
       wantedBy = [ "default.target" ];
       requires = [ "hypersw-kde-rdp-setup.service" "hypersw-plasma-wayland.service" ];
