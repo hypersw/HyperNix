@@ -104,6 +104,7 @@ in
     };
 
     Tpm.Enable = lib.mkEnableOption "TPM support inside this container.";
+    Fuse.Enable = lib.mkEnableOption "FUSE support inside this container.";
 
     Konsole = {
       Enable = lib.mkEnableOption "auto-start Konsole.";
@@ -137,5 +138,11 @@ in
         '';
       };
     };
+  };
+
+  config = lib.mkIf (cfg.Enable && cfg.Fuse.Enable) {
+    # HostSide's matching Fuse.Enable exposes /dev/fuse. This guest-side half
+    # supplies the setuid fusermount/fusermount3 wrappers.
+    programs.fuse.enable = true;
   };
 }

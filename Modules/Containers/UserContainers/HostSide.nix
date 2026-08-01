@@ -64,6 +64,7 @@ let
     Path = null;
     Gui = {};
     Tpm = {};
+    Fuse = {};
     Copybox = {};
     Konsole = {};
     SelfSwitch = {};
@@ -104,6 +105,7 @@ let
     decl // {
       Gui = normalizeGui decl.Gui;
       Tpm = { Enable = false; } // decl.Tpm;
+      Fuse = { Enable = false; } // decl.Fuse;
       Copybox = {
         Enable = false;
         Name = "Copybox";
@@ -258,6 +260,7 @@ let
               Gui.RdpListenAddress = decl.Gui.RdpListenAddress;
               Gui.RdpPort = decl.Gui.RdpPort;
               Tpm.Enable = decl.Tpm.Enable;
+              Fuse.Enable = decl.Fuse.Enable;
               Konsole.Enable = decl.Konsole.Enable;
               Konsole.WorkspaceId = decl.Konsole.WorkspaceId;
               SelfSwitch.Enable = decl.SelfSwitch.Enable;
@@ -313,6 +316,12 @@ let
                 isReadOnly = false;
               };
             } //
+            lib.optionalAttrs decl.Fuse.Enable {
+              "/dev/fuse" = {
+                hostPath = "/dev/fuse";
+                isReadOnly = false;
+              };
+            } //
             lib.optionalAttrs decl.Copybox.Enable {
               "/home/${decl.User}/${decl.Copybox.Name}" = {
                 hostPath = copyboxHostPath;
@@ -332,6 +341,9 @@ let
             lib.optionals decl.Tpm.Enable [
               { modifier = "rw"; node = "/dev/tpm0"; }
               { modifier = "rw"; node = "/dev/tpmrm0"; }
+            ] ++
+            lib.optionals decl.Fuse.Enable [
+              { modifier = "rw"; node = "/dev/fuse"; }
             ] ++
             decl.ExtraAllowedDevices;
         };
