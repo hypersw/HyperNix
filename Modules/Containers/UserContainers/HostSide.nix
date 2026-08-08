@@ -9,7 +9,7 @@
 }:
 { lib, pkgs, ... }:
 let
-  guiModes = [ "None" "SharedX11" "SharedWayland" "IsolatedWayland" "IsolatedRdpWayland" ];
+  guiModes = [ "None" "SharedX11" "SharedWayland" "IsolatedWayland" "IsolatedRdpWayland" "IsolatedGnomeRdp" "IsolatedKdeRdp" ];
   buildModes = [ "HostEvaluated" "FlakePath" ];
   rebuildModes = [ "switch" "test" "boot" ];
 
@@ -78,7 +78,7 @@ let
     ExtraAllowedDevices = [];
   };
 
-  normalizeGui = rawGui:
+  normalizeGui = name: rawGui:
     let
       gui = {
         Mode = "None";
@@ -92,10 +92,9 @@ let
         RdpPort = 33398;
         RdpFallbackVirtualMonitor = "1920x1080@1";
         RdpQuality = 80;
-        RdpCertificateFile = null;
-        RdpCertificateKeyFile = null;
-        RdpNlaUsername = null;
-        RdpNlaPassword = null;
+        RdpUsername = name;
+        RdpCredentialsFile = "";
+        RdpPassword = null;
       } // rawGui;
     in
     gui // {
@@ -109,7 +108,7 @@ let
       decl = instanceDefaults name // raw;
     in
     decl // {
-      Gui = normalizeGui decl.Gui;
+      Gui = normalizeGui name decl.Gui;
       Tpm = { Enable = false; } // decl.Tpm;
       Fuse = { Enable = false; } // decl.Fuse;
       Copybox = {
@@ -267,10 +266,9 @@ let
               Gui.RdpPort = decl.Gui.RdpPort;
               Gui.RdpFallbackVirtualMonitor = decl.Gui.RdpFallbackVirtualMonitor;
               Gui.RdpQuality = decl.Gui.RdpQuality;
-              Gui.RdpCertificateFile = decl.Gui.RdpCertificateFile;
-              Gui.RdpCertificateKeyFile = decl.Gui.RdpCertificateKeyFile;
-              Gui.RdpNlaUsername = decl.Gui.RdpNlaUsername;
-              Gui.RdpNlaPassword = decl.Gui.RdpNlaPassword;
+              Gui.RdpUsername = decl.Gui.RdpUsername;
+              Gui.RdpCredentialsFile = decl.Gui.RdpCredentialsFile;
+              Gui.RdpPassword = decl.Gui.RdpPassword;
               Tpm.Enable = decl.Tpm.Enable;
               Fuse.Enable = decl.Fuse.Enable;
               Konsole.Enable = decl.Konsole.Enable;

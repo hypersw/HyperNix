@@ -21,6 +21,18 @@ pkgs.writeShellApplication {
       kscreen-doctor --json
     }
 
+    stub_output_enabled() {
+      output_state | jq -e --arg name "$stub_output" '
+        any(.outputs[]; .name == $name and .enabled)
+      ' >/dev/null
+    }
+
+    stub_output_disabled() {
+      output_state | jq -e --arg name "$stub_output" '
+        any(.outputs[]; .name == $name and (.enabled | not))
+      ' >/dev/null
+    }
+
     wait_for_rdp_output() {
       for ((attempt = 0; attempt < 20; attempt += 1)); do
         if output_state | jq -e --arg name "$rdp_output" '
@@ -90,14 +102,21 @@ pkgs.writeShellApplication {
     case "$action" in
       up)
         wait_for_rdp_output
-        kscreen-doctor "output.$stub_output.disable"
+        # A direct KWin --virtual session provides Virtual-0. A persistent
+        # startplasma-wayland session may not, so never manufacture or assume
+        # a stub output merely to run this repair.
+        if stub_output_enabled; then
+          kscreen-doctor "output.$stub_output.disable"
+        fi
         wait_for_sole_rdp_output
         if repair_panels; then
-          systemctl --user restart isolated-rdp-wayland-plasma.service
+          systemctl --user try-restart plasma-plasmashell.service
         fi
         ;;
       down)
-        kscreen-doctor "output.$stub_output.enable"
+        if stub_output_disabled; then
+          kscreen-doctor "output.$stub_output.enable"
+        fi
         ;;
       *)
         echo "Unknown KRdp output lifecycle action: $action" >&2

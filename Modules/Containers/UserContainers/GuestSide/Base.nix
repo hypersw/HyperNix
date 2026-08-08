@@ -25,7 +25,7 @@ in
 
         command_not_found_handle() {
           if [[ $- == *i* ]]; then
-            , "$@"
+            ${pkgs.comma}/bin/, "$@"
             return $?
           else
             echo "$1: command not found" >&2

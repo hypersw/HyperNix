@@ -51,31 +51,27 @@ to a nested compositor. The nested compositor is the only client of the host
 compositor. Optional resources such as GPU, audio, clipboard, and shared folders
 should be enabled explicitly.
 
-`IsolatedRdpWayland` is a displayless Plasma Wayland desktop for remote use.
-It runs a headless KWin virtual framebuffer and a patched KRdp server wholly
-inside the guest; it does not mount a host Wayland socket, access host DRM/GPU,
-or create a window on the host desktop. KRdp is normally bound to loopback and
-reached through SSH forwarding. Its direct Plasma path includes local patches
-for software/QPainter screencasting, initial RDP client size and scale, H.264
-compatibility, input coordinates, modifier cleanup, and plaintext clipboard.
+`IsolatedRdpWayland` is the compact Weston RDP mode. It provides an isolated
+Wayland compositor and a loopback RDP listener without mounting any host
+display, Wayland socket, or GPU device.
 
-`IsolatedRdpWayland` generates a persistent self-signed TLS certificate/key in
-the guest user's state directory when no explicit `RdpCertificateFile` and
-`RdpCertificateKeyFile` pair is supplied. This certificate authenticates the
-RDP server; it is not an NLA user credential. `RdpNlaUsername` and
-`RdpNlaPassword` authenticate RDP clients. The password is temporarily
-store-visible for the agentNext experiment and must be replaced with a
-guest-local SOPS/agenix runtime credential before real use.
+`IsolatedGnomeRdp` is a remote-only Wayland desktop. GNOME Remote Desktop retains an independent headless GNOME/Mutter session inside the container; it does not mount the host display or Wayland socket. It uses Mutter virtual monitors, PipeWire, libei and FreeRDP, so the RDP client determines virtual display size when connecting. TLS material and credentials persist in the guest home directory. Upstream GNOME RDP has a port setting but no listen-address setting, so this mode cannot provide a self-contained loopback-only bind.
 
-The initial virtual monitor follows the connecting RDP client's reported size
-and desktop scale; `RdpFallbackVirtualMonitor` is only the fallback for clients
-that do not report valid capabilities. Live Display-Control resize is currently
+`IsolatedKdeRdp` is the persistent remote-only Plasma Wayland desktop. A
+lingering user manager starts `startplasma-wayland` and its KDE portal backend,
+then runs KRdp against that session. KRdp binds `Gui.RdpListenAddress` directly
+(localhost by default) and persists TLS material and credentials in guest
+state. It does not mount a host display, Wayland socket, or GPU device.
+
+This mode uses one patched KWin/KRdp/KPipeWire package set: QPainter software
+screencasting, initial RDP-driven monitor size and scale, H.264 level 5.2,
+input-coordinate and modifier fixes, and plaintext clipboard support. The
+initial `Gui.RdpFallbackVirtualMonitor` is used only when a client does not
+report valid dimensions/scale; live Display-Control resize remains
 diagnostic-only. KRdp synchronously runs a packaged output lifecycle helper
-after `Virtual-RDP-*` creation and before its teardown. The helper uses KScreen
-to disable or re-enable KWin's `Virtual-0` stub and uses KConfig tools to repair
-the affected Plasma panel's `lastScreen` setting before restarting Plasma only
-when a repair was required. It has bounded in-callback waits, not a competing
-systemd/journal polling watcher.
+after `Virtual-RDP-*` creation and before its teardown. When a `Virtual-0` stub
+exists, the helper changes it only at those callback points and repairs an
+affected Plasma panel with KScreen/KConfig, never a competing watcher.
 
 `None` means no GUI integration.
 
