@@ -1,0 +1,41 @@
+--- a/src/RdpConnection.cpp
++++ b/src/RdpConnection.cpp
+@@ -517,12 +517,33 @@
+     const QSize desktopSize(freerdp_settings_get_uint32(settings, FreeRDP_DesktopWidth),
+                             freerdp_settings_get_uint32(settings, FreeRDP_DesktopHeight));
+     const auto desktopScaleFactor = freerdp_settings_get_uint32(settings, FreeRDP_DesktopScaleFactor);
+-    const qreal desktopScale = desktopScaleFactor >= 100 && desktopScaleFactor <= 500 ? qreal(desktopScaleFactor) / 100.0 : 0;
+-    qWarning().nospace() << "KRDP-CLIENT-LAYOUT: DesktopWidth=" << desktopSize.width()
+-                         << " DesktopHeight=" << desktopSize.height()
+-                         << " DesktopScaleFactor=" << desktopScaleFactor
++    QSize effectiveDesktopSize = desktopSize;
++    uint32_t effectiveDesktopScaleFactor = desktopScaleFactor;
++    const auto monitorCount = freerdp_settings_get_uint32(settings, FreeRDP_MonitorCount);
++    const auto monitors = static_cast<const rdpMonitor *>(freerdp_settings_get_pointer(settings, FreeRDP_MonitorDefArray));
++    for (uint32_t index = 0; monitors && index < monitorCount; ++index) {
++        const auto &monitor = monitors[index];
++        qCWarning(KRDP) << "KRDP-CORE-MONITOR-LAYOUT:" << index
++                         << monitor.width << 'x' << monitor.height
++                         << "primary=" << monitor.is_primary
++                         << "physical=" << monitor.attributes.physicalWidth << 'x' << monitor.attributes.physicalHeight
++                         << "desktopScale=" << monitor.attributes.desktopScaleFactor
++                         << "deviceScale=" << monitor.attributes.deviceScaleFactor;
++        if (monitor.is_primary && monitor.width >= 200 && monitor.height >= 200
++            && monitor.attributes.desktopScaleFactor >= 100 && monitor.attributes.desktopScaleFactor <= 500) {
++            effectiveDesktopSize = QSize(monitor.width, monitor.height);
++            effectiveDesktopScaleFactor = monitor.attributes.desktopScaleFactor;
++        }
++    }
++    const auto deviceScaleFactor = freerdp_settings_get_uint32(settings, FreeRDP_DeviceScaleFactor);
++    const QSize physicalSize(freerdp_settings_get_uint32(settings, FreeRDP_DesktopPhysicalWidth),
++                             freerdp_settings_get_uint32(settings, FreeRDP_DesktopPhysicalHeight));
++    const qreal desktopScale = effectiveDesktopScaleFactor >= 100 && effectiveDesktopScaleFactor <= 500 ? qreal(effectiveDesktopScaleFactor) / 100.0 : 0;
++    qWarning().nospace() << "KRDP-CLIENT-LAYOUT: DesktopWidth=" << effectiveDesktopSize.width()
++                         << " DesktopHeight=" << effectiveDesktopSize.height()
++                         << " DesktopScaleFactor=" << effectiveDesktopScaleFactor
+                          << " effectiveScale=" << desktopScale;
+-    Q_EMIT initialDesktopConfiguration(desktopSize, desktopScale);
++    Q_EMIT initialDesktopConfiguration(effectiveDesktopSize, desktopScale);
+
+     return true;
+ }

@@ -1,0 +1,30 @@
+--- a/src/PlasmaScreencastV1Session.cpp
++++ b/src/PlasmaScreencastV1Session.cpp
+@@ -215,6 +215,15 @@ void PlasmaScreencastV1Session::sendEvent(const std::shared_ptr<QEvent> &event)
+             qCWarning(KRDP) << "Unsupported mouse button" << me->button();
+             return;
+         }
++        // An RDP button packet carries an absolute pointer position, but KWin's
++        // fake-input button request does not. Keep KWin's pointer in sync before
++        // delivering the button; otherwise a click can be applied at (0,0).
++        const auto position = me->position();
++        const auto monitor = virtualMonitor();
++        const auto scale = monitor ? monitor->dpr : 1.0;
++        const auto logicalPosition = position / scale;
++        d->remoteInterface->pointer_motion_absolute(wl_fixed_from_double(logicalPosition.x()),
++                                                    wl_fixed_from_double(logicalPosition.y()));
+         uint state = me->type() == QEvent::MouseButtonPress ? 1 : 0;
+         d->remoteInterface->button(button, state);
+         break;
+@@ -222,6 +231,10 @@ void PlasmaScreencastV1Session::sendEvent(const std::shared_ptr<QEvent> &event)
+     case QEvent::MouseMove: {
+         auto me = std::static_pointer_cast<QMouseEvent>(event);
+         auto position = me->position();
+-        auto logicalPosition = QPointF{(position.x() / size().width()) * logicalSize().width(), (position.y() / size().height()) * logicalSize().height()};
++        // RDP reports physical pixels; KWin fake-input expects logical output
++        // coordinates. Do not use the encoder's PipeWire stream size here.
++        const auto monitor = virtualMonitor();
++        const auto scale = monitor ? monitor->dpr : 1.0;
++        auto logicalPosition = position / scale;
+         d->remoteInterface->pointer_motion_absolute(wl_fixed_from_double(logicalPosition.x()), wl_fixed_from_double(logicalPosition.y()));
+         break;

@@ -1,0 +1,203 @@
+--- a/src/plugins/screencast/outputscreencastsource.cpp
++++ b/src/plugins/screencast/outputscreencastsource.cpp
+@@ -68,6 +68,11 @@
+
+ Region OutputScreenCastSource::render(QImage *target, const Region &bufferRepair)
+ {
++    if (!qobject_cast<EglBackend *>(Compositor::self()->backend())) {
++        m_layer->setImage(target, bufferRepair & Rect(QPoint(), target->size()));
++        return render(bufferRepair);
++    }
++
+     auto texture = GLTexture::allocate(GL_RGBA8, target->size());
+     if (!texture) {
+         return Region{};
+@@ -81,6 +86,11 @@
+ Region OutputScreenCastSource::render(GLFramebuffer *target, const Region &bufferRepair)
+ {
+     m_layer->setFramebuffer(target, bufferRepair & Rect(QPoint(), target->size()));
++    return render(bufferRepair);
++}
++
++Region OutputScreenCastSource::render(const Region &bufferRepair)
++{
+     if (!m_layer->preparePresentationTest()) {
+         return Region{};
+     }
+@@ -89,7 +99,7 @@
+         return Region{};
+     }
+     m_sceneView->prePaint();
+-    const auto bufferDamage = (m_layer->deviceRepaints() | m_sceneView->collectDamage()) & Rect(QPoint(), target->size());
++    const auto bufferDamage = (m_layer->deviceRepaints() | m_sceneView->collectDamage()) & Rect(QPoint(), beginInfo->renderTarget.size());
+     const auto repaints = beginInfo->repaint | bufferDamage;
+     m_layer->resetRepaints();
+     m_sceneView->paint(beginInfo->renderTarget, QPoint(), repaints);
+@@ -116,7 +126,11 @@
+         return;
+     }
+
+-    m_layer = std::make_unique<ScreencastLayer>(m_output, static_cast<EglBackend *>(Compositor::self()->backend())->openglContext()->displayObject()->nonExternalOnlySupportedDrmFormats());
++    const auto eglBackend = qobject_cast<EglBackend *>(Compositor::self()->backend());
++    const FormatModifierMap formats = eglBackend
++        ? eglBackend->openglContext()->displayObject()->nonExternalOnlySupportedDrmFormats()
++        : FormatModifierMap{};
++    m_layer = std::make_unique<ScreencastLayer>(m_output, formats);
+
+     m_sceneView = std::make_unique<FilteredSceneView>(kwinApp()->scene(), m_output, m_layer.get(), m_pidToHide);
+     m_sceneView->setViewport(m_output->geometryF());
+--- a/src/plugins/screencast/outputscreencastsource.h
++++ b/src/plugins/screencast/outputscreencastsource.h
+@@ -45,6 +45,8 @@
+     RectF mapFromGlobal(const RectF &rect) const override;
+
+ private:
++    Region render(const Region &bufferRepair);
++
+     QPointer<LogicalOutput> m_output;
+     std::optional<pid_t> m_pidToHide;
+     std::unique_ptr<ScreencastLayer> m_layer;
+--- a/src/plugins/screencast/screencastlayer.cpp
++++ b/src/plugins/screencast/screencastlayer.cpp
+@@ -20,6 +20,14 @@
+ {
+     // TODO is there a better way to deal with this?
+     m_buffer = buffer;
++    m_image = nullptr;
++    m_bufferDamage = bufferDamage;
++}
++
++void ScreencastLayer::setImage(QImage *image, const Region &bufferDamage)
++{
++    m_buffer = nullptr;
++    m_image = image;
+     m_bufferDamage = bufferDamage;
+ }
+
+@@ -36,7 +44,7 @@
+ std::optional<OutputLayerBeginFrameInfo> ScreencastLayer::doBeginFrame()
+ {
+     return OutputLayerBeginFrameInfo{
+-        .renderTarget = RenderTarget(m_buffer),
++        .renderTarget = m_buffer ? RenderTarget(m_buffer) : RenderTarget(m_image),
+         .repaint = m_bufferDamage,
+     };
+ }
+--- a/src/plugins/screencast/screencastlayer.h
++++ b/src/plugins/screencast/screencastlayer.h
+@@ -6,6 +6,8 @@
+ #pragma once
+ #include "core/outputlayer.h"
+
++class QImage;
++
+ namespace KWin
+ {
+
+@@ -15,6 +17,7 @@
+     explicit ScreencastLayer(LogicalOutput *output, const FormatModifierMap &formats);
+
+     void setFramebuffer(GLFramebuffer *buffer, const Region &bufferDamage);
++    void setImage(QImage *image, const Region &bufferDamage);
+
+     DrmDevice *scanoutDevice() const override;
+     FormatModifierMap supportedDrmFormats() const override;
+@@ -26,6 +29,7 @@
+
+     const FormatModifierMap m_formats;
+     GLFramebuffer *m_buffer = nullptr;
++    QImage *m_image = nullptr;
+     Region m_bufferDamage;
+ };
+
+--- a/src/plugins/screencast/screencastmanager.cpp
++++ b/src/plugins/screencast/screencastmanager.cpp
+@@ -48,6 +48,15 @@
+     return false;
+ }
+
++static bool isSupportedVirtualOutputCompositingType()
++{
++    if (auto backend = Compositor::self()->backend()) {
++        return backend->compositingType() == OpenGLCompositing
++            || backend->compositingType() == QPainterCompositing;
++    }
++    return false;
++}
++
+ void ScreencastManager::streamWindow(ScreencastStreamV1Interface *waylandStream,
+                                      const QString &winid,
+                                      ScreencastV1Interface::CursorMode mode)
+@@ -77,7 +86,7 @@
+                                             double scale,
+                                             ScreencastV1Interface::CursorMode mode)
+ {
+-    if (!isSupportedCompositingType()) {
++    if (!isSupportedVirtualOutputCompositingType()) {
+         stream->sendFailed(i18n("Unsupported compositing type"));
+         return;
+     }
+--- a/src/plugins/screencast/screencaststream.cpp
++++ b/src/plugins/screencast/screencaststream.cpp
+@@ -372,12 +372,6 @@
+         return false;
+     }
+
+-    EglBackend *backend = qobject_cast<EglBackend *>(Compositor::self()->backend());
+-    if (!backend) {
+-        m_error = i18n("OpenGL compositing is required for screencasting");
+-        return false;
+-    }
+-
+     connect(m_pwCore.get(), &PipeWireCore::pipewireFailed, this, &ScreenCastStream::coreFailed);
+
+     if (!createStream()) {
+@@ -431,7 +425,8 @@
+         m_drmFormat = itModifiers.key();
+         m_modifiers = *itModifiers;
+     }
+-    m_hasDmaBuf = testCreateDmaBuf(m_resolution, m_drmFormat, m_modifiers).has_value();
++    m_hasDmaBuf = qobject_cast<EglBackend *>(Compositor::self()->backend())
++        && testCreateDmaBuf(m_resolution, m_drmFormat, m_modifiers).has_value();
+
+     char buffer[2048];
+     QList<const spa_pod *> params = buildFormats(false, buffer);
+@@ -576,9 +571,6 @@
+ void ScreenCastStream::record(Contents contents)
+ {
+     EglBackend *backend = qobject_cast<EglBackend *>(Compositor::self()->backend());
+-    if (!backend) {
+-        return;
+-    }
+
+     struct pw_buffer *pwBuffer = dequeueBuffer();
+     if (!pwBuffer) {
+@@ -608,8 +600,10 @@
+         break;
+     }
+
+-    EglContext *context = backend->openglContext();
+-    context->makeCurrent();
++    EglContext *context = backend ? backend->openglContext() : nullptr;
++    if (context) {
++        context->makeCurrent();
++    }
+
+     spa_meta_sync_timeline *synctmeta = nullptr;
+
+@@ -619,6 +613,7 @@
+             damage = m_source->render(memfd->view.image(), m_damageJournal.accumulate(memfd->m_age, Region::infinite()));
+             bumpBufferAge(memfd);
+         } else if (auto dmabuf = dynamic_cast<DmaBufScreenCastBuffer *>(buffer)) {
++            Q_ASSERT(backend);
+             if (dmabuf->synctimeline) {
+                 synctmeta = static_cast<spa_meta_sync_timeline *>(spa_buffer_find_meta_data(spa_buffer,
+                                                                                             SPA_META_SyncTimeline,
+@@ -637,6 +632,8 @@
+     }
+
+     if (spa_data[0].type == SPA_DATA_DmaBuf) {
++        Q_ASSERT(backend);
++        Q_ASSERT(context);
+         if (synctmeta) {
+             EGLNativeFence fence(backend->eglDisplayObject());

@@ -1,0 +1,86 @@
+--- a/server/SessionController.cpp
++++ b/server/SessionController.cpp
+@@ -7,6 +7,7 @@
+ #include <QCoreApplication>
+ #include <QDBusInterface>
+ #include <QMenu>
++#include <QProcess>
+ 
+ #include <KLocalizedString>
+ 
+@@ -63,6 +64,7 @@ public:
+     void onSessionStarted()
+     {
+         m_sessionStarted = true;
++        runOutputLifecycleHandler(QStringLiteral("up"));
+         connection->videoStream()->setPipeWireSource(session->nodeId(), session->takePipeWireFd());
+         connection->videoStream()->setStreamingEnabled(connection->videoStream()->enabled());
+     }
+@@ -77,6 +79,48 @@ public:
+         session->start();
+     }
+ 
++    void setVirtualMonitor(const KRdp::VirtualMonitor &virtualMonitor)
++    {
++        m_virtualMonitorName = virtualMonitor.name;
++        session->setVirtualMonitor(virtualMonitor);
++    }
++
++    void runOutputLifecycleHandler(const QString &action)
++    {
++        const QString handler = qEnvironmentVariable("KRDP_LIFECYCLE_HANDLER");
++        if (m_virtualMonitorName.isEmpty() || handler.isEmpty()) {
++            return;
++        }
++
++        // The helper is called from KRdp's stream lifecycle, not a poller.
++        // "up" follows KWin virtual-output creation; "down" runs before the
++        // SessionWrapper releases the corresponding stream.
++        QProcess process;
++        process.setProcessChannelMode(QProcess::MergedChannels);
++        process.start(handler, {action, m_virtualMonitorName});
++        if (!process.waitForStarted(1000)) {
++            qWarning() << "KRDP-LIFECYCLE: could not start" << handler << action << m_virtualMonitorName
++                       << process.errorString();
++            return;
++        }
++        if (!process.waitForFinished(5000)) {
++            process.kill();
++            process.waitForFinished(1000);
++            qWarning() << "KRDP-LIFECYCLE: helper timed out" << action << m_virtualMonitorName;
++            return;
++        }
++        if (process.exitStatus() != QProcess::NormalExit || process.exitCode() != 0) {
++            qWarning().nospace() << "KRDP-LIFECYCLE: helper failed action=" << action
++                                 << " monitor=" << m_virtualMonitorName
++                                 << " exit=" << process.exitCode()
++                                 << " output=" << process.readAll();
++        } else {
++            qInfo().nospace() << "KRDP-LIFECYCLE: helper completed action=" << action
++                              << " monitor=" << m_virtualMonitorName
++                              << " output=" << process.readAll();
++        }
++    }
++
+     void onConnectionDestroyed()
+     {
+         Q_EMIT connectionDestroyed(this);
+@@ -89,5 +134,6 @@ public:
+     QPointer<KRdp::RdpConnection> connection;
+     KStatusNotifierItem *m_sni;
++    QString m_virtualMonitorName;
+     bool m_sessionStarted = false;
+     bool m_sessionStartRequested = false;
+ };
+@@ -165,4 +211,4 @@ void SessionController::onNewConnection(KRdp::RdpConnection *newConnection)
+                                  << " (configured fallback=" << configuredVirtualMonitor.size << '@' << configuredVirtualMonitor.dpr << ')';
+-            wrapper->session->setVirtualMonitor(virtualMonitor);
++            wrapper->setVirtualMonitor(virtualMonitor);
+             wrapper->startSession();
+         });
+@@ -166,4 +212,5 @@ void SessionController::onNewConnection(KRdp::RdpConnection *newConnection)
+     connect(wrapper.get(), &SessionWrapper::connectionDestroyed, this, [this](SessionWrapper *wrapper) {
++        wrapper->runOutputLifecycleHandler(QStringLiteral("down"));
+         m_wrappers.erase(std::remove_if(m_wrappers.begin(),
+                                         m_wrappers.end(),
+                                         [wrapper](std::unique_ptr<SessionWrapper> &entry) {

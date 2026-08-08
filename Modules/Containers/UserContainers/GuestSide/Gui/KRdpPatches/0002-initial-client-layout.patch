@@ -1,0 +1,102 @@
+diff --git a/src/RdpConnection.h b/src/RdpConnection.h
+--- a/src/RdpConnection.h
++++ b/src/RdpConnection.h
+@@ -7,5 +7,6 @@
+ #include <thread>
+
+ #include <QObject>
++#include <QSize>
+
+ #include <freerdp/freerdp.h>
+@@ -75,4 +75,10 @@ public:
+     State state() const;
+     Q_SIGNAL void stateChanged(State newState);
+-
++
++    /**
++     * The initial client desktop configuration, as negotiated by RDP.
++     * A scale of 0 means that the client supplied no valid desktop scale.
++     */
++    Q_SIGNAL void initialDesktopConfiguration(QSize size, qreal scale);
++
+     void close(CloseReason reason = CloseReason::None);
+
+diff --git a/src/RdpConnection.cpp b/src/RdpConnection.cpp
+--- a/src/RdpConnection.cpp
++++ b/src/RdpConnection.cpp
+@@ -512,5 +512,15 @@ bool RdpConnection::onCapabilities()
+         return false;
+     }
+
++    const QSize desktopSize(freerdp_settings_get_uint32(settings, FreeRDP_DesktopWidth),
++                            freerdp_settings_get_uint32(settings, FreeRDP_DesktopHeight));
++    const auto desktopScaleFactor = freerdp_settings_get_uint32(settings, FreeRDP_DesktopScaleFactor);
++    const qreal desktopScale = desktopScaleFactor >= 100 && desktopScaleFactor <= 500 ? qreal(desktopScaleFactor) / 100.0 : 0;
++    qWarning().nospace() << "KRDP-CLIENT-LAYOUT: DesktopWidth=" << desktopSize.width()
++                         << " DesktopHeight=" << desktopSize.height()
++                         << " DesktopScaleFactor=" << desktopScaleFactor
++                         << " effectiveScale=" << desktopScale;
++    Q_EMIT initialDesktopConfiguration(desktopSize, desktopScale);
++
+     return true;
+ }
+diff --git a/server/SessionController.cpp b/server/SessionController.cpp
+--- a/server/SessionController.cpp
++++ b/server/SessionController.cpp
+@@ -76,6 +76,15 @@ public:
+         connection->videoStream()->setStreamingEnabled(connection->videoStream()->enabled());
+     }
+
++    void startSession()
++    {
++        if (m_sessionStartRequested) {
++            return;
++        }
++        m_sessionStartRequested = true;
++        session->start();
++    }
++
+     void onConnectionDestroyed()
+     {
+         Q_EMIT connectionDestroyed(this);
+@@ -89,4 +98,5 @@ public:
+     QPointer<KRdp::RdpConnection> connection;
+     KStatusNotifierItem *m_sni;
+     bool m_sessionStarted = false;
++    bool m_sessionStartRequested = false;
+ };
+@@ -132,10 +142,31 @@ void SessionController::onNewConnection(KRdp::RdpConnection *newConnection)
+ {
+     auto wrapper = std::make_unique<SessionWrapper>(newConnection, makeSession(), m_sni);
+     if (m_virtualMonitor) {
+-        wrapper->session->setVirtualMonitor(*m_virtualMonitor);
++        const auto configuredVirtualMonitor = *m_virtualMonitor;
++        connect(newConnection, &KRdp::RdpConnection::initialDesktopConfiguration, wrapper.get(), [wrapper = wrapper.get(), configuredVirtualMonitor](QSize clientSize, qreal clientScale) {
++            auto virtualMonitor = configuredVirtualMonitor;
++            if (clientSize.width() >= 200 && clientSize.height() >= 200 && clientSize.width() <= 8192 && clientSize.height() <= 8192) {
++                // KWin's virtual-monitor size is logical.  RDP advertises
++                // physical desktop pixels, so at 200% a 2736x1824 client
++                // needs a 1368x912 logical monitor with DPR 2, not a
++                // 2736x1824@2 (which would render 5472x3648 pixels).
++                const qreal scale = clientScale >= 1.0 && clientScale <= 5.0 ? clientScale : virtualMonitor.dpr;
++                virtualMonitor.size = QSize(qRound(clientSize.width() / scale), qRound(clientSize.height() / scale));
++            }
++            if (clientScale >= 1.0 && clientScale <= 5.0) {
++                virtualMonitor.dpr = clientScale;
++            }
++            virtualMonitor.name = QStringLiteral("RDP-%1x%2@%3").arg(virtualMonitor.size.width()).arg(virtualMonitor.size.height()).arg(virtualMonitor.dpr);
++            qWarning().nospace() << "KRDP-CLIENT-LAYOUT: creating virtual monitor " << virtualMonitor.name
++                                 << " (configured fallback=" << configuredVirtualMonitor.size << '@' << configuredVirtualMonitor.dpr << ')';
++            wrapper->session->setVirtualMonitor(virtualMonitor);
++            wrapper->startSession();
++        });
+     } else if (m_monitorIndex) {
+         wrapper->session->setActiveStream(*m_monitorIndex);
+     }
+     wrapper->connection->videoStream()->setVideoQuality(m_quality.value());
+-    wrapper->session->start();
++    if (!m_virtualMonitor) {
++        wrapper->startSession();
++    }
+
+     connect(wrapper.get(), &SessionWrapper::connectionDestroyed, this, [this](SessionWrapper *wrapper) {

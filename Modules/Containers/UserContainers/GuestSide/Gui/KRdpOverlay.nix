@@ -1,0 +1,66 @@
+# The displayless KRdp path needs matching patched KPipeWire, KRdp, and KWin
+# derivations. Keep the patches with this module so a guest does not depend on
+# a mutable Copybox checkout or an LD_PRELOAD workaround.
+final: prev:
+let
+  inherit (final) lib;
+  patch = name: ./KRdpPatches + "/${name}";
+
+  patchedKPipeWire = prev.kdePackages.kpipewire.overrideAttrs (old: {
+    patches = (old.patches or [ ]) ++ [
+      (patch "0009-h264-max-level-5.2.patch")
+    ];
+  });
+
+  patchedKrdp = prev.kdePackages.krdp.overrideAttrs (old: {
+    patches = (old.patches or [ ]) ++ [
+      (patch "0001-pointer-coordinate-fix.patch")
+      (patch "0002-initial-client-layout.patch")
+      (patch "0005-layout-and-pointer-diagnostics.patch")
+      # This advertises Display Control and retains diagnostics. It deliberately
+      # does not claim to implement live mid-session output resize yet.
+      (patch "0006-display-control-diagnostics.patch")
+      (patch "0007-global-pointer-origin-and-modifier-cleanup.patch")
+      (patch "0008-plasma-clipboard-bridge.patch")
+      # KRdp calls the configured helper synchronously after virtual-output
+      # creation and before virtual-output teardown.
+      (patch "0010-krdp-output-lifecycle-handler.patch")
+    ];
+
+    # KRdp propagates KPipeWire's development output. Replace the original
+    # package there as well as in kdePackages, so the wrapped server links and
+    # runs against the H.264-level-corrected library without LD_PRELOAD.
+    propagatedBuildInputs =
+      lib.filter
+        (input: !(lib.hasInfix "-kpipewire-" (toString input)))
+        (old.propagatedBuildInputs or [ ])
+      ++ [ patchedKPipeWire.dev ];
+  });
+
+  patchedKwin = prev.kdePackages.kwin.overrideAttrs (old: {
+    pname = "kwin-qpainter-krdp";
+    patches = (old.patches or [ ]) ++ [
+      (patch "0003-qpainter-virtual-screencast.patch")
+    ];
+
+    # Do not apply 0004-allow-zero-virtual-outputs.patch. KWin's initial
+    # Virtual-0 stub is currently needed while KRdp creates the negotiated
+    # Virtual-RDP-* output; allowing zero outputs leaves teardown/reconnect
+    # ordering unsafe until there is a synchronous lifecycle callback.
+
+    # KWin authorizes its private screencast and fake-input protocols by the
+    # desktop entry's executable. Install the exact entry from patched KRdp,
+    # never a similar entry from an unpatched package set.
+    postInstall = (old.postInstall or "") + ''
+      install -Dm444 ${patchedKrdp}/share/applications/org.kde.krdpserver.desktop \
+        "$out/share/applications/org.kde.krdpserver.desktop"
+    '';
+  });
+in
+{
+  kdePackages = prev.kdePackages // {
+    kpipewire = patchedKPipeWire;
+    krdp = patchedKrdp;
+    kwin = patchedKwin;
+  };
+}

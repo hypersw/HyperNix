@@ -51,6 +51,32 @@ to a nested compositor. The nested compositor is the only client of the host
 compositor. Optional resources such as GPU, audio, clipboard, and shared folders
 should be enabled explicitly.
 
+`IsolatedRdpWayland` is a displayless Plasma Wayland desktop for remote use.
+It runs a headless KWin virtual framebuffer and a patched KRdp server wholly
+inside the guest; it does not mount a host Wayland socket, access host DRM/GPU,
+or create a window on the host desktop. KRdp is normally bound to loopback and
+reached through SSH forwarding. Its direct Plasma path includes local patches
+for software/QPainter screencasting, initial RDP client size and scale, H.264
+compatibility, input coordinates, modifier cleanup, and plaintext clipboard.
+
+`IsolatedRdpWayland` generates a persistent self-signed TLS certificate/key in
+the guest user's state directory when no explicit `RdpCertificateFile` and
+`RdpCertificateKeyFile` pair is supplied. This certificate authenticates the
+RDP server; it is not an NLA user credential. `RdpNlaUsername` and
+`RdpNlaPassword` authenticate RDP clients. The password is temporarily
+store-visible for the agentNext experiment and must be replaced with a
+guest-local SOPS/agenix runtime credential before real use.
+
+The initial virtual monitor follows the connecting RDP client's reported size
+and desktop scale; `RdpFallbackVirtualMonitor` is only the fallback for clients
+that do not report valid capabilities. Live Display-Control resize is currently
+diagnostic-only. KRdp synchronously runs a packaged output lifecycle helper
+after `Virtual-RDP-*` creation and before its teardown. The helper uses KScreen
+to disable or re-enable KWin's `Virtual-0` stub and uses KConfig tools to repair
+the affected Plasma panel's `lastScreen` setting before restarting Plasma only
+when a repair was required. It has bounded in-callback waits, not a competing
+systemd/journal polling watcher.
+
 `None` means no GUI integration.
 
 For shared GUI modes, capabilities default toward convenience and can be disabled

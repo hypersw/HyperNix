@@ -1,0 +1,147 @@
+--- a/src/CMakeLists.txt
++++ b/src/CMakeLists.txt
+@@ -18,6 +18,8 @@ target_sources(KRdp PRIVATE
+     AbstractSession.cpp
+     Clipboard.cpp
+     Clipboard.h
++    DisplayControl.cpp
++    DisplayControl.h
+     RdpConnection.cpp
+     Server.cpp
+     Server.h
+--- /dev/null
++++ b/src/DisplayControl.h
+@@ -0,0 +1,18 @@
++#pragma once
++#include <freerdp/server/disp.h>
++
++namespace KRdp
++{
++class RdpConnection;
++class DisplayControl
++{
++public:
++    explicit DisplayControl(RdpConnection *session);
++    ~DisplayControl();
++    bool initialize();
++    void close();
++private:
++    RdpConnection *m_session;
++    DispServerContext *m_context = nullptr;
++};
++}
+--- /dev/null
++++ b/src/DisplayControl.cpp
+@@ -0,0 +1,62 @@
++#include "DisplayControl.h"
++#include "PeerContext_p.h"
++#include "RdpConnection.h"
++#include "krdp_logging.h"
++#include <freerdp/server/disp.h>
++#include <freerdp/peer.h>
++
++using namespace KRdp;
++
++static UINT receiveMonitorLayout(DispServerContext *context, const DISPLAY_CONTROL_MONITOR_LAYOUT_PDU *pdu)
++{
++    if (pdu->NumMonitors != 1) {
++        qCWarning(KRDP) << "KRDP-DISPLAY-CONTROL: monitor count" << pdu->NumMonitors;
++        return CHANNEL_RC_BAD_CHANNEL;
++    }
++    const auto &monitor = pdu->Monitors[0];
++    qCWarning(KRDP) << "KRDP-DISPLAY-CONTROL: layout" << monitor.Width << 'x' << monitor.Height
++                     << "physical=" << monitor.PhysicalWidth << 'x' << monitor.PhysicalHeight
++                     << "desktopScale=" << monitor.DesktopScaleFactor << "deviceScale=" << monitor.DeviceScaleFactor;
++    return CHANNEL_RC_OK;
++}
++
++DisplayControl::DisplayControl(RdpConnection *session)
++    : m_session(session)
++{
++}
++
++DisplayControl::~DisplayControl()
++{
++    close();
++}
++
++bool DisplayControl::initialize()
++{
++    if (m_context) {
++        return true;
++    }
++    auto peerContext = reinterpret_cast<PeerContext *>(m_session->rdpPeer()->context);
++    m_context = disp_server_context_new(peerContext->virtualChannelManager);
++    if (!m_context) {
++        return false;
++    }
++    m_context->rdpcontext = m_session->rdpPeer()->context;
++    m_context->DispMonitorLayout = receiveMonitorLayout;
++    m_context->MaxNumMonitors = 1;
++    m_context->MaxMonitorAreaFactorA = 8192;
++    m_context->MaxMonitorAreaFactorB = 8192;
++    if (m_context->Open(m_context) != CHANNEL_RC_OK || m_context->DisplayControlCaps(m_context) != CHANNEL_RC_OK) {
++        close();
++        return false;
++    }
++    qCWarning(KRDP) << "KRDP-DISPLAY-CONTROL: advertised";
++    return true;
++}
++
++void DisplayControl::close()
++{
++    if (m_context) {
++        disp_server_context_free(m_context);
++        m_context = nullptr;
++    }
++}
+--- a/src/RdpConnection.cpp
++++ b/src/RdpConnection.cpp
+@@ -20,5 +20,6 @@
+ #include <freerdp/channels/drdynvc.h>
+
+ #include "Clipboard.h"
++#include "DisplayControl.h"
+ #include "Cursor.h"
+ #include "InputHandler.h"
+@@ -196,4 +197,5 @@ public:
+     std::unique_ptr<NetworkDetection> networkDetection;
+     std::unique_ptr<Clipboard> clipboard;
++    std::unique_ptr<DisplayControl> displayControl;
+
+     freerdp_peer *peer = nullptr;
+@@ -224,4 +226,5 @@ RdpConnection::RdpConnection(Server *server, qintptr socketHandle)
+     d->networkDetection = std::make_unique<NetworkDetection>(this);
+     d->clipboard = std::make_unique<Clipboard>(this);
++    d->displayControl = std::make_unique<DisplayControl>(this);
+
+     QMetaObject::invokeMethod(this, &RdpConnection::initialize, Qt::QueuedConnection);
+@@ -388,4 +391,6 @@ void RdpConnection::initialize()
+     freerdp_settings_set_bool(settings, FreeRDP_FrameMarkerCommandEnabled, true);
+     freerdp_settings_set_bool(settings, FreeRDP_SurfaceFrameMarkerEnabled, true);
++    freerdp_settings_set_bool(settings, FreeRDP_SupportMonitorLayoutPdu, true);
++    freerdp_settings_set_bool(settings, FreeRDP_SupportDisplayControl, true);
+
+     d->peer->Capabilities = peerCapabilities;
+@@ -460,4 +465,7 @@ void RdpConnection::run(std::stop_token stopToken)
+         if (d->peer->connected && d->state == State::Activated && drdynvcJoined) {
+             if (drdynvcState == DRDYNVC_STATE_READY) {
++                if (!d->displayControl->initialize()) {
++                    break;
++                }
+                 if (!d->videoStream->openChannel()) {
+                     qCWarning(KRDP) << "Unable to open RDPGFX channel";
+@@ -568,3 +576,4 @@ bool RdpConnection::onClose()
+ {
++    d->displayControl->close();
+     d->clipboard->close();
+     d->videoStream->close();
+--- a/src/RdpConnection.h
++++ b/src/RdpConnection.h
+@@ -120,6 +120,7 @@ private:
+     friend class VideoStream;
+     friend class NetworkDetection;
+     friend class Clipboard;
++    friend class DisplayControl;
+
+     void setState(State newState);

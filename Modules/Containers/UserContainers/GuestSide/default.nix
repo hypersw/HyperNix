@@ -97,6 +97,50 @@ in
         default = 33398;
         description = "TCP port where IsolatedRdpWayland exposes its RDP listener.";
       };
+      RdpFallbackVirtualMonitor = lib.mkOption {
+        type = lib.types.str;
+        default = "1920x1080@1";
+        description = ''
+          Initial KRdp virtual-monitor geometry used only when an RDP client
+          does not report a valid desktop size and scale.
+        '';
+      };
+      RdpQuality = lib.mkOption {
+        type = lib.types.ints.between 0 100;
+        default = 80;
+        description = "KRdp video quality from 0 through 100.";
+      };
+      RdpCertificateFile = lib.mkOption {
+        type = lib.types.nullOr lib.types.str;
+        default = null;
+        description = ''
+          Optional guest-visible TLS certificate path. When both certificate
+          options are null, IsolatedRdpWayland persistently generates a local
+          self-signed server identity on first start.
+        '';
+      };
+      RdpCertificateKeyFile = lib.mkOption {
+        type = lib.types.nullOr lib.types.str;
+        default = null;
+        description = "Optional guest-visible TLS private-key path paired with RdpCertificateFile.";
+      };
+      RdpNlaUsername = lib.mkOption {
+        type = lib.types.nullOr lib.types.str;
+        default = null;
+        description = ''
+          NLA username for IsolatedRdpWayland. TODO: Keep this explicit so a
+          future secret-backed credential policy can choose its own identity.
+        '';
+      };
+      RdpNlaPassword = lib.mkOption {
+        type = lib.types.nullOr lib.types.str;
+        default = null;
+        description = ''
+          NLA password for IsolatedRdpWayland. TODO: This temporary testing
+          option is intentionally store-visible. Replace it with a guest-local
+          SOPS/agenix runtime credential before using this desktop for real.
+        '';
+      };
       FontPackages = lib.mkOption {
         type = lib.types.listOf lib.types.package;
         default = [ ];

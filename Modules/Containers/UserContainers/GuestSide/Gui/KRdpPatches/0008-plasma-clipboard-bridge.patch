@@ -1,0 +1,64 @@
+--- a/src/PlasmaScreencastV1Session.cpp
++++ b/src/PlasmaScreencastV1Session.cpp
+@@ -5,12 +5,16 @@
+ #include "PlasmaScreencastV1Session.h"
+
+ #include <QGuiApplication>
++#include <QClipboard>
+ #include <QMouseEvent>
++#include <QMimeData>
+ #include <QScreen>
+ #include <QQueue>
+ #include <QWaylandClientExtensionTemplate>
+ #include <qpa/qplatformnativeinterface.h>
+
++#include <KSystemClipboard>
++
+ #include <linux/input-event-codes.h>
+ #include <sys/mman.h>
+ #include <unistd.h>
+@@ -156,6 +159,30 @@ PlasmaScreencastV1Session::PlasmaScreencastV1Session()
+ {
+     d->remoteInterface = new FakeInput();
+     d->remoteInterface->authenticate(QStringLiteral("krdpserver"), QString());
++
++    // The direct --plasma backend used to leave clipboard handling as a
++    // no-op. KSystemClipboard is the compositor-facing clipboard API: unlike
++    // QGuiApplication::clipboard(), it is usable by this headless privileged
++    // Wayland client without requiring a focused surface.
++    connect(KSystemClipboard::instance(), &KSystemClipboard::changed, this, [this](auto mode) {
++        if (mode != QClipboard::Clipboard) {
++            return;
++        }
++
++        const auto data = KSystemClipboard::instance()->mimeData(mode);
++        if (!data) {
++            return;
++        }
++
++        // Clipboard.cpp currently implements only CF_UNICODETEXT. Copy the
++        // text into an owned QMimeData object because KSystemClipboard retains
++        // ownership of the object it returns.
++        auto copy = new QMimeData();
++        if (data->hasText()) {
++            copy->setText(data->text());
++        }
++        Q_EMIT clipboardDataChanged(copy);
++    });
+ }
+
+ PlasmaScreencastV1Session::~PlasmaScreencastV1Session()
+@@ -297,6 +323,12 @@ void PlasmaScreencastV1Session::sendEvent(const std::shared_ptr<QEvent> &event)
+
+ void PlasmaScreencastV1Session::setClipboardData(std::unique_ptr<QMimeData> data)
+ {
+-    Q_UNUSED(data);
++    // KSystemClipboard takes ownership. This is the reverse CLIPRDR path:
++    // text copied by the RDP client becomes the Plasma session clipboard.
++    if (data) {
++        KSystemClipboard::instance()->setMimeData(data.release(), QClipboard::Clipboard);
++    } else {
++        KSystemClipboard::instance()->clear(QClipboard::Clipboard);
++    }
+ }
+ }

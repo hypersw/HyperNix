@@ -90,6 +90,12 @@ let
         IsolatedWaylandSocketName = "wayland-isolated";
         RdpListenAddress = "127.0.0.1";
         RdpPort = 33398;
+        RdpFallbackVirtualMonitor = "1920x1080@1";
+        RdpQuality = 80;
+        RdpCertificateFile = null;
+        RdpCertificateKeyFile = null;
+        RdpNlaUsername = null;
+        RdpNlaPassword = null;
       } // rawGui;
     in
     gui // {
@@ -259,6 +265,12 @@ let
               Gui.IsolatedWaylandSocketName = decl.Gui.IsolatedWaylandSocketName;
               Gui.RdpListenAddress = decl.Gui.RdpListenAddress;
               Gui.RdpPort = decl.Gui.RdpPort;
+              Gui.RdpFallbackVirtualMonitor = decl.Gui.RdpFallbackVirtualMonitor;
+              Gui.RdpQuality = decl.Gui.RdpQuality;
+              Gui.RdpCertificateFile = decl.Gui.RdpCertificateFile;
+              Gui.RdpCertificateKeyFile = decl.Gui.RdpCertificateKeyFile;
+              Gui.RdpNlaUsername = decl.Gui.RdpNlaUsername;
+              Gui.RdpNlaPassword = decl.Gui.RdpNlaPassword;
               Tpm.Enable = decl.Tpm.Enable;
               Fuse.Enable = decl.Fuse.Enable;
               Konsole.Enable = decl.Konsole.Enable;

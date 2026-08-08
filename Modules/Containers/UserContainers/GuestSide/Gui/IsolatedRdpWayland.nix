@@ -1,30 +1,65 @@
 { config, lib, pkgs, ... }:
 let
   cfg = config.hypersw.containers.UserContainers.Guest;
-  westonConfig = pkgs.writeText "isolated-rdp-wayland.ini" ''
-    [shell]
-    # Makes the built-in interactive Weston window switcher Alt+Tab, which is
-    # natural in an RDP session. The panel itself remains launcher-only.
-    binding-modifier=alt
-  '';
+  hasRdpCredentials =
+    cfg.Gui.RdpNlaUsername != null
+    && cfg.Gui.RdpNlaPassword != null;
+  hasCustomTlsIdentity =
+    cfg.Gui.RdpCertificateFile != null
+    && cfg.Gui.RdpCertificateKeyFile != null;
+  compositorUnit = "isolated-rdp-wayland-compositor.service";
+  rdpOutputLifecycle = import ./RdpOutputLifecycle.nix { inherit pkgs; };
 in
 {
-  # RDP is a separate isolated mode. It creates its own compositor and does not
-  # mount, link, or ACL the host Wayland socket at all.
+  # This mode is deliberately independent from host graphics: KWin renders to
+  # a virtual framebuffer, KRdp captures it through the patched QPainter path,
+  # and the only exposed transport is the guest's loopback RDP listener.
   config = lib.mkIf (cfg.Enable && cfg.Gui.Mode == "IsolatedRdpWayland") {
-    environment.systemPackages = [ pkgs.weston pkgs.openssl ];
+    nixpkgs.overlays = [ (import ./KRdpOverlay.nix) ];
+
+    warnings = lib.optional (!hasRdpCredentials) ''
+      IsolatedRdpWayland is not starting KRdp: configure Gui.RdpNlaUsername and
+      Gui.RdpNlaPassword. The current test password is intentionally temporary;
+      replace it with a guest-local runtime secret before real use.
+    '';
+
+    assertions = [
+      {
+        assertion =
+          (cfg.Gui.RdpCertificateFile == null)
+          == (cfg.Gui.RdpCertificateKeyFile == null);
+        message = ''
+          IsolatedRdpWayland requires Gui.RdpCertificateFile and
+          Gui.RdpCertificateKeyFile to be configured together.
+        '';
+      }
+    ];
+
+    environment.systemPackages = [
+      pkgs.kdePackages.kwin
+      pkgs.kdePackages.krdp
+      pkgs.kdePackages.plasma-workspace
+      pkgs.kdePackages.plasma-desktop
+      pkgs.kdePackages.kglobalacceld
+      pkgs.openssl
+      rdpOutputLifecycle
+    ];
 
     environment.sessionVariables = {
       WAYLAND_DISPLAY = cfg.Gui.IsolatedWaylandSocketName;
+      XDG_SESSION_TYPE = "wayland";
+      XDG_CURRENT_DESKTOP = "KDE";
+      KDE_FULL_SESSION = "true";
+      KDE_SESSION_VERSION = "6";
+      QT_QPA_PLATFORM = "wayland";
+      QT_QPA_PLATFORMTHEME = "kde";
       NIXOS_OZONE_WL = "1";
       OZONE_PLATFORM = "wayland";
       ELECTRON_OZONE_PLATFORM_HINT = "wayland";
       GDK_BACKEND = "wayland";
-      QT_QPA_PLATFORM = "wayland";
       SDL_VIDEODRIVER = "wayland";
       GLFW_PLATFORM = "wayland";
       CLUTTER_BACKEND = "wayland";
-      XDG_SESSION_TYPE = "wayland";
       WINIT_UNIX_BACKEND = "wayland";
       MOZ_ENABLE_WAYLAND = "1";
       NO_AT_BRIDGE = "1";
@@ -32,37 +67,87 @@ in
     };
 
     systemd.user.services.isolated-rdp-wayland-compositor = {
-      description = "Isolated RDP Wayland compositor";
+      description = "Headless KWin compositor for isolated KRdp desktop";
       wantedBy = [ "default.target" ];
+      after = [ "dbus.socket" ];
       serviceConfig = {
         Type = "simple";
         Restart = "on-failure";
-        ExecStart = pkgs.writeShellScript "isolated-rdp-wayland-compositor" ''
+        RestartSec = 2;
+        UnsetEnvironment = [ "WAYLAND_DISPLAY" ];
+        ExecStart = "${pkgs.kdePackages.kwin}/bin/kwin_wayland --virtual --no-lockscreen --socket=${cfg.Gui.IsolatedWaylandSocketName}";
+      };
+    };
+
+    systemd.user.services.isolated-rdp-wayland-plasma = {
+      description = "Plasma desktop shell for isolated KRdp desktop";
+      wantedBy = [ "default.target" ];
+      requires = [ compositorUnit ];
+      after = [ compositorUnit ];
+      serviceConfig = {
+        Type = "simple";
+        Restart = "on-failure";
+        RestartSec = 2;
+        ExecStartPre = pkgs.writeShellScript "wait-for-isolated-rdp-wayland" ''
+          set -euo pipefail
+          socket="/run/user/$(id -u)/${cfg.Gui.IsolatedWaylandSocketName}"
+          for attempt in $(seq 1 100); do
+            [ -S "$socket" ] && exit 0
+            sleep 0.1
+          done
+          echo "KWin Wayland socket did not appear: $socket" >&2
+          exit 1
+        '';
+        ExecStart = "${pkgs.kdePackages.plasma-workspace}/bin/plasmashell --no-respawn";
+      };
+    };
+
+    systemd.user.services.isolated-rdp-wayland-server = lib.mkIf hasRdpCredentials {
+      description = "Loopback-only KRdp server for isolated Plasma desktop";
+      wantedBy = [ "default.target" ];
+      requires = [ compositorUnit "isolated-rdp-wayland-plasma.service" ];
+      after = [ compositorUnit "isolated-rdp-wayland-plasma.service" ];
+      serviceConfig = {
+        Type = "simple";
+        Restart = "on-failure";
+        RestartSec = 2;
+        Environment = [
+          "WAYLAND_DISPLAY=${cfg.Gui.IsolatedWaylandSocketName}"
+          "KRDP_LIFECYCLE_HANDLER=${rdpOutputLifecycle}/bin/hypersw-rdp-output-lifecycle"
+        ];
+        ExecStart = pkgs.writeShellScript "isolated-rdp-wayland-server" ''
           set -euo pipefail
           state="$HOME/.local/state/hypersw/isolated-rdp-wayland"
           mkdir -p "$state"
+          umask 077
 
-          # Weston 15 requires security material for every TCP RDP listener.
-          # FreeRDP 3 no longer creates legacy RDP4 keys, so use a local TLS
-          # pair even when SSH is the outer transport. Keep it out of the Nix
-          # store because the private key belongs to this guest instance.
-          if [ ! -s "$state/tls.key" ] || [ ! -s "$state/tls.crt" ]; then
-            ${pkgs.openssl}/bin/openssl req -x509 -newkey rsa:2048 -nodes \
-              -keyout "$state/tls.key" \
-              -out "$state/tls.crt" \
-              -days 3650 \
-              -subj ${lib.escapeShellArg "/CN=${cfg.Name}-rdp"}
+          certificate=${lib.escapeShellArg (if hasCustomTlsIdentity then cfg.Gui.RdpCertificateFile else "")}
+          certificate_key=${lib.escapeShellArg (if hasCustomTlsIdentity then cfg.Gui.RdpCertificateKeyFile else "")}
+          if [ -z "$certificate" ]; then
+            certificate="$state/tls.crt"
+            certificate_key="$state/tls.key"
+            if [ ! -s "$certificate" ] || [ ! -s "$certificate_key" ]; then
+              ${pkgs.openssl}/bin/openssl req -x509 -newkey rsa:2048 -nodes \
+                -keyout "$certificate_key" \
+                -out "$certificate" \
+                -days 3650 \
+                -subj ${lib.escapeShellArg "/CN=${cfg.Name}-krdp"}
+            fi
           fi
 
-          exec ${pkgs.weston}/bin/weston \
-            --backend=rdp-backend.so \
-            --shell=desktop-shell.so \
-            --config=${westonConfig} \
-            --address=${lib.escapeShellArg cfg.Gui.RdpListenAddress} \
-            --port=${toString cfg.Gui.RdpPort} \
-            --rdp-tls-key="$state/tls.key" \
-            --rdp-tls-cert="$state/tls.crt" \
-            --socket=${lib.escapeShellArg cfg.Gui.IsolatedWaylandSocketName}
+          # TODO: This test password is embedded in the Nix-built script and
+          # appears in KRdp's process arguments. Replace RdpNlaPassword with a
+          # secret-backed runtime credential before using this beyond testing.
+          exec ${pkgs.kdePackages.krdp}/bin/krdpserver \
+            --plasma \
+            --virtual-monitor ${lib.escapeShellArg cfg.Gui.RdpFallbackVirtualMonitor} \
+            --address ${lib.escapeShellArg cfg.Gui.RdpListenAddress} \
+            --port ${toString cfg.Gui.RdpPort} \
+            --quality ${toString cfg.Gui.RdpQuality} \
+            --certificate "$certificate" \
+            --certificate-key "$certificate_key" \
+            --username ${lib.escapeShellArg cfg.Gui.RdpNlaUsername} \
+            --password ${lib.escapeShellArg cfg.Gui.RdpNlaPassword}
         '';
       };
     };

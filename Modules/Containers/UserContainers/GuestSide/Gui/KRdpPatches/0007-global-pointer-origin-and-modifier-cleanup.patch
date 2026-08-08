@@ -1,0 +1,70 @@
+--- a/src/PlasmaScreencastV1Session.cpp
++++ b/src/PlasmaScreencastV1Session.cpp
+@@ -8,6 +8,7 @@
+
+ #include <QGuiApplication>
+ #include <QMouseEvent>
++#include <QScreen>
+ #include <QQueue>
+ #include <QWaylandClientExtensionTemplate>
+ #include <qpa/qplatformnativeinterface.h>
+@@ -150,6 +151,27 @@ class KRDP_NO_EXPORT PlasmaScreencastV1Session::Private
+     FakeInput *remoteInterface = nullptr;
+ };
+
++static QPointF fakeInputPosition(const QPointF &rdpPosition, const std::optional<VirtualMonitor> &monitor)
++{
++    const qreal scale = monitor ? monitor->dpr : 1.0;
++    const QPointF localPosition = rdpPosition / scale;
++    if (!monitor) {
++        return localPosition;
++    }
++
++    const QString expectedScreenName = QStringLiteral("Virtual-") + monitor->name;
++    for (QScreen *screen : qApp->screens()) {
++        if (screen->name() == expectedScreenName) {
++            // KWin's fake-input absolute coordinates are in virtual-desktop
++            // space, while RDP coordinates are relative to this output.
++            return QPointF(screen->geometry().topLeft()) + localPosition;
++        }
++    }
++    qCWarning(KRDP) << "KRDP-POINTER: virtual output not found" << expectedScreenName
++                     << "available=" << qApp->screens();
++    return localPosition;
++}
++
+ PlasmaScreencastV1Session::PlasmaScreencastV1Session()
+     : AbstractSession()
+     , d(std::make_unique<Private>())
+@@ -163,5 +185,12 @@ PlasmaScreencastV1Session::~PlasmaScreencastV1Session()
+ {
+     qCDebug(KRDP) << "Closing Plasma Remote Session";
++    // A transport loss can omit a final RDP key-release.  KWin maintains key
++    // state independently, so release all modifiers before this fake-input
++    // object disappears instead of leaving Meta/Shift/Alt stuck in Plasma.
++    for (uint keycode : {KEY_LEFTCTRL, KEY_RIGHTCTRL, KEY_LEFTSHIFT, KEY_RIGHTSHIFT,
++                         KEY_LEFTALT, KEY_RIGHTALT, KEY_LEFTMETA, KEY_RIGHTMETA}) {
++        d->remoteInterface->keyboard_key(keycode, 0);
++    }
+ }
+
+ void PlasmaScreencastV1Session::start()
+@@ -222,7 +253,9 @@ void PlasmaScreencastV1Session::sendEvent(const std::shared_ptr<QEvent> &event)
+         const auto position = me->position();
+         const auto monitor = virtualMonitor();
+         const auto scale = monitor ? monitor->dpr : 1.0;
+-        const auto logicalPosition = position / scale;
++        const auto logicalPosition = fakeInputPosition(position, monitor);
++        qCWarning(KRDP) << "KRDP-POINTER: click rdp=" << position << "scale=" << scale
++                         << "fake-input-global=" << logicalPosition;
+         d->remoteInterface->pointer_motion_absolute(wl_fixed_from_double(logicalPosition.x()),
+                                                     wl_fixed_from_double(logicalPosition.y()));
+         uint state = me->type() == QEvent::MouseButtonPress ? 1 : 0;
+@@ -234,6 +266,6 @@ void PlasmaScreencastV1Session::sendEvent(const std::shared_ptr<QEvent> &event)
+         // monitor's pixel coordinates. Do not use the encoder's PipeWire stream size here.
+         const auto monitor = virtualMonitor();
+         const auto scale = monitor ? monitor->dpr : 1.0;
+-        auto logicalPosition = position / scale;
++        const auto logicalPosition = fakeInputPosition(position, monitor);
+         d->remoteInterface->pointer_motion_absolute(wl_fixed_from_double(logicalPosition.x()), wl_fixed_from_double(logicalPosition.y()));
+         break;
