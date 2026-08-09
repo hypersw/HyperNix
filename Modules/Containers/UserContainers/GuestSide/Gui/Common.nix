@@ -31,7 +31,13 @@ in
       packages = cfg.Gui.FontPackages;
       enableDefaultPackages = true;
       fontDir.enable = true;
-      fontconfig.enable = true;
+      fontconfig = {
+        enable = true;
+        # GUI guests are currently tuned for the known RGB Surface display.
+        # Keep this in the common GUI layer so every guest uses one font
+        # rasterization policy; revisit it before supporting rotated/BGR clients.
+        subpixel.rgba = "rgb";
+      };
     };
 
     hardware.graphics.enable = lib.mkIf cfg.Gui.Gpu true;
