@@ -3,6 +3,14 @@ let
   cfg = config.hypersw.containers.UserContainers.Guest;
   waylandDisplay = "wayland-0";
   plasmaShellService = "hypersw-plasmashell.service";
+  screenLockerConfig = pkgs.writeText "hypersw-kscreenlockerrc" ''
+    [Daemon]
+    Autolock=false
+    Lock=false
+    LockOnResume=false
+    LockOnStart=false
+    RequirePassword=false
+  '';
   rdpOutputLifecycle = import ./RdpOutputLifecycle.nix {
     inherit pkgs;
     PlasmaShellService = plasmaShellService;
@@ -22,6 +30,10 @@ let
     "XDG_CURRENT_DESKTOP=KDE"
     "DESKTOP_SESSION=plasma"
     "XDG_DATA_DIRS=${kdeDataDirs}"
+    # Do not inherit a persistent user KScreenLocker configuration. This
+    # dedicated, loopback-only RDP session has KRdp authentication but no
+    # usable local Unix password to unlock a Plasma screen-lock greeter.
+    "XDG_CONFIG_HOME=%t/hypersw-kde-rdp-config"
     "KWIN_COMPOSE=QPainter"
   ];
 
@@ -51,10 +63,24 @@ let
     echo "Timed out waiting for the virtual KWin socket: $socket" >&2
     exit 1
   '';
+
+  prepareKdeSessionConfig = pkgs.writeShellScript "hypersw-prepare-kde-rdp-session-config" ''
+    set -euo pipefail
+    config_dir="$XDG_RUNTIME_DIR/hypersw-kde-rdp-config"
+    ${pkgs.coreutils}/bin/mkdir -p "$config_dir"
+    ${pkgs.coreutils}/bin/install -m 600 ${screenLockerConfig} "$config_dir/kscreenlockerrc"
+  '';
 in {
   # KRdp owns an existing Plasma Wayland session.  Unlike GNOME Remote Desktop,
   # its --address option provides a real loopback-only listener.
   config = lib.mkIf (cfg.Enable && cfg.Gui.Mode == "IsolatedKdeRdp") {
+    assertions = [
+      {
+        assertion = cfg.Gui.RdpPassword != "";
+        message = "IsolatedKdeRdp cannot use an explicitly empty Gui.RdpPassword: KRdp rejects an empty password after connection. Use null for generated credentials, or provide a nonempty password / credentials file.";
+      }
+    ];
+
     # The persistent Plasma/portal session comes from this profile. The KRdp,
     # KWin, and KPipeWire packages below must be one patched package set so
     # KWin authorizes the exact KRdp executable that captures its output.
@@ -110,6 +136,7 @@ in {
       serviceConfig = {
         Type = "simple";
         Environment = virtualKwinEnvironment;
+        ExecStartPre = prepareKdeSessionConfig;
         ExecStart = "${pkgs.kdePackages.kwin}/bin/kwin_wayland --virtual --socket ${waylandDisplay}";
         ExecStartPost = waitForKwinSocket;
         Restart = "on-failure";

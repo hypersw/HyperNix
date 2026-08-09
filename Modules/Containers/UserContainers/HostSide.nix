@@ -41,11 +41,13 @@ let
   # guest modules either consume them there directly or link them into
   # XDG_RUNTIME_DIR where desktop protocols require that location.
   unitName = name: "container@${name}";
+  registrationRepairUnitName = name: "hypersw-managed-container-registration-repair-${name}";
   containerBindMountDir = "/run/ContainerBindMounts";
   pipeWireSocketName = "pipewire-0";
   pulseBridgeSocketName = "pulse_native";
   pulseHostSocket = "pulse/native";
   guestBootRequestDir = "/run/ContainerHostControl/boot-requests";
+  managedContainerStopTimeout = "3min";
 
   stateDir = name: "${hostControl.StateDir}/${name}";
   bootSlot = name: "${stateDir name}/current-system";
@@ -203,13 +205,18 @@ let
   ];
 
   serviceConfigFor = decl:
-    lib.filterAttrs (_: v: v != null) {
+    (lib.filterAttrs (_: v: v != null) {
       MemoryMax = decl.MemoryMax;
       MemoryHigh = decl.MemoryHigh;
       MemorySwapMax = decl.MemorySwapMax;
       AllowedCPUs = decl.AllowedCPUs;
       TasksMax = decl.TasksMax;
       LimitNOFILE = decl.LimitNOFILE;
+    }) // {
+      # Bound a managed guest's orderly shutdown. KillMode=mixed remains the
+      # NixOS nspawn default; this is a host-unit deadline, not a replacement
+      # for the stale-registration guard below.
+      TimeoutStopSec = managedContainerStopTimeout;
     };
 
   mkContainer = name: decl:
@@ -363,6 +370,92 @@ let
       (lib.mkIf (serviceConfig != {}) {
         systemd.services.${unitName name}.serviceConfig = serviceConfig;
       })
+
+      # Applies to this container's host lifecycle only. systemd-machined tracks
+      # a container by its guest PID 1. Normally nspawn unregisters it at exit.
+      # If guest PID 1 reaches systemd-shutdown but never exits, a later machined
+      # restart can restore that stale registration and reject a fresh nspawn
+      # registration with the same name. Repair only that exact, known-safe
+      # shape before starting this managed container; any broader inconsistency
+      # is left untouched and fails loudly for investigation.
+      {
+        systemd.services.${registrationRepairUnitName name} = {
+          description = "Repair stale machine registration for managed container ${name}";
+          requiredBy = [ "${unitName name}.service" ];
+          before = [ "${unitName name}.service" ];
+          after = [ "systemd-machined.service" ];
+          requires = [ "systemd-machined.service" ];
+          path = [ pkgs.coreutils pkgs.systemd ];
+          serviceConfig = {
+            Type = "oneshot";
+            TimeoutStartSec = "15s";
+          };
+          script = ''
+            set -euo pipefail
+
+            container_name=${lib.escapeShellArg name}
+            container_unit=${lib.escapeShellArg "${unitName name}.service"}
+            service_leader="$(systemctl show --value --property=MainPID "$container_unit")"
+            registered_leader="$(machinectl show --value --property=Leader "$container_name" 2>/dev/null || true)"
+
+            # No existing registration is the normal case.
+            case "$registered_leader" in
+              ""|"0" ) exit 0 ;;
+            esac
+
+            case "$registered_leader" in
+              *[!0-9]* )
+                echo "Managed container $container_name has an invalid machined leader: $registered_leader" >&2
+                exit 1
+                ;;
+            esac
+
+            # A nonzero supervisor means this is not a stale pre-start state.
+            # Do not guess which live process owns a conflicting registration.
+            if [ "$service_leader" != "0" ]; then
+              if [ "$service_leader" = "$registered_leader" ]; then
+                exit 0
+              fi
+
+              echo "Managed container $container_name has conflicting live leaders: service=$service_leader machined=$registered_leader" >&2
+              exit 1
+            fi
+
+            process_comm="$(cat "/proc/$registered_leader/comm" 2>/dev/null || true)"
+            process_cgroup="$(cat "/proc/$registered_leader/cgroup" 2>/dev/null || true)"
+            expected_cgroup="0::/machine.slice/$container_unit/payload/init.scope (deleted)"
+
+            if [ "$process_comm" != "systemd-shutdown" ] || [ "$process_cgroup" != "$expected_cgroup" ]; then
+              echo "Managed container $container_name has an unrecognised stale machine leader $registered_leader; refusing automatic cleanup." >&2
+              echo "comm=$process_comm" >&2
+              echo "cgroup=$process_cgroup" >&2
+              exit 1
+            fi
+
+            echo "Removing stale machine registration for $container_name (guest shutdown PID $registered_leader)." >&2
+            busctl call org.freedesktop.machine1 \
+              /org/freedesktop/machine1 \
+              org.freedesktop.machine1.Manager \
+              UnregisterMachine s "$container_name"
+
+            kill -TERM "$registered_leader"
+            for _ in $(seq 1 20); do
+              if [ ! -d "/proc/$registered_leader" ]; then
+                exit 0
+              fi
+              sleep 0.1
+            done
+
+            echo "Stale guest shutdown PID $registered_leader ignored SIGTERM; sending SIGKILL." >&2
+            kill -KILL "$registered_leader"
+          '';
+        };
+
+        systemd.services.${unitName name} = {
+          requires = [ "${registrationRepairUnitName name}.service" ];
+          after = [ "${registrationRepairUnitName name}.service" ];
+        };
+      }
 
       # Applies to Wayland-backed GUI containers. The host compositor socket is
       # owned by the host graphical user; grant only this container's declared

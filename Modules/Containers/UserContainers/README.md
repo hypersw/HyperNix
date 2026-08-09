@@ -73,11 +73,38 @@ after `Virtual-RDP-*` creation and before its teardown. When a `Virtual-0` stub
 exists, the helper changes it only at those callback points and repairs an
 affected Plasma panel with KScreen/KConfig, never a competing watcher.
 
+Its KWin/Plasma session receives a runtime-only KScreenLocker configuration
+which disables locking. KRdp authentication is separate from the local Unix
+account, and this remote-only profile deliberately has no local-password
+unlock path for a displayless screen-lock greeter.
+
 `None` means no GUI integration.
 
 For shared GUI modes, capabilities default toward convenience and can be disabled
 when unwanted. For isolated GUI modes, capabilities default to off and must be
 enabled deliberately.
+
+## Machine Registration Recovery
+
+`systemd-machined` identifies an nspawn machine by the guest's PID 1. During a
+normal stop, nspawn unregisters that machine when guest PID 1 exits. A rare
+failure mode leaves that PID executing `systemd-shutdown` after the host
+container unit has stopped. If `systemd-machined` is then restarted, it restores
+the still-live leader from `/run/systemd/machines`; a replacement nspawn cannot
+register the same machine name, and `machinectl` / `nixos-container` address the
+old PID instead.
+
+Each managed container has a pre-start repair unit for this precise condition.
+It unregisters the stale name and terminates the old process only when all of
+the following are true: the container service has no live supervisor, machined
+reports a numeric leader, and that leader is `systemd-shutdown` in the deleted
+guest `payload/init.scope` belonging to the same container. Any other mismatch
+fails the start rather than risking an unrelated process or an active machine.
+
+Managed container units also have an explicit three-minute host-side stop
+deadline. It bounds an ordinary nspawn stop job, but cannot kill a process that
+has already escaped into a deleted guest cgroup; that is why the pre-start
+registration check remains necessary.
 
 ## GC Roots
 

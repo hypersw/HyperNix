@@ -44,6 +44,11 @@ let
       substituteInPlace "$out/share/applications/org.kde.krdpserver.desktop" \
         --replace-fail "Exec=$out/bin/krdpserver" \
                        "Exec=$out/bin/.krdpserver-wrapped"
+      # Desktop-entry string lists use semicolons, not commas. KWin reads this
+      # property as QStringList before authorizing each private protocol.
+      substituteInPlace "$out/share/applications/org.kde.krdpserver.desktop" \
+        --replace-fail "X-KDE-Wayland-Interfaces=org_kde_kwin_fake_input,zkde_screencast_unstable_v1" \
+                       "X-KDE-Wayland-Interfaces=org_kde_kwin_fake_input;zkde_screencast_unstable_v1;"
     '';
   });
 
