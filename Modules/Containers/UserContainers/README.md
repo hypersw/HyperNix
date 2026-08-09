@@ -78,6 +78,11 @@ which disables locking. KRdp authentication is separate from the local Unix
 account, and this remote-only profile deliberately has no local-password
 unlock path for a displayless screen-lock greeter.
 
+KWin also uses a private cache below its user runtime directory. The directory
+name includes the selected patched-KWin store output, so its KService database
+cannot carry stale KRdp private-protocol authorization metadata across a Nix
+generation change.
+
 `None` means no GUI integration.
 
 For shared GUI modes, capabilities default toward convenience and can be disabled

@@ -3,6 +3,12 @@ let
   cfg = config.hypersw.containers.UserContainers.Guest;
   waylandDisplay = "wayland-0";
   plasmaShellService = "hypersw-plasmashell.service";
+  # Include the store hash as well as the package name. KWin's KService cache
+  # then changes with each patched KWin closure, including a copied KRdp
+  # desktop-entry authorization change.
+  kwinCacheTag = builtins.baseNameOf (toString pkgs.kdePackages.kwin);
+  kwinCacheDirName = "hypersw-kwin-ksycoca-${kwinCacheTag}";
+  kwinCacheHome = "%t/${kwinCacheDirName}";
   screenLockerConfig = pkgs.writeText "hypersw-kscreenlockerrc" ''
     [Daemon]
     Autolock=false
@@ -69,6 +75,9 @@ let
     config_dir="$XDG_RUNTIME_DIR/hypersw-kde-rdp-config"
     ${pkgs.coreutils}/bin/mkdir -p "$config_dir"
     ${pkgs.coreutils}/bin/install -m 600 ${screenLockerConfig} "$config_dir/kscreenlockerrc"
+    # Do not let KWin reuse ~/.cache/ksycoca6_* from a previous Nix closure.
+    # This directory name contains the selected patched-KWin store output.
+    ${pkgs.coreutils}/bin/install -d -m 700 "$XDG_RUNTIME_DIR/${kwinCacheDirName}"
   '';
 in {
   # KRdp owns an existing Plasma Wayland session.  Unlike GNOME Remote Desktop,
@@ -135,7 +144,7 @@ in {
       after = [ "dbus.service" "pipewire.service" ];
       serviceConfig = {
         Type = "simple";
-        Environment = virtualKwinEnvironment;
+        Environment = virtualKwinEnvironment ++ [ "XDG_CACHE_HOME=${kwinCacheHome}" ];
         ExecStartPre = prepareKdeSessionConfig;
         ExecStart = "${pkgs.kdePackages.kwin}/bin/kwin_wayland --virtual --socket ${waylandDisplay}";
         ExecStartPost = waitForKwinSocket;
