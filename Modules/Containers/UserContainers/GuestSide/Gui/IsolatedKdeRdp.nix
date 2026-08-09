@@ -1,7 +1,56 @@
 { config, lib, pkgs, ... }:
 let
   cfg = config.hypersw.containers.UserContainers.Guest;
-  rdpOutputLifecycle = import ./RdpOutputLifecycle.nix { inherit pkgs; };
+  waylandDisplay = "wayland-0";
+  plasmaShellService = "hypersw-plasmashell.service";
+  rdpOutputLifecycle = import ./RdpOutputLifecycle.nix {
+    inherit pkgs;
+    PlasmaShellService = plasmaShellService;
+  };
+
+  # KWin consults XDG_DATA_DIRS to authorize KRdp's private Wayland protocols.
+  # The patched KWin output contains the desktop entry from the exact patched
+  # KRdp output, so both locations deliberately appear here.
+  kdeDataDirs = lib.makeSearchPath "share" [
+    pkgs.kdePackages.kwin
+    pkgs.kdePackages.krdp
+    pkgs.kdePackages.plasma-workspace
+  ] + ":/run/current-system/sw/share";
+
+  virtualKwinEnvironment = [
+    "XDG_SESSION_TYPE=wayland"
+    "XDG_CURRENT_DESKTOP=KDE"
+    "DESKTOP_SESSION=plasma"
+    "XDG_DATA_DIRS=${kdeDataDirs}"
+    "KWIN_COMPOSE=QPainter"
+  ];
+
+  waylandClientEnvironment = virtualKwinEnvironment ++ [
+    "WAYLAND_DISPLAY=${waylandDisplay}"
+    "QT_QPA_PLATFORM=wayland"
+    "GDK_BACKEND=wayland"
+    "SDL_VIDEODRIVER=wayland"
+    "MOZ_ENABLE_WAYLAND=1"
+    "NIXOS_OZONE_WL=1"
+    "OZONE_PLATFORM=wayland"
+    "ELECTRON_OZONE_PLATFORM_HINT=wayland"
+  ];
+
+  waitForKwinSocket = pkgs.writeShellScript "hypersw-wait-for-kwin-socket" ''
+    set -euo pipefail
+    socket="$XDG_RUNTIME_DIR/${waylandDisplay}"
+    for ((attempt = 0; attempt < 100; attempt += 1)); do
+      if [ -S "$socket" ]; then
+        export WAYLAND_DISPLAY=${waylandDisplay}
+        ${pkgs.systemd}/bin/systemctl --user import-environment WAYLAND_DISPLAY
+        exit 0
+      fi
+      ${pkgs.coreutils}/bin/sleep 0.1
+    done
+
+    echo "Timed out waiting for the virtual KWin socket: $socket" >&2
+    exit 1
+  '';
 in {
   # KRdp owns an existing Plasma Wayland session.  Unlike GNOME Remote Desktop,
   # its --address option provides a real loopback-only listener.
@@ -50,16 +99,36 @@ in {
       MOZ_ENABLE_WAYLAND = "1";
     };
 
-    # startplasma-wayland creates the compositor/session which KRdp exposes.
-    # It is deliberately a user service rather than SDDM autologin: no physical
-    # seat or console login is involved, and lingering preserves it on disconnect.
-    systemd.user.services.hypersw-plasma-wayland = {
-      description = "Persistent Plasma Wayland session for managed KRdp";
+    # This is deliberately an explicit KWin invocation, rather than
+    # startplasma-wayland: the latter starts KWin with --xwayland and cannot
+    # create the Virtual-0 bootstrap output needed before KRdp negotiates its
+    # first Virtual-RDP-* output.
+    systemd.user.services.hypersw-kwin-virtual = {
+      description = "Persistent virtual KWin session for managed KRdp";
       wantedBy = [ "default.target" ];
       after = [ "dbus.service" "pipewire.service" ];
       serviceConfig = {
         Type = "simple";
-        ExecStart = "${pkgs.kdePackages.plasma-workspace}/bin/startplasma-wayland";
+        Environment = virtualKwinEnvironment;
+        ExecStart = "${pkgs.kdePackages.kwin}/bin/kwin_wayland --virtual --socket ${waylandDisplay}";
+        ExecStartPost = waitForKwinSocket;
+        Restart = "on-failure";
+        RestartSec = 2;
+      };
+    };
+
+    # Keep the small desktop shell separate from the compositor. KRdp only
+    # needs the virtual KWin session to listen; plasmashell supplies the panel
+    # and window-management UI when it becomes available.
+    systemd.user.services.hypersw-plasmashell = {
+      description = "Plasma shell for the managed virtual KWin session";
+      wantedBy = [ "default.target" ];
+      requires = [ "hypersw-kwin-virtual.service" ];
+      after = [ "hypersw-kwin-virtual.service" ];
+      serviceConfig = {
+        Type = "simple";
+        Environment = waylandClientEnvironment;
+        ExecStart = "${pkgs.kdePackages.plasma-workspace}/bin/plasmashell --no-respawn";
         Restart = "on-failure";
         RestartSec = 2;
       };
@@ -108,42 +177,31 @@ in {
     systemd.user.services."app-org.kde.krdpserver" = {
       description = "KRdp server for the managed Plasma Wayland session";
       wantedBy = [ "default.target" ];
-      # KRdp probes the Screenshot portal during its own startup, before it
-      # calls listen(2).  Starting it merely after KWin's Wayland socket exists
-      # can deadlock it behind the still-booting Plasma portal backend.
+      # KRdp's --plasma backend uses the explicit virtual KWin session below.
+      # Portal services are deliberately not dependencies: without a physical
+      # desktop their settings backend can time out before KRdp opens TCP.
       requires = [
         "hypersw-kde-rdp-setup.service"
-        "hypersw-plasma-wayland.service"
-        "plasma-core.target"
-        "plasma-xdg-desktop-portal-kde.service"
-        "xdg-desktop-portal.service"
+        "hypersw-kwin-virtual.service"
       ];
       after = [
         "hypersw-kde-rdp-setup.service"
-        "hypersw-plasma-wayland.service"
-        "plasma-core.target"
-        "plasma-xdg-desktop-portal-kde.service"
-        "xdg-desktop-portal.service"
+        "hypersw-kwin-virtual.service"
       ];
       serviceConfig = {
         Type = "simple";
         Restart = "on-failure";
         RestartSec = 2;
-        Environment = [
+        Environment = waylandClientEnvironment ++ [
           "KRDP_LIFECYCLE_HANDLER=${rdpOutputLifecycle}/bin/hypersw-rdp-output-lifecycle"
         ];
       };
       script = ''
         set -euo pipefail
-        # startplasma-wayland imports WAYLAND_DISPLAY into the user manager
-        # only after KWin has created its socket. Do not launch Qt/KRdp before
-        # then: Qt would abort rather than waiting for a compositor.
-        wayland_display="$(${pkgs.systemd}/bin/systemctl --user show-environment | ${pkgs.gnused}/bin/sed -n 's/^WAYLAND_DISPLAY=//p')"
-        if [ -z "$wayland_display" ] || [ ! -S "$XDG_RUNTIME_DIR/$wayland_display" ]; then
-          echo "Waiting for Plasma Wayland socket before starting KRdp" >&2
+        if [ ! -S "$XDG_RUNTIME_DIR/$WAYLAND_DISPLAY" ]; then
+          echo "Virtual KWin socket is unavailable: $XDG_RUNTIME_DIR/$WAYLAND_DISPLAY" >&2
           exit 1
         fi
-        export WAYLAND_DISPLAY="$wayland_display"
         state="$HOME/.local/state/hypersw/kde-rdp"
         username=$(${pkgs.gnused}/bin/sed -n '1p' "$state/credentials")
         password=$(${pkgs.gnused}/bin/sed -n '2p' "$state/credentials")

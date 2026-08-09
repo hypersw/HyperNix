@@ -1,4 +1,4 @@
-{ pkgs }:
+{ pkgs, PlasmaShellService }:
 pkgs.writeShellApplication {
   name = "hypersw-rdp-output-lifecycle";
   runtimeInputs = [
@@ -15,6 +15,7 @@ pkgs.writeShellApplication {
     action="''${1:?expected lifecycle action}"
     rdp_output="''${2:?expected virtual-output name}"
     stub_output="Virtual-0"
+    plasma_shell_service="${PlasmaShellService}"
     panel_config="$HOME/.config/plasma-org.kde.plasma.desktop-appletsrc"
 
     output_state() {
@@ -110,7 +111,7 @@ pkgs.writeShellApplication {
         fi
         wait_for_sole_rdp_output
         if repair_panels; then
-          systemctl --user try-restart plasma-plasmashell.service
+          systemctl --user try-restart "$plasma_shell_service"
         fi
         ;;
       down)
