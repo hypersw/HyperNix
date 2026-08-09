@@ -124,8 +124,8 @@ in
       };
       RdpQuality = lib.mkOption {
         type = lib.types.ints.between 0 100;
-        default = 80;
-        description = "KRdp video quality from 0 through 100.";
+        default = 100;
+        description = "KRdp video quality from 0 through 100; defaults to text-oriented maximum quality.";
       };
       FontPackages = lib.mkOption {
         type = lib.types.listOf lib.types.package;

@@ -95,7 +95,9 @@ let
         RdpListenAddress = "127.0.0.1";
         RdpPort = 33398;
         RdpFallbackVirtualMonitor = "1920x1080@1";
-        RdpQuality = 80;
+        # KRdp's default is intentionally biased toward readable desktop text.
+        # Clients may lower it explicitly when bandwidth matters more.
+        RdpQuality = 100;
         RdpUsername = name;
         RdpCredentialsFile = "";
         RdpPassword = null;
