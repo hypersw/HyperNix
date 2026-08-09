@@ -47,6 +47,8 @@ let
   pulseBridgeSocketName = "pulse_native";
   pulseHostSocket = "pulse/native";
   guestBootRequestDir = "/run/ContainerHostControl/boot-requests";
+  # This is deliberately larger than GuestSide's two-minute system-manager
+  # timeout, so nspawn does not preempt the guest's own orderly shutdown.
   managedContainerStopTimeout = "3min";
 
   stateDir = name: "${hostControl.StateDir}/${name}";

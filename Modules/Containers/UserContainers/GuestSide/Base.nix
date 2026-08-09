@@ -1,9 +1,21 @@
 { config, lib, pkgs, ... }:
 let
   cfg = config.hypersw.containers.UserContainers.Guest;
+  managedUserServiceStopTimeout = "1min";
+  managedSystemServiceStopTimeout = "2min";
 in
 {
   config = lib.mkIf cfg.Enable {
+    # Shutdown deadlines deliberately expand outwards. A managed user service
+    # gets at most one minute by default, guest PID 1 allows two minutes for
+    # its system services, and HostSide gives the nspawn container unit three
+    # minutes. Individual latency-sensitive user services may set a shorter
+    # TimeoutStopSec, as the isolated KDE RDP profile does.
+    systemd = {
+      settings.Manager.DefaultTimeoutStopSec = managedSystemServiceStopTimeout;
+      user.settings.Manager.DefaultTimeoutStopSec = managedUserServiceStopTimeout;
+    };
+
     environment = {
       systemPackages = [
         pkgs.htop
