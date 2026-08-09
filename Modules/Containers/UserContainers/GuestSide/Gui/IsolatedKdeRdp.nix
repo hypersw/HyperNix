@@ -20,6 +20,20 @@ let
     LockOnStart=false
     RequirePassword=false
   '';
+  # KWin uses KService to decide which clients may use its private fake-input
+  # and screencast protocols. Index just the immutable copied KRdp entry from
+  # the selected patched KWin closure; do not trust ~/.local/share shortcuts.
+  kServiceApplicationsMenu = pkgs.writeText "hypersw-kde-rdp-applications.menu" ''
+    <!DOCTYPE Menu PUBLIC "-//freedesktop//DTD Menu 1.0//EN"
+      "http://www.freedesktop.org/standards/menu-spec/1.0/menu.dtd">
+    <Menu>
+      <Name>Applications</Name>
+      <AppDir>${pkgs.kdePackages.kwin}/share/applications</AppDir>
+      <Include>
+        <Filename>org.kde.krdpserver.desktop</Filename>
+      </Include>
+    </Menu>
+  '';
   rdpOutputLifecycle = import ./RdpOutputLifecycle.nix {
     inherit pkgs;
     PlasmaShellService = plasmaShellService;
@@ -76,11 +90,15 @@ let
   prepareKdeSessionConfig = pkgs.writeShellScript "hypersw-prepare-kde-rdp-session-config" ''
     set -euo pipefail
     config_dir="$XDG_RUNTIME_DIR/hypersw-kde-rdp-config"
-    ${pkgs.coreutils}/bin/mkdir -p "$config_dir"
+    cache_dir="$XDG_RUNTIME_DIR/${kwinCacheDirName}"
+    ${pkgs.coreutils}/bin/install -d -m 700 "$config_dir/menus"
     ${pkgs.coreutils}/bin/install -m 600 ${screenLockerConfig} "$config_dir/kscreenlockerrc"
-    # Do not let KWin reuse ~/.cache/ksycoca6_* from a previous Nix closure.
-    # This directory name contains the selected patched-KWin store output.
-    ${pkgs.coreutils}/bin/install -d -m 700 "$XDG_RUNTIME_DIR/${kwinCacheDirName}"
+    ${pkgs.coreutils}/bin/install -m 600 ${kServiceApplicationsMenu} "$config_dir/menus/applications.menu"
+    # The path is a fixed private child of XDG_RUNTIME_DIR, derived from the
+    # selected KWin closure. Clear it so KService cannot retain a cache built
+    # before applications.menu existed or before authorization metadata changed.
+    ${pkgs.coreutils}/bin/rm -rf "$cache_dir"
+    ${pkgs.coreutils}/bin/install -d -m 700 "$cache_dir"
   '';
 in {
   # KRdp owns an existing Plasma Wayland session.  Unlike GNOME Remote Desktop,
