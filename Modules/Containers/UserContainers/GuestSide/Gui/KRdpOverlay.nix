@@ -35,6 +35,16 @@ let
         (input: !(lib.hasInfix "-kpipewire-" (toString input)))
         (old.propagatedBuildInputs or [ ])
       ++ [ patchedKPipeWire.dev ];
+
+    # Qt wraps the installed krdpserver binary. KWin authorizes private
+    # screencast and fake-input protocols by comparing the actual Wayland
+    # client's executable with the desktop entry's Exec value, so it must name
+    # the wrapper's inner executable rather than the public launcher script.
+    postFixup = (old.postFixup or "") + ''
+      substituteInPlace "$out/share/applications/org.kde.krdpserver.desktop" \
+        --replace-fail "Exec=$out/bin/krdpserver" \
+                       "Exec=$out/bin/.krdpserver-wrapped"
+    '';
   });
 
   patchedKwin = prev.kdePackages.kwin.overrideAttrs (old: {
