@@ -3,6 +3,9 @@ let
   cfg = config.hypersw.containers.UserContainers.Guest;
   waylandDisplay = "wayland-0";
   plasmaShellService = "hypersw-plasmashell.service";
+  # A hung graphical client must not hold user@.service, and therefore the
+  # whole guest shutdown, for systemd's default 90 seconds.
+  managedSessionStopTimeout = "15s";
   # Include the store hash as well as the package name. KWin's KService cache
   # then changes with each patched KWin closure, including a copied KRdp
   # desktop-entry authorization change.
@@ -150,6 +153,7 @@ in {
         ExecStartPost = waitForKwinSocket;
         Restart = "on-failure";
         RestartSec = 2;
+        TimeoutStopSec = managedSessionStopTimeout;
       };
     };
 
@@ -167,6 +171,7 @@ in {
         ExecStart = "${pkgs.kdePackages.plasma-workspace}/bin/plasmashell --no-respawn";
         Restart = "on-failure";
         RestartSec = 2;
+        TimeoutStopSec = managedSessionStopTimeout;
       };
     };
 
@@ -228,6 +233,7 @@ in {
         Type = "simple";
         Restart = "on-failure";
         RestartSec = 2;
+        TimeoutStopSec = managedSessionStopTimeout;
         Environment = waylandClientEnvironment ++ [
           "KRDP_LIFECYCLE_HANDLER=${rdpOutputLifecycle}/bin/hypersw-rdp-output-lifecycle"
         ];
