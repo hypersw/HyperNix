@@ -36,14 +36,10 @@ let
         (old.propagatedBuildInputs or [ ])
       ++ [ patchedKPipeWire.dev ];
 
-    # Qt wraps the installed krdpserver binary. KWin authorizes private
-    # screencast and fake-input protocols by comparing the actual Wayland
-    # client's executable with the desktop entry's Exec value, so it must name
-    # the wrapper's inner executable rather than the public launcher script.
+    # Keep the upstream public launcher identity. KWin's authorization lookup
+    # uses that client identity even though /proc/<pid>/exe later points at
+    # Qt's inner wrapper after the launcher has exec'd it.
     postFixup = (old.postFixup or "") + ''
-      substituteInPlace "$out/share/applications/org.kde.krdpserver.desktop" \
-        --replace-fail "Exec=$out/bin/krdpserver" \
-                       "Exec=$out/bin/.krdpserver-wrapped"
       # This is a KWin-specific desktop-entry field. KRdp 6.7.4's upstream
       # template deliberately uses a comma here, even though standard desktop
       # entry string lists conventionally use semicolons.
