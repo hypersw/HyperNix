@@ -20,17 +20,24 @@ let
     LockOnStart=false
     RequirePassword=false
   '';
+  plasmaShellConfig = pkgs.writeText "hypersw-plasmashellrc" ''
+    [PlasmaViews][Panel 2]
+    floating=0
+  '';
   # KWin uses KService to decide which clients may use its private fake-input
-  # and screencast protocols. Index just the immutable copied KRdp entry from
-  # the selected patched KWin closure; do not trust ~/.local/share shortcuts.
+  # and screencast protocols. Index every immutable application source chosen
+  # for this guest, but never a user-writable application directory.
   kServiceApplicationsMenu = pkgs.writeText "hypersw-kde-rdp-applications.menu" ''
     <!DOCTYPE Menu PUBLIC "-//freedesktop//DTD Menu 1.0//EN"
       "http://www.freedesktop.org/standards/menu-spec/1.0/menu.dtd">
     <Menu>
       <Name>Applications</Name>
+      <AppDir>${config.system.path}/share/applications</AppDir>
       <AppDir>${pkgs.kdePackages.kwin}/share/applications</AppDir>
+      <AppDir>${pkgs.kdePackages.krdp}/share/applications</AppDir>
+      <AppDir>${pkgs.kdePackages.plasma-workspace}/share/applications</AppDir>
       <Include>
-        <Filename>org.kde.krdpserver.desktop</Filename>
+        <All/>
       </Include>
     </Menu>
   '';
@@ -93,6 +100,7 @@ let
     cache_dir="$XDG_RUNTIME_DIR/${kwinCacheDirName}"
     ${pkgs.coreutils}/bin/install -d -m 700 "$config_dir/menus"
     ${pkgs.coreutils}/bin/install -m 600 ${screenLockerConfig} "$config_dir/kscreenlockerrc"
+    ${pkgs.coreutils}/bin/install -m 600 ${plasmaShellConfig} "$config_dir/plasmashellrc"
     ${pkgs.coreutils}/bin/install -m 600 ${kServiceApplicationsMenu} "$config_dir/menus/applications.menu"
     # The path is a fixed private child of XDG_RUNTIME_DIR, derived from the
     # selected KWin closure. Clear it so KService cannot retain a cache built
