@@ -425,7 +425,10 @@ let
             process_cgroup="$(cat "/proc/$registered_leader/cgroup" 2>/dev/null || true)"
             expected_cgroup="0::/machine.slice/$container_unit/payload/init.scope (deleted)"
 
-            if [ "$process_comm" != "systemd-shutdown" ] || [ "$process_cgroup" != "$expected_cgroup" ]; then
+            # /proc/<pid>/comm is limited to TASK_COMM_LEN (15 visible bytes),
+            # so the 16-byte executable name systemd-shutdown is reported as
+            # systemd-shutdow here.
+            if [ "$process_comm" != "systemd-shutdow" ] || [ "$process_cgroup" != "$expected_cgroup" ]; then
               echo "Managed container $container_name has an unrecognised stale machine leader $registered_leader; refusing automatic cleanup." >&2
               echo "comm=$process_comm" >&2
               echo "cgroup=$process_cgroup" >&2
