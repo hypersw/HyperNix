@@ -425,6 +425,11 @@ let
             process_cgroup="$(cat "/proc/$registered_leader/cgroup" 2>/dev/null || true)"
             expected_cgroup="0::/machine.slice/$container_unit/payload/init.scope (deleted)"
 
+            is_expected_stale_leader() {
+              [ "$(cat "/proc/$registered_leader/comm" 2>/dev/null || true)" = "systemd-shutdow" ] \
+                && [ "$(cat "/proc/$registered_leader/cgroup" 2>/dev/null || true)" = "$expected_cgroup" ]
+            }
+
             # /proc/<pid>/comm is limited to TASK_COMM_LEN (15 visible bytes),
             # so the 16-byte executable name systemd-shutdown is reported as
             # systemd-shutdow here.
@@ -441,7 +446,13 @@ let
               org.freedesktop.machine1.Manager \
               UnregisterMachine s "$container_name"
 
-            kill -TERM "$registered_leader"
+            # Unregistering can race with the final exit of guest PID 1. Check
+            # again before every signal: an ESRCH here is successful cleanup,
+            # and a reused PID must never receive a signal from this guard.
+            if ! is_expected_stale_leader; then
+              exit 0
+            fi
+            kill -TERM "$registered_leader" 2>/dev/null || true
             for _ in $(seq 1 20); do
               if [ ! -d "/proc/$registered_leader" ]; then
                 exit 0
@@ -449,8 +460,12 @@ let
               sleep 0.1
             done
 
-            echo "Stale guest shutdown PID $registered_leader ignored SIGTERM; sending SIGKILL." >&2
-            kill -KILL "$registered_leader"
+            if is_expected_stale_leader; then
+              echo "Stale guest shutdown PID $registered_leader ignored SIGTERM; sending SIGKILL." >&2
+              kill -KILL "$registered_leader" 2>/dev/null || true
+            else
+              echo "Guest shutdown PID $registered_leader exited after unregistration." >&2
+            fi
           '';
         };
 
