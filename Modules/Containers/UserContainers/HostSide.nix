@@ -80,6 +80,10 @@ let
     LimitNOFILE = null;
     ExtraBindMounts = {};
     ExtraAllowedDevices = [];
+    # HostEvaluated-only extension for guest-local policy that belongs to one
+    # instance, such as its application set or MIME defaults. Reusable guest
+    # mechanics remain in GuestSide modules.
+    GuestConfig = {};
   };
 
   normalizeGui = name: rawGui:
@@ -256,7 +260,10 @@ let
           # old "host builds the guest from host nixpkgs" shape for disposable
           # parity tests. The managed long-term path is FlakePath below.
           config = lib.mkIf (decl.BuildMode == "HostEvaluated") ({ ... }: {
-            imports = [ ./GuestSide ];
+            imports = [
+              ./GuestSide
+              decl.GuestConfig
+            ];
 
             hypersw.containers.UserContainers.Guest = {
               Enable = true;
