@@ -40,16 +40,16 @@ let
         (old.propagatedBuildInputs or [ ])
       ++ [ patchedKPipeWire.dev ];
 
-    # Keep the upstream public launcher identity. KWin's authorization lookup
-    # uses that client identity even though /proc/<pid>/exe later points at
-    # Qt's inner wrapper after the launcher has exec'd it.
+    # KWin authorizes a Wayland client by comparing /proc/<pid>/exe to this
+    # desktop entry. Qt's outer launcher execs its generated inner wrapper,
+    # so the entry must name that wrapper rather than bin/krdpserver.
     postFixup = (old.postFixup or "") + ''
-      # This is a KWin-specific desktop-entry field. KRdp 6.7.4's upstream
-      # template deliberately uses a comma here, even though standard desktop
-      # entry string lists conventionally use semicolons.
-      grep -Fqx \
-        "X-KDE-Wayland-Interfaces=org_kde_kwin_fake_input,zkde_screencast_unstable_v1" \
-        "$out/share/applications/org.kde.krdpserver.desktop"
+      desktop_file="$out/share/applications/org.kde.krdpserver.desktop"
+      substituteInPlace "$desktop_file" \
+        --replace-fail "Exec=$out/bin/krdpserver" \
+                       "Exec=$out/bin/.krdpserver-wrapped" \
+        --replace-fail "X-KDE-Wayland-Interfaces=org_kde_kwin_fake_input,zkde_screencast_unstable_v1" \
+                       "X-KDE-Wayland-Interfaces=org_kde_kwin_fake_input;zkde_screencast_unstable_v1;"
     '';
   });
 
@@ -64,9 +64,9 @@ let
     # Virtual-RDP-* output; allowing zero outputs leaves teardown/reconnect
     # ordering unsafe until there is a synchronous lifecycle callback.
 
-    # KWin authorizes its private screencast and fake-input protocols by the
-    # desktop entry's executable. Install the exact entry from patched KRdp,
-    # never a similar entry from an unpatched package set.
+    # KWin searches its own application directory too. Give that location the
+    # same corrected KRdp entry, so KService ordering cannot select stale or
+    # unparseable authorization metadata from a different package output.
     postInstall = (old.postInstall or "") + ''
       install -Dm444 ${patchedKrdp}/share/applications/org.kde.krdpserver.desktop \
         "$out/share/applications/org.kde.krdpserver.desktop"

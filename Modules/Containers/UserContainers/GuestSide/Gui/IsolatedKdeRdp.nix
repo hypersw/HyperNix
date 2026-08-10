@@ -239,6 +239,7 @@ in {
         username=$(${pkgs.gnused}/bin/sed -n '1p' "$credentials")
         password=$(${pkgs.gnused}/bin/sed -n '2p' "$credentials")
         [ -n "$username" ] || { echo "KRdp credentials need a username" >&2; exit 1; }
+        [ -n "$password" ] || { echo "KRdp credentials need a nonempty password" >&2; exit 1; }
         if [ ! -s "$key" ] || [ ! -s "$certificate" ]; then
           ${pkgs.openssl}/bin/openssl req -x509 -newkey rsa:3072 -nodes -keyout "$key" -out "$certificate" -days 3650 -subj ${lib.escapeShellArg "/CN=${cfg.Name}-kde-rdp"}
         fi
