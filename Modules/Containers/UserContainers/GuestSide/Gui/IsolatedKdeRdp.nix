@@ -199,6 +199,10 @@ in {
         RestartSec = 2;
         TimeoutStopSec = managedSessionStopTimeout;
       };
+      # Desktop files intentionally use bare Exec/TryExec commands. Give the
+      # long-lived shell the immutable system profile, not a host or mutable
+      # user-profile PATH, so KService and xdg-open resolve guest packages.
+      path = [ config.system.path ];
     };
 
     systemd.user.services.hypersw-kde-rdp-setup = {

@@ -1,0 +1,377 @@
+diff --git a/server/SessionController.cpp b/server/SessionController.cpp
+index 9baadc7..b9d2298 100644
+--- a/server/SessionController.cpp
++++ b/server/SessionController.cpp
+@@ -8,6 +8,10 @@
+ #include <QDBusInterface>
+ #include <QMenu>
+ #include <QProcess>
++#include <QTimer>
++
++#include <optional>
++#include <utility>
+ 
+ #include <KLocalizedString>
+ 
+@@ -93,40 +97,70 @@ public:
+         session->setVirtualMonitor(virtualMonitor);
+     }
+ 
+-    void runOutputLifecycleHandler(const QString &action)
++    void setPendingVirtualMonitor(const KRdp::VirtualMonitor &virtualMonitor)
+     {
+-        const QString handler = qEnvironmentVariable("KRDP_LIFECYCLE_HANDLER");
+-        if (m_virtualMonitorName.isEmpty() || handler.isEmpty()) {
+-            return;
+-        }
++        m_pendingVirtualMonitor = virtualMonitor;
++    }
++
++    std::optional<KRdp::VirtualMonitor> takePendingVirtualMonitor()
++    {
++        return std::exchange(m_pendingVirtualMonitor, std::nullopt);
++    }
++
++    void finishWithoutOutput(const QString &action)
++    {
++        QTimer::singleShot(0, this, [this, action] {
++            Q_EMIT outputLifecycleFinished(this, action, true);
++        });
++    }
+ 
+-        // The helper is called from KRdp's stream lifecycle, not a poller.
+-        // "up" follows KWin virtual-output creation; "down" runs before the
+-        // SessionWrapper releases the corresponding stream.
+-        QProcess process;
+-        process.setProcessChannelMode(QProcess::MergedChannels);
+-        process.start(handler, {action, m_virtualMonitorName});
+-        if (!process.waitForStarted(1000)) {
+-            qWarning() << "KRDP-LIFECYCLE: could not start" << handler << action << m_virtualMonitorName
+-                       << process.errorString();
++    void runOutputLifecycleHandler(const QString &action)
++    {
++        if (m_virtualMonitorName.isEmpty()) {
++            finishWithoutOutput(action);
+             return;
+         }
+-        if (!process.waitForFinished(5000)) {
+-            process.kill();
+-            process.waitForFinished(1000);
+-            qWarning() << "KRDP-LIFECYCLE: helper timed out" << action << m_virtualMonitorName;
++        const QString handler = qEnvironmentVariable("KRDP_LIFECYCLE_HANDLER");
++        if (handler.isEmpty()) {
++            finishWithoutOutput(action);
+             return;
+         }
+-        if (process.exitStatus() != QProcess::NormalExit || process.exitCode() != 0) {
+-            qWarning().nospace() << "KRDP-LIFECYCLE: helper failed action=" << action
+-                                 << " monitor=" << m_virtualMonitorName
+-                                 << " exit=" << process.exitCode()
+-                                 << " output=" << process.readAll();
++        runConfiguredOutputLifecycleHandler(action, handler);
++    }
++
++    Q_SIGNAL void outputLifecycleFinished(SessionWrapper *wrapper, const QString &action, bool success);
++
++private:
++    friend class SessionController;
++    void runConfiguredOutputLifecycleHandler(const QString &action, const QString &handler)
++    {
++        // The helper runs after virtual-output creation and during its exact
++        // teardown. Keep it asynchronous: connection closure is dispatched
++        // through this same Qt event loop.
++        auto *process = new QProcess(this);
++        process->setProcessChannelMode(QProcess::MergedChannels);
++        connect(process, &QProcess::errorOccurred, this, [this, process, action](QProcess::ProcessError) {
++            qWarning() << "KRDP-LIFECYCLE: could not start" << process->program() << action << m_virtualMonitorName
++                       << process->errorString();
++            Q_EMIT outputLifecycleFinished(this, action, false);
++            process->deleteLater();
++        });
++        connect(process, &QProcess::finished, this, [this, process, action](int exitCode, QProcess::ExitStatus exitStatus) {
++            const bool success = exitStatus == QProcess::NormalExit && exitCode == 0;
++            if (!success) {
++                qWarning().nospace() << "KRDP-LIFECYCLE: helper failed action=" << action
++                                     << " monitor=" << m_virtualMonitorName
++                                     << " exit=" << exitCode
++                                     << " output=" << process->readAll();
+         } else {
+             qInfo().nospace() << "KRDP-LIFECYCLE: helper completed action=" << action
+                               << " monitor=" << m_virtualMonitorName
+-                              << " output=" << process.readAll();
++                              << " output=" << process->readAll();
+         }
++            Q_EMIT outputLifecycleFinished(this, action, success);
++            process->deleteLater();
++        });
++        process->start(handler, {action, m_virtualMonitorName});
+     }
+ 
+     void onConnectionDestroyed()
+@@ -141,6 +175,7 @@ public:
+     QPointer<KRdp::RdpConnection> connection;
+     KStatusNotifierItem *m_sni;
+     QString m_virtualMonitorName;
++    std::optional<KRdp::VirtualMonitor> m_pendingVirtualMonitor;
+     bool m_sessionStarted = false;
+     bool m_sessionStartRequested = false;
+ };
+@@ -150,6 +185,28 @@ SessionController::SessionController(KRdp::Server *server, SessionType sessionTy
+     , m_sessionType(sessionType)
+ {
+     connect(m_server, &KRdp::Server::newConnectionCreated, this, &SessionController::onNewConnection);
++    m_closeTimer = new QTimer(this);
++    m_closeTimer->setSingleShot(true);
++    connect(m_closeTimer, &QTimer::timeout, this, [this] {
++        if (!m_closingWrapper || !m_closingWrapper->connection) {
++            return;
++        }
++        qWarning() << "KRDP-TAKEOVER: close deadline expired; force-terminating old wrapper" << m_closingWrapper;
++        m_server->forceTerminateConnection(m_closingWrapper->connection);
++    });
++    m_outputCleanupTimer = new QTimer(this);
++    m_outputCleanupTimer->setSingleShot(true);
++    connect(m_outputCleanupTimer, &QTimer::timeout, this, [this] {
++        qWarning() << "KRDP-TAKEOVER: output cleanup deadline expired; refusing pending session" << m_pendingWrapper;
++        if (m_pendingWrapper && m_pendingWrapper->connection) {
++            m_pendingWrapper->connection->close();
++        }
++        m_pendingWrapper = nullptr;
++        if (m_closingWrapper) {
++            removeWrapper(m_closingWrapper);
++            m_closingWrapper = nullptr;
++        }
++    });
+     // Status notification item
+     m_sni = new KStatusNotifierItem(u"krdpserver"_s, this);
+     auto menu = new QMenu(u"quitMenu"_s);
+@@ -203,10 +260,11 @@ void SessionController::onNewConnection(KRdp::RdpConnection *newConnection)
+                 virtualMonitor.dpr = clientScale;
+             }
+             virtualMonitor.name = QStringLiteral("RDP-%1x%2@%3").arg(virtualMonitor.size.width()).arg(virtualMonitor.size.height()).arg(virtualMonitor.dpr);
+-            qWarning().nospace() << "KRDP-CLIENT-LAYOUT: creating virtual monitor " << virtualMonitor.name
++            qWarning().nospace() << "KRDP-CLIENT-LAYOUT: recorded virtual monitor " << virtualMonitor.name
+                                  << " (configured fallback=" << configuredVirtualMonitor.size << '@' << configuredVirtualMonitor.dpr << ')';
+-            wrapper->setVirtualMonitor(virtualMonitor);
+-            wrapper->startSession();
++            // Capabilities arrive before authentication. Record this candidate
++            // only; an unauthenticated TCP peer must not steal the desktop.
++            wrapper->setPendingVirtualMonitor(virtualMonitor);
+         });
+     } else if (m_monitorIndex) {
+         wrapper->session->setActiveStream(*m_monitorIndex);
+@@ -216,16 +274,15 @@ void SessionController::onNewConnection(KRdp::RdpConnection *newConnection)
+         wrapper->startSession();
+     }
+ 
+-    connect(wrapper.get(), &SessionWrapper::connectionDestroyed, this, [this](SessionWrapper *wrapper) {
+-        wrapper->runOutputLifecycleHandler(QStringLiteral("down"));
+-        m_wrappers.erase(std::remove_if(m_wrappers.begin(),
+-                                        m_wrappers.end(),
+-                                        [wrapper](std::unique_ptr<SessionWrapper> &entry) {
+-                                            return entry.get() == wrapper;
+-                                        }),
+-                         m_wrappers.end());
++    connect(newConnection, &KRdp::RdpConnection::stateChanged, this, [this, wrapperPtr = wrapper.get()](KRdp::RdpConnection::State state) {
++        if (state == KRdp::RdpConnection::State::Activated && m_virtualMonitor) {
++            requestTakeover(wrapperPtr);
++        }
+     });
+ 
++    connect(wrapper.get(), &SessionWrapper::connectionDestroyed, this, &SessionController::onWrapperConnectionDestroyed);
++    connect(wrapper.get(), &SessionWrapper::outputLifecycleFinished, this, &SessionController::onOutputLifecycleFinished);
++
+     connect(wrapper.get(), &SessionWrapper::sessionError, this, [newConnection] {
+         newConnection->close(KRdp::RdpConnection::CloseReason::None);
+     });
+@@ -233,6 +290,108 @@ void SessionController::onNewConnection(KRdp::RdpConnection *newConnection)
+     m_wrappers.push_back(std::move(wrapper));
+ }
+ 
++void SessionController::activateWrapper(SessionWrapper *wrapper)
++{
++    if (!wrapper) {
++        return;
++    }
++    const auto virtualMonitor = wrapper->takePendingVirtualMonitor();
++    if (!virtualMonitor) {
++        qWarning() << "KRDP-TAKEOVER: authenticated wrapper lacks a valid initial layout" << wrapper;
++        if (wrapper->connection) {
++            wrapper->connection->close();
++        }
++        return;
++    }
++
++    qInfo().nospace() << "KRDP-TAKEOVER: activating wrapper=" << wrapper
++                      << " output=" << virtualMonitor->name;
++    m_pendingWrapper = nullptr;
++    m_activeWrapper = wrapper;
++    wrapper->setVirtualMonitor(*virtualMonitor);
++    wrapper->startSession();
++}
++
++void SessionController::requestTakeover(SessionWrapper *wrapper)
++{
++    if (!wrapper || wrapper == m_activeWrapper || wrapper == m_closingWrapper) {
++        return;
++    }
++
++    if (!m_activeWrapper) {
++        activateWrapper(wrapper);
++        return;
++    }
++
++    if (m_pendingWrapper && m_pendingWrapper != wrapper && m_pendingWrapper->connection) {
++        qWarning() << "KRDP-TAKEOVER: replacing an already pending wrapper" << m_pendingWrapper
++                   << "with" << wrapper;
++        m_pendingWrapper->connection->close();
++    }
++    m_pendingWrapper = wrapper;
++    m_closingWrapper = m_activeWrapper;
++    qInfo() << "KRDP-TAKEOVER: requesting controlled close of old wrapper" << m_closingWrapper
++            << "for pending wrapper" << m_pendingWrapper;
++    if (m_closingWrapper->connection) {
++        m_closingWrapper->connection->close();
++        m_closeTimer->start(3000);
++    } else {
++        onWrapperConnectionDestroyed(m_closingWrapper);
++    }
++}
++
++void SessionController::onWrapperConnectionDestroyed(SessionWrapper *wrapper)
++{
++    if (wrapper != m_activeWrapper && wrapper != m_closingWrapper) {
++        if (wrapper == m_pendingWrapper) {
++            m_pendingWrapper = nullptr;
++        }
++        removeWrapper(wrapper);
++        return;
++    }
++
++    m_closeTimer->stop();
++    m_activeWrapper = nullptr;
++    m_closingWrapper = wrapper;
++    qInfo() << "KRDP-TAKEOVER: old connection destroyed; waiting for output cleanup" << wrapper;
++    wrapper->runOutputLifecycleHandler(QStringLiteral("down"));
++    m_outputCleanupTimer->start(5000);
++}
++
++void SessionController::onOutputLifecycleFinished(SessionWrapper *wrapper, const QString &action, bool success)
++{
++    if (action != u"down"_s || wrapper != m_closingWrapper) {
++        return;
++    }
++
++    m_outputCleanupTimer->stop();
++    qInfo() << "KRDP-TAKEOVER: old output cleanup finished wrapper=" << wrapper << "success=" << success;
++    m_closingWrapper = nullptr;
++    removeWrapper(wrapper);
++    if (success && m_pendingWrapper) {
++        activateWrapper(m_pendingWrapper);
++    } else if (!success && m_pendingWrapper) {
++        qWarning() << "KRDP-TAKEOVER: refusing pending session after failed old-output cleanup" << m_pendingWrapper;
++        if (m_pendingWrapper->connection) {
++            m_pendingWrapper->connection->close();
++        }
++        m_pendingWrapper = nullptr;
++    }
++}
++
++void SessionController::removeWrapper(SessionWrapper *wrapper)
++{
++    if (!wrapper) {
++        return;
++    }
++    m_wrappers.erase(std::remove_if(m_wrappers.begin(),
++                                    m_wrappers.end(),
++                                    [wrapper](const std::unique_ptr<SessionWrapper> &entry) {
++                                        return entry.get() == wrapper;
++                                    }),
++                     m_wrappers.end());
++}
++
+ void SessionController::stopFromSNI()
+ {
+     // Uses dbus to stop the server service, like in the KCM
+diff --git a/server/SessionController.h b/server/SessionController.h
+index 98f514d..5875e79 100644
+--- a/server/SessionController.h
++++ b/server/SessionController.h
+@@ -6,6 +6,7 @@
+ #include "RdpConnection.h"
+ #include <AbstractSession.h>
+ #include <KStatusNotifierItem>
++#include <QTimer>
+ #include <vector>
+ 
+ #include <QObject>
+@@ -39,6 +40,11 @@ public:
+ 
+ private:
+     void onNewConnection(KRdp::RdpConnection *newConnection);
++    void activateWrapper(SessionWrapper *wrapper);
++    void requestTakeover(SessionWrapper *wrapper);
++    void onWrapperConnectionDestroyed(SessionWrapper *wrapper);
++    void onOutputLifecycleFinished(SessionWrapper *wrapper, const QString &action, bool success);
++    void removeWrapper(SessionWrapper *wrapper);
+     std::unique_ptr<KRdp::AbstractSession> makeSession();
+ 
+     KRdp::Server *m_server = nullptr;
+@@ -51,5 +57,14 @@ private:
+ 
+     std::vector<std::unique_ptr<SessionWrapper>> m_wrappers;
+ 
++    // A virtual monitor belongs to one authenticated desktop session. Keep
++    // new authenticated clients pending until the old session has released
++    // its exact output, rather than creating competing Virtual-RDP-* outputs.
++    SessionWrapper *m_activeWrapper = nullptr;
++    SessionWrapper *m_pendingWrapper = nullptr;
++    SessionWrapper *m_closingWrapper = nullptr;
++    QTimer *m_closeTimer = nullptr;
++    QTimer *m_outputCleanupTimer = nullptr;
++
+     KStatusNotifierItem *m_sni;
+ };
+diff --git a/src/Server.cpp b/src/Server.cpp
+index 9fbbf7b..caecd96 100644
+--- a/src/Server.cpp
++++ b/src/Server.cpp
+@@ -178,6 +178,20 @@ void Server::incomingConnection(qintptr handle)
+     Q_EMIT newConnectionCreated(sessionPtr);
+ }
+ 
++void Server::forceTerminateConnection(RdpConnection *connection)
++{
++    const auto itr = std::find_if(d->sessions.begin(), d->sessions.end(), [connection](const auto &session) {
++        return session.get() == connection;
++    });
++    if (itr == d->sessions.end()) {
++        return;
++    }
++
++    qCWarning(KRDP) << "Force-terminating stuck RDP connection" << connection;
++    (*itr)->close();
++    d->sessions.erase(itr);
++}
++
+ rdp_settings *Server::rdpSettings() const
+ {
+     return d->settings;
+diff --git a/src/Server.h b/src/Server.h
+index 5fcd298..97c3c6f 100644
+--- a/src/Server.h
++++ b/src/Server.h
+@@ -115,6 +115,12 @@ public:
+      */
+     Q_SIGNAL void newConnectionCreated(RdpConnection *connection);
+ 
++    /**
++     * Destroy a stuck connection through the server's ownership collection.
++     * This closes the FreeRDP peer before joining its worker thread.
++     */
++    void forceTerminateConnection(RdpConnection *connection);
++
+ protected:
+     /**
+      * Overridden from QTcpServer
+

@@ -15,6 +15,8 @@ pkgs.writeShellApplication {
     action="''${1:?expected lifecycle action}"
     requested_rdp_output="''${2:?expected virtual-output name}"
     rdp_output=""
+    rdp_output_id=""
+    rdp_output_scale=""
     stub_output="Virtual-0"
     plasma_shell_service="${PlasmaShellService}"
     panel_config="''${XDG_CONFIG_HOME:?}/plasma-org.kde.plasma.desktop-appletsrc"
@@ -27,24 +29,36 @@ pkgs.writeShellApplication {
       # KRdp asks for RDP-*, while KWin exposes that negotiated output as
       # Virtual-RDP-*. Prefer an exact requested name, otherwise accept only
       # its one exact Virtual- prefixed counterpart.
-      rdp_output="$(output_state | jq -r --arg requested "$requested_rdp_output" '
-        [.outputs[] | select(.connected) | .name] as $connected
-        | [$connected[] | select(. == $requested)] as $exact
+      local output
+      output="$(output_state | jq -cer --arg requested "$requested_rdp_output" '
+        [.outputs[]] as $outputs
+        | [$outputs[] | select(.name == $requested)] as $exact
         | if ($exact | length) == 1 then
             $exact[0]
           elif ($exact | length) == 0 then
-            [$connected[] | select(. == ("Virtual-" + $requested))] as $virtual
-            | if ($virtual | length) == 1 then $virtual[0] else empty end
+            [$outputs[] | select(.name == ("Virtual-" + $requested))] as $virtual
+            | if ($virtual | length) == 1 then $virtual[0] else error("ambiguous RDP output") end
           else
-            empty
+            error("ambiguous RDP output")
           end
-      ')"
-
-      [ -n "$rdp_output" ] || {
+      ')" || {
         echo "Could not resolve connected RDP output: requested=$requested_rdp_output" >&2
         return 1
       }
-      echo "KRDP-LIFECYCLE: requested output=$requested_rdp_output resolved output=$rdp_output" >&2
+      rdp_output="$(jq -r '.name' <<<"$output")"
+      rdp_output_id="$(jq -r '.id' <<<"$output")"
+
+      [ -n "$rdp_output" ] && [ "$rdp_output_id" != "null" ] || {
+        echo "Resolved RDP output lacks a KScreen ID: requested=$requested_rdp_output" >&2
+        return 1
+      }
+      if [[ "$requested_rdp_output" =~ @([1-5](\.[0-9]+)?)$ ]]; then
+        rdp_output_scale="''${BASH_REMATCH[1]}"
+      else
+        echo "RDP output has no valid negotiated scale suffix: $requested_rdp_output" >&2
+        return 1
+      fi
+      echo "KRDP-LIFECYCLE: requested output=$requested_rdp_output resolved output=$rdp_output id=$rdp_output_id scale=$rdp_output_scale" >&2
     }
 
     stub_output_enabled() {
@@ -88,6 +102,41 @@ pkgs.writeShellApplication {
       return 1
     }
 
+    apply_rdp_scale() {
+      kscreen-doctor "output.$rdp_output_id.scale.$rdp_output_scale"
+      for ((attempt = 0; attempt < 20; attempt += 1)); do
+        if output_state | jq -e --arg name "$rdp_output" --argjson scale "$rdp_output_scale" '
+          any(.outputs[]; .name == $name and .enabled and (.scale == $scale))
+        ' >/dev/null; then
+          return 0
+        fi
+        sleep 0.1
+      done
+
+      echo "Timed out applying scale $rdp_output_scale to RDP output: $rdp_output" >&2
+      return 1
+    }
+
+    wait_for_rdp_output_disabled() {
+      for ((attempt = 0; attempt < 20; attempt += 1)); do
+        if output_state | jq -e --arg name "$rdp_output" '
+          any(.outputs[]; .name == $name and (.enabled | not))
+        ' >/dev/null; then
+          return 0
+        fi
+        sleep 0.1
+      done
+
+      echo "Timed out disabling departing RDP output: $rdp_output" >&2
+      return 1
+    }
+
+    no_rdp_output_enabled() {
+      output_state | jq -e '
+        all(.outputs[]; (.name | startswith("Virtual-RDP-") | not) or (.enabled | not))
+      ' >/dev/null
+    }
+
     repair_panels() {
       [ -f "$panel_config" ] || return 0
 
@@ -125,6 +174,10 @@ pkgs.writeShellApplication {
       up)
         resolve_rdp_output
         wait_for_rdp_output
+        # KWin does not infer this scale from KRdp's virtual-monitor DPR. Set
+        # the negotiated client DPI on the freshly resolved numeric output ID
+        # before Plasma is repaired or the bootstrap output is hidden.
+        apply_rdp_scale
         # A direct KWin --virtual session provides Virtual-0. A persistent
         # startplasma-wayland session may not, so never manufacture or assume
         # a stub output merely to run this repair.
@@ -139,7 +192,13 @@ pkgs.writeShellApplication {
         systemctl --user restart "$plasma_shell_service"
         ;;
       down)
-        if stub_output_disabled; then
+        resolve_rdp_output
+        # Tear down precisely the departing output. A later connection may be
+        # active, so never restore the bootstrap display merely because this
+        # wrapper has ended.
+        kscreen-doctor "output.$rdp_output_id.disable"
+        wait_for_rdp_output_disabled
+        if no_rdp_output_enabled && stub_output_disabled; then
           kscreen-doctor "output.$stub_output.enable"
         fi
         ;;

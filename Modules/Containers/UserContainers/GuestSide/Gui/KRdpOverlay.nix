@@ -22,9 +22,13 @@ let
       (patch "0006-display-control-diagnostics.patch")
       (patch "0007-global-pointer-origin-and-modifier-cleanup.patch")
       (patch "0008-plasma-clipboard-bridge.patch")
-      # KRdp calls the configured helper synchronously after virtual-output
-      # creation and before virtual-output teardown.
+      # Connect the virtual-output lifecycle to the managed KScreen/Plasma
+      # helper. The next patch makes that callback asynchronous.
       (patch "0010-krdp-output-lifecycle-handler.patch")
+      # One managed Plasma desktop has one active RDP seat. Authenticate and
+      # record a new layout first, then asynchronously release the old exact
+      # output before the new session creates its virtual monitor.
+      (patch "0011-single-seat-takeover.patch")
     ];
 
     # KRdp propagates KPipeWire's development output. Replace the original
