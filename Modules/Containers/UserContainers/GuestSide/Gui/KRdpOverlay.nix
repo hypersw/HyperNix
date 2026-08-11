@@ -40,16 +40,16 @@ let
         (old.propagatedBuildInputs or [ ])
       ++ [ patchedKPipeWire.dev ];
 
-    # KWin authorizes a Wayland client by comparing /proc/<pid>/exe to this
-    # desktop entry. Qt's outer launcher execs its generated inner wrapper,
-    # so the entry must name that wrapper rather than bin/krdpserver.
+    # KWin resolves KRdp's public launcher identity, rather than the Qt
+    # wrapper reported later by /proc/<pid>/exe. Its KConfig string-list
+    # conversion for this custom field uses commas, unlike standard desktop
+    # entry list fields.
     postFixup = (old.postFixup or "") + ''
       desktop_file="$out/share/applications/org.kde.krdpserver.desktop"
-      substituteInPlace "$desktop_file" \
-        --replace-fail "Exec=$out/bin/krdpserver" \
-                       "Exec=$out/bin/.krdpserver-wrapped" \
-        --replace-fail "X-KDE-Wayland-Interfaces=org_kde_kwin_fake_input,zkde_screencast_unstable_v1" \
-                       "X-KDE-Wayland-Interfaces=org_kde_kwin_fake_input;zkde_screencast_unstable_v1;"
+      grep -Fqx "Exec=$out/bin/krdpserver" "$desktop_file"
+      grep -Fqx \
+        "X-KDE-Wayland-Interfaces=org_kde_kwin_fake_input,zkde_screencast_unstable_v1" \
+        "$desktop_file"
     '';
   });
 
@@ -65,8 +65,8 @@ let
     # ordering unsafe until there is a synchronous lifecycle callback.
 
     # KWin searches its own application directory too. Give that location the
-    # same corrected KRdp entry, so KService ordering cannot select stale or
-    # unparseable authorization metadata from a different package output.
+    # same corrected KRdp entry, so KService ordering cannot select a stale
+    # authorization record from a different package output.
     postInstall = (old.postInstall or "") + ''
       install -Dm444 ${patchedKrdp}/share/applications/org.kde.krdpserver.desktop \
         "$out/share/applications/org.kde.krdpserver.desktop"
