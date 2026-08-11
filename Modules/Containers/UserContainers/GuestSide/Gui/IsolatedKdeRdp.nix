@@ -12,6 +12,7 @@ let
   kwinCacheTag = builtins.baseNameOf (toString pkgs.kdePackages.kwin);
   kwinCacheDirName = "hypersw-kwin-ksycoca-${kwinCacheTag}";
   kwinCacheHome = "%t/${kwinCacheDirName}";
+  kwinConfigHome = "%t/hypersw-kde-rdp-config";
   screenLockerConfig = pkgs.writeText "hypersw-kscreenlockerrc" ''
     [Daemon]
     Autolock=false
@@ -19,10 +20,6 @@ let
     LockOnResume=false
     LockOnStart=false
     RequirePassword=false
-  '';
-  plasmaShellConfig = pkgs.writeText "hypersw-plasmashellrc" ''
-    [PlasmaViews][Panel 2]
-    floating=0
   '';
   # KWin uses KService to decide which clients may use its private fake-input
   # and screencast protocols. Index every immutable application source chosen
@@ -60,10 +57,6 @@ let
     "XDG_CURRENT_DESKTOP=KDE"
     "DESKTOP_SESSION=plasma"
     "XDG_DATA_DIRS=${kdeDataDirs}"
-    # Do not inherit a persistent user KScreenLocker configuration. This
-    # dedicated, loopback-only RDP session has KRdp authentication but no
-    # usable local Unix password to unlock a Plasma screen-lock greeter.
-    "XDG_CONFIG_HOME=%t/hypersw-kde-rdp-config"
     "KWIN_COMPOSE=QPainter"
   ];
 
@@ -100,12 +93,9 @@ let
     cache_dir="$XDG_RUNTIME_DIR/${kwinCacheDirName}"
     ${pkgs.coreutils}/bin/install -d -m 700 "$config_dir/menus"
     ${pkgs.coreutils}/bin/install -m 600 ${screenLockerConfig} "$config_dir/kscreenlockerrc"
-    ${pkgs.coreutils}/bin/install -m 600 ${plasmaShellConfig} "$config_dir/plasmashellrc"
     ${pkgs.coreutils}/bin/install -m 600 ${kServiceApplicationsMenu} "$config_dir/menus/applications.menu"
-    # The path is a fixed private child of XDG_RUNTIME_DIR, derived from the
-    # selected KWin closure. Clear it so KService cannot retain a cache built
-    # before applications.menu existed or before authorization metadata changed.
-    ${pkgs.coreutils}/bin/rm -rf "$cache_dir"
+    # This directory is unique to the selected immutable KWin closure. Keep
+    # it across ordinary KWin restarts; a changed closure selects a new cache.
     ${pkgs.coreutils}/bin/install -d -m 700 "$cache_dir"
   '';
 in {
@@ -173,7 +163,12 @@ in {
       after = [ "dbus.service" "pipewire.service" ];
       serviceConfig = {
         Type = "simple";
-        Environment = virtualKwinEnvironment ++ [ "XDG_CACHE_HOME=${kwinCacheHome}" ];
+        Environment = virtualKwinEnvironment ++ [
+          # KWin alone reads the generated authorization menu and no-lock
+          # configuration. Desktop applications retain $HOME/.config.
+          "XDG_CONFIG_HOME=${kwinConfigHome}"
+          "XDG_CACHE_HOME=${kwinCacheHome}"
+        ];
         ExecStartPre = prepareKdeSessionConfig;
         ExecStart = "${pkgs.kdePackages.kwin}/bin/kwin_wayland --virtual --socket ${waylandDisplay}";
         ExecStartPost = waitForKwinSocket;
