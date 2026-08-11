@@ -137,25 +137,11 @@ pkgs.writeShellApplication {
       ' >/dev/null
     }
 
-    repair_panels() {
+    panel_containments() {
       [ -f "$panel_config" ] || return 0
-
       while IFS= read -r containment; do
         [ -n "$containment" ] || continue
-        current_screen=$(kreadconfig6 \
-          --file "$panel_config" \
-          --group Containments \
-          --group "$containment" \
-          --key lastScreen \
-          --default 0)
-        if [ "$current_screen" != "0" ]; then
-          kwriteconfig6 \
-            --file "$panel_config" \
-            --group Containments \
-            --group "$containment" \
-            --key lastScreen \
-            0
-        fi
+        printf '%s\n' "$containment"
       done < <(
         awk '
           /^\[Containments\]\[[0-9]+\]$/ {
@@ -168,6 +154,44 @@ pkgs.writeShellApplication {
           }
         ' "$panel_config"
       )
+    }
+
+    panels_attached_to_rdp_output() {
+      # After the stub is disabled, a healthy topology has this exact RDP
+      # output as screen zero. Plasma persists that attachment as lastScreen.
+      # Do not restart its shell on a same-layout reconnect when it is already
+      # correct: the restart itself produces a visible panel gap.
+      local containment panel_count=0
+      [ -f "$panel_config" ] || return 1
+
+      while IFS= read -r containment; do
+        [ -n "$containment" ] || continue
+        panel_count=$((panel_count + 1))
+        current_screen=$(kreadconfig6 \
+          --file "$panel_config" \
+          --group Containments \
+          --group "$containment" \
+          --key lastScreen \
+          --default 0)
+        if [ "$current_screen" != "0" ]; then
+          return 1
+        fi
+      done < <(panel_containments)
+
+      [ "$panel_count" -gt 0 ]
+    }
+
+    repair_panels() {
+      local containment
+      while IFS= read -r containment; do
+        [ -n "$containment" ] || continue
+        kwriteconfig6 \
+          --file "$panel_config" \
+          --group Containments \
+          --group "$containment" \
+          --key lastScreen \
+          0
+      done < <(panel_containments)
     }
 
     case "$action" in
@@ -185,11 +209,13 @@ pkgs.writeShellApplication {
           kscreen-doctor "output.$stub_output.disable"
         fi
         wait_for_sole_rdp_output
-        repair_panels
-        # Plasma can retain a panel attached to the disabled bootstrap output
-        # even when lastScreen was already zero, so rebuild it on every
-        # successful output transition rather than only after a file change.
-        systemctl --user restart "$plasma_shell_service"
+        if panels_attached_to_rdp_output; then
+          echo "KRDP-LIFECYCLE: panel-healthy/no-restart output=$rdp_output" >&2
+        else
+          repair_panels
+          echo "KRDP-LIFECYCLE: panel-repair/restart output=$rdp_output" >&2
+          systemctl --user restart "$plasma_shell_service"
+        fi
         ;;
       down)
         resolve_rdp_output
