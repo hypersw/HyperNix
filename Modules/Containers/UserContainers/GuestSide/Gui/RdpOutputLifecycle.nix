@@ -19,7 +19,10 @@ pkgs.writeShellApplication {
     rdp_output_scale=""
     stub_output="Virtual-0"
     plasma_shell_service="${PlasmaShellService}"
-    panel_config="''${XDG_CONFIG_HOME:?}/plasma-org.kde.plasma.desktop-appletsrc"
+    # KWin has a private runtime XDG_CONFIG_HOME for authorization metadata,
+    # but Plasma and applications deliberately keep their normal persistent
+    # configuration below $HOME/.config.
+    panel_config="''${XDG_CONFIG_HOME:-$HOME/.config}/plasma-org.kde.plasma.desktop-appletsrc"
 
     output_state() {
       kscreen-doctor --json
@@ -131,6 +134,18 @@ pkgs.writeShellApplication {
       return 1
     }
 
+    wait_for_stub_output_enabled() {
+      for ((attempt = 0; attempt < 20; attempt += 1)); do
+        if stub_output_enabled; then
+          return 0
+        fi
+        sleep 0.1
+      done
+
+      echo "Timed out enabling bootstrap output: $stub_output" >&2
+      return 1
+    }
+
     no_rdp_output_enabled() {
       output_state | jq -e '
         all(.outputs[]; (.name | startswith("Virtual-RDP-") | not) or (.enabled | not))
@@ -219,9 +234,14 @@ pkgs.writeShellApplication {
         ;;
       down)
         resolve_rdp_output
-        # Tear down precisely the departing output. A later connection may be
-        # active, so never restore the bootstrap display merely because this
-        # wrapper has ended.
+        # KScreen refuses to disable the final enabled output. During a
+        # single-seat takeover the departing RDP output can be that final
+        # output, so restore KWin's bootstrap display as a temporary anchor
+        # before tearing it down.
+        if stub_output_disabled; then
+          kscreen-doctor "output.$stub_output.enable"
+          wait_for_stub_output_enabled
+        fi
         kscreen-doctor "output.$rdp_output_id.disable"
         wait_for_rdp_output_disabled
         if no_rdp_output_enabled && stub_output_disabled; then
