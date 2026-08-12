@@ -29,6 +29,10 @@ let
       # record a new layout first, then asynchronously release the old exact
       # output before the new session creates its virtual monitor.
       (patch "0011-single-seat-takeover.patch")
+      # SessionWrapper can emit its connection-close signal while still on
+      # its own Qt stack. Defer the owning-vector removal until that event
+      # unwinds, avoiding a use-after-free during repeated RDP handovers.
+      (patch "0012-defer-wrapper-removal.patch")
     ];
 
     # KRdp propagates KPipeWire's development output. Replace the original
@@ -50,6 +54,9 @@ let
       grep -Fqx \
         "X-KDE-Wayland-Interfaces=org_kde_kwin_fake_input,zkde_screencast_unstable_v1" \
         "$desktop_file"
+      # Diagnostic only: this changes with the built KRdp output, allowing a
+      # KService probe to confirm it selected the current desktop entry.
+      printf '%s\\n' "X-HyperNix-Auth-Generation=$out" >> "$desktop_file"
     '';
   });
 

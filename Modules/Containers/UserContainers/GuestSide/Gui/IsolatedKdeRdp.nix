@@ -52,11 +52,21 @@ let
     pkgs.kdePackages.plasma-workspace
   ] + ":/run/current-system/sw/share";
 
+  # KWin retains its generated menu in a private runtime config directory.
+  # Keep that directory visible as an XDG fallback so Plasma can discover the
+  # same immutable application set, while applications keep $HOME/.config as
+  # their writable configuration location.
+  kdeConfigDirs = "${kwinConfigHome}:${lib.makeSearchPath "etc/xdg" [
+    pkgs.kdePackages.plasma-workspace
+    config.system.path
+  ]}";
+
   virtualKwinEnvironment = [
     "XDG_SESSION_TYPE=wayland"
     "XDG_CURRENT_DESKTOP=KDE"
     "DESKTOP_SESSION=plasma"
     "XDG_DATA_DIRS=${kdeDataDirs}"
+    "XDG_CONFIG_DIRS=${kdeConfigDirs}"
     "KWIN_COMPOSE=QPainter"
   ];
 

@@ -1,0 +1,71 @@
+diff --git a/server/SessionController.cpp b/server/SessionController.cpp
+--- a/server/SessionController.cpp
++++ b/server/SessionController.cpp
+@@ -12,6 +12,7 @@
+ #include <QProcess>
+ #include <QTimer>
+ 
++#include <QPointer>
+ #include <optional>
+ #include <utility>
+ 
+@@ -137,7 +138,8 @@ SessionController::SessionController(KRdp::Server *server, SessionType sessionT
+         }
+         m_pendingWrapper = nullptr;
+         if (m_closingWrapper) {
+-            removeWrapper(m_closingWrapper);
++            auto *closingWrapper = m_closingWrapper;
+             m_closingWrapper = nullptr;
++            scheduleRemoveWrapper(closingWrapper);
+         }
+     });
+@@ -245,6 +247,6 @@ void SessionController::onWrapperConnectionDestroyed(SessionWrapper *wrapper)
+         if (wrapper == m_pendingWrapper) {
+             m_pendingWrapper = nullptr;
+         }
+-        removeWrapper(wrapper);
++        scheduleRemoveWrapper(wrapper);
+         return;
+     }
+@@ -265,7 +267,7 @@ void SessionController::onOutputLifecycleFinished(SessionWrapper *wrapper, cons
+     m_outputCleanupTimer->stop();
+     qInfo() << "KRDP-TAKEOVER: old output cleanup finished wrapper=" << wrapper << "success=" << success;
+     m_closingWrapper = nullptr;
+-    removeWrapper(wrapper);
++    scheduleRemoveWrapper(wrapper);
+     if (success && m_pendingWrapper) {
+         activateWrapper(m_pendingWrapper);
+     } else if (!success && m_pendingWrapper) {
+@@ -278,6 +280,22 @@ void SessionController::onOutputLifecycleFinished(SessionWrapper *wrapper, cons
+     }
+ }
+ 
++void SessionController::scheduleRemoveWrapper(SessionWrapper *wrapper)
++{
++    // Direct slots here run in a signal emitted by wrapper (or by its child
++    // QProcess). Deleting wrapper synchronously deletes a QObject while it is
++    // still emitting. Defer the owning-vector erase until this event unwinds.
++    QPointer<SessionWrapper> guardedWrapper(wrapper);
++    QTimer::singleShot(0, this, [this, guardedWrapper] {
++        if (!guardedWrapper) {
++            return;
++        }
++        qInfo() << "KRDP-TAKEOVER: wrapper-removal-completed" << guardedWrapper.data();
++        removeWrapper(guardedWrapper.data());
++    });
++    qInfo() << "KRDP-TAKEOVER: wrapper-removal-queued" << wrapper;
++}
++
+ void SessionController::removeWrapper(SessionWrapper *wrapper)
+ {
+     if (!wrapper) {
+diff --git a/server/SessionController.h b/server/SessionController.h
+--- a/server/SessionController.h
++++ b/server/SessionController.h
+@@ -44,6 +44,7 @@ private:
+     void requestTakeover(SessionWrapper *wrapper);
+     void onWrapperConnectionDestroyed(SessionWrapper *wrapper);
+     void onOutputLifecycleFinished(SessionWrapper *wrapper, const QString &action, bool success);
++    void scheduleRemoveWrapper(SessionWrapper *wrapper);
+     void removeWrapper(SessionWrapper *wrapper);
+     std::unique_ptr<KRdp::AbstractSession> makeSession();
