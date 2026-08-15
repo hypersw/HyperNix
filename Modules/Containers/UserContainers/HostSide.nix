@@ -43,9 +43,10 @@ let
   unitName = name: "container@${name}";
   registrationRepairUnitName = name: "hypersw-managed-container-registration-repair-${name}";
   containerBindMountDir = "/run/ContainerBindMounts";
+  audioBridgeDirectoryName = "container-audio";
+  audioBridgeDir = "${hostGraphicalUser.RuntimeDir}/${audioBridgeDirectoryName}";
   pipeWireSocketName = "pipewire-0";
-  pulseBridgeSocketName = "pulse_native";
-  pulseHostSocket = "pulse/native";
+  pulseBridgeSocketName = "pulse-native";
   guestBootRequestDir = "/run/ContainerHostControl/boot-requests";
   # This is deliberately larger than GuestSide's two-minute system-manager
   # timeout, so nspawn does not preempt the guest's own orderly shutdown.
@@ -325,12 +326,10 @@ let
             } //
             lib.optionalAttrs decl.Gui.Gpu hostGpu.BindMounts //
             lib.optionalAttrs decl.Gui.Audio {
-              "${containerBindMountDir}/${pipeWireSocketName}" = {
-                hostPath = "${hostGraphicalUser.RuntimeDir}/${pipeWireSocketName}";
-                isReadOnly = false;
-              };
-              "${containerBindMountDir}/${pulseBridgeSocketName}" = {
-                hostPath = "${hostGraphicalUser.RuntimeDir}/${pulseHostSocket}";
+              # Mount the listener directory, so socket recreation on the host
+              # is visible to guests without restarting their containers.
+              "${containerBindMountDir}/audio" = {
+                hostPath = audioBridgeDir;
                 isReadOnly = false;
               };
             } //

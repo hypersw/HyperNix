@@ -2,8 +2,9 @@
 let
   cfg = config.hypersw.containers.UserContainers.Guest;
   hasGui = cfg.Gui.Mode != "None";
+  audioBridgeDir = "${cfg.HostBridgeDir}/audio";
   pipeWireSocketName = "pipewire-0";
-  pulseBridgeSocketName = "pulse_native";
+  pulseBridgeSocketName = "pulse-native";
   pulseRuntimeSocket = "pulse/native";
 in
 {
@@ -82,7 +83,8 @@ in
     };
 
     environment.sessionVariables = lib.mkIf cfg.Gui.Audio {
-      PULSE_SERVER = "unix:${cfg.HostBridgeDir}/${pulseBridgeSocketName}";
+      # The mounted directory survives host PipeWire socket replacement.
+      PULSE_SERVER = "unix:${audioBridgeDir}/${pulseBridgeSocketName}";
     };
 
     environment.etc = lib.optionalAttrs cfg.Gui.Audio {
@@ -102,14 +104,14 @@ in
           set -euo pipefail
           RTDIR="/run/user/$(id -u)"
           mkdir -p "$RTDIR/pulse"
-          # Host audio sockets are bind-mounted under ${cfg.HostBridgeDir} to keep
+          # Host audio sockets are bind-mounted under ${audioBridgeDir} to keep
           # host/container crossings visible. Many clients probe the conventional
           # XDG_RUNTIME_DIR names directly, so create links there as compatibility
           # shims while keeping the host bridge path stable and explicit.
           [ ! -L "$RTDIR/${pipeWireSocketName}" ] && \
-            ln -s ${cfg.HostBridgeDir}/${pipeWireSocketName} "$RTDIR/${pipeWireSocketName}"
+            ln -s ${audioBridgeDir}/${pipeWireSocketName} "$RTDIR/${pipeWireSocketName}"
           [ ! -L "$RTDIR/${pulseRuntimeSocket}" ] && \
-            ln -s ${cfg.HostBridgeDir}/${pulseBridgeSocketName} "$RTDIR/${pulseRuntimeSocket}"
+            ln -s ${audioBridgeDir}/${pulseBridgeSocketName} "$RTDIR/${pulseRuntimeSocket}"
         '';
       };
     };
