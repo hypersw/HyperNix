@@ -2,6 +2,7 @@
   Enable ? true,
   RootDir ? "/var/lib/nixos-containers",
   HostGraphicalUser ? {},
+  HostAudioBridgeDir ? "/run/ContainerAudio",
   HostGpu ? {},
   GcRoots ? {},
   HostControl ? {},
@@ -43,8 +44,7 @@ let
   unitName = name: "container@${name}";
   registrationRepairUnitName = name: "hypersw-managed-container-registration-repair-${name}";
   containerBindMountDir = "/run/ContainerBindMounts";
-  audioBridgeDirectoryName = "container-audio";
-  audioBridgeDir = "${hostGraphicalUser.RuntimeDir}/${audioBridgeDirectoryName}";
+  audioBridgeDir = HostAudioBridgeDir;
   pipeWireSocketName = "pipewire-0";
   pulseBridgeSocketName = "pulse-native";
   guestBootRequestDir = "/run/ContainerHostControl/boot-requests";
@@ -193,9 +193,13 @@ let
     {
       assertion =
         !needsAny
-          (decl: decl.Gui.Audio || decl.Gui.Mode == "SharedWayland" || decl.Gui.Mode == "IsolatedWayland")
+          (decl: decl.Gui.Mode == "SharedWayland" || decl.Gui.Mode == "IsolatedWayland")
         || hostGraphicalUser.RuntimeDir != null;
-      message = "Managed containers using Wayland or host audio require HostGraphicalUser.RuntimeDir.";
+      message = "Managed Wayland containers require HostGraphicalUser.RuntimeDir.";
+    }
+    {
+      assertion = !needsAny (decl: decl.Gui.Audio) || (HostAudioBridgeDir != null && lib.hasPrefix "/" HostAudioBridgeDir);
+      message = "Managed containers using host audio require an absolute HostAudioBridgeDir.";
     }
     {
       assertion =
@@ -516,6 +520,12 @@ let
           requires = [ "${waylandAclUnit}.service" ];
           after = [ "${waylandAclUnit}.service" ];
         };
+      })
+
+      (lib.mkIf decl.Gui.Audio {
+        # Order after directory creation only. Do not require PipeWire or its
+        # listeners: missing audio must not prevent this guest from starting.
+        systemd.services.${unitName name}.after = [ "systemd-tmpfiles-setup.service" ];
       })
 
       # Applies to FlakePath managed containers. `container-rebuild boot` in the
