@@ -1,4 +1,4 @@
-{ config, lib, pkgs, ... }:
+{ config, lib, options, pkgs, ... }:
 let
   cfg = config.hypersw.containers.UserContainers.Guest;
   managedUserServiceStopTimeout = "1min";
@@ -13,7 +13,18 @@ in
     # TimeoutStopSec, as the isolated KDE RDP profile does.
     systemd = {
       settings.Manager.DefaultTimeoutStopSec = managedSystemServiceStopTimeout;
+    }
+    # NixOS exposed the user manager as extraConfig before adopting the
+    # structured settings.Manager interface. HyperNix is consumed by both
+    # generations while hosts migrate, so select the interface the caller
+    # actually provides rather than pinning this reusable module to one.
+    // lib.optionalAttrs (options.systemd.user ? settings) {
       user.settings.Manager.DefaultTimeoutStopSec = managedUserServiceStopTimeout;
+    }
+    // lib.optionalAttrs (!(options.systemd.user ? settings)) {
+      user.extraConfig = ''
+        DefaultTimeoutStopSec=${managedUserServiceStopTimeout}
+      '';
     };
 
     environment = {
