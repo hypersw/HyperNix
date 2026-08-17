@@ -266,6 +266,8 @@
           specialArgs = { inherit nixos-raspberrypi; };
           modules = [
             nixos-raspberrypi.nixosModules.raspberry-pi-4.base
+            ./Modules/Hardware/RaspberryPiVendorKernelCompat
+            ./Modules/Hardware/RaspberryPiNonProvisioningBase
             sops-nix.nixosModules.sops
             {
               system.configurationRevision = self.rev or self.dirtyRev or "dirty";
@@ -302,6 +304,7 @@
           specialArgs = { inherit nixos-raspberrypi; };
           modules = [
             nixos-raspberrypi.nixosModules.raspberry-pi-4.base
+            ./Modules/Hardware/RaspberryPiVendorKernelCompat
             sops-nix.nixosModules.sops
             # nvmd's sd-image module, not stock sd-image-aarch64.nix:
             # it bumps the firmware partition to 1 GB (kernel +
@@ -336,6 +339,7 @@
           specialArgs = { inherit nixos-raspberrypi; };
           modules = [
             nixos-raspberrypi.nixosModules.raspberry-pi-4.base
+            ./Modules/Hardware/RaspberryPiVendorKernelCompat
             # nvmd's sd-image module, not stock sd-image-aarch64.nix:
             # it bumps the firmware partition to 1 GB (kernel +
             # initrd + multiple generations live there), wires
@@ -412,6 +416,8 @@
           specialArgs = { inherit nixos-raspberrypi; };
           modules = [
             nixos-raspberrypi.nixosModules.raspberry-pi-5.base
+            ./Modules/Hardware/RaspberryPiVendorKernelCompat
+            ./Modules/Hardware/RaspberryPiNonProvisioningBase
             sops-nix.nixosModules.sops
             # Kernel override — lib.mkForce so we win against any
             # default nvmd's raspberry-pi-5.base sets. Out-of-tree
@@ -454,6 +460,7 @@
           specialArgs = { inherit nixos-raspberrypi; };
           modules = [
             nixos-raspberrypi.nixosModules.raspberry-pi-5.base
+            ./Modules/Hardware/RaspberryPiVendorKernelCompat
             sops-nix.nixosModules.sops
             # nvmd's sd-image module, not stock sd-image-aarch64.nix:
             # it bumps the firmware partition to 1 GB (kernel +
@@ -514,6 +521,7 @@
           specialArgs = { inherit nixos-raspberrypi; };
           modules = [
             nixos-raspberrypi.nixosModules.raspberry-pi-5.base
+            ./Modules/Hardware/RaspberryPiVendorKernelCompat
             # nvmd's sd-image module, not stock sd-image-aarch64.nix:
             # it bumps the firmware partition to 1 GB (kernel +
             # initrd + multiple generations live there), wires
