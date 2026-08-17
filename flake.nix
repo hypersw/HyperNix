@@ -64,6 +64,23 @@
   outputs = { self, nixpkgs, nixos-hardware, microvm, sops-nix, nixos-raspberrypi }:
     let
       forAllSystems = nixpkgs.lib.genAttrs [ "x86_64-linux" "aarch64-linux" ];
+      # The Pi vendor kernels ship their matching ZFS kernel module through
+      # boot.kernelPackages. Keep userspace on that exact ZFS release too;
+      # current nixpkgs rejects mixed module/userspace versions.
+      vendorKernelZfs = { config, lib, pkgs, ... }:
+        let
+          vendorZfs = config.boot.kernelPackages.${pkgs.zfs.kernelModuleAttribute};
+        in {
+          # Vendor kernels do not expose nixpkgs' buildDTBs passthru. Give
+          # image variants the staging-safe value while leaving each machine's
+          # explicit device-tree policy authoritative.
+          hardware.deviceTree.enable = lib.mkDefault true;
+
+          boot.zfs = {
+            package = vendorZfs;
+            modulePackage = vendorZfs;
+          };
+        };
     in
     {
       # ── Packages ──
