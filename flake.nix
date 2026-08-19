@@ -539,6 +539,9 @@
           modules = [
             nixos-raspberrypi.nixosModules.raspberry-pi-5.base
             ./Modules/Hardware/RaspberryPiVendorKernelCompat
+            # This provisioning image targets GhostHome's confirmed BCM2712 D0
+            # board, but does not import its full machine configuration.
+            ./Modules/Hardware/RaspberryPi5D0
             # nvmd's sd-image module, not stock sd-image-aarch64.nix:
             # it bumps the firmware partition to 1 GB (kernel +
             # initrd + multiple generations live there), wires

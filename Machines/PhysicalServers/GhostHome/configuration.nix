@@ -20,6 +20,9 @@
 #
 {
   imports = [
+    # GhostHome is a BCM2712 D0 Pi 5 (Rev 1.1). Select its D0-specific
+    # base device tree in every normal GhostHome generation.
+    ../../../Modules/Hardware/RaspberryPi5D0
     # The whole HyperNix module-list: every sub-module + every
     # profile, loaded once. Activation is via option-setting
     # below (`hypersw.profiles.X.enable = true`, etc.). See
