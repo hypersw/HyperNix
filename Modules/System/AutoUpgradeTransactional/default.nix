@@ -263,13 +263,14 @@ in
         NIX_PATH = "nixpkgs=flake:nixpkgs:/nix/var/nix/profiles/per-user/root/channels";
       };
 
+      # Step 4 may install a changed version of this unit. Do not let
+      # activation restart the still-running transaction: that kills its
+      # parent shell after a successful switch and turns success into a
+      # spurious failure/retry loop.
+      restartIfChanged = false;
+
       serviceConfig = {
         Type = "oneshot";
-        # Step 4 may install a changed version of this unit. Do not let
-        # activation restart the still-running transaction: that kills its
-        # parent shell after a successful switch and turns success into a
-        # spurious failure/retry loop.
-        restartIfChanged = false;
         ExecStart = "${upgradeScript}";
         # Clear the stock `system.autoUpgrade` module's ExecStartPre,
         # which runs `nix flake update --flake /etc/nixos` on live
