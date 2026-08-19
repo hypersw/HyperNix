@@ -1155,10 +1155,19 @@ Last failing boot ended with:
     };
 
     # NixOS upgrade failure → alert
-    systemd.services.nixos-upgrade = lib.mkIf config.system.autoUpgrade.enable {
-      unitConfig.OnFailure = "upgrade-failure-notify.service";
-      unitConfig.OnSuccess = "upgrade-success-notify.service";
-    };
+    # The transactional replacement deliberately disables the stock
+    # `system.autoUpgrade` option, but it retains the same service name.
+    # It has a specialized failure notifier of its own; add only the missing
+    # success handler there.
+    systemd.services.nixos-upgrade = lib.mkMerge [
+      (lib.mkIf config.system.autoUpgrade.enable {
+        unitConfig.OnFailure = "upgrade-failure-notify.service";
+        unitConfig.OnSuccess = "upgrade-success-notify.service";
+      })
+      (lib.mkIf config.hypersw.system.autoUpgradeTransactional.enable {
+        unitConfig.OnSuccess = "upgrade-success-notify.service";
+      })
+    ];
 
     systemd.services.upgrade-success-notify = {
       description = "Notify Telegram that upgrade service completed";
