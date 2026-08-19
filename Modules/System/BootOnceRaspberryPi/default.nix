@@ -199,8 +199,8 @@ let
       # nodes — guard against running this before #candidate ever
       # evaluated, in which case the candidate inputs are still
       # un-locked.
-      for name in nixpkgs-candidate nixos-hardware-candidate nixos-raspberrypi-candidate; do
-        if ! jq -e --arg n "$name" '.nodes[$n].locked.rev' "$LOCK" >/dev/null; then
+      for name in nixpkgs-candidate nixos-hardware-candidate nixos-raspberrypi-candidate upstream-candidate; do
+        if ! jq -e --arg n "$name" '.nodes[.nodes.root.inputs[$n]].locked.rev' "$LOCK" >/dev/null; then
           echo "error: $LOCK has no .nodes.$name.locked.rev — has" >&2
           echo "       #candidate ever been built? Try:" >&2
           echo "         sudo nixos-rebuild build --flake /etc/nixos#candidate" >&2
@@ -213,19 +213,15 @@ let
       NEW=$(mktemp -p "$(dirname "$LOCK")" .flake.lock.XXXXXX)
       trap 'rm -f "$NEW"' EXIT
 
-      jq '
-        .nodes.nixpkgs.locked
-          = .nodes["nixpkgs-candidate"].locked
-        | .nodes["nixos-hardware"].locked
-          = .nodes["nixos-hardware-candidate"].locked
-        | .nodes["nixos-raspberrypi"].locked
-          = .nodes["nixos-raspberrypi-candidate"].locked
-      ' "$LOCK" > "$NEW"
+      jq --argjson new '[]' --arg mode candidate-promote \
+        --argjson inputs '["nixpkgs", "nixos-hardware", "nixos-raspberrypi", "upstream"]' \
+        -f ${../LockGraph/lock-graph.jq} "$LOCK" > "$NEW"
 
       if ! jq -e '
-        .nodes.nixpkgs.locked.rev != null
-        and .nodes["nixos-hardware"].locked.rev != null
-        and .nodes["nixos-raspberrypi"].locked.rev != null
+        .nodes[.nodes.root.inputs.nixpkgs].locked.rev != null
+        and .nodes[.nodes.root.inputs["nixos-hardware"]].locked.rev != null
+        and .nodes[.nodes.root.inputs["nixos-raspberrypi"]].locked.rev != null
+        and .nodes[.nodes.root.inputs.upstream].locked.rev != null
       ' "$NEW" >/dev/null; then
         echo "error: post-transform lock failed sanity check" >&2
         exit 1
@@ -237,13 +233,15 @@ let
       mv -f "$NEW" "$LOCK"
       trap - EXIT
 
-      NEW_NIXPKGS=$(jq -r '.nodes.nixpkgs.locked.rev' "$LOCK")
-      NEW_NHW=$(jq -r '.nodes["nixos-hardware"].locked.rev' "$LOCK")
-      NEW_RPI=$(jq -r '.nodes["nixos-raspberrypi"].locked.rev' "$LOCK")
+      NEW_NIXPKGS=$(jq -r '.nodes[.nodes.root.inputs.nixpkgs].locked.rev' "$LOCK")
+      NEW_NHW=$(jq -r '.nodes[.nodes.root.inputs["nixos-hardware"]].locked.rev' "$LOCK")
+      NEW_RPI=$(jq -r '.nodes[.nodes.root.inputs["nixos-raspberrypi"]].locked.rev' "$LOCK")
+      NEW_UPSTREAM=$(jq -r '.nodes[.nodes.root.inputs.upstream].locked.rev' "$LOCK")
       echo "promoted:"
       echo "  nixpkgs           -> $NEW_NIXPKGS"
       echo "  nixos-hardware    -> $NEW_NHW"
       echo "  nixos-raspberrypi -> $NEW_RPI"
+      echo "  upstream          -> $NEW_UPSTREAM"
       echo
 
       # Non-interactive invocation (CI / agent / cron) defaults to

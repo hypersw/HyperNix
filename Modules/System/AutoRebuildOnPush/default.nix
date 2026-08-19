@@ -69,8 +69,10 @@ let
       exit 0
     fi
 
-    CURRENT_REV=$(${pkgs.jq}/bin/jq -r \
-      ".nodes.\"$INPUT_NAME\".locked.rev // empty" "$LOCK" 2>/dev/null)
+    # Input names are logical root handles; lock-node labels may be suffixed
+    # when transitive dependencies also have a node named, e.g., nixpkgs.
+    CURRENT_REV=$(${pkgs.jq}/bin/jq -r --arg n "$INPUT_NAME" \
+      '.nodes[.nodes.root.inputs[$n]].locked.rev // empty' "$LOCK" 2>/dev/null)
 
     if [ -z "$CURRENT_REV" ]; then
       echo "could not read .nodes.$INPUT_NAME.locked.rev from $LOCK" >&2
@@ -80,8 +82,8 @@ let
     # Extract upstream coordinates straight from the same lock. Handles
     # both the structured input form (type+owner+repo+ref) and the url
     # form (github:owner/repo/ref).
-    ORIGINAL=$(${pkgs.jq}/bin/jq -c \
-      ".nodes.\"$INPUT_NAME\".original" "$LOCK" 2>/dev/null)
+    ORIGINAL=$(${pkgs.jq}/bin/jq -c --arg n "$INPUT_NAME" \
+      '.nodes[.nodes.root.inputs[$n]].original' "$LOCK" 2>/dev/null)
 
     UPSTREAM_TYPE=$(echo "$ORIGINAL" | ${pkgs.jq}/bin/jq -r '.type // empty')
     if [ "$UPSTREAM_TYPE" = "github" ]; then

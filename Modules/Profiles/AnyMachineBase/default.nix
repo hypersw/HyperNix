@@ -590,13 +590,13 @@ in
 
           Lock-update commands (each touches only the named inputs; others are left as they were):
 
-          sudo nix flake update upstream /etc/nixos
+          sudo nix flake update --flake /etc/nixos upstream
               Bumps the production HyperNix snapshot. Wired into the ~5-minute auto-rebuild-on-push timer.
 
-          sudo nix flake update /etc/nixos
+          sudo nix flake update --flake /etc/nixos
               Advances every input (both trios + upstream) to current branch HEAD. Wired as the preStart of nixos-upgrade.service (monthly or per-cadence timer). The candidate trio auto-rolls forward along with the production trio at the monthly tick — promote or discard within the cadence window if you want a probe to outlive that.
 
-          sudo nix flake update nixpkgs-candidate nixos-hardware-candidate nixos-raspberrypi-candidate upstream-candidate /etc/nixos
+          sudo nix flake update --flake /etc/nixos nixpkgs-candidate nixos-hardware-candidate nixos-raspberrypi-candidate upstream-candidate
               Starts a fresh major-upgrade probe at current branch HEADs without touching production.
 
           Try-boot the candidate (Pi 5 EEPROM one-shot; failure auto-reverts on the next power cycle):
@@ -608,7 +608,7 @@ in
 
           sudo nixos-rebuild-promote-candidate
 
-          Structurally copies nodes.nixpkgs-candidate.locked over nodes.nixpkgs.locked (same for nixos-hardware and nixos-raspberrypi) inside /etc/nixos/flake.lock and offers a 1-4 apply prompt (nothing / switch / boot / boot + reboot). See Modules/System/BootOnceRaspberryPi/.
+          Promotes the tested candidate lock graph through the root input handles, then offers a 1-4 apply prompt (nothing / switch / boot / boot + reboot). See Modules/System/BootOnceRaspberryPi/.
             ''';
 
             inputs = {

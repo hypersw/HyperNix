@@ -1,0 +1,17 @@
+{
+  "version": 7,
+  "root": "root",
+  "nodes": {
+    "root": { "inputs": { "nixpkgs": "nixpkgs_5", "nixos-hardware": "nixos-hardware", "nixos-raspberrypi": "nixos-raspberrypi", "upstream": "upstream", "nixpkgs-candidate": "nixpkgs-candidate", "nixos-hardware-candidate": "nixos-hardware-candidate", "nixos-raspberrypi-candidate": "nixos-raspberrypi-candidate", "upstream-candidate": "upstream-candidate" } },
+    "nixpkgs_5": { "locked": { "rev": "old" }, "original": { "ref": "unstable" } },
+    "nixos-hardware": { "locked": { "rev": "old" } },
+    "nixos-raspberrypi": { "inputs": { "nixpkgs": "rpi-old-pkgs" }, "locked": { "rev": "old" } },
+    "rpi-old-pkgs": { "locked": { "rev": "old" } },
+    "upstream": { "inputs": { "nixpkgs": [ "nixpkgs" ] }, "locked": { "rev": "old" }, "original": { "ref": "master" } },
+    "nixpkgs-candidate": { "locked": { "rev": "new" }, "original": { "ref": "unstable" } },
+    "nixos-hardware-candidate": { "locked": { "rev": "new" } },
+    "nixos-raspberrypi-candidate": { "inputs": { "nixpkgs": "rpi-new-pkgs" }, "locked": { "rev": "new" } },
+    "rpi-new-pkgs": { "locked": { "rev": "new" } },
+    "upstream-candidate": { "inputs": { "nixpkgs": [ "nixpkgs-candidate" ] }, "locked": { "rev": "new" }, "original": { "ref": "master" } }
+  }
+}
