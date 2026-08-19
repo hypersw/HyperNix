@@ -10,6 +10,11 @@ let
   vendorZfs = config.boot.kernelPackages.${pkgs.zfs.kernelModuleAttribute};
 in
 {
+  # The generic monitoring module owns alerts and common metrics. This shared
+  # live-Pi base selects only its Pi-specific collector policy, so Pi 4/Pi 5
+  # machines do not duplicate it and provisioning images stay untouched.
+  hypersw.services.telegram-alerts.netdata.profile = "raspberry-pi";
+
   boot.zfs = {
     package = vendorZfs;
     modulePackage = vendorZfs;

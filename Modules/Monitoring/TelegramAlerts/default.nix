@@ -1,6 +1,7 @@
 { config, lib, pkgs, ... }:
 let
   cfg = config.hypersw.services.telegram-alerts;
+  isRaspberryPi = cfg.netdata.profile == "raspberry-pi";
 
   # ─── Alert pipeline ──────────────────────────────────────────────────────
   #
@@ -655,6 +656,17 @@ in
       description = "CPU temperature critical threshold (Celsius)";
     };
 
+    netdata.profile = lib.mkOption {
+      type = lib.types.enum [ "generic" "raspberry-pi" ];
+      default = "generic";
+      description = ''
+        Hardware-specific Netdata collector policy. The Raspberry Pi profile
+        keeps Pi telemetry while avoiding server-only probes and their boot
+        overhead. Set by the shared live-Pi hardware base, never by an
+        individual machine configuration.
+      '';
+    };
+
     # Build-time revision info — set from the flake where revisions are available.
     # The module embeds these into a monitoring-specific file at build time.
     configRevision = lib.mkOption {
@@ -699,7 +711,7 @@ in
 
     # ── Netdata: system metrics + built-in alarms + Telegram delivery ──
 
-    # Delay the netdata spawn by 30 s past service-start to push its
+    # On Raspberry Pi, delay Netdata by 30 s past service-start to push its
     # CPU/IO-intensive plugin startup past the kernel's peripheral
     # bring-up window (the first ~10-15 s of boot where we've seen
     # this Pi occasionally brown-out-reset silently — see the
@@ -713,12 +725,20 @@ in
     # systemd has no `StartDelaySec=` property and a timer-driven
     # variant would require unpinning netdata from multi-user.target.
     # One forked sleep for 30 s is fine.
-    systemd.services.netdata.serviceConfig.ExecStartPre = [
+    systemd.services.netdata.serviceConfig.ExecStartPre = lib.mkIf isRaspberryPi [
       "${pkgs.coreutils}/bin/sleep 30"
     ];
 
     services.netdata = {
       enable = true;
+      # Config-level disables alone still let recent Netdata enumerate some
+      # packaged helpers during startup. Remove the whole unsupported feature
+      # families on Pi; runtime-only plugins remain disabled below.
+      package = lib.mkIf isRaspberryPi (pkgs.netdata.override {
+        withIpmi = false;
+        withOtel = false;
+        withNetworkViewer = false;
+      });
       config = {
         global = {
           "memory mode" = "dbengine";
@@ -728,7 +748,10 @@ in
         web = {
           "mode" = "none"; # no dashboard, alerts only
         };
-        # Disable plugins that don't apply (RPi has no IPMI, IPsec, etc.)
+      } // lib.optionalAttrs isRaspberryPi {
+        # No IPMI/EDAC or server-oriented integrations on Pi. Keep these
+        # runtime disables for plugins which Netdata does not feature-gate at
+        # package build time.
         "plugin:freeipmi" = { enabled = "no"; };
         "plugin:perf" = { enabled = "no"; };
         "plugin:ioping" = { enabled = "no"; };
@@ -750,27 +773,6 @@ in
         # just disable our broken custom one. Built-in defaults are
         # warn at 80%, crit at 90% which matches our config.
         # To customize further, override the built-in alarm template.
-
-        # CPU temperature — RPi thermal zone
-        "health.d/temperature_custom.conf" = pkgs.writeText "temperature_custom.conf" ''
-          alarm: cpu_temperature_warn
-              on: sensors.cpu_thermal_zone0_temperature
-          lookup: average -30s
-           units: Celsius
-           every: 10s
-            warn: $this > ${toString cfg.temperatureThreshold}
-              to: log
-            info: CPU temperature above ${toString cfg.temperatureThreshold}C
-
-          alarm: cpu_temperature_crit
-              on: sensors.cpu_thermal_zone0_temperature
-          lookup: average -30s
-           units: Celsius
-           every: 10s
-            crit: $this > ${toString cfg.temperatureCritical}
-              to: alerts
-            info: CPU temperature above ${toString cfg.temperatureCritical}C
-        '';
 
         # Systemd failed units — any service entering failed state
         "health.d/systemd_custom.conf" = pkgs.writeText "systemd_custom.conf" ''
@@ -805,6 +807,28 @@ in
               to: alerts
             info: RAM usage above 95%
         '';
+      } // lib.optionalAttrs isRaspberryPi {
+        # CPU temperature — Pi thermal zone
+        "health.d/temperature_custom.conf" = pkgs.writeText "temperature_custom.conf" ''
+          alarm: cpu_temperature_warn
+              on: sensors.cpu_thermal_zone0_temperature
+          lookup: average -30s
+           units: Celsius
+           every: 10s
+            warn: $this > ${toString cfg.temperatureThreshold}
+              to: log
+            info: CPU temperature above ${toString cfg.temperatureThreshold}C
+
+          alarm: cpu_temperature_crit
+              on: sensors.cpu_thermal_zone0_temperature
+          lookup: average -30s
+           units: Celsius
+           every: 10s
+            crit: $this > ${toString cfg.temperatureCritical}
+              to: alerts
+            info: CPU temperature above ${toString cfg.temperatureCritical}C
+        '';
+
       };
     };
 
