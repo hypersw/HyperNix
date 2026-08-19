@@ -631,7 +631,11 @@ in
 
               nixpkgs-candidate.url = "github:NixOS/nixpkgs/nixos-unstable";
               nixos-hardware-candidate.url = "github:NixOS/nixos-hardware";
-              nixos-raspberrypi-candidate.url = "github:nvmd/nixos-raspberrypi";
+              # Keep the candidate on the same maintained loader fork as
+              # production. Upstream currently evaluates its kernel filename
+              # through a vendor-kernel passthru (`kernel.target`) that is
+              # absent with current nixpkgs; the fork fixes this as `Image`.
+              nixos-raspberrypi-candidate.url = "github:hypersw/nixos-raspberrypi/develop";
               upstream-candidate = {
                 url = "${cfg.localFlake.upstreamUrl}";
                 inputs.nixpkgs.follows = "nixpkgs-candidate";
