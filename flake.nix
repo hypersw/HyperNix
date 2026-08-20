@@ -118,6 +118,11 @@
             self.nixosConfigurations.GhostHome-provisioning-sdImage.config.system.build.sdImage or null;
         });
 
+      # Build another isolated SshFront instance by passing a different name,
+      # MAC, IPv4 address, and optional gateway/hostname. The name also scopes
+      # all host-local sockets and persistent vTPM/PKCS#11 state.
+      lib."Machines-MicroVM-VmSshFront" = args:
+        import ./Machines/MicroVM/VmSshFront/nixos.nix ({ inherit nixpkgs microvm; } // args);
       # ── NixOS Modules ──
       # Single entry point: `default` imports the
       # `Modules/default.nix` module-list which transitively loads

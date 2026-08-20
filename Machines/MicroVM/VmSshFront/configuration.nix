@@ -1,12 +1,21 @@
 # VmSshFront machine configuration — SSH bastion MicroVM
-{ VmNameBare, VmNamePrefixed }:
+{ VmNameBare
+, VmNamePrefixed
+, VmMacAddress
+, VmIpv4Address
+, VmGatewayAddress
+, VmHostname
+}:
+let
+  VmStateDir = "/var/lib/${VmNamePrefixed}";
+in
 { config, lib, pkgs, ... }:
 {
   microvm = {
     interfaces = [{
       type = "tap";
       id = "vm-${VmNameBare}";
-      mac = "02:34:54:83:93:01";
+      mac = VmMacAddress;
     }];
     hypervisor = "qemu";
     socket = "/run/VmControl.${VmNameBare}.socket";
@@ -17,7 +26,7 @@
     # raw SSH private key. It must survive image rebuilds, otherwise the TPM
     # identity is lost.
     preStart = ''
-      state_dir=/var/lib/VmSshFront/swtpm
+      state_dir=${VmStateDir}/swtpm
       socket="$state_dir/swtpm.sock"
       pid_file="$state_dir/swtpm.pid"
       install -d -m 0700 "$state_dir"
@@ -28,7 +37,7 @@
         old_pid=$(cat "$pid_file")
         if kill -0 "$old_pid" 2>/dev/null; then
           printf '%s\n' "stale swtpm process (PID $old_pid) found before VM start; terminating it to protect the persistent TPM state" \
-            | ${config.microvm.vmHostPackages.systemd}/bin/systemd-cat --priority=err --identifier=VmSshFront-swtpm
+            | ${config.microvm.vmHostPackages.systemd}/bin/systemd-cat --priority=err --identifier=${VmNamePrefixed}-swtpm
           kill -TERM "$old_pid"
           while kill -0 "$old_pid" 2>/dev/null; do sleep 0.1; done
         fi
@@ -47,7 +56,7 @@
     '';
 
     qemu.extraArgs = [
-      "-chardev" "socket,id=chrtpm,path=/var/lib/VmSshFront/swtpm/swtpm.sock"
+      "-chardev" "socket,id=chrtpm,path=${VmStateDir}/swtpm/swtpm.sock"
       "-tpmdev" "emulator,id=tpm0,chardev=chrtpm"
       # microvm retains an ISA bus; tpm-tis is the matching TPM frontend.
       "-device" "tpm-tis,tpmdev=tpm0"
@@ -56,12 +65,14 @@
     # This volume stores PKCS#11 token metadata and TPM-wrapped blobs, never a
     # raw SSH private key. It is needed to find the key after a VM rebuild.
     volumes = [{
-      image = "/var/lib/VmSshFront/tpm2-pkcs11.img";
+      image = "${VmStateDir}/tpm2-pkcs11.img";
       mountPoint = "/var/lib/tpm2-pkcs11";
       size = 32;
       fsType = "ext4";
     }];
   };
+
+  networking.hostName = VmHostname;
 
   system.stateVersion = lib.trivial.release;
 
@@ -70,8 +81,8 @@
     networks."20-lan" = {
       matchConfig.Type = "ether";
       networkConfig = {
-        Address = [ "192.168.1.8/24" ];
-        Gateway = "192.168.1.1";
+        Address = [ VmIpv4Address ];
+        Gateway = VmGatewayAddress;
         IPv6AcceptRA = false;
         LinkLocalAddressing = "no";
         DHCP = "no";
