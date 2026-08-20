@@ -22,7 +22,8 @@
       pid_file="$state_dir/swtpm.pid"
       install -d -m 0700 "$state_dir"
 
-      # Do not let two emulators open the same TPM state concurrently.
+      # A live process here means the runner previously crashed or was killed.
+      # Normal QEMU shutdown closes swtpm's control connection and stops it.
       if [ -r "$pid_file" ]; then
         old_pid=$(cat "$pid_file")
         if kill -0 "$old_pid" 2>/dev/null; then
@@ -34,10 +35,13 @@
       fi
       rm -f "$socket" "$pid_file"
 
+      # QEMU holds this control connection for the VM's lifetime. `terminate`
+      # makes swtpm exit as soon as QEMU releases it, including after an
+      # ungraceful QEMU death; no detached emulator is left behind.
       ${config.microvm.vmHostPackages.swtpm}/bin/swtpm socket \
         --tpm2 \
         --tpmstate "dir=$state_dir,mode=0700,lock" \
-        --ctrl "type=unixio,path=$socket,mode=0600" \
+        --ctrl "type=unixio,path=$socket,mode=0600,terminate" \
         --pid "file=$pid_file" \
         --daemon
     '';
