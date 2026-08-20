@@ -26,6 +26,8 @@
       if [ -r "$pid_file" ]; then
         old_pid=$(cat "$pid_file")
         if kill -0 "$old_pid" 2>/dev/null; then
+          printf '%s\n' "stale swtpm process (PID $old_pid) found before VM start; terminating it to protect the persistent TPM state" \
+            | ${config.microvm.vmHostPackages.systemd}/bin/systemd-cat --priority=err --identifier=VmSshFront-swtpm
           kill -TERM "$old_pid"
           while kill -0 "$old_pid" 2>/dev/null; do sleep 0.1; done
         fi
