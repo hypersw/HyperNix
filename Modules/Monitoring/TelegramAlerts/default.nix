@@ -731,14 +731,6 @@ in
 
     services.netdata = {
       enable = true;
-      # Config-level disables alone still let recent Netdata enumerate some
-      # packaged helpers during startup. Remove the whole unsupported feature
-      # families on Pi; runtime-only plugins remain disabled below.
-      package = lib.mkIf isRaspberryPi (pkgs.netdata.override {
-        withIpmi = false;
-        withOtel = false;
-        withNetworkViewer = false;
-      });
       config = {
         global = {
           "memory mode" = "dbengine";
