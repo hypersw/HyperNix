@@ -125,6 +125,13 @@ in {
     nixpkgs.overlays = [ (import ./KRdpOverlay.nix) ];
 
     services.desktopManager.plasma6.enable = true;
+    environment.systemPackages = [
+      # Make Kvantum styles available to the managed Plasma 6 guest and its
+      # remaining Qt 5 applications, so user-installed KDE themes can apply
+      # consistently without adding a VCS client to every guest.
+      pkgs.kdePackages.qtstyleplugin-kvantum
+      pkgs.libsForQt5.qtstyleplugin-kvantum
+    ];
     services.pipewire.enable = true;
     xdg.portal = {
       enable = true;
