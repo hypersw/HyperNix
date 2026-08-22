@@ -33,6 +33,9 @@ let
       # its own Qt stack. Defer the owning-vector removal until that event
       # unwinds, avoiding a use-after-free during repeated RDP handovers.
       (patch "0012-defer-wrapper-removal.patch")
+      # Record every takeover decision and screencast failure with the active,
+      # pending, and closing session state for field diagnosis.
+      (patch "0013-takeover-decision-diagnostics.patch")
     ];
 
     # KRdp propagates KPipeWire's development output. Replace the original

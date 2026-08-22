@@ -1,0 +1,125 @@
+diff --git a/server/SessionController.cpp b/server/SessionController.cpp
+--- a/server/SessionController.cpp
++++ b/server/SessionController.cpp
+@@ -77,6 +77,8 @@
+ 
+     void onSessionStarted()
+     {
++        qInfo() << "KRDP-TAKEOVER: session started wrapper=" << this << "connection=" << connection.data()
++                << "monitor=" << m_virtualMonitorName;
+         m_sessionStarted = true;
+         runOutputLifecycleHandler(QStringLiteral("up"));
+         connection->videoStream()->setPipeWireSource(session->nodeId(), session->takePipeWireFd());
+@@ -85,6 +87,8 @@
+ 
+     void startSession()
+     {
++        qInfo() << "KRDP-TAKEOVER: start-session requested wrapper=" << this << "connection=" << connection.data()
++                << "alreadyRequested=" << m_sessionStartRequested << "monitor=" << m_virtualMonitorName;
+         if (m_sessionStartRequested) {
+             return;
+         }
+@@ -246,6 +250,9 @@
+ void SessionController::onNewConnection(KRdp::RdpConnection *newConnection)
+ {
+     auto wrapper = std::make_unique<SessionWrapper>(newConnection, makeSession(), m_sni);
++    qInfo() << "KRDP-TAKEOVER: new wrapper=" << wrapper.get() << "connection=" << newConnection
++            << "active=" << m_activeWrapper << "pending=" << m_pendingWrapper << "closing=" << m_closingWrapper
++            << "wrapperCountBeforeInsert=" << m_wrappers.size();
+     if (m_virtualMonitor) {
+         const auto configuredVirtualMonitor = *m_virtualMonitor;
+         connect(newConnection, &KRdp::RdpConnection::initialDesktopConfiguration, wrapper.get(), [wrapper = wrapper.get(), configuredVirtualMonitor](QSize clientSize, qreal clientScale) {
+@@ -277,6 +284,10 @@
+     }
+ 
+     connect(newConnection, &KRdp::RdpConnection::stateChanged, this, [this, wrapperPtr = wrapper.get()](KRdp::RdpConnection::State state) {
++        qInfo() << "KRDP-TAKEOVER: connection state changed wrapper=" << wrapperPtr
++                << "state=" << static_cast<int>(state) << "active=" << m_activeWrapper
++                << "pending=" << m_pendingWrapper << "closing=" << m_closingWrapper
++                << "wrapperCount=" << m_wrappers.size();
+         if (state == KRdp::RdpConnection::State::Activated && m_virtualMonitor) {
+             requestTakeover(wrapperPtr);
+         }
+@@ -285,15 +296,25 @@
+     connect(wrapper.get(), &SessionWrapper::connectionDestroyed, this, &SessionController::onWrapperConnectionDestroyed);
+     connect(wrapper.get(), &SessionWrapper::outputLifecycleFinished, this, &SessionController::onOutputLifecycleFinished);
+ 
+-    connect(wrapper.get(), &SessionWrapper::sessionError, this, [newConnection] {
++    connect(wrapper.get(), &SessionWrapper::sessionError, this, [this, wrapperPtr = wrapper.get(), newConnection] {
++        qWarning() << "KRDP-TAKEOVER: session error; closing connection wrapper=" << wrapperPtr
++                   << "connection=" << newConnection << "active=" << m_activeWrapper
++                   << "pending=" << m_pendingWrapper << "closing=" << m_closingWrapper;
+         newConnection->close(KRdp::RdpConnection::CloseReason::None);
+     });
+ 
++    auto *wrapperPtr = wrapper.get();
+     m_wrappers.push_back(std::move(wrapper));
++    qInfo() << "KRDP-TAKEOVER: wrapper registered wrapper=" << wrapperPtr
++            << "active=" << m_activeWrapper << "pending=" << m_pendingWrapper << "closing=" << m_closingWrapper
++            << "wrapperCount=" << m_wrappers.size();
+ }
+ 
+ void SessionController::activateWrapper(SessionWrapper *wrapper)
+ {
++    qInfo() << "KRDP-TAKEOVER: activate requested wrapper=" << wrapper << "active=" << m_activeWrapper
++            << "pending=" << m_pendingWrapper << "closing=" << m_closingWrapper
++            << "wrapperCount=" << m_wrappers.size();
+     if (!wrapper) {
+         return;
+     }
+@@ -316,7 +337,11 @@
+ 
+ void SessionController::requestTakeover(SessionWrapper *wrapper)
+ {
++    qInfo() << "KRDP-TAKEOVER: request received wrapper=" << wrapper << "active=" << m_activeWrapper
++            << "pending=" << m_pendingWrapper << "closing=" << m_closingWrapper
++            << "wrapperCount=" << m_wrappers.size();
+     if (!wrapper || wrapper == m_activeWrapper || wrapper == m_closingWrapper) {
++        qInfo() << "KRDP-TAKEOVER: request ignored wrapper=" << wrapper;
+         return;
+     }
+ 
+@@ -344,6 +369,9 @@
+ 
+ void SessionController::onWrapperConnectionDestroyed(SessionWrapper *wrapper)
+ {
++    qInfo() << "KRDP-TAKEOVER: connection destroyed wrapper=" << wrapper << "active=" << m_activeWrapper
++            << "pending=" << m_pendingWrapper << "closing=" << m_closingWrapper
++            << "wrapperCount=" << m_wrappers.size();
+     if (wrapper != m_activeWrapper && wrapper != m_closingWrapper) {
+         if (wrapper == m_pendingWrapper) {
+             m_pendingWrapper = nullptr;
+@@ -362,6 +390,9 @@
+ 
+ void SessionController::onOutputLifecycleFinished(SessionWrapper *wrapper, const QString &action, bool success)
+ {
++    qInfo() << "KRDP-TAKEOVER: lifecycle finished wrapper=" << wrapper << "action=" << action
++            << "success=" << success << "active=" << m_activeWrapper << "pending=" << m_pendingWrapper
++            << "closing=" << m_closingWrapper << "wrapperCount=" << m_wrappers.size();
+     if (action != u"down"_s || wrapper != m_closingWrapper) {
+         return;
+     }
+@@ -402,6 +433,7 @@
+     if (!wrapper) {
+         return;
+     }
++    qInfo() << "KRDP-TAKEOVER: removing wrapper=" << wrapper << "wrapperCountBefore=" << m_wrappers.size();
+     m_wrappers.erase(std::remove_if(m_wrappers.begin(),
+                                     m_wrappers.end(),
+                                     [wrapper](const std::unique_ptr<SessionWrapper> &entry) {
+diff --git a/src/PlasmaScreencastV1Session.cpp b/src/PlasmaScreencastV1Session.cpp
+--- a/src/PlasmaScreencastV1Session.cpp
++++ b/src/PlasmaScreencastV1Session.cpp
+@@ -241,6 +241,11 @@
+     } else {
+         d->request = d->m_screencasting.createWorkspaceStream(Screencasting::Metadata);
+     }
+-    connect(d->request, &ScreencastingStream::failed, this, &PlasmaScreencastV1Session::error);
++    connect(d->request, &ScreencastingStream::failed, this, [this](const QString &reason) {
++        const auto monitor = virtualMonitor();
++        qCWarning(KRDP) << "Plasma screencast stream failed" << reason
++                         << "virtualMonitor=" << (monitor ? monitor->name : QString());
++        Q_EMIT error();
++    });
+     connect(d->request, &ScreencastingStream::created, this, [this](uint nodeId) {
+         qCDebug(KRDP) << "Started Plasma session";
