@@ -235,18 +235,19 @@ pkgs.writeShellApplication {
       down)
         resolve_rdp_output
         # KScreen refuses to disable the final enabled output. During a
-        # single-seat takeover the departing RDP output can be that final
-        # output, so restore KWin's bootstrap display as a temporary anchor
-        # before tearing it down.
+        # single-seat handover the departing RDP output can be that final
+        # output, so restore KWin's bootstrap display as a temporary anchor.
         if stub_output_disabled; then
           kscreen-doctor "output.$stub_output.enable"
           wait_for_stub_output_enabled
         fi
-        kscreen-doctor "output.$rdp_output_id.disable"
-        wait_for_rdp_output_disabled
-        if no_rdp_output_enabled && stub_output_disabled; then
-          kscreen-doctor "output.$stub_output.enable"
-        fi
+        # Do not disable this connector through KScreen. That state is stored
+        # by connector name; when KRdp creates the next Virtual-RDP-* output
+        # with the same name, KWin applies the stored disabled state before it
+        # creates a LogicalOutput and its screencast fails with "Could not find
+        # output". Destruction of the old SessionWrapper releases/removes the
+        # virtual output itself. `up` disables the temporary stub again.
+        echo "KRDP-LIFECYCLE: preserving departing RDP connector state; stream release removes it" >&2
         ;;
       *)
         echo "Unknown KRdp output lifecycle action: $action" >&2
