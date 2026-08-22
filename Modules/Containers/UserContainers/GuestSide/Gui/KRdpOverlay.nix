@@ -36,6 +36,9 @@ let
       # Record every takeover decision and screencast failure with the active,
       # pending, and closing session state for field diagnosis.
       (patch "0013-takeover-decision-diagnostics.patch")
+      # Activate a replacement only after queued old-wrapper destruction has
+      # released its Plasma screencast request and virtual output.
+      (patch "0014-activate-after-old-stream-release.patch")
     ];
 
     # KRdp propagates KPipeWire's development output. Replace the original

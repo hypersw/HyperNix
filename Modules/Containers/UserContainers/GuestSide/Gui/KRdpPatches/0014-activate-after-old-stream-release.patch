@@ -1,0 +1,68 @@
+diff --git a/server/SessionController.cpp b/server/SessionController.cpp
+--- a/server/SessionController.cpp
++++ b/server/SessionController.cpp
+@@ -267,14 +267,22 @@ void SessionController::onOutputLifecycleFinished(SessionWrapper *wrapper, cons
+     m_outputCleanupTimer->stop();
+     qInfo() << "KRDP-TAKEOVER: old output cleanup finished wrapper=" << wrapper << "success=" << success;
+     m_closingWrapper = nullptr;
+-    scheduleRemoveWrapper(wrapper);
+     if (success && m_pendingWrapper) {
+-        activateWrapper(m_pendingWrapper);
++        // The old SessionWrapper owns the Plasma screencast request. Its
++        // virtual output remains visible to KWin until queued removal
++        // destroys that request. Starting a new request earlier makes KWin
++        // find the old disabled output and fail it with "Could not find output".
++        m_activateAfterRemovalWrapper = m_pendingWrapper;
++        m_pendingWrapper = nullptr;
++        scheduleRemoveWrapper(wrapper);
+     } else if (!success && m_pendingWrapper) {
++        scheduleRemoveWrapper(wrapper);
+         qWarning() << "KRDP-TAKEOVER: refusing pending session after failed old-output cleanup" << m_pendingWrapper;
+         if (m_pendingWrapper->connection) {
+             m_pendingWrapper->connection->close();
+         }
+         m_pendingWrapper = nullptr;
++    } else {
++        scheduleRemoveWrapper(wrapper);
+     }
+ }
+@@ -296,6 +308,21 @@ void SessionController::scheduleRemoveWrapper(SessionWrapper *wrapper)
+         }
+         qInfo() << "KRDP-TAKEOVER: wrapper-removal-completed" << guardedWrapper.data();
+         removeWrapper(guardedWrapper.data());
++        if (m_activateAfterRemovalWrapper) {
++            // Queue once more after releasing the old session, giving KWin a
++            // turn to remove its old virtual output before the replacement
++            // stream asks it to create the same (or a new) virtual output.
++            QPointer<SessionWrapper> pendingWrapper = m_activateAfterRemovalWrapper;
++            m_activateAfterRemovalWrapper = nullptr;
++            QTimer::singleShot(0, this, [this, pendingWrapper] {
++                if (!pendingWrapper || !pendingWrapper->connection) {
++                    qWarning() << "KRDP-TAKEOVER: pending connection disappeared before activation";
++                    return;
++                }
++                qInfo() << "KRDP-TAKEOVER: old stream released; activating pending wrapper" << pendingWrapper.data();
++                activateWrapper(pendingWrapper.data());
++            });
++        }
+     });
+     qInfo() << "KRDP-TAKEOVER: wrapper-removal-queued" << wrapper;
+ }
+diff --git a/server/SessionController.h b/server/SessionController.h
+--- a/server/SessionController.h
++++ b/server/SessionController.h
+@@ -7,6 +7,7 @@
+ #include <AbstractSession.h>
+ #include <KStatusNotifierItem>
+ #include <QTimer>
++#include <QPointer>
+ #include <vector>
+ 
+ #include <QObject>
+@@ -60,5 +61,6 @@ private:
+     SessionWrapper *m_activeWrapper = nullptr;
+     SessionWrapper *m_pendingWrapper = nullptr;
+     SessionWrapper *m_closingWrapper = nullptr;
++    QPointer<SessionWrapper> m_activateAfterRemovalWrapper;
+     QTimer *m_closeTimer = nullptr;
+     QTimer *m_outputCleanupTimer = nullptr;
