@@ -99,6 +99,7 @@
           Util-CloseFrom3 = closefrom3;
           Git-SshAskpassCredentialHelper = import ./Git/SshAskpassCredentialHelper/package.nix { inherit pkgs closefrom3; };
           Git-SpaceGitCredential = import ./Git/SpaceGitCredential/package.nix { inherit pkgs; };
+          Git-AskpassSafe = import ./Git/AskpassSafe/package.nix { inherit pkgs closefrom3; };
           Modules-PrintersScanners-Shared = printScanShared;
           Modules-PrintersScanners-Daemon = printScanDaemon;
           Modules-PrintersScanners-TelegramBot = printScanBot;
