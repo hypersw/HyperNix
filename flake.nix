@@ -150,6 +150,21 @@
         default = import ./Modules;
       };
 
+      # ── Home-Manager Modules ──
+      # Counterpart to `nixosModules.default`, with the same
+      # single-entry-point rationale: `Modules/Home/default.nix` is
+      # the module-list, consumers import the bundle and activate by
+      # setting options. See that file for the discussion.
+      homeModules = {
+        default = import ./Modules/Home;
+      };
+
+      # home-manager renamed this output `hmModules` -> `homeModules`.
+      # Channel-based consumers still reach for the old name (the
+      # `import-flake` flake-compat helper looks up `defaultNix.hmModules`),
+      # so keep it as an alias rather than forcing them to update in step.
+      hmModules = self.homeModules;
+
       # ── Checks (automated tests) ──
       # `nix build .#checks.x86_64-linux.first-boot-log` boots a
       # NixOS VM with the provisioning profile enabled, triggers
