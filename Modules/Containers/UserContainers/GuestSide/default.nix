@@ -10,12 +10,11 @@ in
     ./Tpm.nix
     ./Konsole.nix
     ./Gui/Common.nix
-    ./Gui/SharedX11.nix
-    ./Gui/SharedWayland.nix
-    ./Gui/IsolatedWayland.nix
-    ./Gui/IsolatedRdpWayland.nix
-    ./Gui/IsolatedGnomeRdp.nix
-    ./Gui/IsolatedKdeRdp.nix
+    ./Gui/PropagatedX11.nix
+    ./Gui/PropagatedWayland.nix
+    ./Gui/RdpWeston.nix
+    ./Gui/RdpGnome.nix
+    ./Gui/RdpKde.nix
   ];
 
   options.hypersw.containers.UserContainers.Guest = {
@@ -55,7 +54,7 @@ in
 
     Gui = {
       Mode = lib.mkOption {
-        type = lib.types.enum [ "None" "SharedX11" "SharedWayland" "IsolatedWayland" "IsolatedRdpWayland" "IsolatedGnomeRdp" "IsolatedKdeRdp" ];
+        type = lib.types.enum [ "None" "PropagatedX11" "PropagatedWayland" "RdpWeston" "RdpGnome" "RdpKdeIsolated" "RdpKdeWithDevices" ];
         default = "None";
       };
       Gpu = lib.mkOption { type = lib.types.bool; default = false; };
@@ -80,24 +79,29 @@ in
           when resolving WAYLAND_DISPLAY.
         '';
       };
-      IsolatedWaylandSocketName = lib.mkOption {
+      LocalWaylandSocketName = lib.mkOption {
         type = lib.types.str;
-        default = "wayland-isolated";
+        default = "wayland-local";
         description = ''
-          Guest-visible socket name produced by the nested compositor.
-          In IsolatedWayland mode, normal apps use this socket while
-          only the compositor uses HostWaylandSocketName.
+          Guest-visible socket name produced by a compositor the guest
+          runs itself, as opposed to HostWaylandSocketName, which names
+          the host compositor propagated in.
         '';
       };
       RdpListenAddress = lib.mkOption {
         type = lib.types.str;
         default = "127.0.0.1";
-        description = "Address where an isolated RDP GUI mode exposes its RDP listener.";
+        description = "Address where an Rdp* GUI mode exposes its listener.";
       };
       RdpPort = lib.mkOption {
-        type = lib.types.port;
-        default = 33398;
-        description = "TCP port where an isolated RDP GUI mode exposes its RDP listener.";
+        type = lib.types.nullOr lib.types.port;
+        default = null;
+        description = ''
+          TCP port where an Rdp* GUI mode exposes its listener. Deliberately
+          without a default: managed containers share one network namespace,
+          so a default would hand every guest the same port and let whichever
+          one starts second lose its bind.
+        '';
       };
       RdpUsername = lib.mkOption {
         type = lib.types.str;
@@ -118,7 +122,7 @@ in
         type = lib.types.str;
         default = "1920x1080@1";
         description = ''
-          Initial IsolatedKdeRdp virtual-monitor geometry used only when an
+          Initial RdpKde* virtual-monitor geometry used only when an
           RDP client does not report a valid desktop size and scale.
         '';
       };

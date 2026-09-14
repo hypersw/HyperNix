@@ -3,7 +3,7 @@ let
   cfg = config.hypersw.containers.UserContainers.Guest;
 in
 {
-  config = lib.mkIf (cfg.Enable && cfg.Gui.Mode == "SharedWayland") {
+  config = lib.mkIf (cfg.Enable && cfg.Gui.Mode == "PropagatedWayland") {
     environment.sessionVariables = {
       WAYLAND_DISPLAY = cfg.Gui.HostWaylandSocketName;
       GDK_BACKEND = "wayland,x11";

@@ -2,7 +2,7 @@
 let cfg = config.hypersw.containers.UserContainers.Guest;
 in {
   # Own an independent GNOME/Mutter Wayland session; no host display or socket is mounted.
-  config = lib.mkIf (cfg.Enable && cfg.Gui.Mode == "IsolatedGnomeRdp") {
+  config = lib.mkIf (cfg.Enable && cfg.Gui.Mode == "RdpGnome") {
     services.desktopManager.gnome.enable = true;
     services.pipewire.enable = true;
 
@@ -89,14 +89,14 @@ in {
     # this mode cannot currently expose an RDP port. Keep the explicit warning
     # visible in the lingered user manager instead of failing silently.
     systemd.user.services.hypersw-gnome-rdp-bind-warning = {
-      description = "Explain the IsolatedGnomeRdp loopback bind limitation";
+      description = "Explain the RdpGnome loopback bind limitation";
       wantedBy = [ "default.target" ];
       after = [ "gnome-remote-desktop-headless.service" ];
       serviceConfig.Type = "oneshot";
       script = ''
-        echo "WARNING: IsolatedGnomeRdp is prevented from opening its RDP port by its loopback-only network policy." >&2
+        echo "WARNING: RdpGnome is prevented from opening its RDP port by its loopback-only network policy." >&2
         echo "GNOME Remote Desktop binds a wildcard address and has no listen-address setting." >&2
-        echo "Use IsolatedKdeRdp for an actual localhost-only listener, or explicitly change this mode's network policy." >&2
+        echo "Use an RdpKde* mode for an actual localhost-only listener, or explicitly change this mode's network policy." >&2
       '';
     };
     # Upstream starts this from gnome-session.target. Managed containers have no

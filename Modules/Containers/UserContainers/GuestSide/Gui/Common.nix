@@ -82,10 +82,22 @@ in
       };
     };
 
-    environment.sessionVariables = lib.mkIf cfg.Gui.Audio {
-      # The mounted directory survives host PipeWire socket replacement.
-      PULSE_SERVER = "unix:${audioBridgeDir}/${pulseBridgeSocketName}";
-    };
+    environment.sessionVariables = lib.mkMerge [
+      (lib.mkIf cfg.Gui.Audio {
+        # The mounted directory survives host PipeWire socket replacement.
+        PULSE_SERVER = "unix:${audioBridgeDir}/${pulseBridgeSocketName}";
+      })
+
+      # Every GPU-enabled mode needs the driver override, not only PropagatedX11.
+      # An isolated RDP desktop reaches its GPU through exactly these two
+      # variables: the Mesa loader picks the render-node driver for KWin's
+      # OpenGL backend, and libva picks the VA-API driver that lets KPipeWire
+      # encode H.264 on the GPU instead of on the CPU.
+      (lib.mkIf (cfg.Gui.Gpu && cfg.Gui.MesaDriverName != "") {
+        LIBVA_DRIVER_NAME = cfg.Gui.MesaDriverName;
+        MESA_LOADER_DRIVER_OVERRIDE = cfg.Gui.MesaDriverName;
+      })
+    ];
 
     environment.etc = lib.optionalAttrs cfg.Gui.Audio {
       "asound.conf".text = ''

@@ -61,26 +61,68 @@ let
     config.system.path
   ]}";
 
+  # KWin's virtual backend carries both an EGL and a QPainter renderer, and the
+  # screencast patch below supports either, so the GPU crossing decides which one
+  # this session uses. With a render node the OpenGL renderer composites on the
+  # GPU and hands KPipeWire dmabuf frames, which is also what lets the encoder
+  # reach VA-API instead of encoding a software composite on the CPU. Without
+  # one, QPainter is the only renderer that can start at all.
+  kwinRenderBackend = if cfg.Gui.Gpu then "O2" else "QPainter";
+
+  # The two RdpKde modes share every mechanism here and differ only in what
+  # they let across the boundary: RdpKdeIsolated crosses nothing and runs pure
+  # Wayland, RdpKdeWithDevices crosses host devices and carries an Xwayland
+  # server for clients that have no Wayland path. HostSide seeds the crossing
+  # flags from the mode and refuses the ones Isolated must not have, so the
+  # guest only has to read the flags.
+  isRdpKde = (cfg.Gui.Mode == "RdpKdeIsolated") || (cfg.Gui.Mode == "RdpKdeWithDevices");
+  hasXwayland = cfg.Gui.Mode == "RdpKdeWithDevices";
+
   virtualKwinEnvironment = [
     "XDG_SESSION_TYPE=wayland"
     "XDG_CURRENT_DESKTOP=KDE"
     "DESKTOP_SESSION=plasma"
     "XDG_DATA_DIRS=${kdeDataDirs}"
     "XDG_CONFIG_DIRS=${kdeConfigDirs}"
-    "KWIN_COMPOSE=QPainter"
+    "KWIN_COMPOSE=${kwinRenderBackend}"
   ];
 
-  waylandClientEnvironment = virtualKwinEnvironment ++ [
+  # Toolkit selection. Without Xwayland there is no X server to fall back to,
+  # so each variable names Wayland alone and an X11-only client fails loudly
+  # rather than hunting for a display that does not exist. With Xwayland the
+  # same variables become preference lists: Wayland still wins wherever the
+  # toolkit supports it, and only a client with no Wayland path lands on X11.
+  toolkitPlatformEnvironment =
+    if hasXwayland then [
+      "QT_QPA_PLATFORM=wayland;xcb"
+      "GDK_BACKEND=wayland,x11"
+      "SDL_VIDEODRIVER=wayland,x11"
+    ] else [
+      "QT_QPA_PLATFORM=wayland"
+      "GDK_BACKEND=wayland"
+      "SDL_VIDEODRIVER=wayland"
+    ];
+
+  waylandClientEnvironment = virtualKwinEnvironment ++ toolkitPlatformEnvironment ++ [
     "WAYLAND_DISPLAY=${waylandDisplay}"
-    "QT_QPA_PLATFORM=wayland"
-    "GDK_BACKEND=wayland"
-    "SDL_VIDEODRIVER=wayland"
+    # Chromium and Electron keep their own selector. The ozone hints put them
+    # on Wayland in both variants; they fall back on their own if it is absent.
     "MOZ_ENABLE_WAYLAND=1"
     "NIXOS_OZONE_WL=1"
     "OZONE_PLATFORM=wayland"
     "ELECTRON_OZONE_PLATFORM_HINT=wayland"
   ];
 
+  # KWin publishes its Wayland socket, and with --xwayland an X display too.
+  # Both have to reach the systemd user manager, because every other unit in
+  # this session is started by it and inherits its environment rather than
+  # KWin's. Nothing here crosses the container boundary: the X server is this
+  # guest's own, unlike PropagatedX11 where DISPLAY names the host's.
+  #
+  # Its number is not known in advance, because Xwayland takes the first free
+  # one. That is safe to discover by looking: /tmp/.X11-unix belongs to this
+  # container alone in an Rdp* mode, no host X socket being mounted, so the
+  # socket that appears there is the one KWin just started.
   waitForKwinSocket = pkgs.writeShellScript "hypersw-wait-for-kwin-socket" ''
     set -euo pipefail
     socket="$XDG_RUNTIME_DIR/${waylandDisplay}"
@@ -88,6 +130,22 @@ let
       if [ -S "$socket" ]; then
         export WAYLAND_DISPLAY=${waylandDisplay}
         ${pkgs.systemd}/bin/systemctl --user import-environment WAYLAND_DISPLAY
+        ${lib.optionalString hasXwayland ''
+          for ((xattempt = 0; xattempt < 100; xattempt += 1)); do
+            for xsocket in /tmp/.X11-unix/X*; do
+              [ -S "$xsocket" ] || continue
+              DISPLAY=":''${xsocket##*/X}"
+              export DISPLAY
+              ${pkgs.systemd}/bin/systemctl --user import-environment DISPLAY
+              exit 0
+            done
+            ${pkgs.coreutils}/bin/sleep 0.1
+          done
+          # Xwayland is an accessory here: Wayland clients are unaffected, so
+          # report the loss and leave the session running rather than failing
+          # KWin and taking the whole desktop down with it.
+          echo "Timed out waiting for an Xwayland display; X11 clients will not start" >&2
+        ''}
         exit 0
       fi
       ${pkgs.coreutils}/bin/sleep 0.1
@@ -111,13 +169,23 @@ let
 in {
   # KRdp owns an existing Plasma Wayland session.  Unlike GNOME Remote Desktop,
   # its --address option provides a real loopback-only listener.
-  config = lib.mkIf (cfg.Enable && cfg.Gui.Mode == "IsolatedKdeRdp") {
+  config = lib.mkIf (cfg.Enable && isRdpKde) {
     assertions = [
       {
         assertion = cfg.Gui.RdpPassword != "";
-        message = "IsolatedKdeRdp cannot use an explicitly empty Gui.RdpPassword: KRdp rejects an empty password after connection. Use null for generated credentials, or provide a nonempty password / credentials file.";
+        message = "An RdpKde mode cannot use an explicitly empty Gui.RdpPassword: KRdp rejects an empty password after connection. Use null for generated credentials, or provide a nonempty password / credentials file.";
+      }
+      {
+        assertion = cfg.Gui.RdpPort != null;
+        message = "An RdpKde mode needs an explicit Gui.RdpPort. There is no default, because guests sharing a network namespace would otherwise all claim the same one.";
       }
     ];
+
+    # KWin is started with --xwayland in the WithDevices mode and needs the
+    # server on PATH to exec it. Forced rather than merely set, because Plasma
+    # turns this on by default: the Isolated mode promises pure Wayland, so it
+    # must not even carry an X server it could be talked into starting.
+    programs.xwayland.enable = lib.mkForce hasXwayland;
 
     # The persistent Plasma/portal session comes from this profile. The KRdp,
     # KWin, and KPipeWire packages below must be one patched package set so
@@ -157,6 +225,9 @@ in {
       console-getty.enable = lib.mkForce false;
     };
 
+    # Same toolkit policy as the session units above, for login shells and
+    # anything else that reads the system environment instead of inheriting
+    # the user manager's.
     environment.sessionVariables = {
       XDG_SESSION_TYPE = "wayland";
       XDG_CURRENT_DESKTOP = "KDE";
@@ -164,9 +235,9 @@ in {
       NIXOS_OZONE_WL = "1";
       OZONE_PLATFORM = "wayland";
       ELECTRON_OZONE_PLATFORM_HINT = "wayland";
-      GDK_BACKEND = "wayland";
-      QT_QPA_PLATFORM = "wayland";
-      SDL_VIDEODRIVER = "wayland";
+      GDK_BACKEND = if hasXwayland then "wayland,x11" else "wayland";
+      QT_QPA_PLATFORM = if hasXwayland then "wayland;xcb" else "wayland";
+      SDL_VIDEODRIVER = if hasXwayland then "wayland,x11" else "wayland";
       MOZ_ENABLE_WAYLAND = "1";
     };
 
@@ -187,7 +258,7 @@ in {
           "XDG_CACHE_HOME=${kwinCacheHome}"
         ];
         ExecStartPre = prepareKdeSessionConfig;
-        ExecStart = "${pkgs.kdePackages.kwin}/bin/kwin_wayland --virtual --socket ${waylandDisplay}";
+        ExecStart = "${pkgs.kdePackages.kwin}/bin/kwin_wayland --virtual${lib.optionalString hasXwayland " --xwayland"} --socket ${waylandDisplay}";
         ExecStartPost = waitForKwinSocket;
         Restart = "on-failure";
         RestartSec = 2;
@@ -230,7 +301,7 @@ in {
         credentials="$state/credentials"
         certificate="$state/tls.crt"
         key="$state/tls.key"
-        # A previous IsolatedGnomeRdp generation can have enabled this user unit
+        # A previous RdpGnome generation can have enabled this user unit
         # persistently through grdctl. It is invalid in the KRdp mode and must
         # not survive a managed mode switch.
         ${pkgs.systemd}/bin/systemctl --user disable --now gnome-remote-desktop-headless.service || true

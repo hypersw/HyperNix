@@ -1,7 +1,7 @@
 { config, lib, pkgs, ... }:
 let
   cfg = config.hypersw.containers.UserContainers.Guest;
-  westonConfig = pkgs.writeText "isolated-rdp-wayland.ini" ''
+  westonConfig = pkgs.writeText "rdp-weston.ini" ''
     [shell]
     # Makes the built-in interactive Weston window switcher Alt+Tab, which is
     # natural in an RDP session. The panel itself remains launcher-only.
@@ -11,11 +11,11 @@ in
 {
   # RDP is a separate isolated mode. It creates its own compositor and does not
   # mount, link, or ACL the host Wayland socket at all.
-  config = lib.mkIf (cfg.Enable && cfg.Gui.Mode == "IsolatedRdpWayland") {
+  config = lib.mkIf (cfg.Enable && cfg.Gui.Mode == "RdpWeston") {
     environment.systemPackages = [ pkgs.weston pkgs.openssl ];
 
     environment.sessionVariables = {
-      WAYLAND_DISPLAY = cfg.Gui.IsolatedWaylandSocketName;
+      WAYLAND_DISPLAY = cfg.Gui.LocalWaylandSocketName;
       NIXOS_OZONE_WL = "1";
       OZONE_PLATFORM = "wayland";
       ELECTRON_OZONE_PLATFORM_HINT = "wayland";
@@ -31,15 +31,15 @@ in
       GTK_A11Y = "none";
     };
 
-    systemd.user.services.isolated-rdp-wayland-compositor = {
+    systemd.user.services.rdp-weston-compositor = {
       description = "Isolated RDP Wayland compositor";
       wantedBy = [ "default.target" ];
       serviceConfig = {
         Type = "simple";
         Restart = "on-failure";
-        ExecStart = pkgs.writeShellScript "isolated-rdp-wayland-compositor" ''
+        ExecStart = pkgs.writeShellScript "rdp-weston-compositor" ''
           set -euo pipefail
-          state="$HOME/.local/state/hypersw/isolated-rdp-wayland"
+          state="$HOME/.local/state/hypersw/rdp-weston"
           mkdir -p "$state"
 
           # Weston 15 requires security material for every TCP RDP listener.
@@ -62,7 +62,7 @@ in
             --port=${toString cfg.Gui.RdpPort} \
             --rdp-tls-key="$state/tls.key" \
             --rdp-tls-cert="$state/tls.crt" \
-            --socket=${lib.escapeShellArg cfg.Gui.IsolatedWaylandSocketName}
+            --socket=${lib.escapeShellArg cfg.Gui.LocalWaylandSocketName}
         '';
       };
     };

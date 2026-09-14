@@ -3,7 +3,7 @@ let
   cfg = config.hypersw.containers.UserContainers.Guest;
 in
 {
-  config = lib.mkIf (cfg.Enable && cfg.Gui.Mode == "SharedX11") {
+  config = lib.mkIf (cfg.Enable && cfg.Gui.Mode == "PropagatedX11") {
     environment = {
       sessionVariables = {
         XAUTHORITY = "/home/${cfg.User}/.Xauth/.Xauth_container";
@@ -13,9 +13,6 @@ in
         XCB_FAKE_MONITORS = pkgs.writeText "libxcb-fake-monitors.xml" "<monitors version=\"1\"><configuration><disable_shm/></configuration></monitors>";
         NO_AT_BRIDGE = "1";
         GTK_A11Y = "none";
-      } // lib.optionalAttrs (cfg.Gui.MesaDriverName != "") {
-        LIBVA_DRIVER_NAME = cfg.Gui.MesaDriverName;
-        MESA_LOADER_DRIVER_OVERRIDE = cfg.Gui.MesaDriverName;
       };
 
       shellInit = ''

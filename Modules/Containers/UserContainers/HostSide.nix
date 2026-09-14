@@ -10,7 +10,17 @@
 }:
 { lib, pkgs, ... }:
 let
-  guiModes = [ "None" "SharedX11" "SharedWayland" "IsolatedWayland" "IsolatedRdpWayland" "IsolatedGnomeRdp" "IsolatedKdeRdp" ];
+  # A catalogue of configurations that are intended and have been run, not a
+  # grammar to compose new names from. The first token says how the guest gets
+  # a display: Propagated* is the host's own display server reaching in, Rdp*
+  # is a display server the guest runs itself and exports over RDP. A trailing
+  # Isolated/WithDevices appears only where both have been built and tried, and
+  # there it is enforced rather than merely defaulted.
+  guiModes = [ "None" "PropagatedX11" "PropagatedWayland" "RdpWeston" "RdpGnome" "RdpKdeIsolated" "RdpKdeWithDevices" ];
+  # The subset of guiModes that opens a TCP listener of its own.
+  rdpGuiModes = [ "RdpWeston" "RdpGnome" "RdpKdeIsolated" "RdpKdeWithDevices" ];
+  # The subset whose name promises no host crossings at all.
+  isolatedGuiModes = [ "RdpWeston" "RdpGnome" "RdpKdeIsolated" ];
   buildModes = [ "HostEvaluated" "FlakePath" ];
   rebuildModes = [ "switch" "test" "boot" ];
 
@@ -56,7 +66,11 @@ let
   bootSlot = name: "${stateDir name}/current-system";
   bootRequestDir = name: "${stateDir name}/boot-requests";
 
-  sharedGuiDefault = mode: mode == "SharedX11" || mode == "SharedWayland";
+  # Crossings default on where the mode already implies host integration, and
+  # off everywhere else. For the modes carrying an explicit suffix this is not
+  # just a default: an assertion below holds them to it.
+  crossingsDefaultOn = mode:
+    (mode == "PropagatedX11") || (mode == "PropagatedWayland") || (mode == "RdpKdeWithDevices");
 
   instanceDefaults = name: {
     Enable = false;
@@ -97,9 +111,9 @@ let
         Clipboard = null;
         FontPackages = [];
         HostWaylandSocketName = "wayland-host";
-        IsolatedWaylandSocketName = "wayland-isolated";
+        LocalWaylandSocketName = "wayland-local";
         RdpListenAddress = "127.0.0.1";
-        RdpPort = 33398;
+        RdpPort = null;
         RdpFallbackVirtualMonitor = "1920x1080@1";
         # KRdp's default is intentionally biased toward readable desktop text.
         # Clients may lower it explicitly when bandwidth matters more.
@@ -110,9 +124,9 @@ let
       } // rawGui;
     in
     gui // {
-      Gpu = if gui.Gpu == null then sharedGuiDefault gui.Mode else gui.Gpu;
-      Audio = if gui.Audio == null then sharedGuiDefault gui.Mode else gui.Audio;
-      Clipboard = if gui.Clipboard == null then sharedGuiDefault gui.Mode else gui.Clipboard;
+      Gpu = if gui.Gpu == null then crossingsDefaultOn gui.Mode else gui.Gpu;
+      Audio = if gui.Audio == null then crossingsDefaultOn gui.Mode else gui.Audio;
+      Clipboard = if gui.Clipboard == null then crossingsDefaultOn gui.Mode else gui.Clipboard;
     };
 
   normalizeInstance = name: raw:
@@ -178,26 +192,57 @@ let
               message = "Managed container ${name} Copybox.HostSubdir must be a relative path without '..' components.";
             }
             {
+              # The Isolated suffix is a promise, not a default. Were it only a
+              # default, `Mode = "RdpKdeIsolated"; Gui.Gpu = true;` would be
+              # expressible and one of the two would have to lose silently.
+              # Refuse instead, and name the mode that does allow it.
               assertion =
-                !(decl.Gui.Mode == "SharedWayland" || decl.Gui.Mode == "IsolatedWayland")
+                !(lib.elem decl.Gui.Mode isolatedGuiModes)
+                || !(decl.Gui.Gpu || decl.Gui.Audio || decl.Gui.Clipboard);
+              message = "Managed container ${name} is ${decl.Gui.Mode}, which crosses nothing from the host; it cannot set Gui.Gpu, Gui.Audio or Gui.Clipboard. Use RdpKdeWithDevices for a remote desktop that does.";
+            }
+            {
+              assertion = !(lib.elem decl.Gui.Mode rdpGuiModes) || decl.Gui.RdpPort != null;
+              message = "Managed container ${name} uses ${decl.Gui.Mode} and must set Gui.RdpPort explicitly; the option has no default because guests share one network namespace.";
+            }
+            {
+              assertion =
+                (decl.Gui.Mode != "PropagatedWayland")
                 || decl.HostWaylandSocketAccessUid != null;
-              message = "Managed Wayland container ${name} requires HostWaylandSocketAccessUid, the host-visible UID allowed to connect to the host compositor socket.";
+              message = "Managed PropagatedWayland container ${name} requires HostWaylandSocketAccessUid, the host-visible UID allowed to connect to the host compositor socket.";
             }
           ])
           enabledDeclarations
       );
 
   hostAssertions = [
+    # Managed containers share the host network namespace, so two RDP guests
+    # cannot hold one port. Addresses do not separate them either: GNOME's
+    # server has no listen-address setting and always binds 0.0.0.0, and the
+    # module default puts every guest on the same port unless the machine
+    # config says otherwise. Compare ports alone and fail here, rather than
+    # letting the container that loses the race fail its bind at runtime.
+    (
+      let
+        rdpPorts =
+          lib.mapAttrsToList (_: decl: decl.Gui.RdpPort)
+            (lib.filterAttrs (_: decl: lib.elem decl.Gui.Mode rdpGuiModes) enabledDeclarations);
+      in
+      {
+        assertion = lib.length (lib.unique rdpPorts) == lib.length rdpPorts;
+        message = "Managed containers with an RDP GUI mode need one distinct Gui.RdpPort each; got ${lib.concatMapStringsSep ", " toString rdpPorts}.";
+      }
+    )
     {
-      assertion = !needsAny (decl: decl.Gui.Mode == "SharedX11") || hostGraphicalUser.XauthKeysDir != null;
-      message = "Managed SharedX11 containers require HostGraphicalUser.XauthKeysDir.";
+      assertion = !needsAny (decl: decl.Gui.Mode == "PropagatedX11") || hostGraphicalUser.XauthKeysDir != null;
+      message = "Managed PropagatedX11 containers require HostGraphicalUser.XauthKeysDir.";
     }
     {
       assertion =
         !needsAny
-          (decl: decl.Gui.Mode == "SharedWayland" || decl.Gui.Mode == "IsolatedWayland")
+          (decl: decl.Gui.Mode == "PropagatedWayland")
         || hostGraphicalUser.RuntimeDir != null;
-      message = "Managed Wayland containers require HostGraphicalUser.RuntimeDir.";
+      message = "Managed PropagatedWayland containers require HostGraphicalUser.RuntimeDir.";
     }
     {
       assertion = !needsAny (decl: decl.Gui.Audio) || (HostAudioBridgeDir != null && lib.hasPrefix "/" HostAudioBridgeDir);
@@ -205,17 +250,17 @@ let
     }
     {
       assertion =
-        !needsAny (decl: decl.Gui.Mode == "SharedWayland" || decl.Gui.Mode == "IsolatedWayland")
+        !needsAny (decl: decl.Gui.Mode == "PropagatedWayland")
         || hostGraphicalUser.WaylandDisplay != null;
-      message = "Managed Wayland containers require HostGraphicalUser.WaylandDisplay.";
+      message = "Managed PropagatedWayland containers require HostGraphicalUser.WaylandDisplay.";
     }
     {
       assertion = !needsAny (decl: decl.Gui.Gpu) || (hostGpu.BindMounts != {} && hostGpu.AllowedDevices != []);
       message = "Managed containers with Gui.Gpu require HostGpu.BindMounts and HostGpu.AllowedDevices.";
     }
     {
-      assertion = !needsAny (decl: decl.Gui.Mode == "SharedX11") || hostGpu.MesaDriverName != null;
-      message = "Managed SharedX11 containers require HostGpu.MesaDriverName; use \"\" to explicitly avoid Mesa driver environment variables.";
+      assertion = !needsAny (decl: decl.Gui.Gpu || decl.Gui.Mode == "PropagatedX11") || hostGpu.MesaDriverName != null;
+      message = "Managed containers with Gui.Gpu, and all PropagatedX11 containers, require HostGpu.MesaDriverName; use \"\" to explicitly avoid Mesa driver environment variables.";
     }
   ];
 
@@ -237,8 +282,8 @@ let
   mkContainer = name: decl:
     let
       hasGui = decl.Gui.Mode != "None";
-      needsX11 = decl.Gui.Mode == "SharedX11";
-      needsHostWayland = decl.Gui.Mode == "SharedWayland" || decl.Gui.Mode == "IsolatedWayland";
+      needsX11 = decl.Gui.Mode == "PropagatedX11";
+      needsHostWayland = decl.Gui.Mode == "PropagatedWayland";
       hostWaylandSocket = "${hostGraphicalUser.RuntimeDir}/${hostGraphicalUser.WaylandDisplay}";
       copyboxHostPath =
         if decl.Copybox.HostSubdir == null
@@ -286,7 +331,7 @@ let
               Gui.MesaDriverName = hostGpu.MesaDriverName;
               Gui.FontPackages = decl.Gui.FontPackages;
               Gui.HostWaylandSocketName = decl.Gui.HostWaylandSocketName;
-              Gui.IsolatedWaylandSocketName = decl.Gui.IsolatedWaylandSocketName;
+              Gui.LocalWaylandSocketName = decl.Gui.LocalWaylandSocketName;
               Gui.RdpListenAddress = decl.Gui.RdpListenAddress;
               Gui.RdpPort = decl.Gui.RdpPort;
               Gui.RdpFallbackVirtualMonitor = decl.Gui.RdpFallbackVirtualMonitor;
