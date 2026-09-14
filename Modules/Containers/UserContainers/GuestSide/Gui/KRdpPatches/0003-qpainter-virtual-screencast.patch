@@ -172,20 +172,21 @@
 
      struct pw_buffer *pwBuffer = dequeueBuffer();
      if (!pwBuffer) {
-@@ -608,8 +600,10 @@
+@@ -608,8 +600,11 @@
          break;
      }
 
 -    EglContext *context = backend->openglContext();
--    context->makeCurrent();
+-    if (!context->makeCurrent()) {
++    // The QPainter path has no EGL backend and therefore no context to make
++    // current; only the OpenGL path can fail here, and upstream returns the
++    // buffer to PipeWire when it does.
 +    EglContext *context = backend ? backend->openglContext() : nullptr;
-+    if (context) {
-+        context->makeCurrent();
-+    }
-
-     spa_meta_sync_timeline *synctmeta = nullptr;
-
-@@ -619,6 +613,7 @@
++    if (context && !context->makeCurrent()) {
+         pw_stream_return_buffer(m_pwStream, pwBuffer);
+         return;
+     }
+@@ -622,6 +617,7 @@
              damage = m_source->render(memfd->view.image(), m_damageJournal.accumulate(memfd->m_age, Region::infinite()));
              bumpBufferAge(memfd);
          } else if (auto dmabuf = dynamic_cast<DmaBufScreenCastBuffer *>(buffer)) {
@@ -193,7 +194,7 @@
              if (dmabuf->synctimeline) {
                  synctmeta = static_cast<spa_meta_sync_timeline *>(spa_buffer_find_meta_data(spa_buffer,
                                                                                              SPA_META_SyncTimeline,
-@@ -637,6 +632,8 @@
+@@ -640,6 +636,8 @@
      }
 
      if (spa_data[0].type == SPA_DATA_DmaBuf) {
