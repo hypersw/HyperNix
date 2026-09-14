@@ -70,6 +70,7 @@ let
     Gui = {};
     Tpm = {};
     Fuse = {};
+    NixLd = {};
     Copybox = {};
     Konsole = {};
     SelfSwitch = {};
@@ -122,6 +123,7 @@ let
       Gui = normalizeGui name decl.Gui;
       Tpm = { Enable = false; } // decl.Tpm;
       Fuse = { Enable = false; } // decl.Fuse;
+      NixLd = { Enable = false; } // decl.NixLd;
       Copybox = {
         Enable = false;
         Name = "Copybox";
@@ -294,6 +296,8 @@ let
               Gui.RdpPassword = decl.Gui.RdpPassword;
               Tpm.Enable = decl.Tpm.Enable;
               Fuse.Enable = decl.Fuse.Enable;
+              # Guest-only feature: no bind mount or device follows from it.
+              NixLd.Enable = decl.NixLd.Enable;
               Konsole.Enable = decl.Konsole.Enable;
               Konsole.WorkspaceId = decl.Konsole.WorkspaceId;
               SelfSwitch.Enable = decl.SelfSwitch.Enable;

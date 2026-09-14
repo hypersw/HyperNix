@@ -13,11 +13,13 @@
 #
 # Activation is via option-setting:
 #   programs.askpass-safe.enable = true;
+#   programs.nix-ld-libraries.enable = true;
 #
 # Modules live next to their NixOS siblings (`Modules/<Area>/<Name>/home.nix`)
 # so a subject's NixOS and HM halves stay in one directory.
 {
   imports = [
     ../Git/AskpassSafe/home.nix
+    ../Programs/NixLdLibraries/home.nix
   ];
 }

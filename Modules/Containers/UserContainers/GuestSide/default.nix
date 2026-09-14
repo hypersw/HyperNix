@@ -135,6 +135,11 @@ in
 
     Tpm.Enable = lib.mkEnableOption "TPM support inside this container.";
     Fuse.Enable = lib.mkEnableOption "FUSE support inside this container.";
+    NixLd.Enable = lib.mkEnableOption ''
+      nix-ld, so unpatched binaries can run in this container. The loader
+      only: which libraries a program finds through it belongs to the user,
+      not to the container
+    '';
 
     Konsole = {
       Enable = lib.mkEnableOption "auto-start Konsole.";
@@ -170,9 +175,37 @@ in
     };
   };
 
-  config = lib.mkIf (cfg.Enable && cfg.Fuse.Enable) {
-    # HostSide's matching Fuse.Enable exposes /dev/fuse. This guest-side half
-    # supplies the setuid fusermount/fusermount3 wrappers.
-    programs.fuse.enable = true;
-  };
+  config = lib.mkMerge [
+    (lib.mkIf (cfg.Enable && cfg.Fuse.Enable) {
+      # HostSide's matching Fuse.Enable exposes /dev/fuse. This guest-side half
+      # supplies the setuid fusermount/fusermount3 wrappers.
+      programs.fuse.enable = true;
+    })
+
+    (lib.mkIf (cfg.Enable && cfg.NixLd.Enable) {
+      # Unlike Tpm and Fuse this crosses nothing from the host, so there is no
+      # device to bind and the HostSide half is just the declaration flag.
+      #
+      # It has to be system configuration all the same, because nix-ld works by
+      # owning the ELF interpreter path that unpatched binaries have baked in
+      # (/lib64/ld-linux-x86-64.so.2, via environment.ldso). Only the system
+      # can place a file there, so the mechanism cannot be turned on ad hoc
+      # from a shell. What a program then finds through it is a plain
+      # environment variable, and that half is free to be per-user or
+      # per-shell.
+      #
+      # TODO: temporary. Once this container evaluates its own configuration,
+      # its flake declares nix-ld and this host-side flag goes away.
+      programs.nix-ld.enable = true;
+
+      # The loader, and deliberately nothing to load. nix-ld's own module body
+      # defines a stock list of common libraries, which is a definition rather
+      # than an option default, so emptying it takes mkForce. Left in place it
+      # would put those libraries on NIX_LD_LIBRARY_PATH for every process in
+      # the container that goes through the loader, which is the leak this
+      # split exists to avoid: enabling the mechanism must not also decide what
+      # it resolves. The user's home-manager profile supplies the list.
+      programs.nix-ld.libraries = lib.mkForce [ ];
+    })
+  ];
 }
