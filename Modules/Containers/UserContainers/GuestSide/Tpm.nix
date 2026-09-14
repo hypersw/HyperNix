@@ -29,8 +29,13 @@ in
         set -euo pipefail
         for dev in /dev/tpm0 /dev/tpmrm0; do
           [ -e "$dev" ] || continue
-          chgrp tss "$dev"
-          chmod 660 "$dev"
+          # Grant the local tss group rw through an ACL rather than chgrp.
+          # These are the host's device nodes, and host and guest allocate
+          # system GIDs independently, so taking the inode group would hand it
+          # this container's tss GID and revoke the host's own tss access to
+          # its TPM. An ACL entry leaves owner and group untouched, so every
+          # party can add its own.
+          ${pkgs.acl}/bin/setfacl -m g:tss:rw "$dev"
         done
       '';
     };
