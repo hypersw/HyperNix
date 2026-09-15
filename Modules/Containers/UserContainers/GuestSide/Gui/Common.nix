@@ -68,6 +68,17 @@ in
       };
     };
 
+    # The document portal is a FUSE mount: it hands files to sandboxed clients
+    # through /run/user/$UID/doc. Without /dev/fuse it exits NOTCONFIGURED and
+    # systemd records a failed unit, which is then reported at every
+    # home-manager activation for something this container does not use.
+    #
+    # State the requirement instead of suppressing it. The condition is true
+    # whenever Fuse.Enable binds the device, so this needs no flag of its own
+    # and cannot drift out of step with one: with FUSE the unit starts, and
+    # without it systemd skips the unit rather than failing it.
+    systemd.user.services.xdg-document-portal.unitConfig.ConditionPathExists = "/dev/fuse";
+
     systemd.user.services.gnome-keyring-unlock = {
       description = "Start and unlock the empty-password gnome-keyring (secrets)";
       wantedBy = [ "default.target" ];

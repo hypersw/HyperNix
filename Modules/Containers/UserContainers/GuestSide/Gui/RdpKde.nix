@@ -266,6 +266,13 @@ in {
       pkgs.kdePackages.qtstyleplugin-kvantum
       pkgs.libsForQt5.qtstyleplugin-kvantum
     ];
+    # Same reasoning as xdg-document-portal in Gui/Common.nix, for the unit KDE
+    # pulls in: kio-fuse exposes KIO locations (sftp:// and friends) as real
+    # filesystem paths for non-KIO applications, and needs /dev/fuse to do it.
+    # Dolphin browses those locations either way; only the appears-as-a-path
+    # feature depends on this, so a skipped unit is the honest outcome.
+    systemd.user.services.kio-fuse.unitConfig.ConditionPathExists = "/dev/fuse";
+
     services.pipewire.enable = true;
     xdg.portal = {
       enable = true;
