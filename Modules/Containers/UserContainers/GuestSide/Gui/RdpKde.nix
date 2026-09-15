@@ -24,6 +24,21 @@ let
   # KWin uses KService to decide which clients may use its private fake-input
   # and screencast protocols. Index every immutable application source chosen
   # for this guest, but never a user-writable application directory.
+  # RDP carries the client's lock-key state in a Synchronize PDU, and KRdp
+  # 6.7.5 drops it on the floor: InputHandler::synchronizeEvent takes its flags
+  # parameter commented out, under a TODO asking whether the sync is wanted at
+  # all. So the guest never learns that the client has NumLock on, KWin leaves
+  # its own state at the default, and the numpad emits Home/End/arrows instead
+  # of digits — which an entry field silently ignores, so it reads as a
+  # keyboard that will not type numbers.
+  #
+  # Decide it here instead of inheriting it. 0 is STATE_ON; the default 2 is
+  # STATE_UNCHANGED, which is the state that produces the symptom.
+  keyboardConfig = pkgs.writeText "hypersw-kcminputrc" ''
+    [Keyboard]
+    NumLock=0
+  '';
+
   kServiceApplicationsMenu = pkgs.writeText "hypersw-kde-rdp-applications.menu" ''
     <!DOCTYPE Menu PUBLIC "-//freedesktop//DTD Menu 1.0//EN"
       "http://www.freedesktop.org/standards/menu-spec/1.0/menu.dtd">
@@ -176,6 +191,7 @@ let
     cache_dir="$XDG_RUNTIME_DIR/${kwinCacheDirName}"
     ${pkgs.coreutils}/bin/install -d -m 700 "$config_dir/menus"
     ${pkgs.coreutils}/bin/install -m 600 ${screenLockerConfig} "$config_dir/kscreenlockerrc"
+    ${pkgs.coreutils}/bin/install -m 600 ${keyboardConfig} "$config_dir/kcminputrc"
     ${pkgs.coreutils}/bin/install -m 600 ${kServiceApplicationsMenu} "$config_dir/menus/applications.menu"
     # This directory is unique to the selected immutable KWin closure. Keep
     # it across ordinary KWin restarts; a changed closure selects a new cache.
@@ -271,6 +287,11 @@ in {
           # configuration. Desktop applications retain $HOME/.config.
           "XDG_CONFIG_HOME=${kwinConfigHome}"
           "XDG_CACHE_HOME=${kwinCacheHome}"
+          # Without this KWin consults the NumLock setting once, at startup,
+          # and every later keymap re-evaluation restores whatever state it
+          # last had. With it the configured state is reasserted each time,
+          # so a reconnect or a layout change cannot leave the numpad off.
+          "KWIN_FORCE_NUM_LOCK_EVALUATION=1"
         ];
         ExecStartPre = prepareKdeSessionConfig;
         ExecStart = "${pkgs.kdePackages.kwin}/bin/kwin_wayland --virtual${lib.optionalString hasXwayland " --xwayland"} --socket ${waylandDisplay}";
