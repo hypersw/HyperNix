@@ -103,6 +103,30 @@ let
   # waits for a redirect that cannot arrive.
   kdeSessionVersion = lib.versions.major pkgs.kdePackages.plasma-workspace.version;
 
+  # The rest of what startplasma-wayland would have exported.
+  #
+  # Two are deliberately not here. XDG_MENU_PREFIX=plasma- would make KDE look
+  # for plasma-applications.menu, while the authorization menu this profile
+  # generates is the unprefixed applications.menu — copying it would break the
+  # KRdp private-protocol authorization the whole mode depends on. XKB_DEFAULT_*
+  # is skipped because startplasma queries org.freedesktop.locale1 for it rather
+  # than setting fixed values, so it needs its own mechanism, not a constant.
+  plasmaSessionEnvironment = [
+    "KDE_FULL_SESSION=true"
+    "KDE_APPLICATIONS_AS_SCOPE=1"
+    # Lets Qt clients reconnect to a restarted compositor instead of dying with
+    # it. KWin here has Restart=on-failure, so that case is reachable.
+    "QT_WAYLAND_RECONNECT=1"
+  ]
+  # Only meaningful where an X server exists, and its absence is expensive
+  # exactly there: AWT ignores ConfigureNotify under a non-reparenting window
+  # manager unless told, and Java applications then paint nothing at all.
+  ++ lib.optional hasXwayland "_JAVA_AWT_WM_NONREPARENTING=1"
+  # The one that cannot be set unconditionally: it is the numeric uid, and
+  # systemd does not expand %U in Environment=, so it is available only when
+  # the instance pinned one.
+  ++ lib.optional (cfg.UserUid != null) "KDE_SESSION_UID=${toString cfg.UserUid}";
+
   virtualKwinEnvironment = [
     "XDG_SESSION_TYPE=wayland"
     "XDG_CURRENT_DESKTOP=KDE"
@@ -111,7 +135,7 @@ let
     "XDG_DATA_DIRS=${kdeDataDirs}"
     "XDG_CONFIG_DIRS=${kdeConfigDirs}"
     "KWIN_COMPOSE=${kwinRenderBackend}"
-  ];
+  ] ++ plasmaSessionEnvironment;
 
   # Toolkit selection. Without Xwayland there is no X server to fall back to,
   # so each variable names Wayland alone and an X11-only client fails loudly
@@ -314,6 +338,9 @@ in {
       # the same reason the session units do; see kdeSessionVersion above.
       KDE_SESSION_VERSION = kdeSessionVersion;
       DESKTOP_SESSION = "plasma";
+      KDE_FULL_SESSION = "true";
+      KDE_APPLICATIONS_AS_SCOPE = "1";
+      QT_WAYLAND_RECONNECT = "1";
       NIXOS_OZONE_WL = "1";
       OZONE_PLATFORM = "wayland";
       ELECTRON_OZONE_PLATFORM_HINT = "wayland";
@@ -321,7 +348,9 @@ in {
       QT_QPA_PLATFORM = if hasXwayland then "wayland;xcb" else "wayland";
       SDL_VIDEODRIVER = if hasXwayland then "wayland,x11" else "wayland";
       MOZ_ENABLE_WAYLAND = "1";
-    };
+    }
+    // lib.optionalAttrs hasXwayland { _JAVA_AWT_WM_NONREPARENTING = "1"; }
+    // lib.optionalAttrs (cfg.UserUid != null) { KDE_SESSION_UID = toString cfg.UserUid; };
 
     # This is deliberately an explicit KWin invocation, rather than
     # startplasma-wayland: the latter starts KWin with --xwayland and cannot
