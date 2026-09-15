@@ -93,9 +93,20 @@ let
   isRdpKde = (cfg.Gui.Mode == "RdpKdeIsolated") || (cfg.Gui.Mode == "RdpKdeWithDevices");
   hasXwayland = cfg.Gui.Mode == "RdpKdeWithDevices";
 
+  # startplasma-wayland exports this and we do not use startplasma-wayland, so
+  # it has to be restored by hand. It is not decoration: xdg-open branches on
+  # it, and with it unset takes the pre-Plasma-5 path and calls kfmclient,
+  # which Plasma 6 does not ship. The failure is silent — a broken kde-config
+  # version test makes xdg-open exit 0 regardless — so every attempt to open a
+  # URL succeeds and opens nothing. That is what strands the Space OAuth flow:
+  # it hands the authorization URL to a browser that is never launched, then
+  # waits for a redirect that cannot arrive.
+  kdeSessionVersion = lib.versions.major pkgs.kdePackages.plasma-workspace.version;
+
   virtualKwinEnvironment = [
     "XDG_SESSION_TYPE=wayland"
     "XDG_CURRENT_DESKTOP=KDE"
+    "KDE_SESSION_VERSION=${kdeSessionVersion}"
     "DESKTOP_SESSION=plasma"
     "XDG_DATA_DIRS=${kdeDataDirs}"
     "XDG_CONFIG_DIRS=${kdeConfigDirs}"
@@ -262,6 +273,9 @@ in {
     environment.sessionVariables = {
       XDG_SESSION_TYPE = "wayland";
       XDG_CURRENT_DESKTOP = "KDE";
+      # Shells and anything else reading the system environment need this for
+      # the same reason the session units do; see kdeSessionVersion above.
+      KDE_SESSION_VERSION = kdeSessionVersion;
       DESKTOP_SESSION = "plasma";
       NIXOS_OZONE_WL = "1";
       OZONE_PLATFORM = "wayland";
