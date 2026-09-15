@@ -267,6 +267,43 @@ in {
       console-getty.enable = lib.mkForce false;
     };
 
+    # Hand a shell the display the session is actually running on.
+    #
+    # WAYLAND_DISPLAY is a fixed name, but the Xwayland display number is not:
+    # KWin's ExecStartPost discovers it and imports it into the systemd user
+    # manager, so user *services* inherit it. A shell is not one of those — it
+    # is started by login, not by the manager — so without this a terminal in
+    # the desktop has no DISPLAY at all, and anything it runs that wants to
+    # reach the session fails. That is how a git fetch ends up hanging: its
+    # credential helper asks xdg-open for a browser, with nothing to open onto.
+    #
+    # shellInit rather than interactiveShellInit because a login shell that is
+    # not interactive needs it too, and /etc/bashrc falls back to /etc/profile
+    # for interactive non-login shells, so both are covered. It cannot reach a
+    # plain `bash -c` or a script, which source neither file; those inherit
+    # from their parent, which is the correct behaviour for them anyway.
+    #
+    # Existing values always win: ssh -X sets DISPLAY before the shell starts,
+    # and clobbering it would redirect an X11 forward at the local session.
+    environment.shellInit = ''
+      if [ -S "''${XDG_RUNTIME_DIR:-}/systemd/private" ]; then
+        for hypersw_kv in $(
+          ${pkgs.systemd}/bin/systemctl --user show-environment 2>/dev/null \
+            | ${pkgs.gnugrep}/bin/grep -E '^(DISPLAY|WAYLAND_DISPLAY)='
+        ); do
+          case "$hypersw_kv" in
+            DISPLAY=*)
+              if [ -z "''${DISPLAY:-}" ]; then export "$hypersw_kv"; fi
+              ;;
+            WAYLAND_DISPLAY=*)
+              if [ -z "''${WAYLAND_DISPLAY:-}" ]; then export "$hypersw_kv"; fi
+              ;;
+          esac
+        done
+        unset hypersw_kv
+      fi
+    '';
+
     # Same toolkit policy as the session units above, for login shells and
     # anything else that reads the system environment instead of inheriting
     # the user manager's.
