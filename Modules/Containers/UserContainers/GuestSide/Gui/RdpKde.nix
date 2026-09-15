@@ -264,6 +264,22 @@ in {
         RestartSec = 2;
         TimeoutStopSec = managedSessionStopTimeout;
       };
+      # KWin execs helpers by bare name, Xwayland among them, and a systemd
+      # user unit otherwise gets only the manager's minimal default PATH. The
+      # failure is quiet: KWin logs "Xwayland process failed to start" and
+      # carries on serving Wayland clients, so it surfaces later as X11 apps
+      # not starting rather than as a broken session.
+      path = [ config.system.path ];
+
+      # This compositor is the graphical session, so it has to be what brings
+      # the target up. Nothing else does: startplasma-wayland would have, and
+      # we start KWin directly instead. Without it xdg-desktop-portal never
+      # activates — it requires the target — and portal-mediated file dialogs,
+      # screenshots and xdg-open fail in every app while the desktop itself
+      # looks healthy. The target refuses a manual start by design, so pulling
+      # it in as a dependency is the supported way to do this.
+      wants = [ "graphical-session.target" ];
+      before = [ "graphical-session.target" ];
     };
 
     # Keep the small desktop shell separate from the compositor. KRdp only
