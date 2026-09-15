@@ -131,20 +131,35 @@ let
         export WAYLAND_DISPLAY=${waylandDisplay}
         ${pkgs.systemd}/bin/systemctl --user import-environment WAYLAND_DISPLAY
         ${lib.optionalString hasXwayland ''
+          # The socket file proves nothing. KWin creates the listening socket
+          # itself and hands the fd to Xwayland, so /tmp/.X11-unix/X<N> exists
+          # whether or not the server behind it ever came up — and if it did
+          # not, connect() still succeeds while the X11 handshake is never
+          # answered. Publishing that DISPLAY is worse than publishing none:
+          # a GTK client blocks inside XOpenDisplay before it can create a
+          # window or print a diagnostic, so an askpass prompt becomes a hang.
+          # Only a completed handshake is evidence, which is what xdpyinfo
+          # gives us, under a timeout because the failure mode being probed
+          # for is precisely one that never returns.
           for ((xattempt = 0; xattempt < 100; xattempt += 1)); do
             for xsocket in /tmp/.X11-unix/X*; do
               [ -S "$xsocket" ] || continue
-              DISPLAY=":''${xsocket##*/X}"
-              export DISPLAY
-              ${pkgs.systemd}/bin/systemctl --user import-environment DISPLAY
-              exit 0
+              candidate=":''${xsocket##*/X}"
+              if DISPLAY="$candidate" ${pkgs.coreutils}/bin/timeout 2 \
+                   ${pkgs.xorg.xdpyinfo}/bin/xdpyinfo >/dev/null 2>&1; then
+                DISPLAY="$candidate"
+                export DISPLAY
+                ${pkgs.systemd}/bin/systemctl --user import-environment DISPLAY
+                exit 0
+              fi
             done
             ${pkgs.coreutils}/bin/sleep 0.1
           done
           # Xwayland is an accessory here: Wayland clients are unaffected, so
           # report the loss and leave the session running rather than failing
-          # KWin and taking the whole desktop down with it.
-          echo "Timed out waiting for an Xwayland display; X11 clients will not start" >&2
+          # KWin and taking the whole desktop down with it. DISPLAY stays
+          # unset, so an X11 client fails at once instead of hanging.
+          echo "No Xwayland display answered; X11 clients will not start" >&2
         ''}
         exit 0
       fi
