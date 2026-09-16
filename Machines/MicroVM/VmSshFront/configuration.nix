@@ -60,11 +60,15 @@
   services.resolved.enable = false;
   systemd.services."serial-getty@ttyS0".enable = false;
 
-  services.journald.extraConfig = ''
-    ForwardToConsole=yes
-    TTYPath=/dev/ttyS0
-    MaxLevelConsole=info
-  '';
+  # Migrated off services.journald.extraConfig, which nixpkgs turned into a
+  # hard assertion rather than a warning, so its presence fails the build
+  # outright. settings.Journal is the structured replacement; values go
+  # through systemd unit-option coercion, hence the bool rather than "yes".
+  services.journald.settings.Journal = {
+    ForwardToConsole = true;
+    TTYPath = "/dev/ttyS0";
+    MaxLevelConsole = "info";
+  };
   systemd.services.systemd-journald.environment.SYSTEMD_COLORS = "0";
 
   systemd.timers.heartbeat = {
