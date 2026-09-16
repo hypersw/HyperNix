@@ -196,7 +196,7 @@ let
               [ -S "$xsocket" ] || continue
               candidate=":''${xsocket##*/X}"
               if DISPLAY="$candidate" ${pkgs.coreutils}/bin/timeout 2 \
-                   ${pkgs.xorg.xdpyinfo}/bin/xdpyinfo >/dev/null 2>&1; then
+                   ${pkgs.xdpyinfo}/bin/xdpyinfo >/dev/null 2>&1; then
                 DISPLAY="$candidate"
                 export DISPLAY
                 ${pkgs.systemd}/bin/systemctl --user import-environment DISPLAY
