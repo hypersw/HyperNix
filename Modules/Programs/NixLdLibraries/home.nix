@@ -72,6 +72,16 @@ in
         freetype
         fontconfig.lib
 
+        # Java AWT again, for its Wayland toolkit rather than the X11 one.
+        # JBR resolves `-Dawt.toolkit.name=auto` by dlopening libawt_wlawt.so,
+        # and a failure there is silent: it rewrites the property to XToolkit
+        # and carries on, so the IDE runs under XWayland and keeps AWT's X11
+        # focus model, which no Wayland compositor can honour. What that looks
+        # like is an IDE whose shortcuts work while typed characters land in
+        # whatever window happens to sit underneath.
+        wayland # libwayland-client.so.0 and libwayland-cursor.so.0
+        libxkbcommon
+
         icu # CoreCLR, https://aka.ms/dotnet-missing-libicu
         e2fsprogs # IDEA's FileSystemUtil$E2P calls into it
         libsecret # password storage
