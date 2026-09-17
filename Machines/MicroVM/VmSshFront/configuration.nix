@@ -198,8 +198,13 @@ in
     wantedBy = [ "multi-user.target" ];
     before = [ "sshd.service" ];
     requiredBy = [ "sshd.service" ];
-    after = [ "local-fs.target" ];
-    wants = [ "local-fs.target" ];
+    # The store lives on a mounted volume, and every tpm2_ptool call needs the
+    # kernel resource manager to exist. Ordering after the device unit is what
+    # keeps a cold boot from racing the TPM driver: the guard above recovers
+    # from that race, but recovering costs a restart cycle each boot and fills
+    # the journal with tracebacks that look like real failures.
+    after = [ "local-fs.target" "dev-tpmrm0.device" ];
+    wants = [ "local-fs.target" "dev-tpmrm0.device" ];
 
     serviceConfig = {
       Type = "simple";
@@ -227,7 +232,16 @@ in
       so_pin=vm-sshd-so-key
 
       install -d -m 0700 "$TPM2_PKCS11_STORE"
-      if [ ! -e "$TPM2_PKCS11_STORE/tpm2_pkcs11.sqlite3" ]; then
+
+      # Guard on the primary object, not on the database file. `init` creates
+      # the sqlite store first and the primary afterwards, so an init that
+      # fails partway — most likely because the TPM was not ready yet on a
+      # cold boot — leaves a database behind with no primary in it. A guard
+      # that only checks for the file then skips init forever, and every
+      # retry dies in addtoken with "No primary object id: 1". That turns a
+      # transient first-boot race into a permanent failure, with the restart
+      # loop hiding it as noise.
+      if ! tpm2_ptool listprimaries 2>/dev/null | grep -qE "(^|[^0-9])id: 1([^0-9]|$)"; then
         tpm2_ptool init
       fi
       if ! tpm2_ptool listtokens --pid=1 | grep -Fq "CKA_LABEL: $token_label"; then
