@@ -191,39 +191,76 @@ in
     tctiEnvironment.enable = true;
   };
 
-  # sshd receives the public half only. Every host-key signature is delegated
-  # to this root-owned agent, whose loaded key remains inside the vTPM.
+  # sshd never reads a private host-key file and never learns which of the two
+  # paths below produced the key it is serving. It is pointed at one public key
+  # and one agent socket; this service guarantees both exist, with the vTPM
+  # behind them when the vTPM works and a throwaway key when it does not.
+  #
+  # The guarantee is the point. A bastion that will not accept SSH is worse in
+  # every way than one whose host key rotates: the first costs you access to
+  # the infrastructure, the second costs you a warning. So nothing in here is
+  # allowed to fail the unit — no set -e, every TPM step is attempted and its
+  # failure is a reason to fall back rather than to give up.
   systemd.services.ssh-hostkey-agent = {
-    description = "TPM-backed OpenSSH host-key agent";
+    description = "OpenSSH host-key agent (vTPM-backed, with a throwaway fallback)";
     wantedBy = [ "multi-user.target" ];
     before = [ "sshd.service" ];
     requiredBy = [ "sshd.service" ];
-    # The store lives on a mounted volume, and every tpm2_ptool call needs the
-    # kernel resource manager to exist. Ordering after the device unit is what
-    # keeps a cold boot from racing the TPM driver: the guard above recovers
-    # from that race, but recovering costs a restart cycle each boot and fills
-    # the journal with tracebacks that look like real failures.
-    after = [ "local-fs.target" "dev-tpmrm0.device" ];
-    wants = [ "local-fs.target" "dev-tpmrm0.device" ];
+    # Deliberately no dev-tpmrm0.device dependency. Wanting a device unit for
+    # a device that never appears leaves systemd printing "Expecting device
+    # /dev/tpmrm0..." indefinitely, and sshd — ordered after this — never
+    # starts at all. The script waits for the device briefly and then decides,
+    # which is the same race handled without betting the bastion on the
+    # outcome.
+    after = [ "local-fs.target" ];
+    wants = [ "local-fs.target" ];
 
     serviceConfig = {
       Type = "simple";
       RuntimeDirectory = "ssh-hostkey-agent";
       RuntimeDirectoryMode = "0700";
       Restart = "on-failure";
+      RestartSec = "5s";
+      # Type=simple counts the unit as started the moment it execs, so without
+      # this sshd could be ordered after a service whose socket and public key
+      # do not exist yet. ExecStartPost holds the start job until they do.
+      ExecStartPost = pkgs.writeShellScript "ssh-hostkey-agent-ready" ''
+        for _ in $(seq 1 100); do
+          # A published public key plus either a private half or a loaded
+          # agent is exactly what sshd needs; anything less and it would
+          # start only to exit with "no hostkeys available".
+          if [ -s /run/ssh-hostkey-agent/ssh_host_ecdsa_key.pub ] \
+             && { [ -s /run/ssh-hostkey-agent/ssh_host_ecdsa_key ] \
+                  || SSH_AUTH_SOCK=/run/ssh-hostkey-agent/agent.sock /bin/ssh-add -l >/dev/null 2>&1; }; then
+            exit 0
+          fi
+          sleep 0.1
+        done
+        echo "host-key agent did not publish a key and socket in time" >&2
+        exit 1
+      '';
     };
 
     path = [ pkgs.coreutils pkgs.gnugrep pkgs.openssh pkgs.tpm2-pkcs11-esapi ];
     script = ''
-      set -euo pipefail
+      # No -e on purpose: see the comment above the unit.
+      set -uo pipefail
+
       export TPM2_PKCS11_STORE=/var/lib/tpm2-pkcs11
       export TPM2TOOLS_TCTI=device:/dev/tpmrm0
       export TPM2_PKCS11_TCTI=device:/dev/tpmrm0
       export TSS2_LOG=fapi+NONE
 
       provider=${pkgs.tpm2-pkcs11-esapi}/lib/libtpm2_pkcs11.so
-      socket=/run/ssh-hostkey-agent/agent.sock
-      public_key=/run/ssh-hostkey-agent/ssh_host_ecdsa_key.pub
+      runtime=/run/ssh-hostkey-agent
+      socket="$runtime/agent.sock"
+      # sshd is pointed at the PRIVATE path. With only the .pub present it has
+      # no private half to read and falls through to HostKeyAgent, which is the
+      # vTPM path. When the fallback writes a real private key here, sshd reads
+      # it directly and the agent stops mattering at all — one less moving part
+      # in the path that exists precisely because something else already broke.
+      private_key="$runtime/ssh_host_ecdsa_key"
+      public_key="$runtime/ssh_host_ecdsa_key.pub"
       token_label=sshd-host
       key_label=sshd-host
       # This only gates the PKCS#11 API. The unattended server cannot keep a
@@ -231,53 +268,125 @@ in
       user_pin=vm-sshd-host-key
       so_pin=vm-sshd-so-key
 
-      install -d -m 0700 "$TPM2_PKCS11_STORE"
+      install -d -m 0700 "$runtime"
 
-      # Guard on the primary object, not on the database file. `init` creates
-      # the sqlite store first and the primary afterwards, so an init that
-      # fails partway — most likely because the TPM was not ready yet on a
-      # cold boot — leaves a database behind with no primary in it. A guard
-      # that only checks for the file then skips init forever, and every
-      # retry dies in addtoken with "No primary object id: 1". That turns a
-      # transient first-boot race into a permanent failure, with the restart
-      # loop hiding it as noise.
-      if ! tpm2_ptool listprimaries 2>/dev/null | grep -qE "(^|[^0-9])id: 1([^0-9]|$)"; then
-        tpm2_ptool init
-      fi
-      if ! tpm2_ptool listtokens --pid=1 | grep -Fq "CKA_LABEL: $token_label"; then
-        tpm2_ptool addtoken --pid=1 --label="$token_label" \
-          --sopin="$so_pin" --userpin="$user_pin"
-      fi
-      if ! tpm2_ptool listobjects --label="$token_label" | grep -Fq "CKA_LABEL: $key_label"; then
-        tpm2_ptool addkey --label="$token_label" --userpin="$user_pin" \
-          --algorithm=ecc256 --key-label="$key_label"
-      fi
+      # Give udev a moment before concluding there is no TPM. Short, because
+      # guessing wrong only rotates a host key, while waiting delays SSH on a
+      # machine whose entire purpose is SSH.
+      for _ in $(seq 1 50); do
+        [ -e /dev/tpmrm0 ] && break
+        sleep 0.1
+      done
 
-      ${pkgs.openssh}/bin/ssh-keygen -D "$provider" \
-        | grep -F " $key_label" > "$public_key"
-      test -s "$public_key"
+      PrepareTpmKey()
+      {
+        [ -e /dev/tpmrm0 ] || { echo "no /dev/tpmrm0 in this guest" >&2; return 1; }
 
-      ${pkgs.openssh}/bin/ssh-agent -D -a "$socket" &
+        install -d -m 0700 "$TPM2_PKCS11_STORE" || return 1
+
+        # Guard on the primary object, not on the database file. `init` creates
+        # the sqlite store first and the primary afterwards, so an init that
+        # fails partway leaves a database behind with no primary in it. A guard
+        # that only checks for the file then skips init forever, and every
+        # retry dies in addtoken with "No primary object id: 1".
+        if ! tpm2_ptool listprimaries 2>/dev/null | grep -qE "(^|[^0-9])id: 1([^0-9]|$)"; then
+          tpm2_ptool init || return 1
+        fi
+        if ! tpm2_ptool listtokens --pid=1 2>/dev/null | grep -Fq "CKA_LABEL: $token_label"; then
+          tpm2_ptool addtoken --pid=1 --label="$token_label" \
+            --sopin="$so_pin" --userpin="$user_pin" || return 1
+        fi
+        if ! tpm2_ptool listobjects --label="$token_label" 2>/dev/null | grep -Fq "CKA_LABEL: $key_label"; then
+          tpm2_ptool addkey --label="$token_label" --userpin="$user_pin" \
+            --algorithm=ecc256 --key-label="$key_label" || return 1
+        fi
+
+        ssh-keygen -D "$provider" 2>/dev/null | grep -F " $key_label" > "$public_key.tpm" || return 1
+        [ -s "$public_key.tpm" ] || return 1
+
+        # Publish only after the agent is proven to hold the matching key, so a
+        # half-built TPM path never leaves sshd advertising something unusable.
+        return 0
+      }
+
+      PublishFallbackKey()
+      {
+        # ecdsa to match the TPM key's type, so the file name stays accurate
+        # and sshd sees the same algorithm either way. Regenerated only when
+        # absent, so restarting this unit within one boot does not rotate the
+        # key under live connections.
+        if [ ! -s "$private_key" ]; then
+          rm -f "$private_key" "$public_key"
+          ssh-keygen -q -t ecdsa -b 256 -N "" -C "throwaway host key" -f "$private_key" || return 1
+        fi
+        [ -s "$private_key" ] && [ -s "$public_key" ]
+      }
+
+      # Start the agent first and wait for its socket. ssh-agent -D binds the
+      # socket a moment after it is forked, so an ssh-add fired straight after
+      # the & loses the race, reports "Error connecting to agent", and leaves
+      # the agent empty — with sshd then advertising a key nothing can sign
+      # for. Waiting is the whole fix.
+      ssh-agent -D -a "$socket" &
       agent_pid=$!
       trap 'kill "$agent_pid" 2>/dev/null || true; wait "$agent_pid" 2>/dev/null || true' EXIT INT TERM
       export SSH_AUTH_SOCK="$socket"
-      export SSH_ASKPASS_REQUIRE=force
-      export SSH_ASKPASS=${pkgs.writeShellScript "ssh-hostkey-agent-askpass" ''
-        printf '%s\n' "$user_pin"
-      ''}
-      ${pkgs.openssh}/bin/ssh-add -s "$provider" </dev/null
+
+      for _ in $(seq 1 100); do
+        [ -S "$socket" ] && break
+        sleep 0.1
+      done
+
+      AgentHoldsKey() { ssh-add -l >/dev/null 2>&1; }
+
+      tpm_ok=no
+      if PrepareTpmKey; then
+        export SSH_ASKPASS_REQUIRE=force
+        export SSH_ASKPASS=${pkgs.writeShellScript "ssh-hostkey-agent-askpass" ''
+          printf '%s\n' "$user_pin"
+        ''}
+        if ssh-add -s "$provider" </dev/null && AgentHoldsKey; then
+          # Only now is the TPM key real: remove any private key a previous
+          # fallback left behind, or sshd would read that instead of asking
+          # the agent, and quietly keep serving the throwaway identity.
+          rm -f "$private_key"
+          mv -f "$public_key.tpm" "$public_key"
+          tpm_ok=yes
+          echo "host key: vTPM-backed, non-exportable, stable across rebuilds"
+        else
+          echo "host key: PKCS#11 key would not load into the agent" >&2
+        fi
+        unset SSH_ASKPASS SSH_ASKPASS_REQUIRE
+      fi
+      rm -f "$public_key.tpm"
+
+      if [ "$tpm_ok" = no ]; then
+        echo "host key: vTPM unavailable; using a throwaway key in /run" >&2
+        echo "host key: clients will see a changed host key after every VM boot" >&2
+        if ! PublishFallbackKey; then
+          echo "host key: could not produce a fallback key either" >&2
+          exit 1
+        fi
+        # Loading it is a convenience, not a requirement: sshd reads the
+        # private key at $private_key directly. Failure here is not fatal.
+        ssh-add "$private_key" </dev/null || true
+      fi
+
       wait "$agent_pid"
     '';
   };
-
   services.openssh = {
     enable = true;
     generateHostKeys = false;
     hostKeys = [];
     settings = {
       # A public HostKey plus HostKeyAgent means sshd never reads a private
-      # host-key file: the vTPM-backed agent supplies every signature.
-      HostKey = "/run/ssh-hostkey-agent/ssh_host_ecdsa_key.pub";
+      # host-key file: the agent supplies every signature, from the vTPM when
+      # that works and from a throwaway key in /run when it does not. sshd is
+      # deliberately unaware of which — one path here, decided at runtime by
+      # ssh-hostkey-agent, so no failure of the vTPM can leave sshd without a
+      # key to serve.
+      HostKey = "/run/ssh-hostkey-agent/ssh_host_ecdsa_key";
       HostKeyAgent = "/run/ssh-hostkey-agent/agent.sock";
       PermitRootLogin = "no";
       PasswordAuthentication = false;
