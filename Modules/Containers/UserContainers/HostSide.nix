@@ -107,6 +107,7 @@ let
       gui = {
         Mode = "None";
         Gpu = null;
+        KRdpBeta = false;
         Audio = null;
         Clipboard = null;
         FontPackages = [];
@@ -326,6 +327,7 @@ let
               StateVersion = decl.StateVersion;
               Gui.Mode = decl.Gui.Mode;
               Gui.Gpu = decl.Gui.Gpu;
+              Gui.KRdpBeta = decl.Gui.KRdpBeta;
               Gui.Audio = decl.Gui.Audio;
               Gui.Clipboard = decl.Gui.Clipboard;
               Gui.MesaDriverName = hostGpu.MesaDriverName;

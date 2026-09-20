@@ -84,6 +84,13 @@ let
   # one, QPainter is the only renderer that can start at all.
   kwinRenderBackend = if cfg.Gui.Gpu then "O2" else "QPainter";
 
+  # 6.8 replaced the old flag combinations with an OperationMode enum, and its
+  # default is derived from the KCM: RemoteAccess when exclusive, SharedAccess
+  # otherwise. Neither fits here. AdditionalDisplay is the one that matches this
+  # container: one virtual monitor sized by the client, and no session locking.
+  # The option does not exist before 6.8, so it is only passed on that path.
+  krdpModeArgs = lib.optionalString cfg.Gui.KRdpBeta "--mode AdditionalDisplay \\\n          ";
+
   # The two RdpKde modes share every mechanism here and differ only in what
   # they let across the boundary: RdpKdeIsolated crosses nothing and runs pure
   # Wayland, RdpKdeWithDevices crosses host devices and carries an Xwayland
@@ -256,7 +263,7 @@ in {
     # The persistent Plasma/portal session comes from this profile. The KRdp,
     # KWin, and KPipeWire packages below must be one patched package set so
     # KWin authorizes the exact KRdp executable that captures its output.
-    nixpkgs.overlays = [ (import ./KRdpOverlay.nix) ];
+    nixpkgs.overlays = [ (import ./KRdpOverlay.nix { beta = cfg.Gui.KRdpBeta; }) ];
 
     services.desktopManager.plasma6.enable = true;
     environment.systemPackages = [
@@ -506,7 +513,7 @@ in {
         # only the fallback. The patched server replaces it with the first
         # RDP client's reported dimensions and desktop scale when available.
         exec ${pkgs.kdePackages.krdp}/bin/krdpserver \
-          --plasma \
+          ${krdpModeArgs}--plasma \
           --virtual-monitor ${lib.escapeShellArg cfg.Gui.RdpFallbackVirtualMonitor} \
           --address ${lib.escapeShellArg cfg.Gui.RdpListenAddress} \
           --port ${toString cfg.Gui.RdpPort} \

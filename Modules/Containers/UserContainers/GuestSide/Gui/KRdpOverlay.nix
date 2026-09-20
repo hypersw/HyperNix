@@ -1,10 +1,36 @@
 # The displayless KRdp path needs matching patched KPipeWire, KRdp, and KWin
 # derivations. Keep the patches with this module so a guest does not depend on
 # a mutable Copybox checkout or an LD_PRELOAD workaround.
+{ beta ? false }:
+
 final: prev:
 let
   inherit (final) lib;
   patch = name: ./KRdpPatches + "/${name}";
+
+  patch68 = name: ./KRdpPatches68 + "/${name}";
+
+  # Pinned to the Plasma/6.8 branch for the Gui.KRdpBeta path. It carries the
+  # teardown fix this stack needs: 50becf4 gives the run thread sole ownership
+  # of the FreeRDP peer, so a streaming session closes instead of stranding the
+  # seat and wedging the server.
+  krdp68Source = prev.fetchFromGitLab {
+    domain = "invent.kde.org";
+    owner = "plasma";
+    repo = "krdp";
+    rev = "31c8fe3135e7dce49bfec607e5fab90014cdb4db";
+    hash = "sha256-2xy9gN+9RvH48m2JwCLdL9iFUxn6r5uqmuYM0C3msc8=";
+  };
+
+  # KRdp 6.8 calls KPipeWire APIs that 6.7.5 does not have (setEncoderPaused,
+  # setRequestedSize, pause/resume), so the two versions move together.
+  kpipewire68Source = prev.fetchFromGitLab {
+    domain = "invent.kde.org";
+    owner = "plasma";
+    repo = "kpipewire";
+    rev = "91b30ab1a81d2b4323874d4b2fbd4a6250629c7a";
+    hash = "sha256-MdyCS+PG8o0bCrq4wxcMTJkbUOUpcWLq07W6hmaxG/o=";
+  };
 
   patchedKPipeWire = prev.kdePackages.kpipewire.overrideAttrs (old: {
     patches = (old.patches or [ ]) ++ [
@@ -73,6 +99,46 @@ let
     '';
   });
 
+  # The 6.8 beta pair, used only when Gui.KRdpBeta is set. KPipeWire is not
+  # swapped globally: only KRdp links this build, so a regression cannot reach
+  # the rest of the Plasma session, which keeps the 6.7.5 package above.
+  kpipewire68 = prev.kdePackages.kpipewire.overrideAttrs (old: {
+    version = "6.7.90";
+    src = kpipewire68Source;
+    patches = [ (patch68 "0009-h264-max-level-5.2.patch") ];
+  });
+
+  krdp68 = prev.kdePackages.krdp.overrideAttrs (old: {
+    version = "6.7.90";
+    src = krdp68Source;
+
+    # nixpkgs' own hardcode-openssl-path patch still applies to 6.8 and is kept.
+    patches = (old.patches or [ ]) ++ [
+      (patch68 "0001-pointer-coordinate-fix.patch")
+    ];
+
+    # 6.8 made libei a hard dependency for the portal input path (28d5ddb).
+    # Without it cmake fails outright on the pkg-config check for libei-1.0.
+    buildInputs = (old.buildInputs or [ ]) ++ [ prev.libei ];
+
+    propagatedBuildInputs =
+      lib.filter
+        (input: !(lib.hasInfix "-kpipewire-" (toString input)))
+        (old.propagatedBuildInputs or [ ])
+      ++ [ kpipewire68.dev ];
+
+    postFixup = (old.postFixup or "") + ''
+      desktop_file="$out/share/applications/org.kde.krdpserver.desktop"
+      grep -Fqx "Exec=$out/bin/krdpserver" "$desktop_file"
+      grep -Fqx \
+        "X-KDE-Wayland-Interfaces=org_kde_kwin_fake_input,zkde_screencast_unstable_v1" \
+        "$desktop_file"
+      printf '%s\n' "X-HyperNix-Auth-Generation=$out" >> "$desktop_file"
+    '';
+  });
+
+  selectedKrdp = if beta then krdp68 else patchedKrdp;
+
   patchedKwin = prev.kdePackages.kwin.overrideAttrs (old: {
     pname = "kwin-qpainter-krdp";
     patches = (old.patches or [ ]) ++ [
@@ -88,7 +154,7 @@ let
     # same corrected KRdp entry, so KService ordering cannot select a stale
     # authorization record from a different package output.
     postInstall = (old.postInstall or "") + ''
-      install -Dm444 ${patchedKrdp}/share/applications/org.kde.krdpserver.desktop \
+      install -Dm444 ${selectedKrdp}/share/applications/org.kde.krdpserver.desktop \
         "$out/share/applications/org.kde.krdpserver.desktop"
     '';
   });
@@ -96,7 +162,7 @@ in
 {
   kdePackages = prev.kdePackages // {
     kpipewire = patchedKPipeWire;
-    krdp = patchedKrdp;
+    krdp = selectedKrdp;
     kwin = patchedKwin;
   };
 }

@@ -58,6 +58,11 @@ in
         default = "None";
       };
       Gpu = lib.mkOption { type = lib.types.bool; default = false; };
+      KRdpBeta = lib.mkOption {
+        type = lib.types.bool;
+        default = false;
+        description = "Build KRdp and KPipeWire from the Plasma/6.8 branch instead of the 6.7.5 release, with the reduced patch set in KRdpPatches68.";
+      };
       Audio = lib.mkOption { type = lib.types.bool; default = false; };
       Clipboard = lib.mkOption { type = lib.types.bool; default = false; };
       MesaDriverName = lib.mkOption {

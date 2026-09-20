@@ -1,0 +1,24 @@
+From: KRdp displayless experiment <noreply@example.invalid>
+Subject: [PATCH] libx264: constrain the advertised H.264 level to 5.2
+
+KPipeWire asks libx264 for Baseline profile but leaves the H.264 level
+unconstrained. With FFmpeg 8/libx264 this produces an SPS declaring level
+6.0 (level_idc=60), even for an ordinary 1024x768 KRdp virtual output.
+
+FreeRDP's OpenH264 decoder supports levels through 5.2 and rejects that SPS;
+it consequently discards every RDPGFX AVC420 surface update. Level 5.2
+covers the intended headless virtual outputs (up to 4096x2160 at 60 fps) and
+is accepted by OpenH264. Keep the setting local to libx264; hardware and
+libopenh264 encoders retain their own capability selection.
+
+--- a/src/libx264encoder.cpp
++++ b/src/libx264encoder.cpp
+@@ -66,6 +66,10 @@ bool LibX264Encoder::initialize(const QSize &size)
+     m_avCodecContext->pix_fmt = AV_PIX_FMT_YUV420P;
+     m_avCodecContext->time_base = AVRational{1, 1000};
+
++    // An unconstrained libx264 level defaults to 6.0 with recent FFmpeg.
++    // OpenH264 (used by FreeRDP/Remmina) supports AVC only through 5.2.
++    m_avCodecContext->level = 52;
++
+     switch (m_profile) {
