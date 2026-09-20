@@ -1,0 +1,140 @@
+From: KRdp displayless experiment <noreply@example.invalid>
+Subject: [PATCH] Server: never join a session thread from the Qt main thread
+
+forceTerminateConnection() erased the session from Server::Private::sessions,
+which runs ~RdpConnection inline. That destructor joins the krdp_session
+worker, and the worker's exit path is run() -> onClose() -> VideoStream::close(),
+which marshals onto the main thread. Calling it from a QTimer slot deadlocks
+the two against each other.
+
+The consequence is worse than a lost session: an event loop stuck that way
+stops calling accept(), so the listening socket keeps queueing clients nobody
+answers. Connections hang rather than fail, and the service has to be restarted
+out of band. Seen in the field as a main thread parked in futex_do_wait with
+five connections backed up in the listen queue, preceded by
+"pw_stream_set_active called from wrong context" as the dying worker reached
+into PipeWire from the wrong context.
+
+Close the peer and let the connection die on its own schedule. peer->Close() is
+asynchronous and safe from any thread; the Closed notification that follows
+erases the session from the main thread with the worker already finished, where
+the join costs nothing. A peer that ignores the close is quarantined rather than
+joined, and destroyed later once it reports Closed. An orphaned connection costs
+a thread; a blocking join costs the whole server.
+
+diff --git a/src/Server.cpp b/src/Server.cpp
+index caecd96..8cefdeb 100644
+--- a/src/Server.cpp
++++ b/src/Server.cpp
+@@ -7,6 +7,7 @@
+ #include <vector>
+ 
+ #include <QCoreApplication>
++#include <QTimer>
+ 
+ #include <freerdp/channels/channels.h>
+ #include <freerdp/freerdp.h>
+@@ -18,10 +19,21 @@
+ 
+ using namespace KRdp;
+ 
++/// How long a force-terminated peer is given to close before it is quarantined.
++static constexpr int ForceCloseGraceMs = 5000;
++
++/// How often a quarantined connection is re-checked for having finished.
++static constexpr int QuarantineReapMs = 2000;
++
+ class KRDP_NO_EXPORT Server::Private
+ {
+ public:
+     std::vector<std::unique_ptr<RdpConnection>> sessions;
++
++    /// Connections that ignored peer->Close(). Held here instead of being joined;
++    /// see Server::forceTerminateConnection.
++    std::vector<std::unique_ptr<RdpConnection>> quarantine;
++
+     rdp_settings *settings = nullptr;
+ 
+     QHostAddress address = QHostAddress::LocalHost;
+@@ -188,8 +200,51 @@ void Server::forceTerminateConnection(RdpConnection *connection)
+     }
+ 
+     qCWarning(KRDP) << "Force-terminating stuck RDP connection" << connection;
++
++    // Only ask the peer to close, and do not destroy the connection here.
++    // ~RdpConnection joins the krdp_session worker, and that worker's exit path
++    // is run() -> onClose() -> VideoStream::close(), which marshals onto the
++    // main thread. Joining from the main thread deadlocks the two against each
++    // other, and an event loop stuck that way stops calling accept(): later
++    // connections then queue on the listening socket unanswered, so the whole
++    // server has to be restarted out of band.
++    //
++    // peer->Close() is asynchronous and safe from any thread. It breaks the
++    // worker out of WaitForMultipleObjects, and the Closed notification that
++    // follows erases the session from the main thread with the worker already
++    // finished, where the join costs nothing.
+     (*itr)->close();
+-    d->sessions.erase(itr);
++
++    QTimer::singleShot(ForceCloseGraceMs, this, [this, connection] {
++        const auto itr = std::find_if(d->sessions.begin(), d->sessions.end(), [connection](const auto &session) {
++            return session.get() == connection;
++        });
++        if (itr == d->sessions.end()) {
++            return; // it closed on its own, and the Closed path already erased it
++        }
++
++        qCWarning(KRDP) << "RDP connection ignored close; quarantining rather than joining" << connection;
++        d->quarantine.push_back(std::move(*itr));
++        d->sessions.erase(itr);
++        reapQuarantine();
++    });
++}
++
++void Server::reapQuarantine()
++{
++    // Destroy only what has finished: for a connection already in Closed the
++    // join in ~RdpConnection returns immediately. One still running is left
++    // alone and retried. An orphaned connection costs a thread; a blocking join
++    // costs the whole server.
++    std::erase_if(d->quarantine, [](const std::unique_ptr<RdpConnection> &session) {
++        return session->state() == RdpConnection::State::Closed;
++    });
++
++    if (!d->quarantine.empty()) {
++        QTimer::singleShot(QuarantineReapMs, this, [this] {
++            reapQuarantine();
++        });
++    }
+ }
+ 
+ rdp_settings *Server::rdpSettings() const
+diff --git a/src/Server.h b/src/Server.h
+index 97c3c6f..aa0b31e 100644
+--- a/src/Server.h
++++ b/src/Server.h
+@@ -116,8 +116,12 @@ public:
+     Q_SIGNAL void newConnectionCreated(RdpConnection *connection);
+ 
+     /**
+-     * Destroy a stuck connection through the server's ownership collection.
+-     * This closes the FreeRDP peer before joining its worker thread.
++     * Ask a stuck connection to close, without waiting for it.
++     *
++     * Never joins the session worker. RdpConnection's destructor does, and that
++     * worker needs the main thread to finish, so joining from here deadlocks the
++     * event loop and stops the server accepting connections. A peer that ignores
++     * the close is quarantined and destroyed later, once it reports Closed.
+      */
+     void forceTerminateConnection(RdpConnection *connection);
+ 
+@@ -131,6 +135,9 @@ private:
+     friend class RdpConnection;
+     rdp_settings *rdpSettings() const;
+ 
++    /// Destroy quarantined connections that have finished, and re-arm if any remain.
++    void reapQuarantine();
++
+     class Private;
+     const std::unique_ptr<Private> d;
+ };

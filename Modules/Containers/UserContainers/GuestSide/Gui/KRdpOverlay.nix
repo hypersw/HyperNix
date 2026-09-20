@@ -39,6 +39,13 @@ let
       # Activate a replacement only after queued old-wrapper destruction has
       # released its Plasma screencast request and virtual output.
       (patch "0014-activate-after-old-stream-release.patch")
+      # forceTerminateConnection destroyed the connection inline, and
+      # ~RdpConnection joins the session worker while that worker still needs
+      # the main thread. The join deadlocked the event loop, which then stopped
+      # accepting: clients queued on the listening socket unanswered until the
+      # service was restarted. Close asynchronously and quarantine a peer that
+      # ignores it.
+      (patch "0015-nonblocking-force-terminate.patch")
     ];
 
     # KRdp propagates KPipeWire's development output. Replace the original
