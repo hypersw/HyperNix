@@ -35,3 +35,27 @@ Deliberately not carried over yet, pending what actually breaks without them:
 
 `0003-qpainter-virtual-screencast` is not here: it patches KWin, which this
 path does not bump, so it keeps applying from `../KRdpPatches`.
+
+## Work in progress
+
+`0016-client-layout-lifecycle-pointer.patch.wip` restores the three behaviours
+6.8 lost: a virtual monitor sized and scaled from the client's negotiated
+desktop, the output-lifecycle helper that disables the bootstrap stub output
+and moves the panel, and the pointer origin offset for an output that is not at
+the virtual-desktop origin.
+
+It is **not applied**, and the `.wip` suffix is deliberate: the build runs but
+krdpserver crashes as a client finalizes its connection (KCrash during
+CONNECTION_STATE_FINALIZATION_FONT_LIST). No core was captured, so the cause is
+not yet known. Two candidates, in order of suspicion:
+
+- `fakeInputPosition()` calls `qApp->screens()`. If input events are delivered
+  on the connection's own thread rather than the main thread, that touches GUI
+  state off-thread. The 6.7.5 original did the same, but 6.8 reworked the input
+  path, so the assumption needs rechecking rather than inheriting.
+- `runOutputLifecycleHandler()` runs a QProcess with a blocking wait from
+  `onSessionStarted` and `onConnectionDestroyed`. The destroy path in
+  particular now runs under upstream's reworked teardown.
+
+Next step is a debug build with core dumps enabled, or bisecting by applying
+one of the three changes at a time.

@@ -1,0 +1,264 @@
+diff --git a/server/SessionController.cpp b/server/SessionController.cpp
+index ea7f331..8f352ef 100644
+--- a/server/SessionController.cpp
++++ b/server/SessionController.cpp
+@@ -14,6 +14,7 @@
+ #include <QDBusPendingReply>
+ #include <QDBusReply>
+ #include <QMenu>
++#include <QProcess>
+ 
+ #include <KLocalizedString>
+ 
+@@ -60,6 +61,46 @@ public:
+         connect(connection, &QObject::destroyed, this, &SessionWrapper::onConnectionDestroyed);
+     }
+ 
++    // KRdp names the monitor it asks KWin for; the lifecycle helper needs that
++    // name to find the output again, so route every set through here.
++    void setVirtualMonitor(const KRdp::VirtualMonitor &virtualMonitor)
++    {
++        m_virtualMonitorName = virtualMonitor.name;
++        session->setVirtualMonitor(virtualMonitor);
++    }
++
++    // "up" runs once KWin has created the virtual output, "down" before the
++    // wrapper releases it. The helper disables the bootstrap stub output and
++    // moves the panel onto the RDP one; without it the session keeps a second,
++    // unreachable desktop that holds the panel and the task switcher.
++    void runOutputLifecycleHandler(const QString &action)
++    {
++        const QString handler = qEnvironmentVariable("KRDP_LIFECYCLE_HANDLER");
++        if (m_virtualMonitorName.isEmpty() || handler.isEmpty()) {
++            return;
++        }
++
++        QProcess process;
++        process.setProcessChannelMode(QProcess::MergedChannels);
++        process.start(handler, {action, m_virtualMonitorName});
++        if (!process.waitForStarted(1000)) {
++            qWarning() << "KRDP-LIFECYCLE: could not start" << handler << action << m_virtualMonitorName << process.errorString();
++            return;
++        }
++        if (!process.waitForFinished(5000)) {
++            process.kill();
++            process.waitForFinished(1000);
++            qWarning() << "KRDP-LIFECYCLE: helper timed out" << action << m_virtualMonitorName;
++            return;
++        }
++        if (process.exitStatus() != QProcess::NormalExit || process.exitCode() != 0) {
++            qWarning().nospace() << "KRDP-LIFECYCLE: helper failed action=" << action << " monitor=" << m_virtualMonitorName
++                                 << " exit=" << process.exitCode() << " output=" << process.readAll();
++        } else {
++            qInfo().nospace() << "KRDP-LIFECYCLE: helper completed action=" << action << " monitor=" << m_virtualMonitorName;
++        }
++    }
++
+     void onCursorUpdate(const PipeWireCursor &cursor)
+     {
+         if (!connection) {
+@@ -80,12 +121,14 @@ public:
+     void onSessionStarted()
+     {
+         m_sessionStarted = true;
++        runOutputLifecycleHandler(QStringLiteral("up"));
+         connection->videoStream()->setPipeWireSource(session->nodeId(), session->objectSerial(), session->takePipeWireFd());
+         connection->videoStream()->setStreamingEnabled(connection->videoStream()->enabled());
+     }
+ 
+     void onConnectionDestroyed()
+     {
++        runOutputLifecycleHandler(QStringLiteral("down"));
+         Q_EMIT connectionDestroyed(this);
+     }
+ 
+@@ -96,6 +139,7 @@ public:
+     QPointer<KRdp::RdpConnection> connection;
+     KStatusNotifierItem *m_sni;
+     bool m_sessionStarted = false;
++    QString m_virtualMonitorName;
+ };
+ 
+ SessionController::SessionController(KRdp::Server *server, SessionType sessionType)
+@@ -205,8 +249,33 @@ void SessionController::onNewConnection(KRdp::RdpConnection *newConnection)
+         }
+ 
+         auto wrapper = std::make_unique<SessionWrapper>(newConnection, makeSession(), m_sni);
++        // 6.8 never looks at the client's own desktop: an explicit
++        // --virtual-monitor wins, and otherwise a fixed 1024x768 is used. By
++        // the time a connection reaches Activated its capabilities have been
++        // negotiated, so prefer what the client actually asked for and keep the
++        // configured monitor only as the fallback.
++        auto clientVirtualMonitor = [newConnection](KRdp::VirtualMonitor monitor) {
++            const QSize clientSize = newConnection->clientDesktopSize();
++            const qreal clientScale = newConnection->clientDesktopScale();
++
++            if (clientSize.width() >= 200 && clientSize.height() >= 200 && clientSize.width() <= 8192 && clientSize.height() <= 8192) {
++                // KWin sizes a virtual monitor in logical pixels while RDP
++                // advertises physical ones, so a 2736x1824 client at 200% wants
++                // a 1368x912 monitor with dpr 2, not 2736x1824 at dpr 2 (which
++                // would render 5472x3648).
++                const qreal scale = (clientScale >= 1.0 && clientScale <= 5.0) ? clientScale : monitor.dpr;
++                monitor.size = QSize(qRound(clientSize.width() / scale), qRound(clientSize.height() / scale));
++            }
++            if (clientScale >= 1.0 && clientScale <= 5.0) {
++                monitor.dpr = clientScale;
++            }
++            monitor.name = QStringLiteral("RDP-%1x%2@%3").arg(monitor.size.width()).arg(monitor.size.height()).arg(monitor.dpr);
++            qWarning().nospace() << "KRDP-CLIENT-LAYOUT: client " << clientSize << " scale=" << clientScale << " -> monitor " << monitor.name;
++            return monitor;
++        };
++
+         if (m_virtualMonitor) {
+-            wrapper->session->setVirtualMonitor(*m_virtualMonitor);
++            wrapper->setVirtualMonitor(clientVirtualMonitor(*m_virtualMonitor));
+         } else if (m_monitorIndex) {
+             wrapper->session->setActiveStream(*m_monitorIndex);
+         } else {
+@@ -220,14 +289,14 @@ void SessionController::onNewConnection(KRdp::RdpConnection *newConnection)
+                 // we do not set a virtual monitor, allowing the client to see all the existing session.
+                 break;
+             case OperationMode::RemoteAccess:
+-                wrapper->session->setVirtualMonitor(defaultMonitor);
++                wrapper->setVirtualMonitor(clientVirtualMonitor(defaultMonitor));
+                 // DAVE I kinda feel this shouldn't be here, we should message kwin which should then do this internally
+                 // we also want something to prevent a VT switch breaking things
+                 switchToGreeter();
+                 setSessionLocked(false);
+                 break;
+             case OperationMode::AdditionalDisplay:
+-                wrapper->session->setVirtualMonitor(defaultMonitor);
++                wrapper->setVirtualMonitor(clientVirtualMonitor(defaultMonitor));
+                 break;
+             }
+         }
+diff --git a/src/PlasmaScreencastV1Session.cpp b/src/PlasmaScreencastV1Session.cpp
+index 50a6b36..b35d079 100644
+--- a/src/PlasmaScreencastV1Session.cpp
++++ b/src/PlasmaScreencastV1Session.cpp
+@@ -19,10 +19,34 @@
+ #include "qwayland-fake-input.h"
+ #include "qwayland-wayland.h"
+ #include "screencasting_p.h"
++#include <QScreen>
+ 
+ namespace KRdp
+ {
+ 
++// KWin's fake-input absolute coordinates live in virtual-desktop space, while
++// RDP reports coordinates relative to this connection's own output. With more
++// than one output present the RDP monitor is rarely at the origin, so without
++// the offset every click lands on the wrong output.
++static QPointF fakeInputPosition(const QPointF &rdpPosition, const std::optional<VirtualMonitor> &monitor)
++{
++    const qreal scale = monitor ? monitor->dpr : 1.0;
++    const QPointF localPosition = rdpPosition / scale;
++    if (!monitor) {
++        return localPosition;
++    }
++
++    // KRdp asks KWin for "<name>"; KWin exposes it as "Virtual-<name>".
++    const QString expectedScreenName = QStringLiteral("Virtual-") + monitor->name;
++    for (QScreen *screen : qApp->screens()) {
++        if (screen->name() == expectedScreenName) {
++            return QPointF(screen->geometry().topLeft()) + localPosition;
++        }
++    }
++    qCWarning(KRDP) << "KRDP-POINTER: virtual output not found" << expectedScreenName << "available=" << qApp->screens();
++    return localPosition;
++}
++
+ class FakeInput : public QWaylandClientExtensionTemplate<FakeInput>, public QtWayland::org_kde_kwin_fake_input
+ {
+ public:
+@@ -223,9 +247,7 @@ void PlasmaScreencastV1Session::sendEvent(const std::shared_ptr<QEvent> &event)
+         // fake-input button request does not. Keep KWin's pointer in sync before
+         // delivering the button; otherwise a click can be applied at (0,0).
+         const auto position = me->position();
+-        const auto monitor = virtualMonitor();
+-        const auto scale = monitor ? monitor->dpr : 1.0;
+-        const auto logicalPosition = position / scale;
++        const auto logicalPosition = fakeInputPosition(position, virtualMonitor());
+         d->remoteInterface->pointer_motion_absolute(wl_fixed_from_double(logicalPosition.x()),
+                                                     wl_fixed_from_double(logicalPosition.y()));
+         uint state = me->type() == QEvent::MouseButtonPress ? 1 : 0;
+@@ -237,9 +259,7 @@ void PlasmaScreencastV1Session::sendEvent(const std::shared_ptr<QEvent> &event)
+         auto position = me->position();
+         // RDP reports physical pixels; KWin fake-input expects logical output
+         // coordinates. Do not use the encoder's PipeWire stream size here.
+-        const auto monitor = virtualMonitor();
+-        const auto scale = monitor ? monitor->dpr : 1.0;
+-        auto logicalPosition = position / scale;
++        auto logicalPosition = fakeInputPosition(position, virtualMonitor());
+         d->remoteInterface->pointer_motion_absolute(wl_fixed_from_double(logicalPosition.x()), wl_fixed_from_double(logicalPosition.y()));
+         break;
+     }
+diff --git a/src/RdpConnection.cpp b/src/RdpConnection.cpp
+index fcdf039..f3251c2 100644
+--- a/src/RdpConnection.cpp
++++ b/src/RdpConnection.cpp
+@@ -240,6 +240,10 @@ BOOL suppressOutput(rdpContext *context, uint8_t allow, const RECTANGLE_16 *)
+ class KRDP_NO_EXPORT RdpConnection::Private
+ {
+ public:
++    /// Filled in from the client's capability exchange; see clientDesktopSize().
++    QSize clientDesktopSize;
++    qreal clientDesktopScale = 0;
++
+     Server *server = nullptr;
+ 
+     State state = State::Initial;
+@@ -611,6 +615,16 @@ void RdpConnection::run(std::stop_token stopToken)
+     onClose();
+ }
+ 
++QSize RdpConnection::clientDesktopSize() const
++{
++    return d->clientDesktopSize;
++}
++
++qreal RdpConnection::clientDesktopScale() const
++{
++    return d->clientDesktopScale;
++}
++
+ bool RdpConnection::onCapabilities()
+ {
+     auto settings = d->peer->context->settings;
+@@ -630,6 +644,11 @@ bool RdpConnection::onCapabilities()
+         return false;
+     }
+ 
++    d->clientDesktopSize = QSize(freerdp_settings_get_uint32(settings, FreeRDP_DesktopWidth), freerdp_settings_get_uint32(settings, FreeRDP_DesktopHeight));
++    const auto scaleFactor = freerdp_settings_get_uint32(settings, FreeRDP_DesktopScaleFactor);
++    d->clientDesktopScale = (scaleFactor >= 100 && scaleFactor <= 500) ? qreal(scaleFactor) / 100.0 : 0;
++    qCInfo(KRDP).nospace() << "KRDP-CLIENT-LAYOUT: desktop=" << d->clientDesktopSize << " scaleFactor=" << scaleFactor;
++
+     return true;
+ }
+ 
+diff --git a/src/RdpConnection.h b/src/RdpConnection.h
+index 531b9f0..95c1583 100644
+--- a/src/RdpConnection.h
++++ b/src/RdpConnection.h
+@@ -8,6 +8,7 @@
+ #include <thread>
+ 
+ #include <QObject>
++#include <QSize>
+ 
+ #include <freerdp/freerdp.h>
+ 
+@@ -75,6 +76,12 @@ public:
+      * The current session state.
+      */
+     State state() const;
++
++    /// The desktop the client negotiated, in physical pixels, and its scale
++    /// factor (0 when the client supplied none). Valid once capabilities have
++    /// been exchanged, which has happened by the time the state is Activated.
++    QSize clientDesktopSize() const;
++    qreal clientDesktopScale() const;
+     Q_SIGNAL void stateChanged(State newState);
+ 
+     /**
