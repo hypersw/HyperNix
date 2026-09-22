@@ -44,3 +44,9 @@ path does not bump, so it keeps applying from `../KRdpPatches`.
   a client finalized, with the stack unrecoverable because KCrash faulted
   inside its own handler. `KDE_DEBUG=1` on the service works around that, so
   the next crash produces a readable core.
+- `0017-single-remote-seat.patch` — closes the incumbent connection when a new
+  one is activated. `AdditionalDisplay` adds a monitor per client by design and
+  upstream caps concurrency nowhere, so without this a second seat extends the
+  desktop rather than taking it over. This is the small remnant of the old
+  `0011`-`0014` takeover stack: the rest of it existed only to work around
+  sessions that never closed, which `50becf4` fixed.
