@@ -115,6 +115,7 @@ let
     # nixpkgs' own hardcode-openssl-path patch still applies to 6.8 and is kept.
     patches = (old.patches or [ ]) ++ [
       (patch68 "0001-pointer-coordinate-fix.patch")
+      (patch68 "0016-client-layout-lifecycle-pointer.patch")
     ];
 
     # 6.8 made libei a hard dependency for the portal input path (28d5ddb).

@@ -496,7 +496,13 @@ in {
         TimeoutStopSec = managedSessionStopTimeout;
         Environment = waylandClientEnvironment ++ [
           "KRDP_LIFECYCLE_HANDLER=${rdpOutputLifecycle}/bin/hypersw-rdp-output-lifecycle"
-        ];
+        ]
+        # TODO: remove once the 6.8 patch set is known good. KCrash catches
+        # SIGSEGV and, when its own handler faults, leaves an unusable core:
+        # the crash seen while bringing 0016 up had no recoverable stack at
+        # all. KDE_DEBUG=1 disables that handler so systemd-coredump gets the
+        # real one.
+        ++ lib.optional cfg.Gui.KRdpBeta "KDE_DEBUG=1";
       };
       script = ''
         set -euo pipefail
