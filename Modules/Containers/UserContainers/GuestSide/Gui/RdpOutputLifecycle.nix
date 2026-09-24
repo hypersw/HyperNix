@@ -91,7 +91,12 @@ pkgs.writeShellApplication {
     }
 
     wait_for_sole_rdp_output() {
-      for ((attempt = 0; attempt < 20; attempt += 1)); do
+      # KRdp no longer waits out an incumbent's teardown before creating this
+      # output (that wait bought nothing: closing an incumbent and activating
+      # immediately observably resolves this same topology in under a
+      # second). This loop absorbs whatever remains of that race on its own,
+      # with real margin over the ~1-3s incumbent teardowns seen so far.
+      for ((attempt = 0; attempt < 60; attempt += 1)); do
         if output_state | jq -e --arg name "$rdp_output" '
           ([.outputs[] | select(.enabled)] | length == 1)
           and any(.outputs[]; .name == $name and .enabled)
@@ -223,12 +228,24 @@ pkgs.writeShellApplication {
         if stub_output_enabled; then
           kscreen-doctor "output.$stub_output.disable"
         fi
-        wait_for_sole_rdp_output
-        if panels_attached_to_rdp_output; then
+        # By this point the new output above is confirmed to exist and be
+        # enabled; a timeout here only means some OTHER output (almost always
+        # a departing incumbent) has not been removed yet. That does not
+        # block repairing THIS output, so downgrade a timeout to a warning
+        # and repair unconditionally rather than let `set -e` abort with the
+        # session left permanently unrepaired.
+        sole_output_settled=1
+        wait_for_sole_rdp_output || sole_output_settled=0
+
+        if [ "$sole_output_settled" -eq 1 ] && panels_attached_to_rdp_output; then
           echo "KRDP-LIFECYCLE: panel-healthy/no-restart output=$rdp_output" >&2
         else
           repair_panels
-          echo "KRDP-LIFECYCLE: panel-repair/restart output=$rdp_output" >&2
+          if [ "$sole_output_settled" -eq 0 ]; then
+            echo "KRDP-LIFECYCLE: panel-repair/restart output=$rdp_output (forced: other outputs still present)" >&2
+          else
+            echo "KRDP-LIFECYCLE: panel-repair/restart output=$rdp_output" >&2
+          fi
           systemctl --user restart "$plasma_shell_service"
         fi
         ;;

@@ -1,124 +1,55 @@
 From: KRdp displayless experiment <noreply@example.invalid>
-Subject: [PATCH] Give the desktop to one remote seat, and sequence the handover
+Subject: [PATCH] Give the desktop to one remote seat at a time
 
 Upstream places no limit on concurrent connections, and each one brings its own
 virtual monitor, so a second client extends the desktop instead of taking it
-over. Identical geometry merely confuses; differing geometry puts windows on one
-monitor and leaves the other unreachable.
+over. Close every incumbent when a new connection is activated, and activate
+the new one immediately rather than waiting for the incumbent to actually
+finish tearing down first.
 
-Closing the incumbent is not enough on its own. Its virtual output survives
-until its teardown runs, and the output-lifecycle helper refuses to finish while
-more than one RDP output exists - it reports "Timed out waiting for sole RDP
-output" and fails the replacement's "up", which then tears the new session down
-as well. Observed as a black screen on the first handover between clients of
-differing DPI, with the incumbent's "down" arriving three seconds after the
-replacement had already given up.
-
-So close the incumbent, then poll until it has actually released the seat before
-creating the new session. Once no wrapper holds a live connection, every
-incumbent's onConnectionDestroyed has run, which means the helper has released
-its output. Waiting is bounded: after ten seconds the replacement is activated
-regardless, since a degraded desktop beats refusing the only client.
+An earlier version of this same idea polled the incumbent's teardown for up to
+10 seconds before activating, on the theory that KRdp's own session creation
+needed the old seat fully released first. Measurement showed otherwise:
+activating immediately after close() - even while the incumbent's own
+teardown is still in flight - completes cleanly, including a successful
+output-lifecycle "up", well under a second later. The only thing with a real
+exclusivity requirement is the lifecycle helper's own brief settling window,
+and it already waits that out itself; gating session creation on it a second
+time here only added dead time; that dead time, not the momentary two-output
+overlap itself, is what produced the black screen.
 
 diff --git a/server/SessionController.cpp b/server/SessionController.cpp
-index 8f352ef..6f97327 100644
+index 8f352ef..3471c3f 100644
 --- a/server/SessionController.cpp
 +++ b/server/SessionController.cpp
-@@ -15,6 +15,7 @@
- #include <QDBusReply>
- #include <QMenu>
- #include <QProcess>
-+#include <QTimer>
- 
- #include <KLocalizedString>
- 
-@@ -35,6 +36,12 @@
- 
- using namespace Qt::StringLiterals;
- 
-+/// How long to wait between checks that the incumbent seat has been released.
-+static constexpr int SeatHandoverPollMs = 250;
-+
-+/// Give up waiting after this many checks and activate regardless.
-+static constexpr int SeatHandoverAttempts = 40;
-+
- class SessionWrapper : public QObject
- {
-     Q_OBJECT
-@@ -248,6 +255,55 @@ void SessionController::onNewConnection(KRdp::RdpConnection *newConnection)
+@@ -248,6 +248,30 @@ void SessionController::onNewConnection(KRdp::RdpConnection *newConnection)
              return;
          }
  
-+        awaitFreeSeat(newConnection, SeatHandoverAttempts);
-+    });
-+}
-+
-+// One remote seat. Upstream places no limit on concurrent connections and each
-+// brings its own virtual monitor, so a second client extends the desktop rather
-+// than taking it over; with differing geometry the windows end up on one
-+// monitor and the other is unreachable.
-+//
-+// The incumbent cannot merely be closed and forgotten. Its virtual output lives
-+// until its teardown runs, and the lifecycle helper refuses to finish while more
-+// than one RDP output exists ("Timed out waiting for sole RDP output"), which
-+// takes the replacement down with it. So close the incumbent, then poll until it
-+// has actually released the seat before creating the new session.
-+void SessionController::awaitFreeSeat(KRdp::RdpConnection *newConnection, int attemptsLeft)
-+{
-+    bool seatBusy = false;
-+    for (const auto &incumbent : m_wrappers) {
-+        if (incumbent->connection && incumbent->connection != newConnection) {
-+            seatBusy = true;
-+            incumbent->connection->close();
++        // One remote seat. Upstream places no limit on concurrent connections
++        // and each one brings its own virtual monitor, so a second client
++        // extends the desktop instead of taking it over.
++        //
++        // Close every incumbent and activate the new connection in the same
++        // tick, without waiting for the incumbent to actually finish tearing
++        // down first. An earlier version of this polled m_wrappers for up to
++        // 10s before activating, on the theory that KRdp's own session
++        // creation needed the old one gone. It did not: activating
++        // immediately after close() - even while the incumbent's own
++        // teardown was still in flight - was observed to complete cleanly,
++        // including a successful output-lifecycle "up", well under a second
++        // later. The only thing with a real exclusivity requirement is the
++        // lifecycle helper's own brief settling window, which it already
++        // waits out itself; gating session creation on it a second time here
++        // only added dead time, and that dead time is what produced the
++        // black screen - not the momentary two-output overlap itself.
++        for (const auto &incumbent : m_wrappers) {
++            if (incumbent->connection && incumbent->connection != newConnection) {
++                qInfo() << "KRDP-SEAT: closing incumbent session" << incumbent->connection << "for" << newConnection;
++                incumbent->connection->close();
++            }
 +        }
-+    }
 +
-+    if (!seatBusy) {
-+        // Every incumbent is gone, which means its onConnectionDestroyed has
-+        // run and the lifecycle helper has already released its output.
-+        activateConnection(newConnection);
-+        return;
-+    }
-+
-+    if (attemptsLeft <= 0) {
-+        qWarning() << "KRDP-SEAT: incumbent did not release the seat in time; activating anyway" << newConnection;
-+        activateConnection(newConnection);
-+        return;
-+    }
-+
-+    qInfo() << "KRDP-SEAT: waiting for the incumbent to release the seat for" << newConnection;
-+    QPointer<KRdp::RdpConnection> guardedConnection(newConnection);
-+    QTimer::singleShot(SeatHandoverPollMs, this, [this, guardedConnection, attemptsLeft] {
-+        if (!guardedConnection) {
-+            return; // the client gave up while we waited
-+        }
-+        awaitFreeSeat(guardedConnection, attemptsLeft - 1);
-+    });
-+}
-+
-+void SessionController::activateConnection(KRdp::RdpConnection *newConnection)
-+{
          auto wrapper = std::make_unique<SessionWrapper>(newConnection, makeSession(), m_sni);
          // 6.8 never looks at the client's own desktop: an explicit
          // --virtual-monitor wins, and otherwise a fixed 1024x768 is used. By
-@@ -321,7 +377,6 @@ void SessionController::onNewConnection(KRdp::RdpConnection *newConnection)
- 
-         wrapper->session->start();
-         m_wrappers.push_back(std::move(wrapper));
--    });
- }
- 
- void SessionController::stopFromSNI()
-diff --git a/server/SessionController.h b/server/SessionController.h
-index b28b27b..0dc2de3 100644
---- a/server/SessionController.h
-+++ b/server/SessionController.h
-@@ -49,6 +49,8 @@ public:
- 
- private:
-     void onNewConnection(KRdp::RdpConnection *newConnection);
-+    void awaitFreeSeat(KRdp::RdpConnection *newConnection, int attemptsLeft);
-+    void activateConnection(KRdp::RdpConnection *newConnection);
-     std::unique_ptr<KRdp::AbstractSession> makeSession();
-     // Lock/unlock the desktop session via logind when operating in remote-access mode.
-     void setSessionLocked(bool locked);
