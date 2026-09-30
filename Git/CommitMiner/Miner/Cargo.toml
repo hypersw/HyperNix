@@ -1,0 +1,18 @@
+[package]
+name = "git-mine-commit"
+version = "0.1.0"
+edition = "2021"
+description = "Finds a commit nonce header value that gives the commit object a chosen hash prefix"
+license = "MIT"
+
+[dependencies]
+pollster = "1"
+sha1 = { version = "0.10", features = ["compress"] }
+sha2 = { version = "0.10", features = ["compress"] }
+wgpu = { version = "30", default-features = false, features = ["wgsl", "vulkan", "std"] }
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+panic = "abort"
