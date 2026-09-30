@@ -1,0 +1,168 @@
+--- a/commit.c
++++ b/commit.c
+@@ -31,6 +31,8 @@
+ #include "parse.h"
+ #include "object-file.h"
+ #include "object-file-convert.h"
++#include "run-command.h"
++#include "strvec.h"
+ 
+ static struct commit_extra_header *read_commit_extra_header_lines(const char *buf, size_t len, const char **);
+ 
+@@ -1733,6 +1735,147 @@
+ 	strbuf_add(buffer, msg, msg_len);
+ }
+ 
++/*
++ * Commit mining.
++ *
++ * When mine.prefix is set, a fixed-width "nonce" header is appended to the
++ * commit's header block and an external miner (mine.program, default
++ * "git-mine-commit" on PATH) picks its value so that the object name starts
++ * with the prefix. The message and all user-visible fields stay untouched.
++ *
++ * Miner protocol: the whole object body (without the "commit <len>\0" object
++ * header) arrives on stdin with a placeholder nonce in place; the arguments
++ * name the hash algorithm, the prefix ('_' matches any hex digit), the byte
++ * offset and width of the nonce within the body, and an optional timeout in
++ * seconds. The miner prints exactly <width> lowercase hex digits and exits 0,
++ * or exits non-zero when it gave up. Git re-hashes the result itself; any
++ * failure only warns and writes the commit without a nonce.
++ */
++#define MINE_NONCE_KEY "nonce"
++#define MINE_NONCE_WIDTH 16
++
++static int mine_prefix_matches(const char *hex, const char *prefix)
++{
++	for (; *prefix; prefix++, hex++)
++		if (*prefix != '_' && *prefix != *hex)
++			return 0;
++	return 1;
++}
++
++/*
++ * Drop nonce headers already in the buffer: "commit --amend" and the
++ * sequencer carry extra headers over from the commit they rewrite.
++ */
++static void mine_strip_nonce(struct strbuf *buffer)
++{
++	size_t keylen = strlen(MINE_NONCE_KEY);
++	size_t pos = 0;
++
++	/* The header block ends at the first empty line. */
++	while (pos < buffer->len && buffer->buf[pos] != '\n') {
++		const char *line = buffer->buf + pos;
++		size_t end = strchrnul(line, '\n') - buffer->buf;
++
++		if (end < buffer->len)
++			end++;
++		if (strncmp(line, MINE_NONCE_KEY, keylen) ||
++		    (line[keylen] != ' ' && line[keylen] != '\n')) {
++			pos = end;
++			continue;
++		}
++		/* A header value may continue on lines that start with a space. */
++		while (end < buffer->len && buffer->buf[end] == ' ') {
++			end = strchrnul(buffer->buf + end, '\n') - buffer->buf;
++			if (end < buffer->len)
++				end++;
++		}
++		strbuf_remove(buffer, pos, end - pos);
++	}
++}
++
++static void mine_commit_buffer(struct repository *r, struct strbuf *buffer,
++			       int is_signed)
++{
++	const char *prefix, *program = "git-mine-commit", *timeout = NULL;
++	struct child_process cmd = CHILD_PROCESS_INIT;
++	struct strbuf out = STRBUF_INIT;
++	struct object_id oid;
++	const char *eoh;
++	size_t header_at, header_len, nonce_at;
++
++	if (!git_env_bool("GIT_MINE", 1) ||
++	    repo_config_get_string_tmp(r, "mine.prefix", &prefix) ||
++	    !*prefix)
++		return;
++	/* The signature covers every other header, so the nonce would have to live inside it. */
++	if (is_signed) {
++		warning(_("mining signed commits is not supported; commit not mined"));
++		return;
++	}
++	/* Both object names would have to match, which squares the work. */
++	if (r->compat_hash_algo) {
++		warning(_("mining with a compatibility hash is not supported; commit not mined"));
++		return;
++	}
++	if (strspn(prefix, "0123456789abcdef_") != strlen(prefix) ||
++	    strlen(prefix) > r->hash_algo->hexsz) {
++		warning(_("mine.prefix '%s' is not a lowercase hex prefix; commit not mined"),
++			prefix);
++		return;
++	}
++	repo_config_get_string_tmp(r, "mine.program", &program);
++	repo_config_get_string_tmp(r, "mine.timeout", &timeout);
++
++	mine_strip_nonce(buffer);
++	eoh = strstr(buffer->buf, "\n\n");
++	if (!eoh)
++		BUG("commit buffer without a header terminator");
++	/* Last header, so the fixed part of the object up to it hashes only once. */
++	header_at = eoh - buffer->buf + 1;
++	strbuf_insertf(buffer, header_at, MINE_NONCE_KEY " %.*s\n",
++		       MINE_NONCE_WIDTH, "0000000000000000");
++	header_len = strlen(MINE_NONCE_KEY " \n") + MINE_NONCE_WIDTH;
++	nonce_at = header_at + strlen(MINE_NONCE_KEY " ");
++
++	/* Shell, so that mine.program may carry the miner's own options. */
++	cmd.use_shell = 1;
++	strvec_push(&cmd.args, program);
++	strvec_pushl(&cmd.args, "--algo", r->hash_algo->name, NULL);
++	strvec_pushl(&cmd.args, "--prefix", prefix, NULL);
++	strvec_pushf(&cmd.args, "--offset=%"PRIuMAX, (uintmax_t)nonce_at);
++	strvec_pushf(&cmd.args, "--width=%d", MINE_NONCE_WIDTH);
++	if (timeout)
++		strvec_pushl(&cmd.args, "--timeout", timeout, NULL);
++	/* The miner's stderr stays on the terminal for its progress and errors. */
++	if (pipe_command(&cmd, buffer->buf, buffer->len, &out, 0, NULL, 0)) {
++		warning(_("'%s' found no nonce; commit not mined"), program);
++		goto fail;
++	}
++
++	strbuf_trim(&out);
++	if (out.len != MINE_NONCE_WIDTH ||
++	    strspn(out.buf, "0123456789abcdef") != MINE_NONCE_WIDTH) {
++		warning(_("'%s' printed a malformed nonce '%s'; commit not mined"),
++			program, out.buf);
++		goto fail;
++	}
++	memcpy(buffer->buf + nonce_at, out.buf, MINE_NONCE_WIDTH);
++
++	/* Trust but verify: the miner hashes with its own code. */
++	hash_object_file(r->hash_algo, buffer->buf, buffer->len, OBJ_COMMIT, &oid);
++	if (!mine_prefix_matches(oid_to_hex(&oid), prefix)) {
++		warning(_("'%s' printed nonce %s, but %s does not match '%s'; commit not mined"),
++			program, out.buf, oid_to_hex(&oid), prefix);
++		goto fail;
++	}
++	strbuf_release(&out);
++	return;
++
++fail:
++	strbuf_remove(buffer, header_at, header_len);
++	strbuf_release(&out);
++}
++
+ int commit_tree_extended(const char *msg, size_t msg_len,
+ 			 const struct object_id *tree,
+ 			 const struct commit_list *parents, struct object_id *ret,
+@@ -1772,6 +1915,8 @@
+ 		warned = true;
+ 	}
+ 
++	mine_commit_buffer(r, &buffer, !!sign_commit);
++
+ 	if (sign_commit && sign_buffer(&buffer, &sig, sign_commit,
+ 				       SIGN_BUFFER_USE_DEFAULT_KEY)) {
+ 		result = -1;
