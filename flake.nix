@@ -100,6 +100,13 @@
           Git-SshAskpassCredentialHelper = import ./Git/SshAskpassCredentialHelper/package.nix { inherit pkgs closefrom3; };
           Git-SpaceGitCredential = import ./Git/SpaceGitCredential/package.nix { inherit pkgs; };
           Git-AskpassSafe = import ./Git/AskpassSafe/package.nix { inherit pkgs closefrom3; };
+          # git that mines commit hashes with a chosen prefix (`git config
+          # mine.prefix 0000000`), bundled with its CPU/GPU miner. Also exposed
+          # separately so a consumer can pair them differently.
+          # See Git/CommitMiner/README.md.
+          Git-CommitMiner = import ./Git/CommitMiner/package.nix { inherit pkgs; };
+          Git-CommitMiner-Git = import ./Git/CommitMiner/git.nix { inherit pkgs; };
+          Git-CommitMiner-Miner = pkgs.callPackage ./Git/CommitMiner/Miner/package.nix { };
           Modules-PrintersScanners-Shared = printScanShared;
           Modules-PrintersScanners-Daemon = printScanDaemon;
           Modules-PrintersScanners-TelegramBot = printScanBot;
