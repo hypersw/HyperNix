@@ -50,3 +50,12 @@ path does not bump, so it keeps applying from `../KRdpPatches`.
   desktop rather than taking it over. This is the small remnant of the old
   `0011`-`0014` takeover stack: the rest of it existed only to work around
   sessions that never closed, which `50becf4` fixed.
+- `0018-latency-first-pacing.patch` — retunes the H.264 pacing for interactive
+  use: in-flight window sized from the base RTT (the smoothed one includes
+  queueing delay and grows under congestion), 0.2s of buffered video instead of
+  1s, encoder paused once more than one frame awaits sending, and adaptive
+  quality updating every 500ms with a 25-point step down.
+- `0019-runtime-h264-toggle.patch` — `KRDP_DISABLE_H264` was read once per
+  process. It is now re-evaluated per connection, and
+  `$XDG_RUNTIME_DIR/krdp-disable-h264` disables H.264 for connections made while
+  it exists, so RemoteFX Progressive can be tried from mstsc without a restart.

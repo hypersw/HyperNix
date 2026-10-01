@@ -502,7 +502,13 @@ in {
         # the crash seen while bringing 0016 up had no recoverable stack at
         # all. KDE_DEBUG=1 disables that handler so systemd-coredump gets the
         # real one.
-        ++ lib.optional cfg.Gui.KRdpBeta "KDE_DEBUG=1";
+        ++ lib.optionals cfg.Gui.KRdpBeta [
+          "KDE_DEBUG=1"
+          # TODO: remove with KDE_DEBUG. Pacing decisions (encoder backpressure,
+          # adaptive quality steps) log at debug level only, so without this there
+          # is no way to see whether 0018 engages on a slow link.
+          "QT_LOGGING_RULES=org.kde.krdp.debug=true"
+        ];
       };
       script = ''
         set -euo pipefail

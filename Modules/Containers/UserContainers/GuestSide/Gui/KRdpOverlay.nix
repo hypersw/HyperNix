@@ -117,6 +117,8 @@ let
       (patch68 "0001-pointer-coordinate-fix.patch")
       (patch68 "0016-client-layout-lifecycle-pointer.patch")
       (patch68 "0017-single-remote-seat.patch")
+      (patch68 "0018-latency-first-pacing.patch")
+      (patch68 "0019-runtime-h264-toggle.patch")
     ];
 
     # 6.8 made libei a hard dependency for the portal input path (28d5ddb).

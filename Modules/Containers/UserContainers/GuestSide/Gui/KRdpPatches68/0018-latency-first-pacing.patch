@@ -1,0 +1,56 @@
+From: KRdp displayless experiment <noreply@example.invalid>
+Subject: [PATCH] Pace the H.264 stream for latency rather than throughput
+
+6.8 drops frames before encoding once the send queue backs up, but it lets up
+to a second of video build up behind that point, and it grows the in-flight
+window as a link congests. On a slow link that shows up as full-screen
+animations replaying in slow motion instead of being cut short.
+
+Size the in-flight window from the base RTT, so queueing delay cannot enlarge
+it; cap buffered video at 0.2s instead of 1s; pause the encoder as soon as more
+than one frame is waiting to be sent; and let adaptive quality react within a
+burst, stepping down faster than it climbs back.
+
+diff --git a/src/VideoStream.cpp b/src/VideoStream.cpp
+index ae00e2d..94ce754 100644
+--- a/src/VideoStream.cpp
++++ b/src/VideoStream.cpp
+@@ -44,22 +44,22 @@ namespace clk = std::chrono;
+ 
+ constexpr qsizetype MaximumInFlightFrames = 2; // in-flight window floor
+ constexpr double InFlightGain = 1.0; // window spans this many round trips of frames
+-constexpr double LatencyBudgetSec = 1.0; // never buffer more than this many seconds of video
++constexpr double LatencyBudgetSec = 0.2; // never buffer more than this many seconds of video; interactive use favours stale-frame loss over throughput
+ constexpr double MinimumWindowFrameRate = 5.0; // floor for producer-rate window sizing (avoids stop-and-wait)
+ constexpr double ProducerFpsEwmaAlpha = 0.25; // smoothing for the producer-rate estimate
+ constexpr double RttEwmaAlpha = 0.125; // second-stage smoothing of the (already windowed) averageRTT
+ constexpr double MinimumValidRttMs = 5.0; // ignore implausibly-low RTT samples
+ constexpr double MaximumValidRttMs = 60000.0; // ignore garbage RTT samples
+ 
+-constexpr qsizetype HighQueueCount = 3; // Level of frames in the pending-send queue that pauses frames pre-encoder
++constexpr qsizetype HighQueueCount = 1; // Level of frames in the pending-send queue that pauses frames pre-encoder; past this point a newer frame is worth more than a queued one
+ constexpr qsizetype LowQueueCount = 1; // Level of frames in the pending-send queue that resumes the encoder
+ 
+ constexpr uint32_t ProgressiveCodecContextId = 1;
+ 
+-constexpr clk::system_clock::duration QualityUpdateInterval = clk::milliseconds(1500);
++constexpr clk::system_clock::duration QualityUpdateInterval = clk::milliseconds(500); // fast enough to matter within a single burst such as a task-switcher animation
+ constexpr int MinAdaptiveQuality = 10;
+ constexpr int QualityStepUp = 5;
+-constexpr int QualityStepDown = 10;
++constexpr int QualityStepDown = 25; // asymmetric on purpose: back off quickly, recover slowly
+ 
+ struct BitrateAnchor {
+     double pixels;
+@@ -823,7 +823,10 @@ void VideoStream::updateInFlightWindow()
+         } else {
+             d->smoothedRttMs = (1.0 - RttEwmaAlpha) * d->smoothedRttMs + RttEwmaAlpha * rttMs;
+         }
+-        const double effectiveRttMs = std::max(d->baseRttMs, d->smoothedRttMs);
++        // Size the window from the path's base RTT only. The smoothed RTT includes
++        // queueing delay, so on a congested link it rises, which would grow the window
++        // and admit more stale frames exactly when the link can carry fewer of them.
++        const double effectiveRttMs = d->baseRttMs;
+         const double rttSec = effectiveRttMs / 1000.0;
+         const qsizetype bdp = qsizetype(std::ceil(fps * rttSec * InFlightGain));
+         const qsizetype cap = std::max<qsizetype>(MaximumInFlightFrames, qsizetype(std::ceil(fps * LatencyBudgetSec)));
