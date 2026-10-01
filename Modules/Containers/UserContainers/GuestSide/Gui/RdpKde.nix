@@ -67,6 +67,20 @@ let
     pkgs.kdePackages.plasma-workspace
   ] + ":/run/current-system/sw/share";
 
+  # The ordinary session list, as NixOS builds it for PAM from
+  # environment.profiles, but with systemd specifiers so a unit can carry it:
+  # Environment= expands %h, %u and %S, never $HOME or $USER. The patched KDE
+  # outputs stay in front, so KWin still resolves KRdp's authorization entry
+  # from the exact patched build before any profile copy.
+  regularDataDirs = lib.makeSearchPath "share" [
+    pkgs.kdePackages.kwin
+    pkgs.kdePackages.krdp
+    pkgs.kdePackages.plasma-workspace
+  ] + ":" + lib.concatMapStringsSep ":"
+    (profile: lib.replaceStrings [ "$HOME" "$USER" "\${XDG_STATE_HOME}" ] [ "%h" "%u" "%S" ] profile + "/share")
+    config.environment.profiles;
+  sessionDataDirs = if immutableAppSet then kdeDataDirs else regularDataDirs;
+
   # KWin retains its generated menu in a private runtime config directory.
   # Keep that directory visible as an XDG fallback so Plasma can discover the
   # same immutable application set, while applications keep $HOME/.config as
@@ -100,6 +114,18 @@ let
   isRdpKde = (cfg.Gui.Mode == "RdpKdeIsolated") || (cfg.Gui.Mode == "RdpKdeWithDevices");
   hasXwayland = cfg.Gui.Mode == "RdpKdeWithDevices";
 
+  # KWin hands its private fake-input and screencast protocols - input
+  # injection and screen capture - to any process whose executable has a
+  # desktop entry claiming them, so the desktop entries it can see form an
+  # allowlist. Isolated hosts an untrusted agent running as the session user;
+  # anything able to drop a .desktop file into a user-writable directory there
+  # could grant itself both. So Isolated pins KWin and Plasma to an immutable
+  # application set: store paths only, through a generated menu and fixed
+  # PATH/XDG_DATA_DIRS. WithDevices is the user's own workstation, where nothing
+  # untrusted shares the session, so it runs Plasma the ordinary way: the NixOS
+  # session lists, home-manager's profile included, and the standard menu.
+  immutableAppSet = cfg.Gui.Mode == "RdpKdeIsolated";
+
   # startplasma-wayland exports this and we do not use startplasma-wayland, so
   # it has to be restored by hand. It is not decoration: xdg-open branches on
   # it, and with it unset takes the pre-Plasma-5 path and calls kfmclient,
@@ -115,7 +141,9 @@ let
   # Two are deliberately not here. XDG_MENU_PREFIX=plasma- would make KDE look
   # for plasma-applications.menu, while the authorization menu this profile
   # generates is the unprefixed applications.menu — copying it would break the
-  # KRdp private-protocol authorization the whole mode depends on. XKB_DEFAULT_*
+  # KRdp private-protocol authorization the whole mode depends on - under an
+  # immutable application set. Without one the standard prefix is restored
+  # below, and the stock plasma-applications.menu takes over. XKB_DEFAULT_*
   # is skipped because startplasma queries org.freedesktop.locale1 for it rather
   # than setting fixed values, so it needs its own mechanism, not a constant.
   plasmaSessionEnvironment = [
@@ -125,6 +153,7 @@ let
     # it. KWin here has Restart=on-failure, so that case is reachable.
     "QT_WAYLAND_RECONNECT=1"
   ]
+  ++ lib.optional (!immutableAppSet) "XDG_MENU_PREFIX=plasma-"
   # Only meaningful where an X server exists, and its absence is expensive
   # exactly there: AWT ignores ConfigureNotify under a non-reparenting window
   # manager unless told, and Java applications then paint nothing at all.
@@ -139,7 +168,7 @@ let
     "XDG_CURRENT_DESKTOP=KDE"
     "KDE_SESSION_VERSION=${kdeSessionVersion}"
     "DESKTOP_SESSION=plasma"
-    "XDG_DATA_DIRS=${kdeDataDirs}"
+    "XDG_DATA_DIRS=${sessionDataDirs}"
     "XDG_CONFIG_DIRS=${kdeConfigDirs}"
     "KWIN_COMPOSE=${kwinRenderBackend}"
   ] ++ plasmaSessionEnvironment;
@@ -234,7 +263,7 @@ let
     ${pkgs.coreutils}/bin/install -d -m 700 "$config_dir/menus"
     ${pkgs.coreutils}/bin/install -m 600 ${screenLockerConfig} "$config_dir/kscreenlockerrc"
     ${pkgs.coreutils}/bin/install -m 600 ${keyboardConfig} "$config_dir/kcminputrc"
-    ${pkgs.coreutils}/bin/install -m 600 ${kServiceApplicationsMenu} "$config_dir/menus/applications.menu"
+    ${lib.optionalString immutableAppSet "${pkgs.coreutils}/bin/install -m 600 ${kServiceApplicationsMenu} \"$config_dir/menus/applications.menu\""}
     # This directory is unique to the selected immutable KWin closure. Keep
     # it across ordinary KWin restarts; a changed closure selects a new cache.
     ${pkgs.coreutils}/bin/install -d -m 700 "$cache_dir"
@@ -399,7 +428,11 @@ in {
       # failure is quiet: KWin logs "Xwayland process failed to start" and
       # carries on serving Wayland clients, so it surfaces later as X11 apps
       # not starting rather than as a broken session.
-      path = [ config.system.path ];
+      # Outside an immutable set, no PATH at all: with neither a path nor the
+      # NixOS default, the unit inherits the user manager's, which is the
+      # ordinary NixOS session PATH, user profiles included.
+      path = lib.optionals immutableAppSet [ config.system.path ];
+      enableDefaultPath = immutableAppSet;
 
       # This compositor is the graphical session, so it has to be what brings
       # the target up. Nothing else does: startplasma-wayland would have, and
@@ -428,10 +461,13 @@ in {
         RestartSec = 2;
         TimeoutStopSec = managedSessionStopTimeout;
       };
-      # Desktop files intentionally use bare Exec/TryExec commands. Give the
-      # long-lived shell the immutable system profile, not a host or mutable
-      # user-profile PATH, so KService and xdg-open resolve guest packages.
-      path = [ config.system.path ];
+      # Desktop files use bare Exec/TryExec commands, so this PATH decides what
+      # the menu can launch. Under an immutable set it is the immutable system
+      # profile, not a host or mutable user-profile PATH. Otherwise it is the
+      # user manager's ordinary session PATH, so home-manager applications
+      # launch as well as appear.
+      path = lib.optionals immutableAppSet [ config.system.path ];
+      enableDefaultPath = immutableAppSet;
     };
 
     systemd.user.services.hypersw-kde-rdp-setup = {
