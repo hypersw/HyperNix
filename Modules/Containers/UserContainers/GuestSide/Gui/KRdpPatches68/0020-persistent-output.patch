@@ -1,0 +1,358 @@
+From: KRdp displayless experiment <noreply@example.invalid>
+Subject: [PATCH] Stream one persistent output and change its layout in place
+
+With KRDP_PERSISTENT_OUTPUT naming an output, every connection streams that
+existing output instead of creating a virtual monitor of its own. Its mode and
+scale are set to the client's on connect, and again whenever the client sends a
+Display Control layout, through the output-lifecycle helper's "prepare" action.
+Disconnecting changes nothing, so a reconnect with the same geometry causes no
+relayout, and a new connection never waits for the previous one to tear down.
+
+Display Control now accepts multi-monitor layouts, following the client's
+primary monitor, and carries the client's scale with the size. The pointer is
+mapped through the screen the session actually streams.
+diff --git a/server/SessionController.cpp b/server/SessionController.cpp
+index 3471c3f..de9a6bc 100644
+--- a/server/SessionController.cpp
++++ b/server/SessionController.cpp
+@@ -15,6 +15,12 @@
+ #include <QDBusReply>
+ #include <QMenu>
+ #include <QProcess>
++#include <QGuiApplication>
++#include <QScreen>
++#include <QTimer>
++#include <QPointer>
++#include <functional>
++#include <optional>
+ 
+ #include <KLocalizedString>
+ 
+@@ -35,6 +41,16 @@
+ 
+ using namespace Qt::StringLiterals;
+ 
++/// Settling time for a burst of Display Control layouts, such as a window edge being dragged.
++static constexpr int LayoutDebounceMs = 400;
++
++/// Upper bound on one run of the layout helper before it is killed.
++static constexpr int LayoutHelperTimeoutMs = 10000;
++
++/// How often, and how many times, to look for the persistent output among this process's screens.
++static constexpr int PersistentOutputLookupIntervalMs = 100;
++static constexpr int PersistentOutputLookupAttempts = 30;
++
+ class SessionWrapper : public QObject
+ {
+     Q_OBJECT
+@@ -61,6 +77,123 @@ public:
+         connect(connection, &QObject::destroyed, this, &SessionWrapper::onConnectionDestroyed);
+     }
+ 
++    // Persistent-output mode: every connection streams one existing output,
++    // and its geometry and scale are changed in place to follow the client,
++    // on connect and again whenever the client asks over Display Control.
++    // Nothing is created or destroyed per connection, so a reconnect with the
++    // same geometry changes nothing on screen, and a second connection never
++    // has to wait for the first to finish tearing down.
++    void usePersistentOutput(const QString &outputName)
++    {
++        m_persistentOutput = outputName;
++
++        // Upstream turns a layout request into a size request on the PipeWire
++        // stream. That only works for a virtual monitor KRdp created; here the
++        // output itself has to change mode, or the stream would merely scale.
++        disconnect(connection->displayControl(), &KRdp::DisplayControl::requestedScreenSizeChanged, connection->videoStream(), &KRdp::VideoStream::setRequestedSize);
++
++        // Dragging the client window edge sends a burst of layouts. Apply only
++        // the one it settles on, rather than every mode it passes through.
++        m_layoutDebounce.setSingleShot(true);
++        m_layoutDebounce.setInterval(LayoutDebounceMs);
++        connect(&m_layoutDebounce, &QTimer::timeout, this, [this] {
++            if (m_pendingLayout) {
++                const Layout layout = *m_pendingLayout;
++                m_pendingLayout.reset();
++                applyLayout(layout, {});
++            }
++        });
++        connect(connection->displayControl(), &KRdp::DisplayControl::requestedLayoutChanged, this, [this](const QSize &size, qreal scale) {
++            m_pendingLayout = Layout{size, scale};
++            m_layoutDebounce.start();
++        });
++    }
++
++    struct Layout {
++        QSize size; ///< physical pixels, as RDP reports them
++        qreal scale = 0; ///< 0 when the client sent no usable scale
++    };
++
++    // Ask the lifecycle helper to give the persistent output this layout, then
++    // run then. One helper runs at a time; a request arriving meanwhile waits,
++    // and only the newest of those is applied once it finishes.
++    void applyLayout(const Layout &layout, std::function<void()> then)
++    {
++        if (m_layoutHelper) {
++            m_pendingLayout = layout;
++            return;
++        }
++        const QString handler = qEnvironmentVariable("KRDP_LIFECYCLE_HANDLER");
++        if (handler.isEmpty() || !layout.size.isValid()) {
++            if (then) {
++                then();
++            }
++            return;
++        }
++
++        auto *process = new QProcess(this);
++        m_layoutHelper = process;
++        process->setProcessChannelMode(QProcess::MergedChannels);
++        const QStringList arguments = {QStringLiteral("prepare"),
++                                       m_persistentOutput,
++                                       QString::number(layout.size.width()),
++                                       QString::number(layout.size.height()),
++                                       QString::number(layout.scale, 'g', 4)};
++        auto finish = [this, process, arguments, then](bool ok) {
++            const QByteArray output = process->readAll().trimmed();
++            if (ok) {
++                qInfo().noquote() << "KRDP-LAYOUT: applied" << arguments.join(QLatin1Char(' ')) << (output.isEmpty() ? QString() : QString::fromUtf8(output));
++            } else {
++                qWarning().noquote() << "KRDP-LAYOUT: helper failed" << arguments.join(QLatin1Char(' ')) << QString::fromUtf8(output);
++            }
++            m_layoutHelper = nullptr;
++            process->deleteLater();
++            if (then) {
++                then();
++            }
++            if (m_pendingLayout) {
++                m_layoutDebounce.start();
++            }
++        };
++        connect(process, &QProcess::finished, this, [process, finish](int exitCode, QProcess::ExitStatus status) {
++            finish(status == QProcess::NormalExit && exitCode == 0);
++        });
++        connect(process, &QProcess::errorOccurred, this, [finish](QProcess::ProcessError error) {
++            if (error == QProcess::FailedToStart) {
++                finish(false);
++            }
++        });
++        // A wedged kscreen-doctor must not hold the session hostage.
++        QTimer::singleShot(LayoutHelperTimeoutMs, process, [process] {
++            process->kill();
++        });
++        process->start(handler, arguments);
++    }
++
++    // Stream the persistent output once it is visible to this process. It
++    // normally is already; right after the helper enables it, Qt can learn of
++    // the screen a moment later, so look again briefly before giving up.
++    void startOnPersistentOutput(int attemptsLeft = PersistentOutputLookupAttempts)
++    {
++        const auto screens = QGuiApplication::screens();
++        for (int i = 0; i < screens.size(); ++i) {
++            if (screens.at(i)->name() == m_persistentOutput) {
++                session->setActiveStream(i);
++                session->start();
++                return;
++            }
++        }
++        if (attemptsLeft > 0) {
++            QTimer::singleShot(PersistentOutputLookupIntervalMs, this, [this, attemptsLeft] {
++                startOnPersistentOutput(attemptsLeft - 1);
++            });
++            return;
++        }
++        qWarning() << "KRDP-LAYOUT: output" << m_persistentOutput << "not found; streaming the first screen";
++        session->setActiveStream(0);
++        session->start();
++    }
++
+     // KRdp names the monitor it asks KWin for; the lifecycle helper needs that
+     // name to find the output again, so route every set through here.
+     void setVirtualMonitor(const KRdp::VirtualMonitor &virtualMonitor)
+@@ -140,6 +273,10 @@ public:
+     KStatusNotifierItem *m_sni;
+     bool m_sessionStarted = false;
+     QString m_virtualMonitorName;
++    QString m_persistentOutput;
++    QPointer<QProcess> m_layoutHelper;
++    std::optional<Layout> m_pendingLayout;
++    QTimer m_layoutDebounce;
+ };
+ 
+ SessionController::SessionController(KRdp::Server *server, SessionType sessionType)
+@@ -265,6 +402,10 @@ void SessionController::onNewConnection(KRdp::RdpConnection *newConnection)
+         // waits out itself; gating session creation on it a second time here
+         // only added dead time, and that dead time is what produced the
+         // black screen - not the momentary two-output overlap itself.
++        //
++        // With a persistent output there is no second output to overlap with
++        // at all: the incumbent and the new connection stream the same one, so
++        // the incumbent can take as long as it likes to go away.
+         for (const auto &incumbent : m_wrappers) {
+             if (incumbent->connection && incumbent->connection != newConnection) {
+                 qInfo() << "KRDP-SEAT: closing incumbent session" << incumbent->connection << "for" << newConnection;
+@@ -273,6 +414,9 @@ void SessionController::onNewConnection(KRdp::RdpConnection *newConnection)
+         }
+ 
+         auto wrapper = std::make_unique<SessionWrapper>(newConnection, makeSession(), m_sni);
++        // Set by the deployment to the name of the one output every connection
++        // shares. When set, no virtual monitor is created for anyone.
++        const QString persistentOutput = qEnvironmentVariable("KRDP_PERSISTENT_OUTPUT");
+         // 6.8 never looks at the client's own desktop: an explicit
+         // --virtual-monitor wins, and otherwise a fixed 1024x768 is used. By
+         // the time a connection reaches Activated its capabilities have been
+@@ -298,7 +442,10 @@ void SessionController::onNewConnection(KRdp::RdpConnection *newConnection)
+             return monitor;
+         };
+ 
+-        if (m_virtualMonitor) {
++        if (!persistentOutput.isEmpty()) {
++            // The output, and its layout, are settled just before streaming
++            // starts; see below.
++        } else if (m_virtualMonitor) {
+             wrapper->setVirtualMonitor(clientVirtualMonitor(*m_virtualMonitor));
+         } else if (m_monitorIndex) {
+             wrapper->session->setActiveStream(*m_monitorIndex);
+@@ -343,7 +490,15 @@ void SessionController::onNewConnection(KRdp::RdpConnection *newConnection)
+             newConnection->close(KRdp::RdpConnection::CloseReason::None);
+         });
+ 
+-        wrapper->session->start();
++        if (!persistentOutput.isEmpty()) {
++            SessionWrapper *persistentWrapper = wrapper.get();
++            persistentWrapper->usePersistentOutput(persistentOutput);
++            persistentWrapper->applyLayout({newConnection->clientDesktopSize(), newConnection->clientDesktopScale()}, [persistentWrapper] {
++                persistentWrapper->startOnPersistentOutput();
++            });
++        } else {
++            wrapper->session->start();
++        }
+         m_wrappers.push_back(std::move(wrapper));
+     });
+ }
+diff --git a/src/DisplayControl.cpp b/src/DisplayControl.cpp
+index d09cb1c..9c9427f 100644
+--- a/src/DisplayControl.cpp
++++ b/src/DisplayControl.cpp
+@@ -17,14 +17,32 @@ using namespace KRdp;
+ 
+ static UINT display_control_receive_monitor_layout(DispServerContext *context, const DISPLAY_CONTROL_MONITOR_LAYOUT_PDU *pdu)
+ {
+-    if (pdu->NumMonitors != 1) {
+-        return CHANNEL_RC_BAD_CHANNEL;
++    // A client with several monitors, mstsc's "use all monitors" included,
++    // reports all of them. Refusing that with an error, as this used to,
++    // fails the whole Display Control channel, so no later resize arrives
++    // either. The server shows a single output, so follow the client's
++    // primary monitor, or its first when none is marked primary.
++    if (pdu->NumMonitors < 1) {
++        return CHANNEL_RC_OK;
++    }
++    const DISPLAY_CONTROL_MONITOR_LAYOUT *chosen = &pdu->Monitors[0];
++    for (UINT32 i = 0; i < pdu->NumMonitors; ++i) {
++        if (pdu->Monitors[i].Flags & DISPLAY_CONTROL_MONITOR_PRIMARY) {
++            chosen = &pdu->Monitors[i];
++            break;
++        }
+     }
+ 
+-    QSize monitorSize = QSize(pdu->Monitors[0].Width, pdu->Monitors[0].Height);
++    QSize monitorSize = QSize(chosen->Width, chosen->Height);
++    // Moving a window between monitors of different DPI changes the scale and
++    // possibly nothing else, so the scale has to travel with the size.
++    const UINT32 scaleFactor = chosen->DesktopScaleFactor;
++    const qreal scale = (scaleFactor >= 100 && scaleFactor <= 500) ? qreal(scaleFactor) / 100.0 : 0;
++    qCInfo(KRDP).nospace() << "KRDP-DISPLAY-CONTROL: layout " << monitorSize << " scaleFactor=" << scaleFactor << " monitors=" << pdu->NumMonitors;
+ 
+     auto c = static_cast<DisplayControl *>(context->custom);
+     Q_EMIT c->requestedScreenSizeChanged(monitorSize);
++    Q_EMIT c->requestedLayoutChanged(monitorSize, scale);
+ 
+     return CHANNEL_RC_OK;
+ }
+diff --git a/src/DisplayControl.h b/src/DisplayControl.h
+index 7957263..6e5762e 100644
+--- a/src/DisplayControl.h
++++ b/src/DisplayControl.h
+@@ -26,6 +26,11 @@ public:
+ 
+ Q_SIGNALS:
+     void requestedScreenSizeChanged(const QSize &size);
++    /**
++     * The client's requested desktop, in physical pixels, and its desktop
++     * scale. A scale of 0 means the client did not send a usable one.
++     */
++    void requestedLayoutChanged(const QSize &size, qreal scale);
+ 
+ private:
+     RdpConnection *m_session = nullptr;
+diff --git a/src/PlasmaScreencastV1Session.cpp b/src/PlasmaScreencastV1Session.cpp
+index b35d079..c77767d 100644
+--- a/src/PlasmaScreencastV1Session.cpp
++++ b/src/PlasmaScreencastV1Session.cpp
+@@ -20,6 +20,7 @@
+ #include "qwayland-wayland.h"
+ #include "screencasting_p.h"
+ #include <QScreen>
++#include <QPointer>
+ 
+ namespace KRdp
+ {
+@@ -28,8 +29,21 @@ namespace KRdp
+ // RDP reports coordinates relative to this connection's own output. With more
+ // than one output present the RDP monitor is rarely at the origin, so without
+ // the offset every click lands on the wrong output.
+-static QPointF fakeInputPosition(const QPointF &rdpPosition, const std::optional<VirtualMonitor> &monitor)
++static QPointF fakeInputPosition(const QPointF &rdpPosition, const std::optional<VirtualMonitor> &monitor, QScreen *streamedScreen, const QSize &streamSize)
+ {
++    // When the session streams an existing output it knows exactly which
++    // screen that is, so map through it rather than looking one up by name.
++    // RDP coordinates are pixels of the stream, which is the output's current
++    // mode; the screen's geometry is logical, so the ratio of the two is the
++    // output's effective scale, fractional ones included.
++    if (streamedScreen) {
++        const QRect geometry = streamedScreen->geometry();
++        const qreal scale = (streamSize.width() > 0 && geometry.width() > 0)
++            ? qreal(streamSize.width()) / geometry.width()
++            : streamedScreen->devicePixelRatio();
++        return QPointF(geometry.topLeft()) + rdpPosition / scale;
++    }
++
+     const qreal scale = monitor ? monitor->dpr : 1.0;
+     const QPointF localPosition = rdpPosition / scale;
+     if (!monitor) {
+@@ -179,6 +193,8 @@ public:
+     Screencasting m_screencasting;
+     std::unique_ptr<ScreencastingStream> request;
+     std::unique_ptr<FakeInput> remoteInterface;
++    /// The output this session captures, when it captures an existing one.
++    QPointer<QScreen> streamedScreen;
+ };
+ 
+ PlasmaScreencastV1Session::PlasmaScreencastV1Session()
+@@ -204,6 +220,7 @@ void PlasmaScreencastV1Session::start()
+             return;
+         }
+         auto screen = qApp->screens().at(*streamIndex);
++        d->streamedScreen = screen;
+         d->request.reset(d->m_screencasting.createOutputStream(screen, Screencasting::Metadata));
+     } else {
+         d->request.reset(d->m_screencasting.createWorkspaceStream(Screencasting::Metadata));
+@@ -247,7 +264,7 @@ void PlasmaScreencastV1Session::sendEvent(const std::shared_ptr<QEvent> &event)
+         // fake-input button request does not. Keep KWin's pointer in sync before
+         // delivering the button; otherwise a click can be applied at (0,0).
+         const auto position = me->position();
+-        const auto logicalPosition = fakeInputPosition(position, virtualMonitor());
++        const auto logicalPosition = fakeInputPosition(position, virtualMonitor(), d->streamedScreen, size());
+         d->remoteInterface->pointer_motion_absolute(wl_fixed_from_double(logicalPosition.x()),
+                                                     wl_fixed_from_double(logicalPosition.y()));
+         uint state = me->type() == QEvent::MouseButtonPress ? 1 : 0;
+@@ -259,7 +276,7 @@ void PlasmaScreencastV1Session::sendEvent(const std::shared_ptr<QEvent> &event)
+         auto position = me->position();
+         // RDP reports physical pixels; KWin fake-input expects logical output
+         // coordinates. Do not use the encoder's PipeWire stream size here.
+-        auto logicalPosition = fakeInputPosition(position, virtualMonitor());
++        auto logicalPosition = fakeInputPosition(position, virtualMonitor(), d->streamedScreen, size());
+         d->remoteInterface->pointer_motion_absolute(wl_fixed_from_double(logicalPosition.x()), wl_fixed_from_double(logicalPosition.y()));
+         break;
+     }

@@ -214,7 +214,86 @@ pkgs.writeShellApplication {
       done < <(panel_containments)
     }
 
+    # Persistent-output mode. One existing output carries every connection,
+    # and this gives it the client's geometry and scale in place. Nothing is
+    # created or destroyed, so when the output already matches - a reconnect
+    # from the same screen - it returns without touching anything, and the
+    # desktop is not relaid out.
+    #
+    # KWin's virtual output lists only its native mode, so another size needs
+    # a custom mode. Custom modes accumulate and duplicates are accepted, so
+    # an existing mode of the right size is reused, and every other custom mode
+    # is removed afterwards: at most one exists however long a window edge is
+    # dragged. Mode ids renumber when one is removed, so ids are always looked
+    # up again rather than remembered.
+    prepare_output() {
+      local output="$1" width="$2" height="$3" scale="$4" size current current_scale mode_id custom_indices index
+      size="''${width}x''${height}"
+      current=$(output_state | jq -r --arg name "$output" '
+        .outputs[] | select(.name == $name)
+        | . as $o | ($o.modes[] | select(.id == $o.currentModeId) | "\(.size.width)x\(.size.height)") + " \($o.scale) \($o.enabled)"
+      ')
+      [ -n "$current" ] || { echo "Output not found: $output" >&2; return 1; }
+      read -r current_size current_scale current_enabled <<<"$current"
+      # 0 means the client sent no usable scale: keep the one already set.
+      if awk -v s="$scale" 'BEGIN { exit !(s + 0 == 0) }'; then
+        scale="$current_scale"
+      fi
+
+      if [ "$current_enabled" = true ] && [ "$current_size" = "$size" ] \
+         && awk -v a="$current_scale" -v b="$scale" 'BEGIN { d = a - b; exit !(d < 0.001 && d > -0.001) }'; then
+        echo "KRDP-LIFECYCLE: $output already ''${size}@''${scale}; unchanged" >&2
+        return 0
+      fi
+
+      find_mode() {
+        output_state | jq -r --arg name "$output" --arg size "$size" '
+          [.outputs[] | select(.name == $name) | .modes[] | select("\(.size.width)x\(.size.height)" == $size) | .id][0] // empty
+        '
+      }
+      mode_id=$(find_mode)
+      if [ -z "$mode_id" ]; then
+        kscreen-doctor "output.$output.addCustomMode.$width.$height.60000.full"
+        mode_id=$(find_mode)
+        [ -n "$mode_id" ] || { echo "KWin did not accept mode $size on $output" >&2; return 1; }
+      fi
+
+      # One configuration change, so Plasma relays out once rather than for
+      # the mode and again for the scale.
+      kscreen-doctor "output.$output.mode.$mode_id" "output.$output.scale.$scale" "output.$output.enable"
+      for ((attempt = 0; attempt < 30; attempt += 1)); do
+        if output_state | jq -e --arg name "$output" --arg size "$size" --argjson scale "$scale" '
+          any(.outputs[]; .name == $name and .enabled and (.scale == $scale)
+            and (. as $o | any($o.modes[]; .id == $o.currentModeId and "\(.size.width)x\(.size.height)" == $size)))
+        ' >/dev/null; then
+          break
+        fi
+        sleep 0.1
+      done
+
+      # Custom modes follow the output's native one; index N in KWin's custom
+      # list is modes[N + 1]. Remove from the highest index down, so the
+      # indices still to be removed do not shift.
+      custom_indices=$(output_state | jq -r --arg name "$output" --arg size "$size" '
+        [.outputs[] | select(.name == $name) | .modes[1:] | to_entries[] | select("\(.value.size.width)x\(.value.size.height)" != $size) | .key]
+        | reverse | .[]
+      ')
+      for index in $custom_indices; do
+        kscreen-doctor "output.$output.removeCustomMode.$index" || true
+      done
+
+      echo "KRDP-LIFECYCLE: $output set to ''${size}@''${scale}" >&2
+      if ! panels_attached_to_rdp_output; then
+        repair_panels
+        echo "KRDP-LIFECYCLE: panel-repair/restart output=$output" >&2
+        systemctl --user restart "$plasma_shell_service"
+      fi
+    }
+
     case "$action" in
+      prepare)
+        prepare_output "$requested_rdp_output" "''${3:?expected width}" "''${4:?expected height}" "''${5:?expected scale}"
+        ;;
       up)
         resolve_rdp_output
         wait_for_rdp_output

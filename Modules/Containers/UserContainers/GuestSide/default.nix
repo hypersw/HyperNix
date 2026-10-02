@@ -127,8 +127,11 @@ in
         type = lib.types.str;
         default = "1920x1080@1";
         description = ''
-          Initial RdpKde* virtual-monitor geometry used only when an
-          RDP client does not report a valid desktop size and scale.
+          Initial RdpKde* display geometry, WIDTHxHEIGHT@SCALE with a logical
+          size. With KRdpBeta it is the geometry KWin starts its one
+          persistent output at, kept until the first client asks for its
+          own. Otherwise it is the virtual monitor used when an RDP client
+          does not report a valid desktop size and scale.
         '';
       };
       RdpQuality = lib.mkOption {

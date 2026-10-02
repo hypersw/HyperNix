@@ -119,6 +119,7 @@ let
       (patch68 "0017-single-remote-seat.patch")
       (patch68 "0018-latency-first-pacing.patch")
       (patch68 "0019-runtime-h264-toggle.patch")
+      (patch68 "0020-persistent-output.patch")
     ];
 
     # 6.8 made libei a hard dependency for the portal input path (28d5ddb).

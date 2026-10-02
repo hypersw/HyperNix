@@ -59,3 +59,12 @@ path does not bump, so it keeps applying from `../KRdpPatches`.
   process. It is now re-evaluated per connection, and
   `$XDG_RUNTIME_DIR/krdp-disable-h264` disables H.264 for connections made while
   it exists, so RemoteFX Progressive can be tried from mstsc without a restart.
+- `0020-persistent-output.patch` — with `KRDP_PERSISTENT_OUTPUT` set (the module
+  sets it to `Virtual-0`), every connection streams that one existing output
+  instead of creating a virtual monitor. Its mode and scale follow the client
+  through the lifecycle helper's `prepare` action, on connect and on each
+  Display Control layout, debounced while a window edge is dragged. Display
+  Control also stops rejecting multi-monitor layouts, and the pointer maps
+  through the screen the session actually streams. This supersedes the
+  virtual-monitor half of `0016` and makes `0017`'s handover race moot; both
+  stay applied because their remaining parts still serve this path.

@@ -105,6 +105,26 @@ let
   # The option does not exist before 6.8, so it is only passed on that path.
   krdpModeArgs = lib.optionalString cfg.Gui.KRdpBeta "--mode AdditionalDisplay \\\n          ";
 
+  # On the 6.8 line every connection streams KWin's own Virtual-0 and changes
+  # its mode and scale in place (KRdpPatches68/0020). Nothing replaces that
+  # output later, so KWin has to start it at a sensible geometry, and the
+  # fallback geometry - formerly KRdp's first virtual monitor - is it. Its
+  # WIDTHxHEIGHT@SCALE size is logical, as KRdp's --virtual-monitor took it, so
+  # the output's pixel size is the size times the scale.
+  persistentOutput = "Virtual-0";
+  fallbackGeometry =
+    let
+      sizeAndScale = lib.splitString "@" cfg.Gui.RdpFallbackVirtualMonitor;
+      dimensions = lib.splitString "x" (builtins.head sizeAndScale);
+      scale = if builtins.length sizeAndScale > 1 then lib.toInt (builtins.elemAt sizeAndScale 1) else 1;
+    in {
+      width = lib.toInt (builtins.head dimensions) * scale;
+      height = lib.toInt (builtins.elemAt dimensions 1) * scale;
+      inherit scale;
+    };
+  kwinGeometryArgs = lib.optionalString cfg.Gui.KRdpBeta
+    " --width ${toString fallbackGeometry.width} --height ${toString fallbackGeometry.height} --scale ${toString fallbackGeometry.scale}";
+
   # The two RdpKde modes share every mechanism here and differ only in what
   # they let across the boundary: RdpKdeIsolated crosses nothing and runs pure
   # Wayland, RdpKdeWithDevices crosses host devices and carries an Xwayland
@@ -417,7 +437,7 @@ in {
           "KWIN_FORCE_NUM_LOCK_EVALUATION=1"
         ];
         ExecStartPre = prepareKdeSessionConfig;
-        ExecStart = "${pkgs.kdePackages.kwin}/bin/kwin_wayland --virtual${lib.optionalString hasXwayland " --xwayland"} --socket ${waylandDisplay}";
+        ExecStart = "${pkgs.kdePackages.kwin}/bin/kwin_wayland --virtual${lib.optionalString hasXwayland " --xwayland"} --socket ${waylandDisplay}${kwinGeometryArgs}";
         ExecStartPost = waitForKwinSocket;
         Restart = "on-failure";
         RestartSec = 2;
@@ -533,6 +553,8 @@ in {
         Environment = waylandClientEnvironment ++ [
           "KRDP_LIFECYCLE_HANDLER=${rdpOutputLifecycle}/bin/hypersw-rdp-output-lifecycle"
         ]
+        # The output every connection streams; see persistentOutput above.
+        ++ lib.optional cfg.Gui.KRdpBeta "KRDP_PERSISTENT_OUTPUT=${persistentOutput}"
         # TODO: remove once the 6.8 patch set is known good. KCrash catches
         # SIGSEGV and, when its own handler faults, leaves an unusable core:
         # the crash seen while bringing 0016 up had no recoverable stack at
@@ -561,8 +583,7 @@ in {
         # only the fallback. The patched server replaces it with the first
         # RDP client's reported dimensions and desktop scale when available.
         exec ${pkgs.kdePackages.krdp}/bin/krdpserver \
-          ${krdpModeArgs}--plasma \
-          --virtual-monitor ${lib.escapeShellArg cfg.Gui.RdpFallbackVirtualMonitor} \
+          ${krdpModeArgs}--plasma${lib.optionalString (!cfg.Gui.KRdpBeta) " --virtual-monitor ${lib.escapeShellArg cfg.Gui.RdpFallbackVirtualMonitor}"} \
           --address ${lib.escapeShellArg cfg.Gui.RdpListenAddress} \
           --port ${toString cfg.Gui.RdpPort} \
           --quality ${toString cfg.Gui.RdpQuality} \
