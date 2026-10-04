@@ -425,11 +425,23 @@ in {
       after = [ "dbus.service" "pipewire.service" ];
       serviceConfig = {
         Type = "simple";
-        Environment = virtualKwinEnvironment ++ [
-          # KWin alone reads the generated authorization menu and no-lock
-          # configuration. Desktop applications retain $HOME/.config.
+        Environment = virtualKwinEnvironment
+        # Under an immutable application set KWin alone gets a private,
+        # runtime config and cache home, holding the generated authorization
+        # menu so nothing user-writable can feed it. That home is a tmpfs, and
+        # KWin keeps more than authorization there: kwinrc, and - since the
+        # global-shortcut service runs inside KWin - kglobalshortcutsrc. So
+        # every window-manager setting and shortcut edit made from System
+        # Settings went there, was never read from ~/.config, and vanished on
+        # the next restart. The ordinary workstation keeps KWin on
+        # $HOME/.config and $HOME/.cache like every other client. The no-lock
+        # and NumLock defaults still reach it through XDG_CONFIG_DIRS, where
+        # a setting the user saves in ~/.config overrides them.
+        ++ lib.optionals immutableAppSet [
           "XDG_CONFIG_HOME=${kwinConfigHome}"
           "XDG_CACHE_HOME=${kwinCacheHome}"
+        ]
+        ++ [
           # Without this KWin consults the NumLock setting once, at startup,
           # and every later keymap re-evaluation restores whatever state it
           # last had. With it the configured state is reasserted each time,
