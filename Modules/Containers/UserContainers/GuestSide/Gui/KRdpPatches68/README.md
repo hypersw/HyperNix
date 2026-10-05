@@ -78,3 +78,7 @@ path does not bump, so it keeps applying from `../KRdpPatches`.
   the byte layout they arrive in instead of converting each whole frame first,
   caps RemoteFX at 30 fps, and logs a `KRDP-STATS:` summary (frame rate, damaged
   share, bandwidth, size) every ten seconds while frames are sent.
+- `0024-keep-lost-remotefx-damage.patch` — carries the damage of RemoteFX frames
+  dropped after leaving the queue (write-blocked socket, no confirmed GFX channel,
+  encoder failure) into the next frame sent, and sends full damage after a
+  surface reset. Without it, slow links left stale patches until a repaint.

@@ -1,0 +1,153 @@
+From: KRdp displayless experiment <noreply@example.invalid>
+Subject: [PATCH] Do not lose RemoteFX damage on frames that are not sent
+
+RemoteFX Progressive sends only damaged tiles. The frame queue already folds
+the damage of a replaced frame into its successor, but a frame dropped after
+leaving the queue took its damage with it: a write-blocked socket, routine on a
+slow link, no confirmed GFX channel, or an encoder failure. The client then kept
+stale pixels there until something repainted the area. Keep that damage and add
+it to the next frame that is sent.
+
+A surface reset or resize gives the client a new, empty surface, yet the next
+frame used to cover only what had changed since the previous one. Cover all of
+it.
+
+H.264 frames are whole pictures, so neither problem arises there.
+
+diff --git a/src/VideoStream.cpp b/src/VideoStream.cpp
+index e366904..4ed5c41 100644
+--- a/src/VideoStream.cpp
++++ b/src/VideoStream.cpp
+@@ -190,6 +190,9 @@ public:
+     uint64_t statsDamagedPixels = 0;
+     uint64_t statsFramePixels = 0;
+     uint64_t statsBytes = 0;
++    // Damage of RemoteFX frames that were dropped after leaving the queue,
++    // added to the next frame that is sent. Frame-submission thread only.
++    QRegion lostDamage;
+ 
+     std::atomic_int requestedFrameRate = 60;
+     std::atomic<qsizetype> maxInFlight{MaximumInFlightFrames}; // recomputed from RTT on rttChanged
+@@ -969,29 +972,61 @@ bool VideoStream::hasInFlightCapacity() const
+     return false;
+ }
+ 
+-void VideoStream::sendFrame(const VideoFrame &frame)
++void VideoStream::sendFrame(const VideoFrame &dequeuedFrame)
+ {
++    // RemoteFX sends only damaged tiles, so a frame that is dropped after
++    // leaving the queue takes its damage with it, and the client keeps stale
++    // pixels there until something happens to repaint the area. The queue
++    // already folds the damage of a replaced frame into its successor; this
++    // does the same for every frame that does not go out from here on - a
++    // write-blocked socket, which is routine on a slow link, no confirmed GFX
++    // channel yet, or a failure in the encoder. H.264 frames are whole
++    // pictures, so the next one repairs anything a lost one would have shown.
++    VideoFrame frame = dequeuedFrame;
++    const bool progressive = d->activeEncodingMode == EncodingMode::Progressive;
++    if (progressive && !d->lostDamage.isEmpty()) {
++        frame.damage += d->lostDamage;
++        d->lostDamage = QRegion();
++    }
++    auto keepDamage = [&] {
++        if (progressive) {
++            d->lostDamage += frame.damage;
++        }
++    };
++
+     auto peer = d->session->rdpPeer();
+     if (peer->IsWriteBlocked && peer->IsWriteBlocked(peer)) {
++        keepDamage();
+         return;
+     }
+ 
+     if (!d->gfxContext || !d->capsConfirmed) {
++        keepDamage();
+         return;
+     }
+ 
++    // A reset gives the client a new, empty surface, so the next frame has to
++    // cover all of it, not only what changed since the last one.
++    bool surfaceRecreated = false;
+     if (d->surface->pendingReset) {
+         d->surface->pendingReset = false;
+         performReset(frame.size);
++        surfaceRecreated = true;
+     }
+     if (d->surface->surface.size != frame.size) {
+         performReset(frame.size);
++        surfaceRecreated = true;
++    }
++    if (progressive && surfaceRecreated) {
++        frame.damage = QRegion(QRect(QPoint(0, 0), frame.size));
+     }
+ 
+     if (d->activeEncodingMode == EncodingMode::H264) {
+         sendFrameH264(frame);
+-    } else if (d->activeEncodingMode == EncodingMode::Progressive) {
+-        sendFrameProgressive(frame);
++    } else if (progressive) {
++        if (!sendFrameProgressive(frame)) {
++            keepDamage();
++        }
+     }
+ 
+     // A summary of what actually goes out, so that load which does not match
+@@ -1102,15 +1137,15 @@ void VideoStream::sendFrameH264(const VideoFrame &frame)
+     }
+ }
+ 
+-void VideoStream::sendFrameProgressive(const VideoFrame &frame)
++bool VideoStream::sendFrameProgressive(const VideoFrame &frame)
+ {
+     if (frame.image.isNull()) {
+-        return;
++        return false;
+     }
+ 
+     if (d->surface->surface.id == 0) {
+         qCWarning(KRDP) << "No graphics surface available for progressive frame submission";
+-        return;
++        return false;
+     }
+ 
+     // Hand the encoder the pixels in the layout they already have. A GPU frame
+@@ -1140,7 +1175,7 @@ void VideoStream::sendFrameProgressive(const VideoFrame &frame)
+     auto invalidRegion = toRegion16(frame.damage, frameRect);
+     if (!invalidRegion) {
+         qCWarning(KRDP) << "Failed to build invalid region for progressive frame";
+-        return;
++        return false;
+     }
+ 
+     BYTE *encodedData = nullptr;
+@@ -1160,7 +1195,7 @@ void VideoStream::sendFrameProgressive(const VideoFrame &frame)
+         region16_uninit(&*invalidRegion);
+         qCWarning(KRDP) << "Failed to compress progressive frame"
+                         << "status" << compressionStatus << "rects" << rectCount << "size" << frame.size;
+-        return;
++        return false;
+     }
+     d->statsBytes += encodedSize;
+ 
+@@ -1204,6 +1239,7 @@ void VideoStream::sendFrameProgressive(const VideoFrame &frame)
+     }
+ 
+     region16_uninit(&*invalidRegion);
++    return status == CHANNEL_RC_OK;
+ }
+ 
+ void VideoStream::updateBackpressure()
+diff --git a/src/VideoStream.h b/src/VideoStream.h
+index d92ff42..1ec840f 100644
+--- a/src/VideoStream.h
++++ b/src/VideoStream.h
+@@ -115,7 +115,7 @@ private:
+     bool hasInFlightCapacity() const;
+     void sendFrame(const VideoFrame &frame);
+     void sendFrameH264(const VideoFrame &frame);
+-    void sendFrameProgressive(const VideoFrame &frame);
++    bool sendFrameProgressive(const VideoFrame &frame);
+ 
+     void updateInFlightWindow();
+     double effectiveProducerFps();
