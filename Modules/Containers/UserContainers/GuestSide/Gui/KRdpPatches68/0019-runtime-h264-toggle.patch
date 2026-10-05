@@ -4,40 +4,54 @@ Subject: [PATCH] Let H.264 be disabled per connection, at runtime
 KRDP_DISABLE_H264 is read once per process, so trying RemoteFX Progressive
 meant restarting the server, and from a client that cannot choose its codec
 (mstsc) there was no other way to get it. Re-evaluate the switch for every
-connection, and also honour a flag file in XDG_RUNTIME_DIR: touching it makes
-the next connection negotiate Progressive, removing it brings AVC back. The
-runtime directory is a tmpfs, so the toggle cannot survive a reboot.
+connection, and also honour a flag file: while krdp-disable-h264 exists, new
+connections negotiate Progressive, and removing it brings AVC back. It is looked
+for in XDG_RUNTIME_DIR, a tmpfs, for an experiment that must not outlive the
+session, and in XDG_CONFIG_HOME (default ~/.config), for a deliberate choice
+that should survive restarts.
 
 diff --git a/src/VideoStream.cpp b/src/VideoStream.cpp
-index 28100d0..ae00e2d 100644
+index 66631b0..8c19c49 100644
 --- a/src/VideoStream.cpp
 +++ b/src/VideoStream.cpp
-@@ -8,6 +8,8 @@
+@@ -8,6 +8,9 @@
  // SPDX-License-Identifier: GPL-2.0-or-later
  
  #include "VideoStream.h"
 +
 +#include <QFileInfo>
++#include <QDir>
  #include "VideoStreamSurface.h"
  
  #include <algorithm>
-@@ -201,8 +203,17 @@ static QString encodingModeName(VideoStream::EncodingMode mode)
+@@ -201,8 +204,28 @@ static QString encodingModeName(VideoStream::EncodingMode mode)
  
  bool VideoStream::h264Disabled()
  {
 -    static const bool h264Disabled = qEnvironmentVariableIntValue("KRDP_DISABLE_H264") != 0;
 -    return h264Disabled;
 +    // Checked for every connection rather than once per process, so the codec can be
-+    // switched between connections without restarting the server: KRDP_DISABLE_H264
-+    // still forces it for the whole process, and a flag file in XDG_RUNTIME_DIR
-+    // disables it for connections made while the file exists. XDG_RUNTIME_DIR is a
-+    // tmpfs, so the toggle cannot outlive the session.
++    // switched between connections without restarting the server. KRDP_DISABLE_H264
++    // still forces it for the whole process. Otherwise a flag file disables it for
++    // connections made while the file exists, in either of two places:
++    //   - XDG_RUNTIME_DIR/krdp-disable-h264, a tmpfs, so a quick experiment
++    //     cannot outlive the session;
++    //   - XDG_CONFIG_HOME (default ~/.config)/krdp-disable-h264, which survives
++    //     restarts, for a deliberate choice meant to stick.
 +    static const bool forcedByEnvironment = qEnvironmentVariableIntValue("KRDP_DISABLE_H264") != 0;
 +    if (forcedByEnvironment) {
 +        return true;
 +    }
++    static const QString flagName = QStringLiteral("krdp-disable-h264");
 +    const QString runtimeDir = qEnvironmentVariable("XDG_RUNTIME_DIR");
-+    return !runtimeDir.isEmpty() && QFileInfo::exists(runtimeDir + QStringLiteral("/krdp-disable-h264"));
++    if (!runtimeDir.isEmpty() && QFileInfo::exists(runtimeDir + QLatin1Char('/') + flagName)) {
++        return true;
++    }
++    QString configDir = qEnvironmentVariable("XDG_CONFIG_HOME");
++    if (configDir.isEmpty()) {
++        configDir = QDir::homePath() + QStringLiteral("/.config");
++    }
++    return QFileInfo::exists(configDir + QLatin1Char('/') + flagName);
  }
  
  static RECTANGLE_16 toRectangle16(const QRect &rect)

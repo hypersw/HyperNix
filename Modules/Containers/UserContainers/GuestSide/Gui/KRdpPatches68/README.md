@@ -56,9 +56,11 @@ path does not bump, so it keeps applying from `../KRdpPatches`.
   1s, encoder paused once more than one frame awaits sending, and adaptive
   quality updating every 500ms with a 25-point step down.
 - `0019-runtime-h264-toggle.patch` — `KRDP_DISABLE_H264` was read once per
-  process. It is now re-evaluated per connection, and
-  `$XDG_RUNTIME_DIR/krdp-disable-h264` disables H.264 for connections made while
-  it exists, so RemoteFX Progressive can be tried from mstsc without a restart.
+  process. It is now re-evaluated per connection, and a `krdp-disable-h264` file
+  disables H.264 for connections made while it exists, so RemoteFX Progressive
+  can be chosen from mstsc without a restart. It is looked for in
+  `$XDG_RUNTIME_DIR` (gone on restart) and in `${XDG_CONFIG_HOME:-~/.config}`
+  (kept).
 - `0020-persistent-output.patch` — with `KRDP_PERSISTENT_OUTPUT` set (the module
   sets it to `Virtual-0`), every connection streams that one existing output
   instead of creating a virtual monitor. Its mode and scale follow the client
