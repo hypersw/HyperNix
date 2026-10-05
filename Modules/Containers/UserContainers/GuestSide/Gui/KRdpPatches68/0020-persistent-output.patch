@@ -28,12 +28,14 @@ index 3471c3f..de9a6bc 100644
  
  #include <KLocalizedString>
  
-@@ -35,6 +41,16 @@
+@@ -35,6 +41,18 @@
  
  using namespace Qt::StringLiterals;
  
 +/// Settling time for a burst of Display Control layouts, such as a window edge being dragged.
-+static constexpr int LayoutDebounceMs = 400;
++/// Each size it settles on becomes a custom mode that KWin cannot remove again, so this is
++/// long enough to skip the pauses within one drag and apply only where the drag ends.
++static constexpr int LayoutDebounceMs = 1500;
 +
 +/// Upper bound on one run of the layout helper before it is killed.
 +static constexpr int LayoutHelperTimeoutMs = 10000;
