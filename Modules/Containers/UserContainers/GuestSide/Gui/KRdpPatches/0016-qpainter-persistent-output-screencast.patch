@@ -1,0 +1,25 @@
+From: KRdp displayless experiment <noreply@example.invalid>
+Subject: [PATCH] screencast: allow QPainter for existing-output capture too
+
+0003 lets the QPainter virtual backend serve screencasts, but only through
+streamVirtualOutput. KRdp's persistent-output mode streams an existing output,
+Virtual-0, through streamWaylandOutput, which kept the OpenGL-only guard, so on a
+GPU-less guest every connection failed with "Unsupported compositing type" and
+KRdp closed it. Use 0003's narrower guard there as well. Window and region
+capture stay OpenGL-only.
+
+diff --git a/src/plugins/screencast/screencastmanager.cpp b/src/plugins/screencast/screencastmanager.cpp
+index 5067461..732f904 100644
+--- a/src/plugins/screencast/screencastmanager.cpp
++++ b/src/plugins/screencast/screencastmanager.cpp
+@@ -93,7 +93,9 @@ void ScreencastManager::streamWaylandOutput(ScreencastStreamV1Interface *wayland
+                                             OutputInterface *output,
+                                             ScreencastV1Interface::CursorMode mode)
+ {
+-    if (!isSupportedCompositingType()) {
++    // The displayless KRdp persistent-output route captures Virtual-0 through
++    // stream_output. Its QPainter path produces a shared-memory screencast.
++    if (!isSupportedVirtualOutputCompositingType()) {
+         waylandStream->sendFailed(i18n("Unsupported compositing type"));
+         return;
+     }

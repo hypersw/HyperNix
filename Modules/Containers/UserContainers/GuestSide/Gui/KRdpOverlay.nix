@@ -152,6 +152,9 @@ let
     pname = "kwin-qpainter-krdp";
     patches = (old.patches or [ ]) ++ [
       (patch "0003-qpainter-virtual-screencast.patch")
+      # 0003 only covers streamVirtualOutput; persistent-output KRdp streams an
+      # existing output through streamWaylandOutput, which needs the same guard.
+      (patch "0016-qpainter-persistent-output-screencast.patch")
     ];
 
     # Do not apply 0004-allow-zero-virtual-outputs.patch. KWin's initial
