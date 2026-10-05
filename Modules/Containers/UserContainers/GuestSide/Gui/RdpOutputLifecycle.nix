@@ -221,13 +221,16 @@ pkgs.writeShellApplication {
     # desktop is not relaid out.
     #
     # KWin's virtual output lists only its native mode, so another size needs
-    # a custom mode. Custom modes accumulate and duplicates are accepted, so
-    # an existing mode of the right size is reused, and every other custom mode
-    # is removed afterwards: at most one exists however long a window edge is
-    # dragged. Mode ids renumber when one is removed, so ids are always looked
-    # up again rather than remembered.
+    # a custom mode. KWin accepts duplicates, so an existing mode of the right
+    # size is reused, the current one first. Unused custom modes are left in
+    # place, one per distinct size ever requested; they are harmless, and
+    # there is no reliable way to remove them. removeCustomMode takes an index
+    # into KWin's own custom-mode list, and KScreen's mode listing matches it
+    # neither in order nor in length - in the field it showed three
+    # non-native modes against two custom ones - so an index derived from it
+    # can name the mode in use.
     prepare_output() {
-      local output="$1" width="$2" height="$3" scale="$4" size current current_scale mode_id custom_indices index
+      local output="$1" width="$2" height="$3" scale="$4" size current current_scale mode_id
       size="''${width}x''${height}"
       current=$(output_state | jq -r --arg name "$output" '
         .outputs[] | select(.name == $name)
@@ -248,7 +251,9 @@ pkgs.writeShellApplication {
 
       find_mode() {
         output_state | jq -r --arg name "$output" --arg size "$size" '
-          [.outputs[] | select(.name == $name) | .modes[] | select("\(.size.width)x\(.size.height)" == $size) | .id][0] // empty
+          [.outputs[] | select(.name == $name) | . as $o
+            | ($o.modes | sort_by(if .id == $o.currentModeId then 0 else 1 end))[]
+            | select("\(.size.width)x\(.size.height)" == $size) | .id][0] // empty
         '
       }
       mode_id=$(find_mode)
@@ -269,17 +274,6 @@ pkgs.writeShellApplication {
           break
         fi
         sleep 0.1
-      done
-
-      # Custom modes follow the output's native one; index N in KWin's custom
-      # list is modes[N + 1]. Remove from the highest index down, so the
-      # indices still to be removed do not shift.
-      custom_indices=$(output_state | jq -r --arg name "$output" --arg size "$size" '
-        [.outputs[] | select(.name == $name) | .modes[1:] | to_entries[] | select("\(.value.size.width)x\(.value.size.height)" != $size) | .key]
-        | reverse | .[]
-      ')
-      for index in $custom_indices; do
-        kscreen-doctor "output.$output.removeCustomMode.$index" || true
       done
 
       echo "KRDP-LIFECYCLE: $output set to ''${size}@''${scale}" >&2
