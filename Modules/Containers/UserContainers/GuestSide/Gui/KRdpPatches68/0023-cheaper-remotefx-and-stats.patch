@@ -1,0 +1,159 @@
+From: KRdp displayless experiment <noreply@example.invalid>
+Subject: [PATCH] Make the RemoteFX path cheaper, and log what is sent
+
+The progressive encoder already compresses only damaged tiles, but every frame
+first cost a whole screen of work: the frame was converted to BGRX in full just
+to match the format constant passed to the encoder. Pass the constant that
+matches the bytes as they arrive instead - RGBX for a GPU frame read back as
+RGBA, BGRX for shared memory - and the conversion is gone; the encoder converts
+colours per damaged tile either way.
+
+Cap the RemoteFX frame rate at 30. It is CPU-encoded here and CPU-decoded by
+mstsc, and at 4K the full 60 roughly doubles both for little visible gain.
+
+Log a summary every ten seconds while frames are sent: frame rate, damaged share
+of the frames, bandwidth and size, so load that does not match the screen shows
+up as such.
+diff --git a/src/VideoStream.cpp b/src/VideoStream.cpp
+index b663478..e366904 100644
+--- a/src/VideoStream.cpp
++++ b/src/VideoStream.cpp
+@@ -61,6 +61,8 @@ constexpr clk::steady_clock::duration AckStallTimeout = clk::milliseconds(1000);
+ // MS-RDPEGFX: a FrameAcknowledge with this queue depth means the client stops
+ // acknowledging frames until further notice.
+ constexpr uint32_t SuspendFrameAcknowledgement = 0xFFFFFFFF;
++// How often a summary of what was sent is logged, while anything is sent at all.
++constexpr clk::steady_clock::duration StatsInterval = clk::seconds(10);
+ 
+ constexpr uint32_t ProgressiveCodecContextId = 1;
+ 
+@@ -182,6 +184,12 @@ public:
+     clk::steady_clock::time_point lastAckProgress = clk::steady_clock::now();
+     // Set while the client has suspended frame acknowledgements; guarded likewise.
+     bool acksSuspended = false;
++    // Periodic send statistics, touched only by the frame-submission thread.
++    clk::steady_clock::time_point statsSince = clk::steady_clock::now();
++    uint64_t statsFrames = 0;
++    uint64_t statsDamagedPixels = 0;
++    uint64_t statsFramePixels = 0;
++    uint64_t statsBytes = 0;
+ 
+     std::atomic_int requestedFrameRate = 60;
+     std::atomic<qsizetype> maxInFlight{MaximumInFlightFrames}; // recomputed from RTT on rttChanged
+@@ -986,6 +994,33 @@ void VideoStream::sendFrame(const VideoFrame &frame)
+         sendFrameProgressive(frame);
+     }
+ 
++    // A summary of what actually goes out, so that load which does not match
++    // what is on screen - frames pouring out while nothing visibly changes -
++    // shows up in the journal as such. H.264 encodes whole frames, so damage
++    // only means something for RemoteFX.
++    d->statsFrames++;
++    d->statsFramePixels += uint64_t(frame.size.width()) * uint64_t(frame.size.height());
++    if (d->activeEncodingMode == EncodingMode::H264) {
++        d->statsBytes += uint64_t(frame.data.size());
++        d->statsDamagedPixels += uint64_t(frame.size.width()) * uint64_t(frame.size.height());
++    } else {
++        for (const QRect &rect : frame.damage) {
++            d->statsDamagedPixels += uint64_t(rect.width()) * uint64_t(rect.height());
++        }
++    }
++    const auto now = clk::steady_clock::now();
++    if (now - d->statsSince >= StatsInterval) {
++        const double seconds = clk::duration<double>(now - d->statsSince).count();
++        qCInfo(KRDP).nospace() << "KRDP-STATS: " << (d->activeEncodingMode ? encodingModeName(*d->activeEncodingMode) : QStringLiteral("none"))
++                               << " " << d->statsFrames << " frames in " << qRound(seconds) << "s"
++                               << " (" << QString::number(d->statsFrames / seconds, 'f', 1) << " fps)"
++                               << ", damage " << QString::number(d->statsFramePixels ? 100.0 * d->statsDamagedPixels / d->statsFramePixels : 0, 'f', 1) << "% of frames"
++                               << ", " << QString::number(d->statsBytes / 1024.0 / seconds, 'f', 0) << " KiB/s"
++                               << ", " << frame.size.width() << "x" << frame.size.height();
++        d->statsSince = now;
++        d->statsFrames = d->statsDamagedPixels = d->statsFramePixels = d->statsBytes = 0;
++    }
++
+     QMetaObject::invokeMethod(this, &VideoStream::updateBackpressure, Qt::QueuedConnection);
+ }
+ 
+@@ -1078,7 +1113,29 @@ void VideoStream::sendFrameProgressive(const VideoFrame &frame)
+         return;
+     }
+ 
+-    QImage image = frame.image.convertToFormat(QImage::Format_RGB32);
++    // Hand the encoder the pixels in the layout they already have. A GPU frame
++    // arrives read back as RGBA bytes and a shared-memory one as BGRX, and the
++    // encoder takes either: it converts colours tile by tile, damaged tiles
++    // only. Converting the whole frame first, as this used to, cost a full
++    // screen of work per frame however little had changed - 33 MB at 4K.
++    QImage image = frame.image;
++    UINT32 pixelFormat = 0;
++    switch (image.format()) {
++    case QImage::Format_RGB32:
++    case QImage::Format_ARGB32:
++    case QImage::Format_ARGB32_Premultiplied:
++        pixelFormat = PIXEL_FORMAT_BGRX32; // memory B,G,R,X on little-endian
++        break;
++    case QImage::Format_RGBX8888:
++    case QImage::Format_RGBA8888:
++    case QImage::Format_RGBA8888_Premultiplied:
++        pixelFormat = PIXEL_FORMAT_RGBX32; // memory R,G,B,X
++        break;
++    default:
++        image = image.convertToFormat(QImage::Format_RGB32);
++        pixelFormat = PIXEL_FORMAT_BGRX32;
++        break;
++    }
+     const QRect frameRect(QPoint(0, 0), image.size());
+     auto invalidRegion = toRegion16(frame.damage, frameRect);
+     if (!invalidRegion) {
+@@ -1092,7 +1149,7 @@ void VideoStream::sendFrameProgressive(const VideoFrame &frame)
+     const int compressionStatus = progressive_compress(d->progressive.get(),
+                                                        image.constBits(),
+                                                        image.sizeInBytes(),
+-                                                       PIXEL_FORMAT_BGRX32,
++                                                       pixelFormat,
+                                                        image.width(),
+                                                        image.height(),
+                                                        image.bytesPerLine(),
+@@ -1105,6 +1162,7 @@ void VideoStream::sendFrameProgressive(const VideoFrame &frame)
+                         << "status" << compressionStatus << "rects" << rectCount << "size" << frame.size;
+         return;
+     }
++    d->statsBytes += encodedSize;
+ 
+     auto frameId = d->frameId++;
+ 
+diff --git a/src/VideoStreamSurface.cpp b/src/VideoStreamSurface.cpp
+index e1cc369..fe44921 100644
+--- a/src/VideoStreamSurface.cpp
++++ b/src/VideoStreamSurface.cpp
+@@ -5,6 +5,7 @@
+ 
+ #include "VideoStreamSurface.h"
+ 
++#include <algorithm>
+ #include <chrono>
+ 
+ #include "krdp_logging.h"
+@@ -14,6 +15,9 @@ namespace KRdp
+ 
+ namespace clk = std::chrono;
+ 
++/// Frame-rate ceiling for the RemoteFX Progressive path; see setActiveEncodingMode.
++static constexpr int ProgressiveMaxFrameRate = 30;
++
+ VideoStreamSurface::VideoStreamSurface(VideoStream *stream)
+     : QObject(stream)
+     , m_stream(stream)
+@@ -64,7 +68,11 @@ void VideoStreamSurface::setActiveEncodingMode(VideoStream::EncodingMode mode, q
+         sourceStream = std::make_unique<PipeWireSourceStream>();
+         sourceStream->setAllowDmaBuf(true);
+         sourceStream->setDamageEnabled(true);
+-        sourceStream->setMaxFramerate({static_cast<quint32>(requestedFrameRate), 1});
++        // RemoteFX Progressive is encoded on the CPU here and decoded on the CPU
++        // by mstsc, whereas H.264 has hardware on both ends. It was designed
++        // around 30 frames a second at far lower resolutions, and at 4K the
++        // full 60 roughly doubles both sides' load for little visible gain.
++        sourceStream->setMaxFramerate({static_cast<quint32>(std::min(requestedFrameRate, ProgressiveMaxFrameRate)), 1});
+         if (requestedSize.isValid()) {
+             sourceStream->setRequestedSize(requestedSize);
+         }

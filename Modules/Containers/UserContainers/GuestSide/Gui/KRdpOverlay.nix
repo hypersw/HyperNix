@@ -122,6 +122,7 @@ let
       (patch68 "0020-persistent-output.patch")
       (patch68 "0021-unstall-h264-stream.patch")
       (patch68 "0022-auto-reconnect-cookie.patch")
+      (patch68 "0023-cheaper-remotefx-and-stats.patch")
     ];
 
     # 6.8 made libei a hard dependency for the portal input path (28d5ddb).

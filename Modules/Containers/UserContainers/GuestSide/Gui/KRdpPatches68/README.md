@@ -74,3 +74,7 @@ path does not bump, so it keeps applying from `../KRdpPatches`.
   Session Info, extended logon info) once per connection. Without it mstsc never
   retries a dropped connection, whatever its own setting says. Only network
   drops are retried; a session the server ends is not.
+- `0023-cheaper-remotefx-and-stats.patch` — hands the RemoteFX encoder frames in
+  the byte layout they arrive in instead of converting each whole frame first,
+  caps RemoteFX at 30 fps, and logs a `KRDP-STATS:` summary (frame rate, damaged
+  share, bandwidth, size) every ten seconds while frames are sent.
