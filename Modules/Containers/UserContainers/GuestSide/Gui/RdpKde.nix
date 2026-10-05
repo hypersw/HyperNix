@@ -276,6 +276,52 @@ let
     exit 1
   '';
 
+  # Persistent-output mode creates a custom mode on Virtual-0 for every client
+  # geometry, and KWin's virtual backend cannot remove one at runtime:
+  # removeCustomMode merely regenerates them. They also outlive restarts now
+  # that KWin keeps its output config in ~/.config, so left alone they would
+  # accumulate without bound, each costing a little on every display change
+  # for every client that watches outputs. Trim them while KWin is stopped.
+  #
+  # Deliberately narrow, so nothing else in the file can be harmed: only the
+  # entry for the output named exactly Virtual-0 - a real monitor has its own
+  # connector name - and only its customModes list, keeping the mode that
+  # matches its saved resolution so KWin restores the last client's geometry.
+  # A missing file, invalid JSON, or an entry without a saved mode is left
+  # alone, nothing is written unless something changes, and the write is
+  # atomic.
+  pruneVirtualOutputModes = pkgs.writeShellApplication {
+    name = "hypersw-prune-virtual-output-modes";
+    runtimeInputs = [ pkgs.coreutils pkgs.jq ];
+    text = ''
+      config="''${XDG_CONFIG_HOME:-$HOME/.config}/kwinoutputconfig.json"
+      [ -f "$config" ] || exit 0
+      if ! jq -e . "$config" >/dev/null 2>&1; then
+        echo "KWin output config is not valid JSON; custom modes left alone: $config" >&2
+        exit 0
+      fi
+      pruned=$(jq --arg name "${persistentOutput}" '
+        map(if .name == "outputs" and (.data | type) == "array" then
+              .data |= map(
+                if .connectorName == $name and (.customModes | type) == "array"
+                   and (.mode.width | type) == "number" and (.mode.height | type) == "number" then
+                  .mode as $m | .customModes |= map(select(.width == $m.width and .height == $m.height))
+                else . end)
+            else . end)
+      ' "$config")
+      if [ "$(jq -S . <<<"$pruned")" = "$(jq -S . "$config")" ]; then
+        exit 0
+      fi
+      before=$(jq --arg name "${persistentOutput}" '[.[] | select(.name == "outputs") | .data[] | select(.connectorName == $name) | .customModes[]?] | length' "$config")
+      after=$(jq --arg name "${persistentOutput}" '[.[] | select(.name == "outputs") | .data[] | select(.connectorName == $name) | .customModes[]?] | length' <<<"$pruned")
+      tmp=$(mktemp "$config.XXXXXX")
+      printf '%s\n' "$pruned" > "$tmp"
+      chmod --reference="$config" "$tmp"
+      mv -f "$tmp" "$config"
+      echo "Pruned ${persistentOutput} custom modes: $before -> $after" >&2
+    '';
+  };
+
   prepareKdeSessionConfig = pkgs.writeShellScript "hypersw-prepare-kde-rdp-session-config" ''
     set -euo pipefail
     config_dir="$XDG_RUNTIME_DIR/hypersw-kde-rdp-config"
@@ -448,7 +494,8 @@ in {
           # so a reconnect or a layout change cannot leave the numpad off.
           "KWIN_FORCE_NUM_LOCK_EVALUATION=1"
         ];
-        ExecStartPre = prepareKdeSessionConfig;
+        ExecStartPre = [ prepareKdeSessionConfig ]
+          ++ lib.optional cfg.Gui.KRdpBeta (lib.getExe pruneVirtualOutputModes);
         ExecStart = "${pkgs.kdePackages.kwin}/bin/kwin_wayland --virtual${lib.optionalString hasXwayland " --xwayland"} --socket ${waylandDisplay}${kwinGeometryArgs}";
         ExecStartPost = waitForKwinSocket;
         Restart = "on-failure";
