@@ -70,3 +70,7 @@ path does not bump, so it keeps applying from `../KRdpPatches`.
   through the screen the session actually streams. This supersedes the
   virtual-monitor half of `0016` and makes `0017`'s handover race moot; both
   stay applied because their remaining parts still serve this path.
+- `0022-auto-reconnect-cookie.patch` — sends the auto-reconnect cookie (Save
+  Session Info, extended logon info) once per connection. Without it mstsc never
+  retries a dropped connection, whatever its own setting says. Only network
+  drops are retried; a session the server ends is not.

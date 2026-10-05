@@ -1,0 +1,72 @@
+From: KRdp displayless experiment <noreply@example.invalid>
+Subject: [PATCH] Send an auto-reconnect cookie so clients reconnect by themselves
+
+RDP auto-reconnect is driven by the server: a client retries a dropped
+connection on its own only if the server sent it an auto-reconnect cookie in a
+Save Session Info PDU after logon. KRdp never sent one, so mstsc gave up on every
+network drop even with auto-reconnect enabled on its side.
+
+Send a cookie once per connection, from the activation callback, which runs on
+the connection's own thread. A reconnecting client authenticates over NLA again
+with its saved credentials, so the cookie it returns is logged, not validated.
+
+diff --git a/src/RdpConnection.cpp b/src/RdpConnection.cpp
+index f3251c2..1fb3d00 100644
+--- a/src/RdpConnection.cpp
++++ b/src/RdpConnection.cpp
+@@ -22,6 +22,8 @@
+ 
+ #include <freerdp/channels/wtsvc.h>
+ #include <freerdp/freerdp.h>
++#include <freerdp/session.h>
++#include <QRandomGenerator>
+ #include <freerdp/server/cliprdr.h>
+ 
+ #include <freerdp/channels/drdynvc.h>
+@@ -248,6 +250,8 @@ public:
+ 
+     State state = State::Initial;
+     bool qualitySeeded = false;
++    /// Whether this connection has been sent an auto-reconnect cookie yet.
++    bool autoReconnectCookieSent = false;
+ 
+     qintptr socketHandle;
+ 
+@@ -676,6 +680,37 @@ bool RdpConnection::onActivate()
+ {
+     setState(State::Activated);
+ 
++    // RDP auto-reconnect is server-driven: a client only retries a dropped
++    // connection by itself if the server handed it an auto-reconnect cookie,
++    // which KRdp never did, so mstsc gave up on every network drop regardless
++    // of its own setting. Send one, once per connection - Activate repeats
++    // after a reactivation such as a desktop resize. This runs on the
++    // connection's own thread, the only one allowed to use the peer.
++    //
++    // A reconnecting client returns a verifier derived from the cookie, but
++    // it also completes NLA again with its saved credentials, so the cookie
++    // grants nothing by itself. It is therefore only logged, not validated.
++    if (!d->autoReconnectCookieSent) {
++        d->autoReconnectCookieSent = true;
++        logon_info_ex info = {};
++        info.haveCookie = TRUE;
++        info.LogonId = QRandomGenerator::system()->generate();
++        for (BYTE &b : info.ArcRandomBits) {
++            b = BYTE(QRandomGenerator::system()->bounded(256));
++        }
++        auto *update = d->peer->context->update;
++        if (update && update->SaveSessionInfo && update->SaveSessionInfo(d->peer->context, INFO_TYPE_LOGON_EXTENDED_INF, &info)) {
++            qCInfo(KRDP) << "KRDP-RECONNECT: auto-reconnect cookie sent, logon" << info.LogonId;
++        } else {
++            qCWarning(KRDP) << "KRDP-RECONNECT: could not send an auto-reconnect cookie; the client will not reconnect by itself";
++        }
++
++        auto *clientCookie = static_cast<const ARC_CS_PRIVATE_PACKET *>(freerdp_settings_get_pointer(d->peer->context->settings, FreeRDP_ClientAutoReconnectCookie));
++        if (clientCookie && clientCookie->logonId != 0) {
++            qCInfo(KRDP) << "KRDP-RECONNECT: client is auto-reconnecting, presented a cookie for logon" << clientCookie->logonId;
++        }
++    }
++
+     if (!d->qualitySeeded) {
+         d->qualitySeeded = true;
+         const uint32_t connectionType = freerdp_settings_get_uint32(d->peer->context->settings, FreeRDP_ConnectionType);
