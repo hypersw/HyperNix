@@ -1,0 +1,75 @@
+From: KRdp displayless experiment <noreply@example.invalid>
+Subject: [PATCH] Do not delete client GFX objects after a caps re-advertisement
+
+A client may advertise its GFX caps a second time within a connection, and by
+then it has reset its graphics state: its surfaces and encoding contexts are
+already gone. mstsc does so when it rebuilds its graphics pipeline, for instance
+after falling back from a hardware to a software framebuffer.
+KRdp treated that as a channel reset but still sent DeleteEncodingContext and
+DeleteSurface for the objects it had created, which mstsc rejects with
+E_INVALIDARG and answers by dropping the connection with a protocol error
+(disconnect reason 3334). It only matters when a frame went out before the
+second advertisement.
+
+Drop the surface on the server side only in that case. Surface ids are never
+reused, so even a client that kept its old surface sees no collision.
+
+diff --git a/src/VideoStream.cpp b/src/VideoStream.cpp
+index 4ed5c41..e2718c9 100644
+--- a/src/VideoStream.cpp
++++ b/src/VideoStream.cpp
+@@ -557,7 +557,12 @@ uint32_t VideoStream::onCapsAdvertise(const RDPGFX_CAPS_ADVERTISE_PDU *capsAdver
+         qCDebug(KRDP) << "GFX channel reset (re-advertisement), resetting surface state";
+         d->capsConfirmed = false;
+         d->surface->pendingReset = true;
+-        destroySurface();
++        // A client re-advertising its caps has reset its whole GFX state, so its
++        // surfaces and encoding contexts are gone already. Telling it to delete
++        // them anyway is a protocol error to mstsc: it rejects DeleteEncodingContext
++        // with E_INVALIDARG and drops the connection (reason 3334). Forget them
++        // on this side only.
++        destroySurface(false);
+         {
+             std::lock_guard lock(d->pendingFramesMutex);
+             d->pendingFrames.clear();
+@@ -722,14 +728,14 @@ bool VideoStream::openChannel()
+     return true;
+ }
+ 
+-void VideoStream::destroySurface()
++void VideoStream::destroySurface(bool notifyClient)
+ {
+     auto &surface = d->surface->surface;
+     if (surface.id == 0) {
+         return;
+     }
+ 
+-    if (d->gfxContext && surface.codecContextId != 0) {
++    if (notifyClient && d->gfxContext && surface.codecContextId != 0) {
+         RDPGFX_DELETE_ENCODING_CONTEXT_PDU deleteEncodingContextPdu = {};
+         deleteEncodingContextPdu.surfaceId = surface.id;
+         deleteEncodingContextPdu.codecContextId = surface.codecContextId;
+@@ -739,7 +745,7 @@ void VideoStream::destroySurface()
+         }
+     }
+ 
+-    if (d->gfxContext) {
++    if (notifyClient && d->gfxContext) {
+         RDPGFX_DELETE_SURFACE_PDU deleteSurfacePdu = {};
+         deleteSurfacePdu.surfaceId = surface.id;
+         const UINT status = d->gfxContext->DeleteSurface(d->gfxContext.get(), &deleteSurfacePdu);
+diff --git a/src/VideoStream.h b/src/VideoStream.h
+index 1ec840f..691032e 100644
+--- a/src/VideoStream.h
++++ b/src/VideoStream.h
+@@ -110,7 +110,9 @@ private:
+     void setSize(const QSize &size);
+     bool streamingEnabled() const;
+     void failVideoInitialization();
+-    void destroySurface();
++    /// Tear down the GFX surface. With notifyClient false only the server-side state is
++    /// dropped, for when the client has already discarded its own.
++    void destroySurface(bool notifyClient = true);
+     void performReset(QSize size);
+     bool hasInFlightCapacity() const;
+     void sendFrame(const VideoFrame &frame);

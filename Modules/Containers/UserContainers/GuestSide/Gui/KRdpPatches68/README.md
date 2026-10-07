@@ -82,3 +82,7 @@ path does not bump, so it keeps applying from `../KRdpPatches`.
   dropped after leaving the queue (write-blocked socket, no confirmed GFX channel,
   encoder failure) into the next frame sent, and sends full damage after a
   surface reset. Without it, slow links left stale patches until a repaint.
+- `0025-no-gfx-deletes-after-readvertise.patch` — when a client re-advertises its
+  GFX caps (mstsc does so when it rebuilds its graphics pipeline), the surface is
+  dropped without sending DeleteEncodingContext/DeleteSurface: the client has
+  already discarded those, and mstsc answers the deletes with a protocol error.
