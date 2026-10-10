@@ -1,0 +1,97 @@
+From: KRdp displayless experiment <noreply@example.invalid>
+Subject: [PATCH] Take key repeat from the RDP client, as on a Windows server
+
+mstsc sends key repeats as further key-downs of a held key. KRdp forwarded them
+as presses, which KWin drops as duplicates, so held keys repeated on the server
+side instead, and a key-up delayed by a slow link left the server repeating:
+letters multiplied by the dozen. With KRDP_CLIENT_KEY_REPEAT set - meaning the
+deployment has turned server-side repeat off - each client repeat becomes its
+own keystroke, a release followed by a press. Repeats of modifiers and lock keys
+are dropped.
+
+This scoped version relies on the session having no local keyboard. The
+in-code comment records the device-scoped design an upstream proposal would
+need instead.
+
+diff --git a/src/InputHandler.cpp b/src/InputHandler.cpp
+index f3d9652..f5ac8c7 100644
+--- a/src/InputHandler.cpp
++++ b/src/InputHandler.cpp
+@@ -4,6 +4,7 @@
+ 
+ #include "InputHandler.h"
+ 
++#include <linux/input-event-codes.h>
+ #include <QKeyEvent>
+ #include <QMetaObject>
+ #include <QSet>
+@@ -216,6 +217,69 @@ bool InputHandler::keyboardEvent(uint16_t code, uint16_t flags)
+ 
+     auto type = flags & KBD_FLAGS_RELEASE ? QEvent::KeyRelease : QEvent::KeyPress;
+ 
++    // Key repeat, the way an RDP server on Windows does it: repeats come from
++    // the client only. mstsc sends each repeat as another key-down of a key
++    // that is still held, flagged KBD_FLAGS_DOWN. Without this they are
++    // forwarded as presses, which KWin drops as duplicates, so held keys
++    // repeat on the server side instead - and when the key-up is late on a
++    // slow link, the server keeps repeating and letters multiply. With
++    // KRDP_CLIENT_KEY_REPEAT set, the deployment has turned server-side repeat
++    // off, and each client repeat becomes a keystroke of its own here: a
++    // release followed by a press, which every kind of Wayland or Xwayland
++    // client handles. Repeats of modifiers and lock keys are dropped, so a
++    // held Shift or Ctrl stays held and Caps Lock does not toggle on repeat.
++    //
++    // Known limitation: an application that watches whether a non-modifier
++    // key stays down (hold Space to pan, games) sees it flicker at the
++    // client's repeat rate. That is the price of not touching KWin.
++    //
++    // Upstream shape, if this is ever proposed. The version here relies on
++    // the session having no local keyboard; turning off repeat for a whole
++    // seat would break one in a shared session. A proper fix scopes it to
++    // the remote device instead, across three projects:
++    //   - plasma-wayland-protocols: a "repeated" key state for
++    //     org_kde_kwin_fake_input, plus an opt-in meaning "this device
++    //     delivers its own repeats", so other fake-input users keep today's
++    //     behaviour; a protocol version bump.
++    //   - KWin: for an opted-in device, do not start the seat's repeat timer
++    //     (KeyboardRepeat::keyboardKey would need the device passed in), and
++    //     deliver its repeated events as wl_keyboard v10 REPEATED to clients
++    //     that support it - Qt 6.11 does - with no fake key-ups. Clients
++    //     below v10, Xwayland among them, repeat by themselves from one
++    //     seat-wide rate that cannot be scoped per device; give those this
++    //     device's keys as discrete taps, so they never see a key held long
++    //     enough to start repeating. Local keyboards keep the seat's repeat.
++    //   - KRdp: send client repeats as "repeated" and opt the device in.
++    // The portal path injects through libei, whose key events are press or
++    // release only, so it would need an equivalent extension in libei and
++    // in KWin's EIS side, or the MR has to be scoped to fake-input. Worth
++    // checking first: which clients - Xwayland, Chromium/Electron - support
++    // wl_keyboard v10, since that decides how much the tap fallback matters.
++    static const bool clientKeyRepeat = qEnvironmentVariableIntValue("KRDP_CLIENT_KEY_REPEAT") != 0;
++    const bool isRepeat = type == QEvent::KeyPress && (d->pressedKeys.contains(keycode) || (flags & KBD_FLAGS_DOWN));
++    if (clientKeyRepeat && isRepeat) {
++        switch (keycode) {
++        case KEY_LEFTSHIFT:
++        case KEY_RIGHTSHIFT:
++        case KEY_LEFTCTRL:
++        case KEY_RIGHTCTRL:
++        case KEY_LEFTALT:
++        case KEY_RIGHTALT:
++        case KEY_LEFTMETA:
++        case KEY_RIGHTMETA:
++        case KEY_CAPSLOCK:
++        case KEY_NUMLOCK:
++        case KEY_SCROLLLOCK:
++            return true;
++        default:
++            break;
++        }
++        d->pressedKeys.insert(keycode);
++        Q_EMIT inputEvent(std::make_shared<QKeyEvent>(QEvent::KeyRelease, 0, Qt::KeyboardModifiers{}, keycode, 0, 0));
++        Q_EMIT inputEvent(std::make_shared<QKeyEvent>(QEvent::KeyPress, 0, Qt::KeyboardModifiers{}, keycode, 0, 0));
++        return true;
++    }
++
+     if (type == QEvent::KeyRelease) {
+         d->pressedKeys.remove(keycode);
+     } else {

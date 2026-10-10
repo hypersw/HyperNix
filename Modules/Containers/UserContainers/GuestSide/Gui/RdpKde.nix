@@ -34,10 +34,24 @@ let
   #
   # Decide it here instead of inheriting it. 0 is STATE_ON; the default 2 is
   # STATE_UNCHANGED, which is the state that produces the symptom.
-  keyboardConfig = pkgs.writeText "hypersw-kcminputrc" ''
+  keyboardConfig = pkgs.writeText "hypersw-kcminputrc" (''
     [Keyboard]
     NumLock=0
-  '';
+  ''
+  # On the 6.8 path key repeat comes from the RDP client, as on a Windows
+  # server (KRdpPatches68/0026), so the session must not repeat on its own:
+  # with server-side repeat, a key-up delayed by a slow link keeps the key
+  # repeating and letters multiply. Both settings are needed. KeyRepeat=nothing
+  # only zeroes the rate announced to clients; KWin still starts its own repeat
+  # timer whenever the delay is non-zero and would send compositor repeats to
+  # wl_keyboard v10 clients every RepeatDelay. This is safe only because the
+  # session has no local keyboard - every key arrives over RDP. A value the
+  # user saves in System Settings goes to ~/.config/kcminputrc and overrides
+  # these defaults, turning the multiplication back on.
+  + lib.optionalString cfg.Gui.KRdpBeta ''
+    KeyRepeat=nothing
+    RepeatDelay=0
+  '');
 
   kServiceApplicationsMenu = pkgs.writeText "hypersw-kde-rdp-applications.menu" ''
     <!DOCTYPE Menu PUBLIC "-//freedesktop//DTD Menu 1.0//EN"
@@ -614,6 +628,8 @@ in {
         ]
         # The output every connection streams; see persistentOutput above.
         ++ lib.optional cfg.Gui.KRdpBeta "KRDP_PERSISTENT_OUTPUT=${persistentOutput}"
+        # Paired with KeyRepeat=nothing in keyboardConfig; see KRdpPatches68/0026.
+        ++ lib.optional cfg.Gui.KRdpBeta "KRDP_CLIENT_KEY_REPEAT=1"
         # TODO: remove once the 6.8 patch set is known good. KCrash catches
         # SIGSEGV and, when its own handler faults, leaves an unusable core:
         # the crash seen while bringing 0016 up had no recoverable stack at

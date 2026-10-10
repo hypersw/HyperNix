@@ -86,3 +86,9 @@ path does not bump, so it keeps applying from `../KRdpPatches`.
   GFX caps (mstsc does so when it rebuilds its graphics pipeline), the surface is
   dropped without sending DeleteEncodingContext/DeleteSurface: the client has
   already discarded those, and mstsc answers the deletes with a protocol error.
+- `0026-client-driven-key-repeat.patch` — takes key repeat from the RDP client,
+  as a Windows server does: each client repeat becomes a release and a press,
+  modifier and lock repeats are dropped, and the module turns server-side repeat
+  off (`KeyRepeat=nothing`, `RepeatDelay=0`). Stops letters multiplying when a
+  key-up is late on a slow link. Scoped to a session without a local keyboard;
+  the patch's comment records the device-scoped design an upstream MR would need.
