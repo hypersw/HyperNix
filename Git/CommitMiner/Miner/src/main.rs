@@ -198,10 +198,7 @@ fn search(job: &Job, o: &Options) -> (Arc<Search>, Duration) {
         });
         let use_gpu = o.backend != Backend::Cpu && gpu::eligible(job);
         if o.backend == Backend::Gpu && !use_gpu {
-            eprintln!(
-                "git-mine-commit: the GPU kernel handles only SHA-1 with 16-digit nonces and up to {} tail blocks; using the CPU",
-                gpu::MAX_TAIL_BLOCKS
-            );
+            eprintln!("git-mine-commit: the GPU kernel handles only SHA-1 with 16-digit nonces; using the CPU");
         }
         // The GPU takes the upper half of the counter space, the CPU the lower.
         let half = 1u64 << 63;
