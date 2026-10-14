@@ -87,7 +87,9 @@ as one turns up after that point. A full match returns immediately at any time.
   so GPU setup takes about 150 ms.
 - The GPU loads the host's Vulkan driver into the miner process. A miner built
   from an older nixpkgs than the host's Mesa fails to load it, with `GLIBC_2.44 not found` for example.
-  It then mines on the CPU without saying so; `--verbose` shows the error.
+  The miner then warns on every commit that it mines on the CPU only, and `VK_LOADER_DEBUG=error` shows the loader's reason.
+  The warning appears only when a render node (`/dev/dri/renderD*`) exists, so GPU-less machines stay quiet;
+  `--backend cpu` in `mine.program` silences it.
   Build it from the same nixpkgs as the system, as home-manager does.
 - A shared prefix on every commit makes 7-digit short hashes useless.
   git lengthens abbreviations on its own, but `--oneline` becomes a wall of zeros.

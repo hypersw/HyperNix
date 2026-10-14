@@ -32,6 +32,8 @@ pub struct Search {
     pub gpu_hashed: AtomicU64,
     /// Lets the backends skip the candidate lock once one is held.
     pub has_candidate: AtomicBool,
+    /// The GPU backend has decided whether it has a hardware adapter, and has reported a missing one.
+    pub gpu_probed: AtomicBool,
     /// From this instant on, a fallback candidate ends the search.
     fallback_at: Option<Instant>,
     /// The first hit on the fallback target, kept in reserve until `fallback_at`.
@@ -46,6 +48,7 @@ impl Search {
             hashed: AtomicU64::new(0),
             gpu_hashed: AtomicU64::new(0),
             has_candidate: AtomicBool::new(false),
+            gpu_probed: AtomicBool::new(false),
             fallback_at,
             candidate: Mutex::new(None),
             result: Mutex::new(None),
@@ -211,10 +214,14 @@ fn search(job: &Job, o: &Options) -> (Arc<Search>, Duration) {
             // and joining it would hold back a CPU hit or the timeout. main() exits without waiting.
             std::thread::spawn(move || {
                 if let Err(e) = gpu::run(&gpu_job, &gpu_search, half, verbose) {
-                    // Without a GPU the CPU keeps going; GPU-only mode has nothing left.
-                    if verbose || backend == Backend::Gpu {
-                        eprintln!("git-mine-commit: gpu: {e}");
+                    // Only stderr: git passes it through to the terminal and keeps stdout for the nonce.
+                    if e.is_loud {
+                        eprintln!("git-mine-commit: warning: {}", e.message);
+                    } else if verbose || backend == Backend::Gpu {
+                        eprintln!("git-mine-commit: gpu: {}", e.message);
                     }
+                    gpu_search.gpu_probed.store(true, Ordering::Relaxed);
+                    // Without a GPU the CPU keeps going; GPU-only mode has nothing left.
                     if backend == Backend::Gpu {
                         gpu_search.stop.store(true, Ordering::Relaxed);
                     }
@@ -271,6 +278,14 @@ fn mine(o: &Options) -> Result<bool, String> {
     job.fallback = o.fallback.as_deref().map(|f| Target::parse(f, o.algo)).transpose()?;
 
     let (search, elapsed) = search(&job, o);
+    // A quick CPU hit can beat the GPU's adapter probe, and exiting then would drop its warning about a missing driver.
+    // The probe takes tens of milliseconds; the cap only guards against a driver that hangs while enumerating.
+    if o.backend != Backend::Cpu && gpu::eligible(&job) {
+        let waited = Instant::now();
+        while !search.gpu_probed.load(Ordering::Relaxed) && waited.elapsed() < Duration::from_millis(500) {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
     let hashed = search.hashed.load(Ordering::Relaxed);
     let result = *search.result.lock().unwrap();
     match result {

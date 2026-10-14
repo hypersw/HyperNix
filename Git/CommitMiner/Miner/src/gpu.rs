@@ -230,8 +230,44 @@ fn shader() -> String {
     s
 }
 
+/// Why the GPU backend stopped without a hit.
+pub struct Failure {
+    pub message: String,
+    /// Worth a warning without --verbose: the machine has a GPU the miner cannot use, or the kernel is wrong.
+    pub is_loud: bool,
+}
+
+impl Failure {
+    fn loud(message: String) -> Failure {
+        Failure { message, is_loud: true }
+    }
+
+    /// No usable hardware adapter: expected without a GPU, a deployment problem with one.
+    fn no_driver(detail: String) -> Failure {
+        match render_node() {
+            // wgpu's own detail says only that no adapter was found, so the warning leaves it out.
+            Some(node) => Failure::loud(format!(
+                "{node} is present, but Vulkan found no hardware driver for it, so this commit mines on the CPU only; \
+                 VK_LOADER_DEBUG=error shows why, and --backend cpu silences this"
+            )),
+            None => Failure { message: detail, is_loud: false },
+        }
+    }
+}
+
+/// The first DRM render node, i.e. a GPU the kernel exposes to user space.
+fn render_node() -> Option<String> {
+    let entries = std::fs::read_dir("/dev/dri").ok()?;
+    let mut nodes: Vec<String> = entries
+        .filter_map(|e| e.ok()?.file_name().into_string().ok())
+        .filter(|name| name.starts_with("renderD"))
+        .collect();
+    nodes.sort();
+    nodes.first().map(|name| format!("/dev/dri/{name}"))
+}
+
 /// Searches counters from `start` upward until the search stops; returns why it did not run.
-pub fn run(job: &Job, search: &Arc<Search>, start: u64, verbose: bool) -> Result<(), String> {
+pub fn run(job: &Job, search: &Arc<Search>, start: u64, verbose: bool) -> Result<(), Failure> {
     let started = Instant::now();
     let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
         backends: wgpu::Backends::VULKAN,
@@ -243,23 +279,24 @@ pub fn run(job: &Job, search: &Arc<Search>, start: u64, verbose: bool) -> Result
         compatible_surface: None,
         ..Default::default()
     }))
-    .map_err(|e| format!("no GPU adapter: {e}"))?;
+    .map_err(|e| Failure::no_driver(format!("no GPU adapter: {e}")))?;
     let info = adapter.get_info();
     // A software rasterizer (llvmpipe) would only compete with the CPU threads.
     if info.device_type == wgpu::DeviceType::Cpu {
-        return Err(format!("only a software adapter is available ({})", info.name));
+        return Err(Failure::no_driver(format!("only a software adapter is available ({})", info.name)));
     }
+    search.gpu_probed.store(true, Ordering::Relaxed);
     let job_bytes: Vec<u8> = job_words(job).iter().flat_map(|w| w.to_le_bytes()).collect();
     // The default limit (128 MiB) is far beyond any commit message, but say so rather than fail obscurely.
     let limits = adapter.limits();
     if job_bytes.len() as u64 > limits.max_storage_buffer_binding_size {
-        return Err(format!("the commit needs a {}-byte job buffer, more than {} allows", job_bytes.len(), info.name));
+        return Err(Failure::loud(format!("the commit needs a {}-byte job buffer, more than {} allows", job_bytes.len(), info.name)));
     }
     let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
         label: Some("git-mine-commit"),
         ..Default::default()
     }))
-    .map_err(|e| format!("cannot open {}: {e}", info.name))?;
+    .map_err(|e| Failure::loud(format!("cannot open {}: {e}", info.name)))?;
 
     let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
         label: Some("sha1-mine"),
@@ -338,9 +375,9 @@ pub fn run(job: &Job, search: &Arc<Search>, start: u64, verbose: bool) -> Result
         readback.map_async(wgpu::MapMode::Read, .., |_| {});
         device
             .poll(wgpu::PollType::Wait { submission_index: None, timeout: None })
-            .map_err(|e| format!("GPU poll failed: {e}"))?;
+            .map_err(|e| Failure::loud(format!("GPU poll failed: {e}")))?;
         let (hit, fallback_hit) = {
-            let view = readback.get_mapped_range(..).map_err(|e| format!("GPU readback failed: {e:?}"))?;
+            let view = readback.get_mapped_range(..).map_err(|e| Failure::loud(format!("GPU readback failed: {e:?}")))?;
             let r: Vec<u32> = view.chunks(4).map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
             let slot = |at: usize| (r[at] != 0).then(|| (u64::from(r[at + 2]) << 32) | u64::from(r[at + 1]));
             (slot(0), slot(4))
@@ -355,13 +392,13 @@ pub fn run(job: &Job, search: &Arc<Search>, start: u64, verbose: bool) -> Result
                 search.found(hit, "gpu");
                 return Ok(());
             }
-            return Err(format!("GPU reported nonce {} that does not match; kernel bug", job.format_nonce(hit)));
+            return Err(Failure::loud(format!("GPU reported nonce {} that does not match; kernel bug", job.format_nonce(hit))));
         }
         // The slot keeps reporting its first hit, so only the first readback of it counts.
         if let (Some(hit), Some(fallback)) = (fallback_hit, &job.fallback) {
             if !search.has_candidate.load(Ordering::Relaxed) {
                 if !fallback.matches(&job.digest(hit)) {
-                    return Err(format!("GPU reported fallback nonce {} that does not match; kernel bug", job.format_nonce(hit)));
+                    return Err(Failure::loud(format!("GPU reported fallback nonce {} that does not match; kernel bug", job.format_nonce(hit))));
                 }
                 search.fallback_found(hit, "gpu");
             }
