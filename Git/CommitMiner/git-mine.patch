@@ -9,7 +9,7 @@
  
  static struct commit_extra_header *read_commit_extra_header_lines(const char *buf, size_t len, const char **);
  
-@@ -1733,6 +1735,147 @@
+@@ -1733,6 +1735,171 @@
  	strbuf_add(buffer, msg, msg_len);
  }
  
@@ -25,12 +25,19 @@
 + * header) arrives on stdin with a placeholder nonce in place; the arguments
 + * name the hash algorithm, the prefix ('_' matches any hex digit), the byte
 + * offset and width of the nonce within the body, and an optional timeout in
-+ * seconds. The miner prints exactly <width> lowercase hex digits and exits 0,
-+ * or exits non-zero when it gave up. Git re-hashes the result itself; any
-+ * failure only warns and writes the commit without a nonce.
++ * seconds. A fallback prefix may follow, which the miner may settle for once
++ * the full one is taking too long. The miner prints exactly <width> lowercase
++ * hex digits and exits 0, or exits non-zero when it gave up. Git re-hashes the
++ * result itself; any failure only warns and writes the commit without a nonce.
 + */
 +#define MINE_NONCE_KEY "nonce"
 +#define MINE_NONCE_WIDTH 16
++
++static int mine_prefix_valid(struct repository *r, const char *prefix)
++{
++	return strspn(prefix, "0123456789abcdef_") == strlen(prefix) &&
++	       strlen(prefix) <= r->hash_algo->hexsz;
++}
 +
 +static int mine_prefix_matches(const char *hex, const char *prefix)
 +{
@@ -75,6 +82,8 @@
 +			       int is_signed)
 +{
 +	const char *prefix, *program = "git-mine-commit", *timeout = NULL;
++	const char *fallback = NULL;
++	char *fallback_buf = NULL;
 +	struct child_process cmd = CHILD_PROCESS_INIT;
 +	struct strbuf out = STRBUF_INIT;
 +	struct object_id oid;
@@ -95,14 +104,24 @@
 +		warning(_("mining with a compatibility hash is not supported; commit not mined"));
 +		return;
 +	}
-+	if (strspn(prefix, "0123456789abcdef_") != strlen(prefix) ||
-+	    strlen(prefix) > r->hash_algo->hexsz) {
++	if (!mine_prefix_valid(r, prefix)) {
 +		warning(_("mine.prefix '%s' is not a lowercase hex prefix; commit not mined"),
 +			prefix);
 +		return;
 +	}
 +	repo_config_get_string_tmp(r, "mine.program", &program);
 +	repo_config_get_string_tmp(r, "mine.timeout", &timeout);
++	/* Unset means the prefix minus its last digit; an empty value turns the fallback off. */
++	if (repo_config_get_string_tmp(r, "mine.fallbackprefix", &fallback) &&
++	    strlen(prefix) > 1)
++		fallback = fallback_buf = xstrndup(prefix, strlen(prefix) - 1);
++	if (fallback && !*fallback)
++		fallback = NULL;
++	if (fallback && !mine_prefix_valid(r, fallback)) {
++		warning(_("mine.fallbackPrefix '%s' is not a lowercase hex prefix; ignoring it"),
++			fallback);
++		fallback = NULL;
++	}
 +
 +	mine_strip_nonce(buffer);
 +	eoh = strstr(buffer->buf, "\n\n");
@@ -124,6 +143,8 @@
 +	strvec_pushf(&cmd.args, "--width=%d", MINE_NONCE_WIDTH);
 +	if (timeout)
 +		strvec_pushl(&cmd.args, "--timeout", timeout, NULL);
++	if (fallback)
++		strvec_pushl(&cmd.args, "--fallback", fallback, NULL);
 +	/* The miner's stderr stays on the terminal for its progress and errors. */
 +	if (pipe_command(&cmd, buffer->buf, buffer->len, &out, 0, NULL, 0)) {
 +		warning(_("'%s' found no nonce; commit not mined"), program);
@@ -141,23 +162,26 @@
 +
 +	/* Trust but verify: the miner hashes with its own code. */
 +	hash_object_file(r->hash_algo, buffer->buf, buffer->len, OBJ_COMMIT, &oid);
-+	if (!mine_prefix_matches(oid_to_hex(&oid), prefix)) {
++	if (!mine_prefix_matches(oid_to_hex(&oid), prefix) &&
++	    !(fallback && mine_prefix_matches(oid_to_hex(&oid), fallback))) {
 +		warning(_("'%s' printed nonce %s, but %s does not match '%s'; commit not mined"),
 +			program, out.buf, oid_to_hex(&oid), prefix);
 +		goto fail;
 +	}
 +	strbuf_release(&out);
++	free(fallback_buf);
 +	return;
 +
 +fail:
 +	strbuf_remove(buffer, header_at, header_len);
 +	strbuf_release(&out);
++	free(fallback_buf);
 +}
 +
  int commit_tree_extended(const char *msg, size_t msg_len,
  			 const struct object_id *tree,
  			 const struct commit_list *parents, struct object_id *ret,
-@@ -1772,6 +1915,8 @@
+@@ -1772,6 +1939,8 @@
  		warned = true;
  	}
  
