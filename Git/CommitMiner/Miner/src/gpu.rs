@@ -5,7 +5,7 @@
 //! work that does not depend on the nonce. Each invocation spells its 16
 //! nonce digits from a per-dispatch high word and its own low word.
 
-use crate::job::{Algo, Job};
+use crate::job::{Algo, Job, Target};
 use crate::Search;
 use std::fmt::Write as _;
 use std::sync::atomic::Ordering;
@@ -27,12 +27,33 @@ pub fn eligible(job: &Job) -> bool {
     job.algo == Algo::Sha1 && job.width == 16 && job.tail.len() <= MAX_TAIL_BLOCKS
 }
 
+/// WGSL test of the digest words h0..h4 against `target`.
+fn condition(target: &Target) -> String {
+    let checks: Vec<String> = (0..target.words)
+        .filter(|&i| target.mask[i] != 0)
+        .map(|i| format!("((h{i} & {:#010x}u) == {:#010x}u)", target.mask[i], target.value[i]))
+        .collect();
+    if checks.is_empty() { "true".to_string() } else { checks.join(" && ") }
+}
+
+/// WGSL that stores this invocation's counter in result slots `at + 1, at + 2`, unless an earlier hit took them.
+fn record(at: usize) -> String {
+    format!(
+        "    if atomicAdd(&result[{at}], 1u) == 0u {{\n\
+         \x20     atomicStore(&result[{}], lo);\n\
+         \x20     atomicStore(&result[{}], hi);\n\
+         \x20   }}\n",
+        at + 1,
+        at + 2
+    )
+}
+
 fn shader(job: &Job) -> String {
     let mut s = String::new();
     let w = &mut s;
     w.push_str(
         "@group(0) @binding(0) var<uniform> dispatch: vec4<u32>;\n\
-         @group(0) @binding(1) var<storage, read_write> result: array<atomic<u32>, 4>;\n\
+         @group(0) @binding(1) var<storage, read_write> result: array<atomic<u32>, 8>;\n\
          fn rotl(x: u32, n: u32) -> u32 { return (x << n) | (x >> (32u - n)); }\n\
          fn hexchar(d: u32) -> u32 { return d + 48u + select(0u, 39u, d > 9u); }\n",
     );
@@ -99,19 +120,14 @@ fn shader(job: &Job) -> String {
         let _ = writeln!(w, "  h0 += {a}; h1 += {b}; h2 += {c}; h3 += {d}; h4 += {e};");
     }
 
-    let checks: Vec<String> = (0..job.target.words)
-        .filter(|&i| job.target.mask[i] != 0)
-        .map(|i| format!("((h{i} & {:#010x}u) == {:#010x}u)", job.target.mask[i], job.target.value[i]))
-        .collect();
-    let _ = writeln!(w, "  if {} {{", if checks.is_empty() { "true".to_string() } else { checks.join(" && ") });
-    w.push_str(
-        "    if atomicAdd(&result[0], 1u) == 0u {\n\
-         \x20     atomicStore(&result[1], lo);\n\
-         \x20     atomicStore(&result[2], hi);\n\
-         \x20   }\n\
-         \x20 }\n\
-         }\n",
-    );
+    // Slots 0..3 take the first full hit, slots 4..7 the first fallback hit.
+    let _ = writeln!(w, "  if {} {{", condition(&job.target));
+    w.push_str(&record(0));
+    if let Some(fallback) = &job.fallback {
+        let _ = writeln!(w, "  }} else if {} {{", condition(fallback));
+        w.push_str(&record(4));
+    }
+    w.push_str("  }\n}\n");
     s
 }
 
@@ -160,13 +176,13 @@ pub fn run(job: &Job, search: &Arc<Search>, start: u64, verbose: bool) -> Result
     });
     let result = device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("result"),
-        size: 16,
+        size: 32,
         usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST,
         mapped_at_creation: false,
     });
     let readback = device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("readback"),
-        size: 16,
+        size: 32,
         usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
         mapped_at_creation: false,
     });
@@ -204,16 +220,17 @@ pub fn run(job: &Job, search: &Arc<Search>, start: u64, verbose: bool) -> Result
             pass.set_bind_group(0, &bind_group, &[]);
             pass.dispatch_workgroups(ROW_GROUPS, n_rows as u32, 1);
         }
-        encoder.copy_buffer_to_buffer(&result, 0, &readback, 0, 16);
+        encoder.copy_buffer_to_buffer(&result, 0, &readback, 0, 32);
         queue.submit([encoder.finish()]);
         readback.map_async(wgpu::MapMode::Read, .., |_| {});
         device
             .poll(wgpu::PollType::Wait { submission_index: None, timeout: None })
             .map_err(|e| format!("GPU poll failed: {e}"))?;
-        let hit = {
+        let (hit, fallback_hit) = {
             let view = readback.get_mapped_range(..).map_err(|e| format!("GPU readback failed: {e:?}"))?;
             let r: Vec<u32> = view.chunks(4).map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
-            (r[0] != 0).then(|| (u64::from(r[2]) << 32) | u64::from(r[1]))
+            let slot = |at: usize| (r[at] != 0).then(|| (u64::from(r[at + 2]) << 32) | u64::from(r[at + 1]));
+            (slot(0), slot(4))
         };
         readback.unmap();
         search.hashed.fetch_add(n_rows * ROW, Ordering::Relaxed);
@@ -226,6 +243,15 @@ pub fn run(job: &Job, search: &Arc<Search>, start: u64, verbose: bool) -> Result
                 return Ok(());
             }
             return Err(format!("GPU reported nonce {} that does not match; kernel bug", job.format_nonce(hit)));
+        }
+        // The slot keeps reporting its first hit, so only the first readback of it counts.
+        if let (Some(hit), Some(fallback)) = (fallback_hit, &job.fallback) {
+            if !search.has_candidate.load(Ordering::Relaxed) {
+                if !fallback.matches(&job.digest(hit)) {
+                    return Err(format!("GPU reported fallback nonce {} that does not match; kernel bug", job.format_nonce(hit)));
+                }
+                search.fallback_found(hit, "gpu");
+            }
         }
         if t0.elapsed() < TARGET_DISPATCH && rows < MAX_ROWS {
             rows *= 2;

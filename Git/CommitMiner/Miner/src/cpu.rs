@@ -30,6 +30,12 @@ pub fn run(job: &Job, search: &Arc<Search>, threads: usize, start: u64, end: u64
                             search.found(counter, "cpu");
                             return;
                         }
+                        // One fallback candidate is enough, so stop looking for more once there is one.
+                        if let Some(fallback) = &job.fallback {
+                            if fallback.matches(&state) && !search.has_candidate.load(Ordering::Relaxed) {
+                                search.fallback_found(counter, "cpu");
+                            }
+                        }
                         counter = counter.saturating_add(step);
                     }
                     search.hashed.fetch_add(BATCH, Ordering::Relaxed);

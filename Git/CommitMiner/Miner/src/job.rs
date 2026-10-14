@@ -106,6 +106,8 @@ impl Target {
 pub struct Job {
     pub algo: Algo,
     pub target: Target,
+    /// A looser target the search settles for once the full one is taking too long.
+    pub fallback: Option<Target>,
     /// Hash state after every block that precedes the nonce's first block.
     pub midstate: [u32; 8],
     /// The remaining blocks, padded, with a placeholder nonce.
@@ -143,7 +145,7 @@ impl Job {
         tail.extend_from_slice(&bit_len.to_be_bytes());
         let tail = tail.chunks(64).map(|c| Block::clone_from_slice(c)).collect();
 
-        Ok(Job { algo, target, midstate, tail, nonce_at: nonce_pos - split, width })
+        Ok(Job { algo, target, fallback: None, midstate, tail, nonce_at: nonce_pos - split, width })
     }
 
     /// Size of the counter space a `width`-digit nonce can spell.

@@ -15,6 +15,14 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+#[derive(Clone, Copy)]
+pub struct Hit {
+    pub counter: u64,
+    pub backend: &'static str,
+    /// The hit matches only the fallback target.
+    pub is_fallback: bool,
+}
+
 /// State shared by all backends of one search.
 pub struct Search {
     pub stop: AtomicBool,
@@ -22,32 +30,70 @@ pub struct Search {
     pub hashed: AtomicU64,
     /// The GPU's share of `hashed`.
     pub gpu_hashed: AtomicU64,
-    result: Mutex<Option<(u64, &'static str)>>,
+    /// Lets the backends skip the candidate lock once one is held.
+    pub has_candidate: AtomicBool,
+    /// From this instant on, a fallback candidate ends the search.
+    fallback_at: Option<Instant>,
+    /// The first hit on the fallback target, kept in reserve until `fallback_at`.
+    candidate: Mutex<Option<Hit>>,
+    result: Mutex<Option<Hit>>,
 }
 
 impl Search {
-    fn new() -> Search {
+    fn new(fallback_at: Option<Instant>) -> Search {
         Search {
             stop: AtomicBool::new(false),
             hashed: AtomicU64::new(0),
             gpu_hashed: AtomicU64::new(0),
+            has_candidate: AtomicBool::new(false),
+            fallback_at,
+            candidate: Mutex::new(None),
             result: Mutex::new(None),
         }
     }
 
-    /// Records the first hit and stops every backend; later hits are ignored.
-    pub fn found(&self, counter: u64, backend: &'static str) {
+    fn finish(&self, hit: Hit) {
         let mut result = self.result.lock().unwrap();
         if result.is_none() {
-            *result = Some((counter, backend));
+            *result = Some(hit);
         }
         self.stop.store(true, Ordering::Relaxed);
+    }
+
+    /// Records the first hit and stops every backend; later hits are ignored.
+    pub fn found(&self, counter: u64, backend: &'static str) {
+        self.finish(Hit { counter, backend, is_fallback: false });
+    }
+
+    /// Keeps the first fallback hit, and ends the search on it once the full target is overdue.
+    pub fn fallback_found(&self, counter: u64, backend: &'static str) {
+        {
+            let mut candidate = self.candidate.lock().unwrap();
+            if candidate.is_none() {
+                *candidate = Some(Hit { counter, backend, is_fallback: true });
+            }
+        }
+        self.has_candidate.store(true, Ordering::Relaxed);
+        self.settle();
+    }
+
+    /// Ends the search on the fallback candidate if its time has come and one is held.
+    fn settle(&self) {
+        if self.fallback_at.is_some_and(|at| Instant::now() >= at) {
+            let candidate = *self.candidate.lock().unwrap();
+            if let Some(hit) = candidate {
+                self.finish(hit);
+            }
+        }
     }
 }
 
 struct Options {
     algo: Algo,
     prefix: Option<String>,
+    fallback: Option<String>,
+    /// When to settle for the fallback; half the timeout unless given.
+    fallback_after: Option<Duration>,
     offset: Option<usize>,
     width: usize,
     timeout: Duration,
@@ -67,6 +113,7 @@ enum Backend {
 
 const USAGE: &str = "\
 usage: git-mine-commit --prefix <hex> --offset <n> [--width <n>] [--algo sha1|sha256]
+                       [--fallback <hex> [--fallback-after <seconds>]]
                        [--timeout <seconds>] [--threads <n>] [--backend cpu|gpu|all]
                        [--verbose]   < commit-body
        git-mine-commit --benchmark [--algo sha1|sha256] [--timeout <seconds>] [--threads <n>]
@@ -76,6 +123,8 @@ fn parse_options() -> Result<Options, String> {
     let mut o = Options {
         algo: Algo::Sha1,
         prefix: None,
+        fallback: None,
+        fallback_after: None,
         offset: None,
         width: 16,
         timeout: Duration::from_secs(60),
@@ -94,20 +143,22 @@ fn parse_options() -> Result<Options, String> {
         };
         let mut value = || inline.clone().or_else(|| args.next()).ok_or(format!("{key} needs a value"));
         let number = |v: String| v.parse::<usize>().map_err(|_| format!("{key}: '{v}' is not a number"));
+        let seconds = |v: String| {
+            let secs = v.parse::<f64>().map_err(|_| format!("{key}: '{v}' is not a number"))?;
+            Ok::<_, String>(Duration::from_secs_f64(secs.max(0.0)))
+        };
         match key.as_str() {
             "--algo" => {
                 let v = value()?;
                 o.algo = Algo::parse(&v).ok_or(format!("unsupported hash algorithm '{v}'"))?
             }
             "--prefix" => o.prefix = Some(value()?),
+            "--fallback" => o.fallback = Some(value()?),
             "--offset" => o.offset = Some(number(value()?)?),
             "--width" => o.width = number(value()?)?,
             "--threads" => o.threads = number(value()?)?.max(1),
-            "--timeout" => {
-                let v = value()?;
-                let secs = v.parse::<f64>().map_err(|_| format!("--timeout: '{v}' is not a number"))?;
-                o.timeout = Duration::from_secs_f64(secs.max(0.0));
-            }
+            "--timeout" => o.timeout = seconds(value()?)?,
+            "--fallback-after" => o.fallback_after = Some(seconds(value()?)?),
             "--verbose" | "-v" => o.verbose = true,
             "--benchmark" => o.benchmark = true,
             "--backend" => {
@@ -130,8 +181,9 @@ fn parse_options() -> Result<Options, String> {
 
 /// Runs every backend on `job` until a hit, exhaustion or the deadline.
 fn search(job: &Job, o: &Options) -> (Arc<Search>, Duration) {
-    let search = Arc::new(Search::new());
     let started = Instant::now();
+    let fallback_at = job.fallback.as_ref().map(|_| started + o.fallback_after.unwrap_or(o.timeout / 2));
+    let search = Arc::new(Search::new(fallback_at));
     let end = u64::try_from(job.space()).unwrap_or(u64::MAX);
     std::thread::scope(|scope| {
         let timer = Arc::clone(&search);
@@ -139,6 +191,8 @@ fn search(job: &Job, o: &Options) -> (Arc<Search>, Duration) {
         scope.spawn(move || {
             while started.elapsed() < timeout && !timer.stop.load(Ordering::Relaxed) {
                 std::thread::sleep(Duration::from_millis(10).min(timeout.saturating_sub(started.elapsed())));
+                // A candidate found before its time ends the search when that time comes.
+                timer.settle();
             }
             timer.stop.store(true, Ordering::Relaxed);
         });
@@ -216,13 +270,22 @@ fn mine(o: &Options) -> Result<bool, String> {
     let target = Target::parse(prefix, o.algo)?;
     let mut body = Vec::new();
     std::io::stdin().read_to_end(&mut body).map_err(|e| format!("reading the commit body: {e}"))?;
-    let job = Job::new(o.algo, target, &body, offset, o.width)?;
+    let mut job = Job::new(o.algo, target, &body, offset, o.width)?;
+    job.fallback = o.fallback.as_deref().map(|f| Target::parse(f, o.algo)).transpose()?;
 
     let (search, elapsed) = search(&job, o);
     let hashed = search.hashed.load(Ordering::Relaxed);
     let result = *search.result.lock().unwrap();
     match result {
-        Some((counter, backend)) => {
+        Some(Hit { counter, backend, is_fallback }) => {
+            // Settling is not an error, but it is worth a line even without --verbose.
+            if is_fallback {
+                eprintln!(
+                    "git-mine-commit: no '{prefix}' within {:.0}s; settled for '{}'",
+                    elapsed.as_secs_f64(),
+                    o.fallback.as_deref().unwrap_or_default()
+                );
+            }
             if o.verbose {
                 eprintln!(
                     "git-mine-commit: {} via {backend} after {hashed} attempts in {:.2}s ({})",
