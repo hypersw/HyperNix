@@ -37,27 +37,41 @@ programs.git.settings.mine.prefix = "0000000";
 | `mine.prefix` | Lowercase hex, `_` matches any digit. Unset or empty means off, and the patched git then behaves like stock git. |
 | `mine.program` | Miner command, run through the shell so it may carry options. Default `git-mine-commit` on `PATH`. For example `git-mine-commit --backend cpu --threads 4`. |
 | `mine.timeout` | Seconds before the miner gives up. The miner's own default is 60. |
+| `mine.fallbackPrefix` | What the miner settles for once half the timeout has passed without a full match. Default: `mine.prefix` minus its last digit, which matches 16× more often. Empty means no fallback. |
 | `GIT_MINE=0` | Skip mining for one command, e.g. a long rebase. |
 
 On any failure (timeout, missing miner, bad output) git warns and writes the
 commit **without** a nonce. A commit is never lost to mining.
 
 `git-mine-commit --benchmark [--backend cpu|gpu|all]` prints hash rates.
-Measured on a 7950X3D in a 15-CPU container, iGPU only, 2-block commits:
-CPU ~16 MH/s per thread, 190 MH/s on 15 threads; iGPU (2 CUs) ~170 MH/s.
-Average wait at the default 7 threads plus the iGPU (~280 MH/s): 7 digits
-about 1 s, 8 digits about 15 s. A discrete GPU does SHA-1 two orders of
-magnitude faster.
+The rate is set by hash blocks per attempt, and the benchmark uses a 2-block commit.
+Real messages are longer: a 1.2 KB message costs about 19 blocks, and 3.7 KB about 59.
+Measured on a 7950X3D in a 15-CPU container with only the iGPU (2 CUs):
+
+| | Blocks/s | 2-block commit | 1.2 KB message |
+|---|---|---|---|
+| CPU, default 7 threads | ~260 M | ~105 MH/s | ~14 MH/s |
+| iGPU | ~350 M | ~170 MH/s | ~18 MH/s |
+
+A 7-digit prefix takes about 2.7e8 attempts on average.
+That is about 1 s for a 2-block commit, 10 s for a 1.2 KB message and 60 s for 3.7 KB.
+The last case runs on the CPU only (see Limits).
+A discrete GPU does SHA-1 two orders of magnitude faster.
 
 ## Miner protocol
 
 git writes the whole object body, without the `commit <len>\0` header, to
 stdin, with a 16-digit placeholder nonce in place, and passes:
 
-    --algo sha1|sha256 --prefix <p> --offset=<nonce byte offset in body> --width=16 [--timeout <s>]
+    --algo sha1|sha256 --prefix <p> --offset=<nonce byte offset in body> --width=16 [--timeout <s>] [--fallback <p>]
 
 The miner prints the nonce digits and exits 0, or exits non-zero.
-git re-hashes the result with its own code before accepting it.
+git re-hashes the result with its own code before accepting it,
+and accepts a match on either the prefix or the fallback.
+
+The miner keeps the first fallback match it meets in reserve. It returns that
+match at `--fallback-after` seconds (half the timeout by default), or as soon
+as one turns up after that point. A full match returns immediately at any time.
 
 ## Limits
 
@@ -69,8 +83,15 @@ git re-hashes the result with its own code before accepting it.
   everything from the nonce to the end of the message, roughly 2 KiB. SHA-256
   repos and longer messages mine on the CPU.
 - Each attempt re-hashes from the nonce to the end of the message, because
-  the header sits before the message. That costs 2–8 blocks for typical
-  messages, where a message-tail nonce such as lucky-commit's whitespace costs 1.
+  the header sits before the message. That costs one block per 64 bytes of
+  message, where a message-tail nonce such as lucky-commit's whitespace costs 1–2 blocks.
+- The GPU kernel is generated per commit with the commit baked in, so its
+  compile time grows with the message (3 s at 1.2 KB, 7 s at 1.8 KB on RADV).
+  Mesa's shader cache cannot help, because no two commits share a shader.
+- The GPU loads the host's Vulkan driver into the miner process. A miner built
+  from an older nixpkgs than the host's Mesa fails to load it, with `GLIBC_2.44 not found` for example.
+  It then mines on the CPU without saying so; `--verbose` shows the error.
+  Build it from the same nixpkgs as the system, as home-manager does.
 - A shared prefix on every commit makes 7-digit short hashes useless.
   git lengthens abbreviations on its own, but `--oneline` becomes a wall of zeros.
   Prefer a short tag such as `c0ffee`, or a pattern like `_______0`.
