@@ -51,11 +51,10 @@ Measured on a 7950X3D in a 15-CPU container with only the iGPU (2 CUs):
 | | Blocks/s | 2-block commit | 1.2 KB message |
 |---|---|---|---|
 | CPU, default 7 threads | ~260 M | ~105 MH/s | ~14 MH/s |
-| iGPU | ~350 M | ~170 MH/s | ~18 MH/s |
+| iGPU | ~430 M | ~160 MH/s | ~22 MH/s |
 
 A 7-digit prefix takes about 2.7e8 attempts on average.
-That is about 1 s for a 2-block commit, 10 s for a 1.2 KB message and 60 s for 3.7 KB.
-The last case runs on the CPU only (see Limits).
+With both backends that is about 1 s for a 2-block commit, 8 s for a 1.2 KB message and 23 s for 3.7 KB.
 A discrete GPU does SHA-1 two orders of magnitude faster.
 
 ## Miner protocol
@@ -79,15 +78,13 @@ as one turns up after that point. A full match returns immediately at any time.
   header, so the nonce has to go inside the `gpgsig` value as a trailing
   continuation line. That is what git-facade and lucky-commit do; not done here yet.
 - Repos with `compatObjectFormat` are skipped: both object names would have to match.
-- The GPU kernel handles SHA-1 only, with at most 32 tail blocks; the tail is
-  everything from the nonce to the end of the message, roughly 2 KiB. SHA-256
-  repos and longer messages mine on the CPU.
+- The GPU kernel handles SHA-1 only; SHA-256 repos mine on the CPU.
 - Each attempt re-hashes from the nonce to the end of the message, because
   the header sits before the message. That costs one block per 64 bytes of
   message, where a message-tail nonce such as lucky-commit's whitespace costs 1–2 blocks.
-- The GPU kernel is generated per commit with the commit baked in, so its
-  compile time grows with the message (3 s at 1.2 KB, 7 s at 1.8 KB on RADV).
-  Mesa's shader cache cannot help, because no two commits share a shader.
+- The GPU kernel is the same for every commit and takes the commit as data.
+  Its first compile is cached by the driver (Mesa keeps it in ~/.cache/mesa_shader_cache),
+  so GPU setup takes about 150 ms.
 - The GPU loads the host's Vulkan driver into the miner process. A miner built
   from an older nixpkgs than the host's Mesa fails to load it, with `GLIBC_2.44 not found` for example.
   It then mines on the CPU without saying so; `--verbose` shows the error.
