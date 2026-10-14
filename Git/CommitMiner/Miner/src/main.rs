@@ -153,14 +153,18 @@ fn search(job: &Job, o: &Options) -> (Arc<Search>, Duration) {
         let half = 1u64 << 63;
         if use_gpu {
             let gpu_search = Arc::clone(&search);
+            let gpu_job = job.clone();
             let verbose = o.verbose;
-            scope.spawn(move || {
-                if let Err(e) = gpu::run(job, &gpu_search, half, verbose) {
+            let backend = o.backend;
+            // Detached, not scoped: shader compilation ignores the stop flag and can take seconds,
+            // and joining it would hold back a CPU hit or the timeout. main() exits without waiting.
+            std::thread::spawn(move || {
+                if let Err(e) = gpu::run(&gpu_job, &gpu_search, half, verbose) {
                     // Without a GPU the CPU keeps going; GPU-only mode has nothing left.
-                    if verbose || o.backend == Backend::Gpu {
+                    if verbose || backend == Backend::Gpu {
                         eprintln!("git-mine-commit: gpu: {e}");
                     }
-                    if o.backend == Backend::Gpu {
+                    if backend == Backend::Gpu {
                         gpu_search.stop.store(true, Ordering::Relaxed);
                     }
                 }
