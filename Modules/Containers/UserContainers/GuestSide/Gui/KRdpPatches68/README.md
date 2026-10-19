@@ -96,3 +96,8 @@ path does not bump, so it keeps applying from `../KRdpPatches`.
   only for a progressive context a frame has actually used; the client creates
   it on that first frame, and mstsc drops the connection over a delete of one it
   never created. Logs each surface replacement with old and new size.
+- `0028-serialize-gfx-reset-with-frames.patch` — orders a caps re-advertisement
+  against the frame thread: a lock held per frame keeps a surface reset in flight
+  from sending CreateSurface before the new CapsConfirm, which the client drops,
+  and MapSurfaceToOutput after it, which mstsc rejects with reason 3334. Without
+  it, mstsc's recovery from a rejected GFX command failed this way.

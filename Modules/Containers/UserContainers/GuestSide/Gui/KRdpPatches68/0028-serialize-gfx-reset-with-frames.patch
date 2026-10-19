@@ -1,0 +1,123 @@
+From: KRdp displayless experiment <noreply@example.invalid>
+Subject: [PATCH] Keep a frame in flight from straddling a GFX caps re-advertisement
+
+A client that re-advertises its caps drops all its GFX state and ignores every
+message until the new CapsConfirm (MS-RDPEGFX 3.3.5.19). KRdp handles the
+re-advertisement on the connection thread, while frames, and with them the
+surface resets, go out on the frame submission thread, with nothing ordering
+the two. A reset in flight could send CreateSurface before the new CapsConfirm,
+where the client drops it, and MapSurfaceToOutput after it. mstsc rejects a map
+of a surface it does not have with E_INVALIDARG and drops the connection with
+reason 3334, so its own recovery failed. Hold a lock for each whole frame and
+take it while forgetting the surface on a re-advertisement, and make the flags
+both threads touch atomic. Also replace the comment that took re-advertisement
+for a fixed mstsc habit with the rule from the spec.
+
+diff --git a/src/VideoStream.cpp b/src/VideoStream.cpp
+index 2853a5e..a73e68f 100644
+--- a/src/VideoStream.cpp
++++ b/src/VideoStream.cpp
+@@ -171,8 +171,20 @@ public:
+     uint16_t nextSurfaceId = 1;
+     bool enabled = false;
+     bool streamingEnabled = false;
+-    bool capsConfirmed = false;
++    // Set only once CapsConfirm is written, so that every surface command the
++    // frame thread sends from then on reaches the client behind it.
++    std::atomic_bool capsConfirmed = false;
+     bool channelOpen = false;
++    // Serializes the surface state between the frame submission thread, which
++    // holds it for each whole frame, and the connection thread handling a caps
++    // re-advertisement. A client ignores every GFX message from re-advertising
++    // until the new CapsConfirm (MS-RDPEGFX 3.3.5.19). Without the lock, a
++    // reset in flight could send CreateSurface before that CapsConfirm, where
++    // the client drops it, and MapSurfaceToOutput after it. mstsc rejects a map
++    // of a surface it does not have with E_INVALIDARG and drops the connection.
++    // The connection thread must not hold it across a blocking call to the main
++    // thread, as close() on the main thread joins the frame thread.
++    std::mutex surfaceMutex;
+ 
+     std::jthread frameSubmissionThread;
+     std::mutex frameQueueMutex;
+@@ -549,20 +561,26 @@ bool VideoStream::onChannelIdAssigned(uint32_t channelId)
+ 
+ uint32_t VideoStream::onCapsAdvertise(const RDPGFX_CAPS_ADVERTISE_PDU *capsAdvertise)
+ {
+-    // Windows clients (mstsc) send CapsAdvertise twice: once during
+-    // initial setup and again after confirming. If we already confirmed
+-    // caps, this is a GFX channel reset — clear surface state so
+-    // surfaces get re-created on the next frame.
++    // A client may advertise its caps again once a CapsConfirm of version 10.3 or
++    // later went out, to reset the protocol: it drops all its GFX state and ignores
++    // every message until the new CapsConfirm (MS-RDPEGFX 3.2.5.18, 3.3.5.19). mstsc
++    // does so to recover from a GFX command it rejected. Clear the surface state, so
++    // that surfaces get re-created on the first frame after the new CapsConfirm.
+     if (d->capsConfirmed) {
+         qCDebug(KRDP) << "GFX channel reset (re-advertisement), resetting surface state";
+-        d->capsConfirmed = false;
+-        d->surface->pendingReset = true;
+-        // A client re-advertising its caps has reset its whole GFX state, so its
+-        // surfaces and encoding contexts are gone already. Telling it to delete
+-        // them anyway is a protocol error to mstsc: it rejects DeleteEncodingContext
+-        // with E_INVALIDARG and drops the connection (reason 3334). Forget them
+-        // on this side only.
+-        destroySurface(false);
++        {
++            // Waits out a frame in flight, so that nothing it sends lands after
++            // the new CapsConfirm.
++            std::lock_guard surfaceLock(d->surfaceMutex);
++            d->capsConfirmed = false;
++            d->surface->pendingReset = true;
++            // A client re-advertising its caps has reset its whole GFX state, so its
++            // surfaces and encoding contexts are gone already. Telling it to delete
++            // them anyway is a protocol error to mstsc: it rejects DeleteEncodingContext
++            // with E_INVALIDARG and drops the connection (reason 3334). Forget them
++            // on this side only.
++            destroySurface(false);
++        }
+         {
+             std::lock_guard lock(d->pendingFramesMutex);
+             d->pendingFrames.clear();
+@@ -986,6 +1004,10 @@ bool VideoStream::hasInFlightCapacity() const
+ 
+ void VideoStream::sendFrame(const VideoFrame &dequeuedFrame)
+ {
++    // Held for the whole frame, so that a caps re-advertisement waits until
++    // everything this frame sends is out, ahead of the new CapsConfirm.
++    std::lock_guard surfaceLock(d->surfaceMutex);
++
+     // RemoteFX sends only damaged tiles, so a frame that is dropped after
+     // leaving the queue takes its damage with it, and the client keeps stale
+     // pixels there until something happens to repaint the area. The queue
+@@ -1020,8 +1042,7 @@ void VideoStream::sendFrame(const VideoFrame &dequeuedFrame)
+     // A reset gives the client a new, empty surface, so the next frame has to
+     // cover all of it, not only what changed since the last one.
+     bool surfaceRecreated = false;
+-    if (d->surface->pendingReset) {
+-        d->surface->pendingReset = false;
++    if (d->surface->pendingReset.exchange(false)) {
+         performReset(frame.size);
+         surfaceRecreated = true;
+     }
+diff --git a/src/VideoStreamSurface.h b/src/VideoStreamSurface.h
+index 328c528..f1b8079 100644
+--- a/src/VideoStreamSurface.h
++++ b/src/VideoStreamSurface.h
+@@ -5,6 +5,7 @@
+ 
+ #pragma once
+ 
++#include <atomic>
+ #include <memory>
+ 
+ #include <DmaBufHandler>
+@@ -50,7 +51,8 @@ public:
+     Surface surface;
+     QSize size;
+     QSize requestedSize;
+-    bool pendingReset = true;
++    /// Set from the main thread and the connection thread, consumed by the frame thread.
++    std::atomic_bool pendingReset = true;
+ 
+ private:
+     VideoStream *const m_stream;
