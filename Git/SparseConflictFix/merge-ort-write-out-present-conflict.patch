@@ -1,0 +1,93 @@
+From b57a2f3bf83b294b437e3323163cce5e8f91a36c Mon Sep 17 00:00:00 2001
+From: hypersw <baltic@hypersw.net>
+Date: Mon, 19 Oct 2026 23:28:19 +0200
+Subject: [PATCH] merge-ort: write out a conflicted path that was present
+ before the merge
+
+When a path outside the sparse-checkout patterns is present in the
+working tree, and so lacks SKIP_WORKTREE, a merge that conflicts on
+it leaves the conflict in the index only.  The unpack_trees() call in
+checkout() marks the path SKIP_WORKTREE, sets CE_WT_REMOVE and
+removes the file.  record_conflicted_index_entries() then calls
+checkout_entry() for the path because of SKIP_WORKTREE, but
+checkout_entry() honors the stale CE_WT_REMOVE and removes the file
+again instead of writing it.
+
+This happens, for example, when two commits picked in a row conflict
+on the same file outside the sparse checkout: resolving the first
+conflict leaves the file present, and the second conflict is then
+not written to the working tree.
+
+Clear CE_WT_REMOVE before writing out the entry.
+---
+ merge-ort.c                       | 10 +++++++++-
+ t/t6428-merge-conflicts-sparse.sh | 30 ++++++++++++++++++++++++++++++
+ 2 files changed, 39 insertions(+), 1 deletion(-)
+
+diff --git a/merge-ort.c b/merge-ort.c
+index 1d3d193..df80f00 100644
+--- a/merge-ort.c
++++ b/merge-ort.c
+@@ -4721,9 +4721,17 @@ static int record_conflicted_index_entries(struct merge_options *opt)
+ 			 * the higher order stages.  Thus, we need override
+ 			 * the CE_SKIP_WORKTREE bit and manually write those
+ 			 * files to the working disk here.
++			 *
++			 * If the path was present in the working tree before
++			 * the merge, the unpack_trees() call has just removed
++			 * it as newly sparse and left CE_WT_REMOVE set, which
++			 * would make checkout_entry() remove it once more
++			 * instead of writing it.  Clear that bit first.
+ 			 */
+-			if (ce_skip_worktree(ce))
++			if (ce_skip_worktree(ce)) {
++				ce->ce_flags &= ~CE_WT_REMOVE;
+ 				errs |= checkout_entry(ce, &state, NULL, NULL);
++			}
+ 
+ 			/*
+ 			 * Mark this cache entry for removal and instead add
+diff --git a/t/t6428-merge-conflicts-sparse.sh b/t/t6428-merge-conflicts-sparse.sh
+index c86e02c..08dfc57 100755
+--- a/t/t6428-merge-conflicts-sparse.sh
++++ b/t/t6428-merge-conflicts-sparse.sh
+@@ -110,6 +110,36 @@ test_expect_success 'conflicting entries written to worktree even if sparse' '
+ 	)
+ '
+ 
++test_expect_success 'conflicting entries written to worktree even if present before merge' '
++	test_setup_numerals present &&
++	(
++		cd numerals_present &&
++
++		git checkout A^0 &&
++
++		git sparse-checkout init &&
++		git sparse-checkout set --no-cone README &&
++
++		test_path_is_missing numerals &&
++
++		# Bring the clean file back, as resolving an earlier
++		# conflict in it would; being present, it loses its
++		# SKIP_WORKTREE bit.
++		git checkout --ignore-skip-worktree-bits -- numerals &&
++		echo "H numerals" >expect &&
++		git ls-files -t numerals >actual &&
++		test_cmp expect actual &&
++
++		test_must_fail git merge -s recursive B^0 &&
++
++		git ls-files -t >index_files &&
++		test_cmp expected-index index_files &&
++
++		test_path_is_file numerals &&
++		test_cmp expected-merge numerals
++	)
++'
++
+ test_expect_success 'present-despite-SKIP_WORKTREE handled reasonably' '
+ 	test_setup_numerals in_the_way &&
+ 	(
+-- 
+2.55.0
+
