@@ -126,6 +126,7 @@ let
       (patch68 "0024-keep-lost-remotefx-damage.patch")
       (patch68 "0025-no-gfx-deletes-after-readvertise.patch")
       (patch68 "0026-client-driven-key-repeat.patch")
+      (patch68 "0027-delete-only-used-encoding-context.patch")
     ];
 
     # 6.8 made libei a hard dependency for the portal input path (28d5ddb).

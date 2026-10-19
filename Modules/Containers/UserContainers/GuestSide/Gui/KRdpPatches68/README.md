@@ -92,3 +92,7 @@ path does not bump, so it keeps applying from `../KRdpPatches`.
   off (`KeyRepeat=nothing`, `RepeatDelay=0`). Stops letters multiplying when a
   key-up is late on a slow link. Scoped to a session without a local keyboard;
   the patch's comment records the device-scoped design an upstream MR would need.
+- `0027-delete-only-used-encoding-context.patch` — sends DeleteEncodingContext
+  only for a progressive context a frame has actually used; the client creates
+  it on that first frame, and mstsc drops the connection over a delete of one it
+  never created. Logs each surface replacement with old and new size.

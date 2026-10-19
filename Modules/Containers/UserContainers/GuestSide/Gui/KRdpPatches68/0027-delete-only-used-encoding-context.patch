@@ -1,0 +1,63 @@
+From: KRdp displayless experiment <noreply@example.invalid>
+Subject: [PATCH] Delete a progressive encoding context only once it exists
+
+A client creates a RemoteFX Progressive encoding context implicitly, when the
+first frame naming it arrives. KRdp sent DeleteEncodingContext whenever it
+replaced a surface, including one no frame had gone out on, and mstsc rejects
+a delete of a context it never created with E_INVALIDARG and drops the
+connection (reason 3334). Track whether a frame went out with the context and
+delete it only then. Also log each surface replacement with its sizes, so the
+trigger of an early replacement is visible.
+
+diff --git a/src/VideoStream.cpp b/src/VideoStream.cpp
+index 3b748e7..2853a5e 100644
+--- a/src/VideoStream.cpp
++++ b/src/VideoStream.cpp
+@@ -734,7 +734,11 @@ void VideoStream::destroySurface(bool notifyClient)
+         return;
+     }
+ 
+-    if (notifyClient && d->gfxContext && surface.codecContextId != 0) {
++    // DeleteEncodingContext for a context the client never created is a protocol
++    // error to mstsc (E_INVALIDARG), and it then drops the connection with reason
++    // 3334. That happens whenever a surface is replaced before a single frame went
++    // out on it, as on a reconnect after the client resumes from sleep.
++    if (notifyClient && d->gfxContext && surface.codecContextId != 0 && surface.codecContextUsed) {
+         RDPGFX_DELETE_ENCODING_CONTEXT_PDU deleteEncodingContextPdu = {};
+         deleteEncodingContextPdu.surfaceId = surface.id;
+         deleteEncodingContextPdu.codecContextId = surface.codecContextId;
+@@ -763,6 +767,9 @@ void VideoStream::destroySurface(bool notifyClient)
+ void VideoStream::performReset(QSize newSize)
+ {
+     auto &surface = d->surface->surface;
++    if (surface.id != 0) {
++        qCInfo(KRDP) << "Replacing GFX surface" << surface.id << surface.size << "with" << newSize << "context used:" << surface.codecContextUsed;
++    }
+     if (!d->gfxContext) {
+         auto settings = d->session->rdpPeerContext()->settings;
+         freerdp_settings_set_uint32(settings, FreeRDP_DesktopWidth, newSize.width());
+@@ -1238,6 +1245,9 @@ bool VideoStream::sendFrameProgressive(const VideoFrame &frame)
+     surfaceCommand.extra = nullptr;
+ 
+     const UINT status = d->gfxContext->SurfaceFrameCommand(d->gfxContext.get(), &surfaceCommand, &startFramePdu, &endFramePdu);
++    if (status == CHANNEL_RC_OK) {
++        d->surface->surface.codecContextUsed = true;
++    }
+     if (status != CHANNEL_RC_OK) {
+         qCWarning(KRDP) << "SurfaceFrameCommand failed" << status << "frameId" << frameId << "surface" << d->surface->surface.id << "encodedBytes"
+                         << encodedSize << "damageRects" << rectCount;
+diff --git a/src/VideoStreamSurface.h b/src/VideoStreamSurface.h
+index e01cc7b..328c528 100644
+--- a/src/VideoStreamSurface.h
++++ b/src/VideoStreamSurface.h
+@@ -20,6 +20,10 @@ struct Surface {
+     uint16_t id;
+     uint32_t codecContextId;
+     QSize size;
++    /// Whether a frame has gone out using codecContextId. A client creates a progressive
++    /// encoding context only when the first frame naming it arrives, so before that there
++    /// is nothing on the client side to delete.
++    bool codecContextUsed = false;
+ };
+ 
+ class VideoStreamSurface : public QObject
