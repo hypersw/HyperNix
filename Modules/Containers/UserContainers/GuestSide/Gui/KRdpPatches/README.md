@@ -29,11 +29,12 @@ The rest of the 6.7.5 set was dropped, because 6.8 does the same thing or better
   existed to work around sessions that never close, which `50becf4` fixes at the
   root. `0016` and `0017` below restore the parts still required.
 
-KWin:
-
-- `0003-qpainter-virtual-screencast.patch` and
-  `0016-qpainter-persistent-output-screencast.patch` — let KWin screencast from
-  its QPainter renderer, the only one a guest without a render node could start.
+KWin carries no patches. `0003-qpainter-virtual-screencast` and
+`0016-qpainter-persistent-output-screencast` let KWin 6.7 screencast from its
+QPainter renderer, the only one a guest without a render node could start. KWin
+6.8 has a software render device instead, llvmpipe over `/dev/udmabuf`, so a
+guest without a GPU now composites and screencasts through OpenGL like one
+with a GPU, and both patches were dropped.
 
 KRdp, developed on the 6.8 line:
 

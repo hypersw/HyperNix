@@ -61,14 +61,10 @@ let
     '';
   });
 
+  # KWin carries no source patches: a guest without a GPU renders through
+  # KWin's own software render device, which screencasts like a GPU one.
   patchedKwin = prev.kdePackages.kwin.overrideAttrs (old: {
-    pname = "kwin-qpainter-krdp";
-    patches = (old.patches or [ ]) ++ [
-      (patch "0003-qpainter-virtual-screencast.patch")
-      # 0003 only covers streamVirtualOutput; persistent-output KRdp streams an
-      # existing output through streamWaylandOutput, which needs the same guard.
-      (patch "0016-qpainter-persistent-output-screencast.patch")
-    ];
+    pname = "kwin-krdp";
 
     # KWin searches its own application directory too. Give that location the
     # same corrected KRdp entry, so KService ordering cannot select a stale

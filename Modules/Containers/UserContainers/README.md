@@ -81,22 +81,27 @@ state. Neither mounts a host display or Wayland socket.
 
 What separates them is host access, and the suffix is a promise rather than a
 default. `RdpKdeIsolated` crosses nothing: `Gui.Gpu`, `Gui.Audio` and
-`Gui.Clipboard` are refused outright, KWin composites with QPainter, and the
-session is pure Wayland with no X server present at all, so an X11-only client
-fails loudly instead of finding a display that should not exist. That is the
-agent-sandbox shape. `RdpKdeWithDevices` is the workstation shape: the host GPU
+`Gui.Clipboard` are refused outright, KWin composites in software on Mesa's
+llvmpipe, and the session is pure Wayland with no X server present at all, so
+an X11-only client fails loudly instead of finding a display that should not
+exist. That is the agent-sandbox shape. `RdpKdeWithDevices` is the workstation shape: the host GPU
 and audio bridge cross in, KWin composites on the render node, and the session
 carries an Xwayland server for clients that have no Wayland path. Its toolkit
 variables become preference lists rather than absolutes, so Wayland still wins
 wherever a toolkit supports it and only a client with no Wayland path lands on
 X11.
 
+The one device either KDE mode gets without `Gui.Gpu` is `/dev/udmabuf`. KWin
+6.8 screencasts only from its OpenGL renderer, and without a render node its
+OpenGL is llvmpipe, which allocates its buffers through that node. A udmabuf
+wraps memory the guest already owns, so no host state crosses, but the node is
+kernel surface the guest would not otherwise reach.
+
 Both KDE modes use one patched KWin/KRdp/KPipeWire package set over nixpkgs'
-Plasma release, listed in `GuestSide/Gui/KRdpPatches/README.md`: QPainter
-screencasting support for the no-GPU path, one persistent `Virtual-0` output
-whose mode and scale follow the client, a single remote seat, auto-reconnect,
-client-driven key repeat, latency-first H.264 pacing at level 5.2, and RemoteFX
-fixes. KWin starts `Virtual-0` at `Gui.RdpFallbackVirtualMonitor` and keeps it
+Plasma release, listed in `GuestSide/Gui/KRdpPatches/README.md`: one
+persistent `Virtual-0` output whose mode and scale follow the client, a single
+remote seat, auto-reconnect, client-driven key repeat, latency-first H.264
+pacing at level 5.2, and RemoteFX fixes. KWin starts `Virtual-0` at `Gui.RdpFallbackVirtualMonitor` and keeps it
 until the first client asks for its own size and scale, on connect or through
 Display Control. KRdp applies that through a packaged output lifecycle helper,
 which also repairs an affected Plasma panel with KScreen/KConfig, never a
@@ -128,8 +133,8 @@ suffix crosses nothing. Explicit per-container settings override the defaults
 everywhere except the `Isolated` modes, which refuse them.
 
 `Gui.Gpu` is orthogonal to the mode rather than a property of one, and the
-guest reacts to it: the KDE modes select KWin's OpenGL renderer when a render
-node is present and its QPainter renderer when it is not, and every GPU-enabled
+guest reacts to it: the KDE modes run KWin's OpenGL renderer on the render node
+when one is present and on llvmpipe when it is not, and every GPU-enabled
 mode receives the `HostGpu.MesaDriverName` override so the Mesa loader and
 libva resolve the right driver. On the GPU path KWin composites on the render
 node and hands KPipeWire dmabuf frames, so H.264 encoding can reach VA-API

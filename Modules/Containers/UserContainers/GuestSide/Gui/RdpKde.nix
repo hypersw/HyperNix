@@ -103,13 +103,13 @@ let
     config.system.path
   ]}";
 
-  # KWin's virtual backend carries both an EGL and a QPainter renderer, and the
-  # screencast patch below supports either, so the GPU crossing decides which one
-  # this session uses. With a render node the OpenGL renderer composites on the
-  # GPU and hands KPipeWire dmabuf frames, which is also what lets the encoder
-  # reach VA-API instead of encoding a software composite on the CPU. Without
-  # one, QPainter is the only renderer that can start at all.
-  kwinRenderBackend = if cfg.Gui.Gpu then "O2" else "QPainter";
+  # KWin 6.8 screencasts only from its OpenGL renderer, so the session always
+  # composites with OpenGL, and the GPU crossing decides what runs it. With a
+  # render node it is the GPU, which hands KPipeWire dmabuf frames and so also
+  # lets the encoder reach VA-API instead of encoding on the CPU. Without one,
+  # KWin falls back to its software render device: Mesa's llvmpipe, with
+  # buffers from /dev/udmabuf, which HostSide crosses in for exactly this.
+  kwinRenderBackend = "O2";
 
   # 6.8 replaced the old flag combinations with an OperationMode enum, and its
   # default is derived from the KCM: RemoteAccess when exclusive, SharedAccess
@@ -371,6 +371,11 @@ in {
     # KWin authorizes the exact KRdp executable that captures its output.
     nixpkgs.overlays = [ (import ./KRdpOverlay.nix) ];
 
+    # KWin's OpenGL renderer needs Mesa's EGL even without a GPU: its software
+    # render device is llvmpipe, found through the EGL device that Mesa marks
+    # EGL_MESA_device_software. Plasma does not turn this on by itself.
+    hardware.graphics.enable = true;
+
     services.desktopManager.plasma6.enable = true;
     environment.systemPackages = [
       # Make Kvantum styles available to the managed Plasma 6 guest and its
@@ -402,7 +407,13 @@ in {
     };
 
     users.users = lib.mkIf (cfg.User != null) {
-      "${cfg.User}".linger = true;
+      "${cfg.User}" = {
+        linger = true;
+        # /dev/udmabuf, the allocator of KWin's software render device, is
+        # root:kvm 0660 on the host, and the guest's kvm group has the same id.
+        # No /dev/kvm crosses, so the group grants nothing else here.
+        extraGroups = lib.optional (!cfg.Gui.Gpu) "kvm";
+      };
     };
 
     services.avahi.enable = lib.mkForce false;

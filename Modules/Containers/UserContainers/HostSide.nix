@@ -294,6 +294,14 @@ let
       hasGui = decl.Gui.Mode != "None";
       needsX11 = decl.Gui.Mode == "PropagatedX11";
       needsHostWayland = decl.Gui.Mode == "PropagatedWayland";
+      # KWin 6.8 screencasts only from its OpenGL renderer. Without a GPU it still
+      # gets one: llvmpipe, Mesa's software renderer, as a render device whose
+      # buffers it allocates from /dev/udmabuf. The node shares no host
+      # state - a udmabuf only wraps memory the guest already owns - but it is
+      # kernel surface the guest did not have before, the one device crossing an
+      # Isolated KDE guest gets.
+      needsSoftwareRenderDevice =
+        lib.elem decl.Gui.Mode [ "RdpKdeIsolated" "RdpKdeWithDevices" ] && !decl.Gui.Gpu;
       hostWaylandSocket = "${hostGraphicalUser.RuntimeDir}/${hostGraphicalUser.WaylandDisplay}";
       copyboxHostPath =
         if decl.Copybox.HostSubdir == null
@@ -388,6 +396,12 @@ let
               };
             } //
             lib.optionalAttrs decl.Gui.Gpu hostGpu.BindMounts //
+            lib.optionalAttrs needsSoftwareRenderDevice {
+              "/dev/udmabuf" = {
+                hostPath = "/dev/udmabuf";
+                isReadOnly = false;
+              };
+            } //
             lib.optionalAttrs decl.Gui.Audio {
               # Mount the listener directory, so socket recreation on the host
               # is visible to guests without restarting their containers.
@@ -428,6 +442,9 @@ let
 
           allowedDevices =
             lib.optionals decl.Gui.Gpu hostGpu.AllowedDevices ++
+            lib.optionals needsSoftwareRenderDevice [
+              { modifier = "rw"; node = "/dev/udmabuf"; }
+            ] ++
             lib.optionals decl.Tpm.Enable [
               { modifier = "rw"; node = "/dev/tpm0"; }
               { modifier = "rw"; node = "/dev/tpmrm0"; }
