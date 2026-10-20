@@ -24,16 +24,20 @@ adds a test to `t/t6428-merge-conflicts-sparse.sh`.
 
 ## Status
 
-- Seen on git 2.55.0 and on master at v2.56.0-186 (2026-10-16).
-- The patch is against that master and applies to 2.55.0 as well.
+- Seen on git 2.55.0, 2.56.0 and on master at v2.56.0-186 (2026-10-16).
+- The patch is against that master and applies to 2.55.0 and 2.56.0 as well.
 - Not reported upstream yet as of 2026-10-19.
 - Workaround without the patch: `git sparse-checkout reapply` after resolving
   each conflict, before the next merge.
 
-## Use
+## Testing it end to end
 
-```nix
-git = import "${hypernix}/Git/SparseConflictFix/git.nix" { inherit pkgs; base = pkgs.gitFull; };
+The package is for trying the fix on real repositories; nothing installs it.
+Build it and point the reproduction, or any git command, at its binary:
+
+```sh
+out=$(nix-build --no-out-link -E 'import ./git.nix { pkgs = import <nixpkgs> { }; }')
+GIT=$out/bin/git ./repro.sh      # RESULT: ok; with a stock git: RESULT: BUG
 ```
 
-It composes with `../CommitMiner/git.nix` by passing this as its `base`.
+`base` takes any git derivation, e.g. `pkgs.gitFull`, to test with its extras.
