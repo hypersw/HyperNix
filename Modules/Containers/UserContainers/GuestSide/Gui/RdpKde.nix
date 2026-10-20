@@ -25,21 +25,18 @@ let
   # and screencast protocols. Index every immutable application source chosen
   # for this guest, but never a user-writable application directory.
   # RDP carries the client's lock-key state in a Synchronize PDU, and KRdp
-  # 6.7.5 drops it on the floor: InputHandler::synchronizeEvent takes its flags
-  # parameter commented out, under a TODO asking whether the sync is wanted at
-  # all. So the guest never learns that the client has NumLock on, KWin leaves
+  # drops it on the floor: InputHandler::synchronizeEvent takes its flags
+  # parameter commented out and uses the event only to release held keys.
+  # So the guest never learns that the client has NumLock on, KWin leaves
   # its own state at the default, and the numpad emits Home/End/arrows instead
   # of digits — which an entry field silently ignores, so it reads as a
   # keyboard that will not type numbers.
   #
   # Decide it here instead of inheriting it. 0 is STATE_ON; the default 2 is
   # STATE_UNCHANGED, which is the state that produces the symptom.
-  keyboardConfig = pkgs.writeText "hypersw-kcminputrc" (''
-    [Keyboard]
-    NumLock=0
-  ''
-  # On the 6.8 path key repeat comes from the RDP client, as on a Windows
-  # server (KRdpPatches68/0026), so the session must not repeat on its own:
+  #
+  # Key repeat comes from the RDP client, as on a Windows server
+  # (KRdpPatches/0026), so the session must not repeat on its own:
   # with server-side repeat, a key-up delayed by a slow link keeps the key
   # repeating and letters multiply. Both settings are needed. KeyRepeat=nothing
   # only zeroes the rate announced to clients; KWin still starts its own repeat
@@ -48,10 +45,12 @@ let
   # session has no local keyboard - every key arrives over RDP. A value the
   # user saves in System Settings goes to ~/.config/kcminputrc and overrides
   # these defaults, turning the multiplication back on.
-  + lib.optionalString cfg.Gui.KRdpBeta ''
+  keyboardConfig = pkgs.writeText "hypersw-kcminputrc" ''
+    [Keyboard]
+    NumLock=0
     KeyRepeat=nothing
     RepeatDelay=0
-  '');
+  '';
 
   kServiceApplicationsMenu = pkgs.writeText "hypersw-kde-rdp-applications.menu" ''
     <!DOCTYPE Menu PUBLIC "-//freedesktop//DTD Menu 1.0//EN"
@@ -116,15 +115,13 @@ let
   # default is derived from the KCM: RemoteAccess when exclusive, SharedAccess
   # otherwise. Neither fits here. AdditionalDisplay is the one that matches this
   # container: one virtual monitor sized by the client, and no session locking.
-  # The option does not exist before 6.8, so it is only passed on that path.
-  krdpModeArgs = lib.optionalString cfg.Gui.KRdpBeta "--mode AdditionalDisplay \\\n          ";
+  krdpMode = "AdditionalDisplay";
 
-  # On the 6.8 line every connection streams KWin's own Virtual-0 and changes
-  # its mode and scale in place (KRdpPatches68/0020). Nothing replaces that
-  # output later, so KWin has to start it at a sensible geometry, and the
-  # fallback geometry - formerly KRdp's first virtual monitor - is it. Its
-  # WIDTHxHEIGHT@SCALE size is logical, as KRdp's --virtual-monitor took it, so
-  # the output's pixel size is the size times the scale.
+  # Every connection streams KWin's own Virtual-0 and changes its mode and
+  # scale in place (KRdpPatches/0020). Nothing replaces that output later, so
+  # KWin has to start it at a sensible geometry, and the fallback geometry is
+  # it. Its WIDTHxHEIGHT@SCALE size is logical, as KRdp's --virtual-monitor
+  # took it, so the output's pixel size is the size times the scale.
   persistentOutput = "Virtual-0";
   fallbackGeometry =
     let
@@ -136,7 +133,7 @@ let
       height = lib.toInt (builtins.elemAt dimensions 1) * scale;
       inherit scale;
     };
-  kwinGeometryArgs = lib.optionalString cfg.Gui.KRdpBeta
+  kwinGeometryArgs =
     " --width ${toString fallbackGeometry.width} --height ${toString fallbackGeometry.height} --scale ${toString fallbackGeometry.scale}";
 
   # The two RdpKde modes share every mechanism here and differ only in what
@@ -372,7 +369,7 @@ in {
     # The persistent Plasma/portal session comes from this profile. The KRdp,
     # KWin, and KPipeWire packages below must be one patched package set so
     # KWin authorizes the exact KRdp executable that captures its output.
-    nixpkgs.overlays = [ (import ./KRdpOverlay.nix { beta = cfg.Gui.KRdpBeta; }) ];
+    nixpkgs.overlays = [ (import ./KRdpOverlay.nix) ];
 
     services.desktopManager.plasma6.enable = true;
     environment.systemPackages = [
@@ -508,8 +505,10 @@ in {
           # so a reconnect or a layout change cannot leave the numpad off.
           "KWIN_FORCE_NUM_LOCK_EVALUATION=1"
         ];
-        ExecStartPre = [ prepareKdeSessionConfig ]
-          ++ lib.optional cfg.Gui.KRdpBeta (lib.getExe pruneVirtualOutputModes);
+        ExecStartPre = [
+          prepareKdeSessionConfig
+          (lib.getExe pruneVirtualOutputModes)
+        ];
         ExecStart = "${pkgs.kdePackages.kwin}/bin/kwin_wayland --virtual${lib.optionalString hasXwayland " --xwayland"} --socket ${waylandDisplay}${kwinGeometryArgs}";
         ExecStartPost = waitForKwinSocket;
         Restart = "on-failure";
@@ -625,17 +624,15 @@ in {
         TimeoutStopSec = managedSessionStopTimeout;
         Environment = waylandClientEnvironment ++ [
           "KRDP_LIFECYCLE_HANDLER=${rdpOutputLifecycle}/bin/hypersw-rdp-output-lifecycle"
-        ]
-        # The output every connection streams; see persistentOutput above.
-        ++ lib.optional cfg.Gui.KRdpBeta "KRDP_PERSISTENT_OUTPUT=${persistentOutput}"
-        # Paired with KeyRepeat=nothing in keyboardConfig; see KRdpPatches68/0026.
-        ++ lib.optional cfg.Gui.KRdpBeta "KRDP_CLIENT_KEY_REPEAT=1"
-        # TODO: remove once the 6.8 patch set is known good. KCrash catches
-        # SIGSEGV and, when its own handler faults, leaves an unusable core:
-        # the crash seen while bringing 0016 up had no recoverable stack at
-        # all. KDE_DEBUG=1 disables that handler so systemd-coredump gets the
-        # real one.
-        ++ lib.optionals cfg.Gui.KRdpBeta [
+          # The output every connection streams; see persistentOutput above.
+          "KRDP_PERSISTENT_OUTPUT=${persistentOutput}"
+          # Paired with KeyRepeat=nothing in keyboardConfig; see KRdpPatches/0026.
+          "KRDP_CLIENT_KEY_REPEAT=1"
+          # TODO: remove once the 6.8 patch set is known good. KCrash catches
+          # SIGSEGV and, when its own handler faults, leaves an unusable core:
+          # the crash seen while bringing 0016 up had no recoverable stack at
+          # all. KDE_DEBUG=1 disables that handler so systemd-coredump gets the
+          # real one.
           "KDE_DEBUG=1"
           # TODO: remove with KDE_DEBUG. Pacing decisions (encoder backpressure,
           # adaptive quality steps) log at debug level only, so without this there
@@ -652,13 +649,12 @@ in {
         state="$HOME/.local/state/hypersw/kde-rdp"
         username=$(${pkgs.gnused}/bin/sed -n '1p' "$state/credentials")
         password=$(${pkgs.gnused}/bin/sed -n '2p' "$state/credentials")
-        # This is a remote-only container: no DRM/physical output exists for
-        # KRdp's ordinary Plasma capture mode. Ask KWin to create the first
-        # output, then KRdp can capture it and open its TCP listener. This is
-        # only the fallback. The patched server replaces it with the first
-        # RDP client's reported dimensions and desktop scale when available.
+        # This is a remote-only container with no DRM/physical output. KRdp
+        # streams KWin's persistent Virtual-0 (KRDP_PERSISTENT_OUTPUT) and, on
+        # each connection, sets it to the client's reported size and scale.
         exec ${pkgs.kdePackages.krdp}/bin/krdpserver \
-          ${krdpModeArgs}--plasma${lib.optionalString (!cfg.Gui.KRdpBeta) " --virtual-monitor ${lib.escapeShellArg cfg.Gui.RdpFallbackVirtualMonitor}"} \
+          --mode ${krdpMode} \
+          --plasma \
           --address ${lib.escapeShellArg cfg.Gui.RdpListenAddress} \
           --port ${toString cfg.Gui.RdpPort} \
           --quality ${toString cfg.Gui.RdpQuality} \

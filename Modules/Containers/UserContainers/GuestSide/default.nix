@@ -58,11 +58,6 @@ in
         default = "None";
       };
       Gpu = lib.mkOption { type = lib.types.bool; default = false; };
-      KRdpBeta = lib.mkOption {
-        type = lib.types.bool;
-        default = false;
-        description = "Build KRdp and KPipeWire from the Plasma/6.8 branch instead of the 6.7.5 release, with the reduced patch set in KRdpPatches68.";
-      };
       Audio = lib.mkOption { type = lib.types.bool; default = false; };
       Clipboard = lib.mkOption { type = lib.types.bool; default = false; };
       MesaDriverName = lib.mkOption {
@@ -128,10 +123,8 @@ in
         default = "1920x1080@1";
         description = ''
           Initial RdpKde* display geometry, WIDTHxHEIGHT@SCALE with a logical
-          size. With KRdpBeta it is the geometry KWin starts its one
-          persistent output at, kept until the first client asks for its
-          own. Otherwise it is the virtual monitor used when an RDP client
-          does not report a valid desktop size and scale.
+          size. It is the geometry KWin starts its one persistent output at,
+          kept until the first client asks for its own.
         '';
       };
       RdpQuality = lib.mkOption {

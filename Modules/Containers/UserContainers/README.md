@@ -91,16 +91,16 @@ variables become preference lists rather than absolutes, so Wayland still wins
 wherever a toolkit supports it and only a client with no Wayland path lands on
 X11.
 
-Both KDE modes use one patched KWin/KRdp/KPipeWire package set: QPainter
-screencasting support for the no-GPU path, initial RDP-driven monitor size and
-scale, H.264 level 5.2, input-coordinate and modifier fixes, and plaintext
-clipboard support. The initial `Gui.RdpFallbackVirtualMonitor` is used only when
-a client does not report valid dimensions/scale; live Display-Control resize
-remains diagnostic-only. KRdp synchronously runs a packaged output lifecycle
-helper after `Virtual-RDP-*` creation and before its teardown. When a
-`Virtual-0` stub exists, the helper changes it only at those callback points and
-repairs an affected Plasma panel with KScreen/KConfig, never a competing
-watcher.
+Both KDE modes use one patched KWin/KRdp/KPipeWire package set over nixpkgs'
+Plasma release, listed in `GuestSide/Gui/KRdpPatches/README.md`: QPainter
+screencasting support for the no-GPU path, one persistent `Virtual-0` output
+whose mode and scale follow the client, a single remote seat, auto-reconnect,
+client-driven key repeat, latency-first H.264 pacing at level 5.2, and RemoteFX
+fixes. KWin starts `Virtual-0` at `Gui.RdpFallbackVirtualMonitor` and keeps it
+until the first client asks for its own size and scale, on connect or through
+Display Control. KRdp applies that through a packaged output lifecycle helper,
+which also repairs an affected Plasma panel with KScreen/KConfig, never a
+competing watcher.
 
 Their KWin/Plasma session receives a runtime-only KScreenLocker configuration
 which disables locking. KRdp authentication is separate from the local Unix

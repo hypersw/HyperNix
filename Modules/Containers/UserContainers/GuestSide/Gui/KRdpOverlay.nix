@@ -1,36 +1,11 @@
 # The displayless KRdp path needs matching patched KPipeWire, KRdp, and KWin
 # derivations. Keep the patches with this module so a guest does not depend on
-# a mutable Copybox checkout or an LD_PRELOAD workaround.
-{ beta ? false }:
-
+# a mutable Copybox checkout or an LD_PRELOAD workaround. All three come from
+# nixpkgs' own Plasma release; KRdpPatches/README.md lists what each patch does.
 final: prev:
 let
   inherit (final) lib;
   patch = name: ./KRdpPatches + "/${name}";
-
-  patch68 = name: ./KRdpPatches68 + "/${name}";
-
-  # Pinned to the Plasma/6.8 branch for the Gui.KRdpBeta path. It carries the
-  # teardown fix this stack needs: 50becf4 gives the run thread sole ownership
-  # of the FreeRDP peer, so a streaming session closes instead of stranding the
-  # seat and wedging the server.
-  krdp68Source = prev.fetchFromGitLab {
-    domain = "invent.kde.org";
-    owner = "plasma";
-    repo = "krdp";
-    rev = "31c8fe3135e7dce49bfec607e5fab90014cdb4db";
-    hash = "sha256-2xy9gN+9RvH48m2JwCLdL9iFUxn6r5uqmuYM0C3msc8=";
-  };
-
-  # KRdp 6.8 calls KPipeWire APIs that 6.7.5 does not have (setEncoderPaused,
-  # setRequestedSize, pause/resume), so the two versions move together.
-  kpipewire68Source = prev.fetchFromGitLab {
-    domain = "invent.kde.org";
-    owner = "plasma";
-    repo = "kpipewire";
-    rev = "91b30ab1a81d2b4323874d4b2fbd4a6250629c7a";
-    hash = "sha256-MdyCS+PG8o0bCrq4wxcMTJkbUOUpcWLq07W6hmaxG/o=";
-  };
 
   patchedKPipeWire = prev.kdePackages.kpipewire.overrideAttrs (old: {
     patches = (old.patches or [ ]) ++ [
@@ -39,40 +14,27 @@ let
   });
 
   patchedKrdp = prev.kdePackages.krdp.overrideAttrs (old: {
+    # nixpkgs' own hardcode-openssl-path patch comes first and is kept.
     patches = (old.patches or [ ]) ++ [
       (patch "0001-pointer-coordinate-fix.patch")
-      (patch "0002-initial-client-layout.patch")
-      (patch "0005-layout-and-pointer-diagnostics.patch")
-      # This advertises Display Control and retains diagnostics. It deliberately
-      # does not claim to implement live mid-session output resize yet.
-      (patch "0006-display-control-diagnostics.patch")
-      (patch "0007-global-pointer-origin-and-modifier-cleanup.patch")
-      (patch "0008-plasma-clipboard-bridge.patch")
-      # Connect the virtual-output lifecycle to the managed KScreen/Plasma
-      # helper. The next patch makes that callback asynchronous.
-      (patch "0010-krdp-output-lifecycle-handler.patch")
-      # One managed Plasma desktop has one active RDP seat. Authenticate and
-      # record a new layout first, then asynchronously release the old exact
-      # output before the new session creates its virtual monitor.
-      (patch "0011-single-seat-takeover.patch")
-      # SessionWrapper can emit its connection-close signal while still on
-      # its own Qt stack. Defer the owning-vector removal until that event
-      # unwinds, avoiding a use-after-free during repeated RDP handovers.
-      (patch "0012-defer-wrapper-removal.patch")
-      # Record every takeover decision and screencast failure with the active,
-      # pending, and closing session state for field diagnosis.
-      (patch "0013-takeover-decision-diagnostics.patch")
-      # Activate a replacement only after queued old-wrapper destruction has
-      # released its Plasma screencast request and virtual output.
-      (patch "0014-activate-after-old-stream-release.patch")
-      # forceTerminateConnection destroyed the connection inline, and
-      # ~RdpConnection joins the session worker while that worker still needs
-      # the main thread. The join deadlocked the event loop, which then stopped
-      # accepting: clients queued on the listening socket unanswered until the
-      # service was restarted. Close asynchronously and quarantine a peer that
-      # ignores it.
-      (patch "0015-nonblocking-force-terminate.patch")
+      (patch "0016-client-layout-lifecycle-pointer.patch")
+      (patch "0017-single-remote-seat.patch")
+      (patch "0018-latency-first-pacing.patch")
+      (patch "0019-runtime-h264-toggle.patch")
+      (patch "0020-persistent-output.patch")
+      (patch "0021-unstall-h264-stream.patch")
+      (patch "0022-auto-reconnect-cookie.patch")
+      (patch "0023-cheaper-remotefx-and-stats.patch")
+      (patch "0024-keep-lost-remotefx-damage.patch")
+      (patch "0025-no-gfx-deletes-after-readvertise.patch")
+      (patch "0026-client-driven-key-repeat.patch")
+      (patch "0027-delete-only-used-encoding-context.patch")
+      (patch "0028-serialize-gfx-reset-with-frames.patch")
     ];
+
+    # 6.8 made libei a hard dependency for the portal input path (28d5ddb).
+    # Without it cmake fails outright on the pkg-config check for libei-1.0.
+    buildInputs = (old.buildInputs or [ ]) ++ [ prev.libei ];
 
     # KRdp propagates KPipeWire's development output. Replace the original
     # package there as well as in kdePackages, so the wrapped server links and
@@ -95,62 +57,9 @@ let
         "$desktop_file"
       # Diagnostic only: this changes with the built KRdp output, allowing a
       # KService probe to confirm it selected the current desktop entry.
-      printf '%s\\n' "X-HyperNix-Auth-Generation=$out" >> "$desktop_file"
-    '';
-  });
-
-  # The 6.8 beta pair, used only when Gui.KRdpBeta is set. KPipeWire is not
-  # swapped globally: only KRdp links this build, so a regression cannot reach
-  # the rest of the Plasma session, which keeps the 6.7.5 package above.
-  kpipewire68 = prev.kdePackages.kpipewire.overrideAttrs (old: {
-    version = "6.7.90";
-    src = kpipewire68Source;
-    patches = [ (patch68 "0009-h264-max-level-5.2.patch") ];
-  });
-
-  krdp68 = prev.kdePackages.krdp.overrideAttrs (old: {
-    version = "6.7.90";
-    src = krdp68Source;
-
-    # nixpkgs' own hardcode-openssl-path patch still applies to 6.8 and is kept.
-    patches = (old.patches or [ ]) ++ [
-      (patch68 "0001-pointer-coordinate-fix.patch")
-      (patch68 "0016-client-layout-lifecycle-pointer.patch")
-      (patch68 "0017-single-remote-seat.patch")
-      (patch68 "0018-latency-first-pacing.patch")
-      (patch68 "0019-runtime-h264-toggle.patch")
-      (patch68 "0020-persistent-output.patch")
-      (patch68 "0021-unstall-h264-stream.patch")
-      (patch68 "0022-auto-reconnect-cookie.patch")
-      (patch68 "0023-cheaper-remotefx-and-stats.patch")
-      (patch68 "0024-keep-lost-remotefx-damage.patch")
-      (patch68 "0025-no-gfx-deletes-after-readvertise.patch")
-      (patch68 "0026-client-driven-key-repeat.patch")
-      (patch68 "0027-delete-only-used-encoding-context.patch")
-      (patch68 "0028-serialize-gfx-reset-with-frames.patch")
-    ];
-
-    # 6.8 made libei a hard dependency for the portal input path (28d5ddb).
-    # Without it cmake fails outright on the pkg-config check for libei-1.0.
-    buildInputs = (old.buildInputs or [ ]) ++ [ prev.libei ];
-
-    propagatedBuildInputs =
-      lib.filter
-        (input: !(lib.hasInfix "-kpipewire-" (toString input)))
-        (old.propagatedBuildInputs or [ ])
-      ++ [ kpipewire68.dev ];
-
-    postFixup = (old.postFixup or "") + ''
-      desktop_file="$out/share/applications/org.kde.krdpserver.desktop"
-      grep -Fqx "Exec=$out/bin/krdpserver" "$desktop_file"
-      grep -Fqx \
-        "X-KDE-Wayland-Interfaces=org_kde_kwin_fake_input,zkde_screencast_unstable_v1" \
-        "$desktop_file"
       printf '%s\n' "X-HyperNix-Auth-Generation=$out" >> "$desktop_file"
     '';
   });
-
-  selectedKrdp = if beta then krdp68 else patchedKrdp;
 
   patchedKwin = prev.kdePackages.kwin.overrideAttrs (old: {
     pname = "kwin-qpainter-krdp";
@@ -161,16 +70,11 @@ let
       (patch "0016-qpainter-persistent-output-screencast.patch")
     ];
 
-    # Do not apply 0004-allow-zero-virtual-outputs.patch. KWin's initial
-    # Virtual-0 stub is currently needed while KRdp creates the negotiated
-    # Virtual-RDP-* output; allowing zero outputs leaves teardown/reconnect
-    # ordering unsafe until there is a synchronous lifecycle callback.
-
     # KWin searches its own application directory too. Give that location the
     # same corrected KRdp entry, so KService ordering cannot select a stale
     # authorization record from a different package output.
     postInstall = (old.postInstall or "") + ''
-      install -Dm444 ${selectedKrdp}/share/applications/org.kde.krdpserver.desktop \
+      install -Dm444 ${patchedKrdp}/share/applications/org.kde.krdpserver.desktop \
         "$out/share/applications/org.kde.krdpserver.desktop"
     '';
   });
@@ -178,7 +82,7 @@ in
 {
   kdePackages = prev.kdePackages // {
     kpipewire = patchedKPipeWire;
-    krdp = selectedKrdp;
+    krdp = patchedKrdp;
     kwin = patchedKwin;
   };
 }

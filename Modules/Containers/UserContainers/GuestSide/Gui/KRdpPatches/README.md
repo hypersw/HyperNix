@@ -1,15 +1,15 @@
-# KRdp patches for the Plasma 6.8 beta line
+# KRdp, KPipeWire and KWin patches
 
-Patches for the `Gui.KRdpBeta` path, which builds KRdp and KPipeWire from the
-`Plasma/6.8` branch instead of the 6.7.5 release. Only what 6.8 still needs
-lives here; the 6.7.5 set stays in `../KRdpPatches` and is unaffected.
+Patches over nixpkgs' own Plasma packages, applied by `../KRdpOverlay.nix` for
+both RdpKde modes. The set was developed on the `Plasma/6.8` branch while
+nixpkgs still shipped 6.7.5, behind a `Gui.KRdpBeta` switch; since nixpkgs
+moved to the 6.8.0 release it is the only set, and the 6.7.5 patches are gone.
+Their history explains some of the numbering:
 
-Carried over, verified to apply to 6.8:
+- `0001-pointer-coordinate-fix.patch` — KRdp.
+- `0009-h264-max-level-5.2.patch` — KPipeWire.
 
-- `0001-pointer-coordinate-fix.patch`
-- `0009-h264-max-level-5.2.patch` — KPipeWire; still needed on the 6.8 branch
-
-Dropped, because 6.8 does the same thing or better:
+The rest of the 6.7.5 set was dropped, because 6.8 does the same thing or better:
 
 - `0006-display-control-diagnostics` — 6.8 ships `src/DisplayControl.cpp` itself, and
   unlike this patch it plumbs the resize through: its handler emits
@@ -22,19 +22,20 @@ Dropped, because 6.8 does the same thing or better:
 - `0002-initial-client-layout` — its security rationale is upstream as
   `18631ea` (create the backend session only after authentication), and the
   client-sized virtual monitor is what `--mode AdditionalDisplay` now does.
-
-Deliberately not carried over yet, pending what actually breaks without them:
-
 - `0005` layout/pointer diagnostics — diagnostics only.
 - `0007` pointer origin and modifier cleanup — the libei port (`28d5ddb`)
   reworked the input path this patched.
 - `0010`-`0014` output lifecycle and single-seat takeover — this whole stack
-  exists to work around sessions that never close, which `50becf4` fixes at the
-  root. Re-add only the parts that prove to be still required; `0010`'s removal
-  of the KWin bootstrap output is the most likely to be missed.
+  existed to work around sessions that never close, which `50becf4` fixes at the
+  root. `0016` and `0017` below restore the parts still required.
 
-`0003-qpainter-virtual-screencast` is not here: it patches KWin, which this
-path does not bump, so it keeps applying from `../KRdpPatches`.
+KWin:
+
+- `0003-qpainter-virtual-screencast.patch` and
+  `0016-qpainter-persistent-output-screencast.patch` — let KWin screencast from
+  its QPainter renderer, the only one a guest without a render node could start.
+
+KRdp, developed on the 6.8 line:
 
 - `0016-client-layout-lifecycle-pointer.patch` — restores the three things 6.8
   dropped: a virtual monitor sized and scaled from the client's negotiated

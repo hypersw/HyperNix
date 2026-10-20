@@ -107,7 +107,6 @@ let
       gui = {
         Mode = "None";
         Gpu = null;
-        KRdpBeta = false;
         Audio = null;
         Clipboard = null;
         FontPackages = [];
@@ -166,6 +165,16 @@ let
     assertion = lib.elem value allowed;
     message = "${optionName} must be one of: ${lib.concatStringsSep ", " allowed}.";
   };
+
+  # Gui.KRdpBeta chose the Plasma 6.8 KRdp build while nixpkgs still shipped
+  # 6.7.5. That build is now the only one, so the setting does nothing; it is
+  # tolerated with a warning, so that a host config which still sets it keeps
+  # evaluating against a newer HyperNix.
+  instanceWarnings =
+    lib.concatLists (lib.mapAttrsToList
+      (name: decl: lib.optional (decl.Gui ? KRdpBeta)
+        "Managed container ${name} sets Gui.KRdpBeta, which is retired and ignored: KRdp always uses the Plasma 6.8 patch set now. Remove the setting.")
+      declarations);
 
   instanceAssertions =
     lib.flatten
@@ -327,7 +336,6 @@ let
               StateVersion = decl.StateVersion;
               Gui.Mode = decl.Gui.Mode;
               Gui.Gpu = decl.Gui.Gpu;
-              Gui.KRdpBeta = decl.Gui.KRdpBeta;
               Gui.Audio = decl.Gui.Audio;
               Gui.Clipboard = decl.Gui.Clipboard;
               Gui.MesaDriverName = hostGpu.MesaDriverName;
@@ -745,6 +753,7 @@ in
 lib.mkMerge [
   {
     assertions = hostAssertions ++ instanceAssertions;
+    warnings = instanceWarnings;
   }
 
   (lib.mkIf Enable (lib.mkMerge (lib.mapAttrsToList mkContainer enabledDeclarations)))
