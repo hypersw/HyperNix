@@ -5,7 +5,7 @@ let
   # Pinned source for the fork. Same file is consumed by the flake's
   # `packages.<system>.Modules-System-Btm-Fork` output, so a single
   # `./bump.sh` updates both call sites at once.
-  defaultForkSrc = pkgs.fetchFromGitHub (import ./source.nix);
+  defaultForkSrc = pkgs.fetchFromGitHub (import ./source.nix).src;
 
   # Local-path overrides: `cfg.fork.src` can also be set to a path on
   # disk (e.g. /home/foo/Projects/External/bottom). When that path
@@ -86,6 +86,8 @@ in {
           pin on `hypersw/bottom`; override with a local path (e.g.
           `/home/work/Projects/External/bottom`) while iterating
           locally — anything `lib.types.path` accepts works.
+          The pinned `cargoHash` still applies to a local path.
+          A local `Cargo.lock` that differs from the pinned one fails the build with a lock diff, until the change is pushed and `./bump.sh` re-pins.
         '';
       };
     };

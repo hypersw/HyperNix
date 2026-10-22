@@ -1,26 +1,64 @@
 # Derivation builder for the bottom strict-overcommit fork.
 #
-# Given an `pkgs` set (and optionally a custom `src`), produces a
-# `pkgs.bottom`-equivalent derivation with the fork's source. Used by
-# both the NixOS module (`default.nix`, with `src = cfg.fork.src`) and
-# the flake's packages output (no override → uses the pinned source).
+# Self-contained: the version, source, dependency hash and build recipe all live in this folder.
+# A nixpkgs bump therefore only moves the Rust toolchain and stdenv underneath, never the fork's inputs.
+# It deliberately does not override `pkgs.bottom`.
+# Such an override inherits nixpkgs' `version` and `cargoHash`, which stop matching the fork whenever nixpkgs moves bottom forward.
+# The vendored-crates derivation even keeps its old store path then, so Nix substitutes upstream's crates instead of reporting a hash mismatch.
 #
-# The fork shares `Cargo.lock` with upstream 0.12.3, so nixpkgs's
-# cargoHash continues to validate without override. If a future fork
-# rebase touches Cargo.lock, set `cargoHash = lib.fakeHash;` here, run
-# `nix build` once, and paste the printed hash.
+# The recipe mirrors nixpkgs' pkgs/by-name/bo/bottom/package.nix as of 0.14.9.
+# Used by both the NixOS module (`default.nix`, with `src = cfg.fork.src`) and the flake's packages output (pinned source).
+let
+  pin = import ./source.nix;
+in
 { pkgs
-, src ? pkgs.fetchFromGitHub (import ./source.nix)
+, src ? pkgs.fetchFromGitHub pin.src
+  # Must match `src`'s Cargo.lock.
+  # A local `src` whose lock differs from the pin's needs its own hash here.
+, cargoHash ? pin.cargoHash
 }:
-pkgs.bottom.overrideAttrs (_old: {
-  # NB: don't change `version` here — nixpkgs's bottom uses
-  # `versionCheckHook`, which runs `$out/bin/btm --version` and greps
-  # for the derivation's `version` attribute. The binary's compiled
-  # version string comes from `CARGO_PKG_VERSION` in the fork's
-  # unchanged Cargo.toml (= upstream "0.12.3"), so any suffix here
-  # would fail the check. Two derivations with the same human name
-  # but different src produce different store-path hashes, so the
-  # fork is still distinct from upstream pkgs.bottom — just not
-  # labeled differently in the store path.
-  src = src;
-})
+pkgs.rustPlatform.buildRustPackage {
+  # A pname of its own keeps the fork and its vendored crates apart from upstream `pkgs.bottom` in the store.
+  pname = "bottom-strict-overcommit";
+  # `versionCheckHook` greps `btm --version` for this.
+  # So it must be the fork's own `CARGO_PKG_VERSION`, with no suffix.
+  inherit (pin) version;
+  inherit src cargoHash;
+
+  nativeBuildInputs = [
+    pkgs.autoAddDriverRunpath # NVML is dlopen'ed for the GPU widgets
+    pkgs.installShellFiles
+  ];
+
+  # Makes build.rs write the completions and the manpage under target/tmp/bottom.
+  env.BTM_GENERATE = true;
+
+  postInstall = ''
+    installManPage target/tmp/bottom/manpage/btm.1
+    installShellCompletion \
+      target/tmp/bottom/completion/btm.{bash,fish} \
+      --zsh target/tmp/bottom/completion/_btm
+
+    install -Dm444 desktop/bottom.desktop -t $out/share/applications
+    install -Dm644 assets/icons/bottom-system-monitor.svg -t $out/share/icons/hicolor/scalable/apps
+  '';
+
+  checkFlags = pkgs.lib.optionals pkgs.stdenv.hostPlatform.isDarwin [
+    # The sandbox hides the process list; this works at runtime.
+    "--skip=collection::tests::test_data_collection"
+  ];
+
+  doInstallCheck = true;
+  nativeInstallCheckInputs = [
+    pkgs.versionCheckHook
+    pkgs.writableTmpDirAsHomeHook
+  ];
+  versionCheckProgram = "${placeholder "out"}/bin/btm";
+
+  meta = {
+    description = "bottom (btm) with per-process commit and footprint columns for strict-overcommit hosts";
+    homepage = "https://github.com/hypersw/bottom";
+    license = pkgs.lib.licenses.mit;
+    mainProgram = "btm";
+  };
+}
