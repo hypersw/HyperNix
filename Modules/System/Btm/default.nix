@@ -77,7 +77,7 @@ in {
         defaultText = lib.literalExpression ''
           pkgs.fetchFromGitHub {
             owner = "hypersw"; repo = "bottom";
-            rev = "<pinned tip of f/strict-overcommit-mode>";
+            rev = "<pinned tip of f/strict-overcommit-mode-2>";
             sha256 = "<...>";
           };
         '';

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # bump.sh — refresh the GitHub pin for `programs.btm.fork.src`.
 #
-# Resolves the current tip of `f/strict-overcommit-mode` on github.com/hypersw/bottom (or a user-specified rev).
+# Resolves the current tip of `f/strict-overcommit-mode-2` on github.com/hypersw/bottom (or a user-specified rev).
 # It prefetches that tarball and rewrites all four values in source.nix in place:
 # rev, sha256, version (from the fork's Cargo.toml) and cargoHash (from the fork's Cargo.lock).
 #
@@ -17,7 +17,7 @@ set -euo pipefail
 
 OWNER=hypersw
 REPO=bottom
-BRANCH=f/strict-overcommit-mode
+BRANCH=f/strict-overcommit-mode-2
 MODULE_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO_ROOT="$(cd "$MODULE_DIR/../../.." && pwd)"
 SOURCE="$MODULE_DIR/source.nix"

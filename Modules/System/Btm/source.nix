@@ -9,16 +9,16 @@
 # The four values only make sense together, so never edit one of them by hand.
 {
   # `CARGO_PKG_VERSION` at `src.rev`, which is what `btm --version` prints.
-  version = "0.12.3";
+  version = "0.14.9";
 
   # `fetchFromGitHub` arguments.
   src = {
     owner = "hypersw";
     repo = "bottom";
-    rev = "4545166a013a12c13317cce3b9468a6944fc191c";
-    sha256 = "1n0q9r52gfs90h3whag3ywda6pky1imyviax8lyivhdj6whlf9qd";
+    rev = "ba171c8e728f0a24dc7b3e3889097f02ab6da070";
+    sha256 = "0dfwxhzrq4kwx389dflr0zqap4ym4953rd9fxmvbj3fdncj2004y";
   };
 
   # Hash of the crates vendored from the Cargo.lock at `src.rev`.
-  cargoHash = "sha256-miSMcqy4OFZFhAs9M+zdv4OzYgFxN2/uBo6V/kJql90=";
+  cargoHash = "sha256-uCbVCJUDmcIzsWfc1pRQ5tLM99yW+TVprKTMBLopnow=";
 }
