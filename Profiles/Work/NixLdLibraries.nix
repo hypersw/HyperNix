@@ -41,6 +41,7 @@
       libsecret # password storage
 
       libglvnd # libGL.so.1, for Toolbox Skiso
+      vulkan-loader # libvulkan.so.1, for JBR's Vulkan pipeline (-Dsun.java2d.vulkan=true)
 
       # DotTrace on Avalonia.
       gtk3
