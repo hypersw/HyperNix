@@ -310,6 +310,17 @@ Same helper as Option B — it already works with multiple tokens because
 SSH passes a different prompt per token (e.g., `Enter PIN for 'github':` vs
 `Enter PIN for 'gitlab':`). Each prompt is a separate cache key.
 
+### Option D: Token with an empty user PIN
+
+For unattended jobs (timers, services). Any process of the user can then use the token's keys.
+
+```bash
+tpm2_ptool addtoken --pid=1 --label=<service> --sopin="<sopin>" --userpin=""
+tpm2_ptool addkey --label=<service> --userpin="" --algorithm=ecc256 --key-label=<key>
+```
+
+An empty `--userpin` sets the token's `empty-user-pin` itself, so ssh never asks; tokens with PINs keep asking.
+
 ## Rekeying (new machine or container)
 
 Each machine/container creates its own key. To add a new machine:
