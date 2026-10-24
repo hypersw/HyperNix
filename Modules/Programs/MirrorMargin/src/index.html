@@ -1,0 +1,36 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="theme-color" content="#f1ede4">
+    <title>Mirror Margin</title>
+    <link rel="stylesheet" href="style.css">
+  </head>
+  <body>
+    <header class="toolbar">
+      <div class="brand"><span>Mirror Margin</span><small>parallel reading</small></div>
+      <div class="book-control">
+        <label class="file-picker">Sample<input id="left-file" type="file" accept=".fb2,application/xml,text/xml"></label>
+        <strong id="left-title" class="book-title">Sample language</strong>
+      </div>
+      <div class="book-control">
+        <label class="file-picker">Reference<input id="right-file" type="file" accept=".fb2,application/xml,text/xml"></label>
+        <strong id="right-title" class="book-title">Reference language</strong>
+      </div>
+      <button id="add-alignment" disabled title="Align the paragraphs currently at the top of each view">Add alignment point</button>
+      <button id="reset-alignment" disabled title="Discard manual alignment points">Reset alignment</button>
+      <button id="download-trace" title="Download scroll synchronization diagnostics">Download trace</button>
+    </header>
+    <main class="readers">
+      <section class="reader-panel" aria-label="Sample-language reader">
+        <div id="left-reader" class="reader-host"></div>
+      </section>
+      <div class="divider" aria-hidden="true"></div>
+      <section class="reader-panel" aria-label="Reference-language reader">
+        <div id="right-reader" class="reader-host"></div>
+      </section>
+    </main>
+    <script type="module" src="app.js"></script>
+  </body>
+</html>

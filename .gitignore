@@ -1,3 +1,5 @@
 result
 obj/
 bin/
+Modules/Programs/MirrorMargin/node_modules/
+Modules/Programs/MirrorMargin/dist/
