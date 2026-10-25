@@ -9,7 +9,10 @@ import { tmpdir } from "node:os";
 
 const scriptDirectory = dirname(fileURLToPath(import.meta.url));
 const args = new Map(process.argv.slice(2).flatMap((value, index, values) => value.startsWith("--") ? [[value.slice(2), values[index + 1]]] : []));
-const siteDirectory = resolve(args.get("site") ?? process.env.SITE_DIR ?? join(scriptDirectory, "site"));
+if (args.has("site")) throw new Error("--site is not supported: this launcher always serves its bundled site directory.");
+// Portable mode always serves the `site/` adjacent to this launcher. The Nix
+// wrapper alone may supply an absolute store path through SITE_DIR.
+const siteDirectory = resolve(process.env.SITE_DIR ?? join(scriptDirectory, "site"));
 const port = Number(args.get("port") ?? process.env.PORT ?? 8000);
 const token = process.env.BRIDGE_TOKEN ?? randomBytes(24).toString("hex");
 const codex = process.env.CODEX_BIN ?? (process.platform === "win32" ? "codex.cmd" : "codex");
@@ -17,6 +20,8 @@ const dutchSkillPath = process.env.DUTCH_SKILL_PATH ?? join(scriptDirectory, "sk
 const maxSelectionChars = 4000;
 const codexModel = "gpt-6-luna";
 let running = false;
+let activeChild = null;
+let shuttingDown = false;
 
 const mimeTypes = { ".css": "text/css", ".html": "text/html", ".js": "text/javascript", ".json": "application/json", ".svg": "image/svg+xml" };
 
@@ -57,11 +62,12 @@ async function runCodex(text, language) {
     const prompt = await tutorPrompt(text, language);
     const result = await new Promise((resolve, reject) => {
       const child = spawn(codex, command, { cwd: workdir, stdio: ["pipe", "ignore", "pipe"] });
+      activeChild = child;
       let stderr = "";
       const timer = setTimeout(() => { child.kill(); reject(new Error("Codex did not finish within two minutes.")); }, 120_000);
       child.stderr.on("data", (chunk) => { stderr = `${stderr}${chunk}`.slice(-2000); });
       child.on("error", reject);
-      child.on("close", (code) => { clearTimeout(timer); code === 0 ? resolve(stderr) : reject(new Error(stderr || "Codex did not complete the explanation.")); });
+      child.on("close", (code) => { activeChild = null; clearTimeout(timer); code === 0 ? resolve(stderr) : reject(new Error(stderr || "Codex did not complete the explanation.")); });
       child.stdin.end(prompt);
     });
     const answer = (await fs.readFile(output, "utf8")).trim();
@@ -74,6 +80,12 @@ async function runCodex(text, language) {
 
 const server = createServer(async (request, response) => {
   const url = new URL(request.url, "http://127.0.0.1");
+  if (request.method === "POST" && url.pathname === "/api/shutdown") {
+    if (!sameToken(request.headers["x-mirror-margin-token"])) return sendJson(response, 403, { error: "Invalid local bridge token." });
+    sendJson(response, 200, { shuttingDown: true });
+    response.once("finish", () => shutdown("browser shortcut"));
+    return;
+  }
   if (request.method === "POST" && url.pathname === "/api/explain") {
     if (!sameToken(request.headers["x-mirror-margin-token"])) return sendJson(response, 403, { error: "Invalid local bridge token." });
     let body = "";
@@ -117,6 +129,23 @@ const server = createServer(async (request, response) => {
     response.writeHead(404); response.end();
   }
 });
+
+function shutdown(reason) {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  console.log(`Mirror Margin shutting down (${reason}).`);
+  activeChild?.kill("SIGTERM");
+  server.close(() => {
+    console.log("Mirror Margin stopped.");
+    process.exit(0);
+  });
+  // A browser connection or a child process should not turn shutdown into an
+  // indefinite hang. The normal close callback above remains the gentle path.
+  setTimeout(() => process.exit(0), 2_000).unref();
+}
+
+process.on("SIGINT", () => shutdown("Ctrl+C"));
+process.on("SIGTERM", () => shutdown("SIGTERM"));
 
 server.listen(port, "127.0.0.1", () => {
   const url = `http://127.0.0.1:${port}/?bridge=${token}`;

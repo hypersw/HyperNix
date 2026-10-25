@@ -37,7 +37,7 @@ Mirror Margin portable distribution
 Requirements: Node.js and Codex CLI, logged in for the current user.
 
 Run from this directory:
-  node bridge.mjs --site site --port 8000
+  node bridge.mjs --port 8000
 
 The launcher prints a loopback URL and opens it where the platform supports it.
 Set NO_BROWSER=1 to print the URL only. The bridge uses the local user's Codex

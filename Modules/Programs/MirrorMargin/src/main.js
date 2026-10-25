@@ -1264,6 +1264,13 @@ $("#lookup-drag-handle").addEventListener("pointerup", (event) => {
 $("#lookup-drag-handle").addEventListener("pointercancel", () => { lookupDrag = null; });
 window.addEventListener("keydown", (event) => {
   if (event.key === "Escape" && !$("#lookup-card").hidden) closeLookupCard();
+  if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "q") {
+    event.preventDefault();
+    if (!bridgeToken || !window.confirm("Stop the local Mirror Margin server?")) return;
+    fetch("/api/shutdown", { method: "POST", headers: { "X-Mirror-Margin-Token": bridgeToken } })
+      .catch(() => {})
+      .finally(() => { document.title = "Mirror Margin — stopped"; });
+  }
 });
 $("#add-alignment").addEventListener("click", () => {
   if (syncInProgress) return;

@@ -26,9 +26,16 @@ portable Windows-suitable asset ZIP can be built with:
 nix build .#Modules-Programs-MirrorMargin.portableZip
 ```
 
-After copying and extracting it on Windows, run `node bridge.mjs --site site`.
+After copying and extracting it on Windows, run `node bridge.mjs` from any
+working directory. It always serves the bundled `site` directory next to the
+launcher.
 That machine needs Node.js plus its own logged-in Codex CLI; the distribution
 contains no executable, Nix store reference, or credential.
+
+Press `Ctrl+Q` (or `Ctrl+Shift+Q`) in the reader and confirm to stop its local
+launcher cleanly. `Ctrl+C` also asks the launcher to stop cleanly; when it is started
+from a Windows batch file, `cmd.exe` may additionally show its normal
+“Terminate batch job?” prompt.
 
 ## Prototype behavior
 
