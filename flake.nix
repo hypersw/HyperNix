@@ -95,6 +95,7 @@
           printScanDaemon = import ./Modules/PrintersScanners/Daemon/package.nix { inherit pkgs; sharedPackage = printScanShared; };
           printScanBot = import ./Modules/PrintersScanners/TelegramBot/package.nix { inherit pkgs; sharedPackage = printScanShared; };
           printScanRenderer = import ./Modules/PrintersScanners/Renderer/package.nix { inherit pkgs; };
+          wsl1Exec = pkgs.callPackage ./Modules/Programs/Wsl1Exec/package.nix { };
         in {
           Util-CloseFrom3 = closefrom3;
           Git-SshAskpassCredentialHelper = import ./Git/SshAskpassCredentialHelper/package.nix { inherit pkgs closefrom3; };
@@ -131,6 +132,9 @@
           # Mirror Margin — local, side-by-side FB2 reading prototype. Its
           # launcher serves static assets only on 127.0.0.1 and opens a browser.
           Modules-Programs-MirrorMargin = import ./Modules/Programs/MirrorMargin/package.nix { inherit pkgs; };
+          # Minimal, pinned WSL 1 exec-rescue preload. The Home Manager module
+          # provisions this under ~/.local/lib; export it for manual use too.
+          Modules-Programs-Wsl1Exec = wsl1Exec;
           # keyboard capture (transient grab toggle, type-to-regrab,
           # Ctrl+Alt+Home release chord, floating-toolbar cue). Same
           # derivation the hypersw.programs.remminaAutograb module installs.

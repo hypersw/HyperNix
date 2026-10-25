@@ -14,6 +14,7 @@
 # Activation is via option-setting:
 #   programs.askpass-safe.enable = true;
 #   programs.nix-ld-libraries = { enable = true; libraries = [ ... ]; };
+#   programs.wsl1-exec.enable = true;
 #
 # nix-ld-libraries ships no default list, so enabling it alone yields an empty
 # helper. A ready-made selection lives in `Profiles/Work/NixLdLibraries.nix`,
@@ -25,5 +26,6 @@
   imports = [
     ../Git/AskpassSafe/home.nix
     ../Programs/NixLdLibraries/home.nix
+    ../Programs/Wsl1Exec/home.nix
   ];
 }

@@ -5,6 +5,8 @@
 
 let
   lib = pkgs.lib;
+  # When built under WSL, this package requires WSL 2: WSL 1 rejects this
+  # Nix-built Node executable's large-alignment ELF layout with "Exec format error".
   source = lib.cleanSourceWith {
     src = ./.;
     filter = path: type:
