@@ -24,10 +24,13 @@ in
       message = "programs.wsl1-exec only supports x86_64 Linux.";
     }];
 
-    # This only provisions the immutable, profile-rooted library. A Nix
-    # builder discards LD_PRELOAD, so enabling it for builds requires a
-    # separately managed root-owned /etc/ld.so.preload entry. Keep that
-    # host-wide decision out of a user-level Home Manager module.
+    # This only provisions the immutable, profile-rooted library.  To use it
+    # for Nix builds after `home-manager switch`, an administrator must opt in
+    # explicitly with:
+    #   printf "%s\n" "$HOME/.local/lib/nix-wsl1-exec.so" | sudo tee /etc/ld.so.preload >/dev/null
+    # Nix builders discard LD_PRELOAD, so an interactive-only setting cannot
+    # work.  Keep that host-wide decision out of a user-level Home Manager
+    # module.
     home.file.".local/lib/nix-wsl1-exec.so".source =
       "${cfg.package}/lib/nix-wsl1-exec.so";
   };
