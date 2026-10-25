@@ -18,8 +18,14 @@
         <label class="file-picker">Reference<input id="right-file" type="file" accept=".fb2,.fb2.zip,.epub,.epub.zip,application/xml,text/xml,application/epub+zip,application/zip"></label>
         <strong id="right-title" class="book-title">Reference language</strong>
       </div>
+      <div class="reader-size" aria-label="Reader font size">
+        <button id="decrease-font" type="button" title="Decrease reader font size">A−</button>
+        <output id="font-size" aria-live="polite">20 px</output>
+        <button id="increase-font" type="button" title="Increase reader font size">A+</button>
+      </div>
       <button id="add-alignment" disabled title="Align the paragraphs currently at the top of each view">Add alignment point</button>
       <button id="reset-alignment" disabled title="Discard manual alignment points">Reset alignment</button>
+      <button id="reset-views" title="Rebuild both virtual viewports at their retained logical positions">Reset views</button>
       <button id="download-trace" title="Download scroll synchronization diagnostics">Download trace</button>
     </header>
     <main class="readers">

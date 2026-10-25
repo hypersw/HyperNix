@@ -1,0 +1,36 @@
+name: Build Mirror Margin portable ZIP
+
+on:
+  push:
+    paths:
+      - "Modules/Programs/MirrorMargin/**"
+      - "flake.lock"
+  pull_request:
+    paths:
+      - "Modules/Programs/MirrorMargin/**"
+      - "flake.lock"
+  workflow_dispatch:
+
+jobs:
+  build-portable-zip:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: cachix/install-nix-action@v30
+        with:
+          extra_nix_config: |
+            experimental-features = nix-command flakes
+
+      - name: Build portable ZIP
+        run: |
+          ZIP_PATH=$(nix build .#Modules-Programs-MirrorMargin.portableZip --no-link --print-out-paths)
+          cp "$ZIP_PATH" mirror-margin-portable.zip
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: mirror-margin-portable
+          path: mirror-margin-portable.zip
+          retention-days: 30
+          compression-level: 0

@@ -7,10 +7,13 @@ import { marked } from "marked";
 const $ = (selector) => document.querySelector(selector);
 const paneIds = ["left", "right"];
 const intermediateSyncInterval = 48;
+const minimumReaderFontSize = 16;
+const maximumReaderFontSize = 26;
+let readerFontSize = 20;
 const panes = Object.fromEntries(paneIds.map((id) => [id, {
   id, view: null, model: null, source: null, anchor: 0, anchorDy: 0, measureRequest: 0, syncTimer: null, intermediateTimer: null, resizeObserver: null,
   decorations: new Compartment(), selectionTimer: null,
-  suppressScrollUntil: 0, suppressionReason: null,
+  suppressScrollUntil: 0, suppressionReason: null, lastScroll: null, recoveryPending: false, mouseProbe: null,
 }]));
 let automaticPoints = [];
 let manualPoints = [];
@@ -145,6 +148,7 @@ async function saveSession() {
       books,
       anchors: Object.fromEntries(paneIds.map((id) => [id, { position: panes[id].anchor, dy: panes[id].anchorDy }])),
       manualPoints,
+      readerFontSize,
     }, "current");
     transaction.oncomplete = resolve;
     transaction.onerror = () => reject(transaction.error);
@@ -157,11 +161,29 @@ function scheduleSave() {
   persistTimer = setTimeout(() => saveSession().catch((error) => console.warn("Could not save local reading state", error)), 300);
 }
 
+function applyReaderFontSize(value, { persist = true } = {}) {
+  readerFontSize = Math.max(minimumReaderFontSize, Math.min(maximumReaderFontSize, Math.round(value)));
+  document.documentElement.style.setProperty("--reader-font-size", `${readerFontSize}px`);
+  $("#font-size").textContent = `${readerFontSize} px`;
+  const anchors = Object.fromEntries(paneIds.map((id) => [id, { position: panes[id].anchor, dy: panes[id].anchorDy }]));
+  for (const id of paneIds) panes[id].view?.requestMeasure();
+  // Font-size reflow is exactly the operation logical anchors are intended to
+  // survive. Wait for the stylesheet change to take effect, then re-place each.
+  requestAnimationFrame(() => requestAnimationFrame(() => {
+    for (const id of paneIds) if (panes[id].view) placeAnchor(id, anchors[id], "font-size-change");
+  }));
+  traceBoth("reader-font-size-changed", { readerFontSize, anchors });
+  if (persist) scheduleSave();
+}
+
 const theme = EditorView.theme({
   "&": { height: "100%", backgroundColor: "transparent", color: "#2c2924" },
   ".cm-scroller": {
-    fontFamily: 'Inter, "Aptos", "Segoe UI Variable", ui-sans-serif, system-ui, sans-serif', fontSize: "20px", lineHeight: "1.72",
-    overflowAnchor: "none", overflowY: "scroll", overflowX: "hidden", scrollbarGutter: "stable",
+    fontFamily: 'Inter, "Aptos", "Segoe UI Variable", ui-sans-serif, system-ui, sans-serif', fontSize: "var(--reader-font-size)", lineHeight: "1.72",
+    // CodeMirror changes the estimated height of its virtual spacers as it
+    // discovers wrapped lines. Native scroll anchoring keeps the visible text
+    // fixed through those corrections (notably in Firefox on Windows).
+    overflowAnchor: "auto", overflowY: "scroll", overflowX: "hidden", scrollbarGutter: "stable",
     scrollbarWidth: "thin", scrollbarColor: "#9d907b transparent",
   },
   ".cm-scroller::-webkit-scrollbar": { width: "12px" },
@@ -660,6 +682,7 @@ function makeView(id, model, source) {
   pane.view = new EditorView({ state, parent: host });
   pane.view.scrollDOM.addEventListener("mousedown", (event) => {
     if (event.button !== 0) return;
+    traceMouseProbe(id, event);
     if (!event.ctrlKey && event.detail === 3) {
       const position = pane.view.posAtCoords({ x: event.clientX, y: event.clientY });
       if (position === null) return;
@@ -698,6 +721,7 @@ function makeView(id, model, source) {
   pane.view.scrollDOM.addEventListener("scroll", () => {
     hideSelectionAction();
     trace("scroll-event", { pane: id, state: paneSnapshot(id) });
+    observeScrollAnchor(id);
     if (performance.now() < pane.suppressScrollUntil) {
       trace("scroll-event-suppressed", {
         pane: id, reason: pane.suppressionReason, remainingMilliseconds: rounded(pane.suppressScrollUntil - performance.now()),
@@ -756,6 +780,79 @@ function sampleViewportAnchor(view) {
     if (character) return { position, dy: character.top - viewport.top, probeOffset: offset };
   }
   return null;
+}
+
+function traceMouseProbe(id, event) {
+  const pane = panes[id];
+  const view = pane.view;
+  if (!view) return;
+  const scroller = view.scrollDOM.getBoundingClientRect();
+  const content = view.contentDOM.getBoundingClientRect();
+  let position = null;
+  let error = null;
+  try {
+    position = view.posAtCoords({ x: event.clientX, y: event.clientY });
+  } catch (caught) {
+    error = caught.message;
+  }
+  const probe = { clientX: event.clientX, clientY: event.clientY, position };
+  pane.mouseProbe = probe;
+  trace("mouse-pointer-probe", {
+    pane: id, button: event.button, detail: event.detail, client: probe,
+    page: { x: event.pageX, y: event.pageY }, screen: { x: event.screenX, y: event.screenY },
+    devicePixelRatio: window.devicePixelRatio,
+    visualViewport: window.visualViewport ? { scale: window.visualViewport.scale, offsetLeft: window.visualViewport.offsetLeft, offsetTop: window.visualViewport.offsetTop } : null,
+    scroller: { left: rounded(scroller.left), top: rounded(scroller.top), width: rounded(scroller.width), height: rounded(scroller.height) },
+    content: { left: rounded(content.left), top: rounded(content.top), width: rounded(content.width), height: rounded(content.height) }, error,
+  });
+  requestAnimationFrame(() => {
+    if (pane.mouseProbe !== probe || pane.view !== view) return;
+    const selection = view.state.selection.main;
+    const coordinates = view.coordsAtPos(selection.head);
+    trace("mouse-selection-resolved", {
+      pane: id, probe, selection: { anchor: selection.anchor, head: selection.head },
+      selectionCoordinates: coordinates ? { left: rounded(coordinates.left), top: rounded(coordinates.top), bottom: rounded(coordinates.bottom) } : null,
+    });
+    pane.mouseProbe = null;
+  });
+}
+
+function observeScrollAnchor(id) {
+  const pane = panes[id];
+  const view = pane.view;
+  if (!view || !pane.model) return;
+  const now = performance.now();
+  const currentScroll = { top: view.scrollDOM.scrollTop, height: view.scrollDOM.scrollHeight };
+  const previousScroll = pane.lastScroll;
+  const retainedAnchor = { position: pane.anchor, dy: pane.anchorDy };
+  const sample = sampleViewportAnchor(view);
+  pane.lastScroll = currentScroll;
+  if (!sample) return;
+
+  // CodeMirror refines virtual spacer heights as it encounters wrapped text.
+  // When Firefox turns such a refinement into a large scroll jump, retain the
+  // pre-correction logical anchor instead of accepting the wrong viewport.
+  const heightChanged = previousScroll && Math.abs(currentScroll.height - previousScroll.height) > Math.max(10_000, previousScroll.height * 0.08);
+  const documentJumped = Math.abs(sample.position - retainedAnchor.position) > Math.max(3_000, pane.model.text.length * 0.02);
+  if (heightChanged && documentJumped && now >= pane.suppressScrollUntil && !pane.recoveryPending) {
+    pane.recoveryPending = true;
+    trace("viewport-discontinuity", {
+      pane: id, retainedAnchor, observedAnchor: { position: sample.position, dy: sample.dy },
+      previousScroll, currentScroll,
+    });
+    requestAnimationFrame(() => {
+      pane.recoveryPending = false;
+      if (pane.view !== view) return;
+      trace("viewport-recovery-started", { pane: id, anchor: retainedAnchor });
+      placeAnchor(id, retainedAnchor, "viewport-recovery", () => {
+        trace("viewport-recovery-finished", { pane: id, anchor: retainedAnchor, state: paneSnapshot(id) });
+      });
+    });
+    return;
+  }
+  pane.anchor = sample.position;
+  pane.anchorDy = sample.dy;
+  updatePanePosition(id);
 }
 
 function measureAnchor(id, reason, callback) {
@@ -869,6 +966,7 @@ function placeAnchor(id, requestedAnchor, reason, done = () => {}) {
   const view = pane.view;
   pane.anchor = position;
   pane.anchorDy = dy;
+  pane.lastScroll = null;
   pane.suppressScrollUntil = Math.max(pane.suppressScrollUntil, performance.now() + 400);
   pane.suppressionReason = reason;
   updatePanePosition(id, position);
@@ -948,6 +1046,21 @@ function placeAnchor(id, requestedAnchor, reason, done = () => {}) {
     }));
   };
   place(0);
+}
+
+function resetViewports() {
+  if (!panes.left.view || !panes.right.view || syncInProgress) return;
+  const anchors = Object.fromEntries(paneIds.map((id) => [id, { position: panes[id].anchor, dy: panes[id].anchorDy }]));
+  traceBoth("viewport-reset-requested", { anchors });
+  const operation = beginSync("viewport-reset", "viewport-reset");
+  let remaining = paneIds.length;
+  for (const id of paneIds) {
+    placeAnchor(id, anchors[id], "manual-viewport-reset", () => {
+      if (--remaining || activeSync !== operation) return;
+      traceBoth("viewport-reset-finished", { anchors });
+      releaseSync(operation, { reason: "viewport-reset" });
+    });
+  }
 }
 
 function beginSync(sequence, purpose) {
@@ -1078,6 +1191,7 @@ async function restoreSession() {
       trace("session-restore-empty");
       return;
     }
+    if (Number.isFinite(session.readerFontSize)) applyReaderFontSize(session.readerFontSize, { persist: false });
     for (const id of paneIds) {
       const book = session.books[id];
       if (book?.bytes && book?.name) openBookSource(id, book, book.name);
@@ -1115,6 +1229,9 @@ async function restoreSession() {
 $("#left-file").addEventListener("change", (event) => event.target.files[0] && openBook("left", event.target.files[0]));
 $("#right-file").addEventListener("change", (event) => event.target.files[0] && openBook("right", event.target.files[0]));
 $("#download-trace").addEventListener("click", downloadTrace);
+$("#reset-views").addEventListener("click", resetViewports);
+$("#decrease-font").addEventListener("click", () => applyReaderFontSize(readerFontSize - 1));
+$("#increase-font").addEventListener("click", () => applyReaderFontSize(readerFontSize + 1));
 $("#explain-selection").addEventListener("pointerdown", (event) => event.preventDefault());
 $("#explain-selection").addEventListener("click", () => {
   if (activeSelection) requestExplanation(activeSelection.pane, activeSelection, "selection-control");
