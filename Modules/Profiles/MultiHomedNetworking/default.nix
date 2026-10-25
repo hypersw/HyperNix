@@ -239,7 +239,7 @@ in
     services.avahi = {
       enable = true;
       nssmdns4 = true;
-      publish.enable = true;
+      settings.publish.disable-publishing = false;
     };
     hypersw.services.avahi-per-interface-names.enable = true;
   };

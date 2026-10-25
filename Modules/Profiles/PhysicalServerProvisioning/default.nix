@@ -649,18 +649,17 @@ in
     # needed on the provisioning image.
     services.avahi = {
       enable = true;
-      publish = {
-        enable = true;
-        addresses = true;       # publish A/AAAA records for the hostname
-        workstation = false;    # no "workstation" SRV record clutter
-        userServices = false;
+      settings.publish = {
+        disable-publishing = false;
+        publish-addresses = true;                 # publish A/AAAA records for the hostname
+        publish-workstation = false;              # no "workstation" SRV record clutter
+        disable-user-service-publishing = true;
       };
       nssmdns4 = true;          # also resolves .local locally
     };
     # mDNS uses UDP/5353 — needs the firewall open. The Avahi
-    # NixOS module flips `openFirewall` on automatically when
-    # `publish.enable = true`, but be explicit so it survives a
-    # firewall option override.
+    # NixOS module opens it by default (`openFirewall = true`),
+    # but be explicit so it survives a firewall option override.
     networking.firewall.allowedUDPPorts = [ 5353 ];
 
     # Heartbeat ACT LED. Pi 4's activity LED defaults to the

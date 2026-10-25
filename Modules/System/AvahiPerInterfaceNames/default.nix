@@ -247,11 +247,11 @@ in
       # self-conflict.
       enable = true;
       nssmdns4 = true;
-      publish = {
-        enable = true;
-        addresses = lib.mkForce true;
-        workstation = lib.mkForce false;
-        hinfo = lib.mkForce false;
+      settings.publish = {
+        disable-publishing = false;
+        publish-addresses = lib.mkForce true;
+        publish-workstation = lib.mkForce false;
+        publish-hinfo = lib.mkForce false;
       };
     };
 
