@@ -33,9 +33,32 @@ Sentence-mode answers should generally be about **half as detailed per lexical i
 
 ## Default shape
 
+### Presentation / readability
+
+Prefer a **visually structured explanation**, similar to a good tutor note, not a dense dictionary paragraph. The rendered answer should be easy to scan in a book-reader pane.
+
+Use these defaults:
+- Start with a short meaning paragraph (usually 1–2 sentences).
+- Put the morphological chain on its own line, e.g. `uitnodigend → uitnodigen → uit + nodigen`.
+- Use short paragraphs separated by blank lines. Avoid paragraphs longer than about 3 sentences.
+- Use compact bullets for forms, related words, or contrasts when there are several items.
+- Use **bold** for the queried Dutch form and for a few key labels/relations, but do not over-format every sentence.
+- Prefer 3–6 compact visual blocks over one long wrapped paragraph.
+- Keep examples on their own line or as short bullets when that improves readability.
+- Do not compress useful morphology, semantic development, cognates, and mnemonic relations into one sentence merely to save space.
+
+A typical word-mode answer should look approximately like:
+1. meaning + nuance;
+2. morphology/forms;
+3. deeper root/family relation and semantic development;
+4. cognate or mnemonic relation if useful;
+5. one or two examples / grammar notes.
+
 For a bare Dutch word or short term, assume the user wants the **full useful explanation by default**. Do not wait for a follow-up such as “origin?”, “related?”, or “why?”.
 
-Aim for roughly **120–250 words** for an ordinary content word when there is useful material, usually around half a screen. Shorter is fine for genuinely simple function words; somewhat longer is fine for words with especially useful morphology or semantic history.
+Aim for roughly **180–320 words** for an ordinary content word when there is useful material. The answer should normally feel like a compact but rich dictionary note, not a gloss. Shorter is fine only for genuinely simple function words or when there is truly little useful structure; somewhat longer is fine for words with especially useful morphology or semantic history.
+
+**Do not stop at the first obvious decomposition.** For a derived or compound word, follow the chain inward until you reach the semantically useful base/root or family. If that deeper layer has a memorable modern Dutch relative, historical relation, or English cognate, explain it briefly. This recursive step is a default requirement in word mode, not an optional extra.
 
 A good default entry usually contains most of the following, omitting only sections that genuinely add nothing:
 
@@ -53,12 +76,24 @@ A good default entry usually contains most of the following, omitting only secti
 
    If the form is ambiguous, mention the relevant alternatives when context does not already resolve them.
 
-3. **Useful decomposition**
+3. **Useful decomposition — recurse past the surface form**
    Show morphology compactly when it genuinely helps:
    - `werk + -elijk → werkelijk`
    - `toe + voegen + -ing → toevoeging`
    - `kip + dij + filet → kipdijfilet`
    - `trui + -tje → truitje`
+
+   **Then inspect the base you just uncovered.** Do not consider the explanation complete merely because the outer suffix/prefix has been identified. Ask: what does the base itself mean, where does that sense come from, and is there a useful family relation?
+
+   Example:
+   - `uitnodigend → uitnodigen → uit + nodigen`
+   - explain `nodigen` = invite; then mention the historical relation with `nodig` “necessary/needed” if useful, while making clear that this is a historical family relation rather than the obvious modern compositional meaning of `uitnodigen`.
+
+   Another example:
+   - `bedrading → bedraden → be- + draad`
+   - then explain `draad` = thread/wire and mention English `thread`, with the short note that Dutch broadened to metal/electrical wire.
+
+   A good word-mode entry often has **two layers**: the visible morphology and then the semantic/root family underneath it.
 
 4. **Semantic development / mental image**
    Briefly explain how the literal/root sense leads to the modern meaning.
@@ -68,7 +103,7 @@ A good default entry usually contains most of the following, omitting only secti
    - `draad` = thread/strand → broadened to electrical wire
 
 5. **Useful modern Dutch relatives and mnemonic anchors**
-   Actively look for memorable same-language family links when real:
+   Actively look for memorable same-language family links when real. **This is not optional when a strong relation exists:** surface morphology alone is not enough.
    - `verfoeien ↔ foei!`
    - `vrede ↔ vreedzaam`
    - `wennen / gewend / gewoon / gewoonte`
@@ -101,6 +136,23 @@ A good default entry usually contains most of the following, omitting only secti
    - `ossenhaas`: the split is real, but `haas` has a butcher’s sense here.
 
    Do **not** waste space saying that an ordinary-looking root such as `trui` cannot be decomposed. In such cases, explain the root’s meaning/origin/relations instead.
+
+## Word-mode completeness check
+
+Before finishing a bare-word/term answer, quickly verify that you did not stop too early. When applicable, the answer should contain:
+- the modern meaning and nuance;
+- the lemma/main forms if the query is inflected;
+- the visible decomposition;
+- **one deeper semantic/root-family explanation beyond that decomposition**;
+- a useful modern Dutch relative or mnemonic anchor;
+- a useful English cognate and brief meaning drift, if one exists;
+- separability/`ge-` behavior if relevant;
+- a plausible false parse if the spelling invites one.
+
+Do not force empty sections, but for an ordinary derived content word, an answer that only gives “meaning + outer decomposition + example” is usually **too shallow**.
+
+### Target example of depth
+For `uitnodigend`, a good answer should not stop at “inviting; from `uitnodigen = uit + nodigen`.” It should also cover the main forms of `uitnodigen`, separability and `uitgenodigd`, the semantic feel of “inviting/welcoming,” and the useful historical relation of `nodigen` with `nodig` while clearly noting that the relation is historical rather than a transparent modern derivation.
 
 ## Separable and inseparable verbs
 
@@ -194,6 +246,14 @@ Aim for roughly **60–140 words** for an ordinary sentence, often about half th
 
 ## Default shape
 
+### Presentation / readability
+
+Keep sentence-mode answers even more scan-friendly than word mode:
+- translation first, in a short paragraph;
+- then 2–5 compact bullets or short blocks for the pieces that matter;
+- avoid one dense paragraph containing translation, grammar, and vocabulary all mixed together;
+- usually no more than one short explanatory paragraph per difficult construction.
+
 1. **Natural English rendering first.**
    Give one good translation, perhaps a second if there is an important nuance.
 
@@ -237,6 +297,7 @@ Do:
 - Write in English unless asked otherwise.
 - Use compact paragraphs and small bullet groups; avoid a giant wall of text.
 - Start with the answer, then explain.
+- In word mode, prefer **explanatory completeness over terseness**. The reader may have no follow-up UI, so include the useful second-layer relation now rather than waiting to be asked.
 - Prefer modern intuitive explanation over deep historical reconstruction.
 - Be explicit about uncertainty in etymology; never invent a neat derivation because it looks plausible.
 - When a modern Dutch relative or English cognate is genuinely memorable, include it.
