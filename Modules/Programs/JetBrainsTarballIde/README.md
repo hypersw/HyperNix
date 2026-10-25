@@ -21,8 +21,13 @@ Drop-in, in a folder holding exactly one tarball:
 
 ```sh
 nix flake init -t github:hypersw/HyperNix#Modules-Programs-JetBrainsTarballIde
-nix run path:.
+chmod +x run.sh   # nix flake init drops the executable bit
+./run.sh   # or: nix run path:.
 ```
+
+`run.sh` runs the flake of its own folder from any working directory, so `~/Apps/Draft/run.sh` is one fixed command line.
+The `path:` it uses keeps Nix from treating the folder as part of a parent git repo, which would hide the untracked tarball.
+For a new build, replace the tarball: the folder must hold exactly one.
 
 From another flake: `hypernix.lib."Modules-Programs-JetBrainsTarballIde" { inherit pkgs; src = ./ide.tar.gz; }`, with `allowUnfree` on `pkgs`.
 
