@@ -17,7 +17,7 @@ let
     pname = "mirror-margin-static";
     version = "0.1.0";
     src = source;
-    npmDepsHash = "sha256-BkD3BYMkhuFVHwAC6pcnsERYS+KPK0u6IoKBZ7JEI5M=";
+    npmDepsHash = "sha256-oSgEgGEVY18CPUYCrNHiVR/CWouobv8CmnUc9td0G6U=";
     npmBuildScript = "build";
     installPhase = ''
       runHook preInstall

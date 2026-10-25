@@ -10,7 +10,9 @@
   "dependencies": {
     "@codemirror/state": "^6.5.2",
     "@codemirror/view": "^6.37.1",
-    "fflate": "0.8.3"
+    "dompurify": "3.4.17",
+    "fflate": "0.8.3",
+    "marked": "15.0.12"
   },
   "devDependencies": {
     "esbuild": "^0.25.1"

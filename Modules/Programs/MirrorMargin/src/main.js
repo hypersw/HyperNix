@@ -1,6 +1,8 @@
 import { Compartment, EditorState, RangeSetBuilder } from "@codemirror/state";
 import { Decoration, EditorView } from "@codemirror/view";
+import DOMPurify from "dompurify";
 import { unzipSync } from "fflate";
+import { marked } from "marked";
 
 const $ = (selector) => document.querySelector(selector);
 const paneIds = ["left", "right"];
@@ -158,7 +160,7 @@ function scheduleSave() {
 const theme = EditorView.theme({
   "&": { height: "100%", backgroundColor: "transparent", color: "#2c2924" },
   ".cm-scroller": {
-    fontFamily: 'Georgia, "Iowan Old Style", serif', fontSize: "20px", lineHeight: "1.72",
+    fontFamily: 'Inter, "Aptos", "Segoe UI Variable", ui-sans-serif, system-ui, sans-serif', fontSize: "20px", lineHeight: "1.72",
     overflowAnchor: "none", overflowY: "scroll", overflowX: "hidden", scrollbarGutter: "stable",
     scrollbarWidth: "thin", scrollbarColor: "#9d907b transparent",
   },
@@ -545,15 +547,14 @@ async function codexExplain(text, language) {
   return payload.answer;
 }
 
-function plainExplanation(value) {
-  // Responses are stored locally, so clean up both legacy Markdown answers and
-  // new plain-text ones without ever interpreting model output as HTML.
-  return value
-    .replace(/\*\*([^*]+)\*\*/g, "$1")
-    .replace(/__([^_]+)__/g, "$1")
-    .replace(/`([^`]+)`/g, "$1")
-    .replace(/\*([^*]+)\*/g, "$1")
-    .replace(/_([^_]+)_/g, "$1");
+function renderExplanation(value) {
+  // The model response is never trusted as HTML. Marked provides the reading
+  // format and DOMPurify enforces a deliberately small, link-safe subset.
+  return DOMPurify.sanitize(marked.parse(value, { async: false, breaks: true, gfm: true }), {
+    ALLOWED_TAGS: ["p", "br", "strong", "em", "del", "code", "pre", "ul", "ol", "li", "blockquote", "a", "h1", "h2", "h3", "hr"],
+    ALLOWED_ATTR: ["href", "title"],
+    ALLOWED_URI_REGEXP: /^(?:(?:https?|mailto):|[^a-z]|[a-z+.-]+(?:[^a-z+.-:]|$))/i,
+  });
 }
 
 function showLookupCard(id, record) {
@@ -561,7 +562,7 @@ function showLookupCard(id, record) {
   activeLookup = record;
   $("#lookup-kind").textContent = record.answerKind === "codex" ? "Codex · luna · low effort" : record.answerKind === "error" ? "Codex request failed" : "Asking Codex…";
   $("#lookup-text").textContent = record.text;
-  $("#lookup-answer").textContent = plainExplanation(record.answer);
+  $("#lookup-answer").innerHTML = renderExplanation(record.answer);
   $("#lookup-count").textContent = `Looked up ${record.count} ${record.count === 1 ? "time" : "times"} · stored on this device`;
   card.hidden = false;
 }
@@ -578,8 +579,8 @@ function escapeHtml(value) {
 function openLookupInNewTab() {
   if (!activeLookup) return;
   const title = escapeHtml(activeLookup.text);
-  const answer = escapeHtml(plainExplanation(activeLookup.answer));
-  const contents = `<!doctype html><meta charset="utf-8"><title>${title} — Mirror Margin</title><style>body{max-width:52rem;margin:4rem auto;padding:0 1.5rem;background:#f1ede4;color:#29261f;font:18px/1.6 Georgia,serif}small{font:14px system-ui;color:#71695d}h1{line-height:1.25}p{white-space:pre-wrap}</style><small>Mirror Margin · Codex · luna · low effort · looked up ${activeLookup.count} ${activeLookup.count === 1 ? "time" : "times"}</small><h1>${title}</h1><p>${answer}</p>`;
+  const answer = renderExplanation(activeLookup.answer);
+  const contents = `<!doctype html><meta charset="utf-8"><title>${title} — Mirror Margin</title><style>body{max-width:52rem;margin:4rem auto;padding:0 1.5rem;background:#f1ede4;color:#29261f;font:18px/1.6 Inter,Aptos,"Segoe UI Variable",ui-sans-serif,system-ui,sans-serif}small{font:14px Inter,Aptos,"Segoe UI Variable",ui-sans-serif,system-ui,sans-serif;color:#71695d}h1{line-height:1.25}.answer>*:first-child{margin-top:1.5rem}.answer p{margin:.8rem 0}.answer code{padding:.08em .28em;border-radius:.22em;background:#e4ded2}.answer pre{overflow:auto;padding:1rem;border-radius:.4rem;background:#e4ded2}.answer a{color:#71592f}</style><small>Mirror Margin · Codex · luna · low effort · looked up ${activeLookup.count} ${activeLookup.count === 1 ? "time" : "times"}</small><h1>${title}</h1><main class="answer">${answer}</main>`;
   const url = URL.createObjectURL(new Blob([contents], { type: "text/html" }));
   window.open(url, "_blank", "noopener");
   setTimeout(() => URL.revokeObjectURL(url), 60_000);
@@ -744,6 +745,19 @@ function updatePanePosition(id, position = panes[id].anchor) {
   if (positionLabel) positionLabel.textContent = chapter ? `${chapter.title} · ${Math.round(fraction * 100)}%` : "—";
 }
 
+function sampleViewportAnchor(view) {
+  const viewport = view.scrollDOM.getBoundingClientRect();
+  const x = viewport.left + Math.max(1, Math.min(viewport.width - 1, viewport.width / 2));
+  const maximumProbe = Math.min(80, Math.max(1, viewport.height - 1));
+  for (let offset = 1; offset <= maximumProbe; offset += 4) {
+    const position = view.posAtCoords({ x, y: viewport.top + offset });
+    if (position === null) continue;
+    const character = view.coordsAtPos(position);
+    if (character) return { position, dy: character.top - viewport.top, probeOffset: offset };
+  }
+  return null;
+}
+
 function measureAnchor(id, reason, callback) {
   const pane = panes[id];
   const view = pane.view;
@@ -760,18 +774,22 @@ function measureAnchor(id, reason, callback) {
     trace("anchor-measure-timeout", { pane: id, reason, request });
     finish(null);
   }, 900);
+  // requestMeasure can be deferred indefinitely while CodeMirror is extending
+  // a virtual viewport during a long fling. This is a read-only public-view
+  // query, so prefer it as the source anchor and retain requestMeasure only as
+  // a fallback for the rare frame where browser layout is not ready yet.
+  const immediate = sampleViewportAnchor(view);
+  if (immediate) {
+    const previous = { position: pane.anchor, dy: pane.anchorDy };
+    pane.anchor = immediate.position;
+    pane.anchorDy = immediate.dy;
+    updatePanePosition(id);
+    trace("anchor-measured-immediate", { pane: id, reason, previous, anchor: { position: pane.anchor, dy: pane.anchorDy }, probeOffset: immediate.probeOffset });
+    return finish({ position: pane.anchor, dy: pane.anchorDy });
+  }
   view.requestMeasure({
     read(measuredView) {
-      const viewport = measuredView.scrollDOM.getBoundingClientRect();
-      const x = viewport.left + Math.max(1, Math.min(viewport.width - 1, viewport.width / 2));
-      const maximumProbe = Math.min(80, Math.max(1, viewport.height - 1));
-      for (let offset = 1; offset <= maximumProbe; offset += 4) {
-        const position = measuredView.posAtCoords({ x, y: viewport.top + offset });
-        if (position === null) continue;
-        const character = measuredView.coordsAtPos(position);
-        if (character) return { position, dy: character.top - viewport.top, probeOffset: offset };
-      }
-      return null;
+      return sampleViewportAnchor(measuredView);
     },
     write(sample) {
       if (pane.view !== view || pane.measureRequest !== request) {

@@ -46,14 +46,15 @@ contains no executable, Nix store reference, or credential.
   adds a user pair at the two current anchors. Mapping between pairs is linear
   in character offsets, so the two translations need not have matching
   paragraphs.
-- Supports paragraph text plus simple FB2 bold, emphasis, and links. Images,
-  notes, and `.fb2.zip` are intentionally outside this slice.
+- Supports paragraph text plus simple FB2 bold, emphasis, and links. Common
+  FB2-in-ZIP and unencrypted EPUB 2/3 files are supported; images and notes
+  are intentionally outside this slice.
 - Keeps a book-independent local lookup ledger in IndexedDB. Double-click/tap
   selects a word; triple-click/tap selects a sentence; any settled selection
   gets an **Explain** control. On a desktop, `Ctrl`-click queries the current
   selection, or the clicked word when there is no selection.
 - Starts a loopback-only Codex bridge when run through `nix run`. It uses the
-  pinned Nix `codex` CLI with `gpt-5.6-terra` and low reasoning effort, sending
+  pinned Nix `codex` CLI with `gpt-6-luna` and low reasoning effort, sending
   only the explicitly selected text. Responses are cached locally. Lookup data
   is stored as normalized text plus append-only local events, so a later sync
   provider can merge it without tying history to a particular book. Looked-up
