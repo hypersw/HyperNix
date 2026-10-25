@@ -1,5 +1,6 @@
 import { Compartment, EditorState, RangeSetBuilder } from "@codemirror/state";
 import { Decoration, EditorView } from "@codemirror/view";
+import { unzipSync } from "fflate";
 
 const $ = (selector) => document.querySelector(selector);
 const paneIds = ["left", "right"];
@@ -75,6 +76,7 @@ const databaseStore = "session";
 const lookupStore = "lookups";
 const lookupEventStore = "lookup-events";
 const lookups = new Map();
+const bridgeToken = new URLSearchParams(window.location.search).get("bridge");
 let activeSelection = null;
 let activeLookup = null;
 let lookupDrag = null;
@@ -218,65 +220,44 @@ function directChild(element, tag) {
   return directChildren(element, tag)[0];
 }
 
+function elementsNamed(element, tag) {
+  return [...element.getElementsByTagNameNS("*", tag)];
+}
+
 function textOf(element) {
   return normalizeText(element?.textContent ?? "");
 }
 
-function parseFb2(source, fallbackTitle) {
-  const xml = new DOMParser().parseFromString(source, "application/xml");
-  if (xml.querySelector("parsererror")) throw new Error("The selected file is not valid FB2 XML.");
-  const bodies = [...xml.getElementsByTagNameNS("*", "body")];
-  const body = bodies.find((candidate) => !candidate.getAttribute("name"));
-  if (!body) throw new Error("The FB2 file has no main text body.");
-
-  const bookTitle = textOf(xml.querySelector("description title-info book-title")) || fallbackTitle;
-  const blocks = [];
-  const chapters = [];
-  const addBlock = (runs, kind, chapterId) => {
-    const normalizedRuns = [];
-    let needsSpace = false;
-    for (const run of runs) {
-      for (const token of run.text.match(/\S+|\s+/g) ?? []) {
-        if (/^\s+$/.test(token)) {
-          needsSpace ||= normalizedRuns.length > 0;
-          continue;
-        }
-        if (needsSpace) normalizedRuns.push({ text: " " });
-        normalizedRuns.push({ ...run, text: token });
-        needsSpace = false;
+function addBlock(blocks, runs, kind) {
+  const normalizedRuns = [];
+  let needsSpace = false;
+  for (const run of runs) {
+    for (const token of run.text.match(/\S+|\s+/g) ?? []) {
+      if (/^\s+$/.test(token)) {
+        needsSpace ||= normalizedRuns.length > 0;
+        continue;
       }
+      if (needsSpace) normalizedRuns.push({ text: " " });
+      normalizedRuns.push({ ...run, text: token });
+      needsSpace = false;
     }
-    const value = normalizedRuns.map((run) => run.text).join("");
-    if (!value) return;
-    blocks.push({ kind, chapterId, text: value, runs: normalizedRuns });
-  };
+  }
+  const text = normalizedRuns.map((run) => run.text).join("");
+  if (text) blocks.push({ kind, text, runs: normalizedRuns });
+}
 
-  const collectSection = (section, chapter, depth) => {
-    const title = directChild(section, "title");
-    if (title) addBlock(inlineRuns(title), depth === 0 ? "title" : "heading", chapter.id);
-    for (const child of section.children) {
-      const tag = nameOf(child);
-      if (tag === "title") continue;
-      if (tag === "section") collectSection(child, chapter, depth + 1);
-      else if (tag === "p" || tag === "subtitle" || tag === "text-author") addBlock(inlineRuns(child), tag === "text-author" ? "epigraph" : "paragraph", chapter.id);
-      else if (tag === "poem" || tag === "epigraph" || tag === "cite") {
-        for (const paragraph of child.querySelectorAll(":scope p")) addBlock(inlineRuns(paragraph), tag === "epigraph" ? "epigraph" : "paragraph", chapter.id);
-      }
-    }
-  };
+function semanticChapterKey(title) {
+  const value = normalizeText(title).toLocaleLowerCase();
+  if (/^\d+$/.test(value)) return `chapter:${Number(value)}`;
+  if (/epilogue|epiloog/.test(value)) return "epilogue";
+  if (!/part|deel/.test(value)) return null;
+  const match = value.match(/(?:part|deel)\s*(1|2|3|one|two|three|een|twee|drie|i|ii|iii)/);
+  const numbers = { "1": 1, one: 1, een: 1, i: 1, "2": 2, two: 2, twee: 2, ii: 2, "3": 3, three: 3, drie: 3, iii: 3 };
+  return match ? `part:${numbers[match[1]]}` : null;
+}
 
-  const topSections = directChildren(body, "section");
-  const sections = topSections.length ? topSections : [body];
-  sections.forEach((section, index) => {
-    const title = textOf(directChild(section, "title")) || `Chapter ${index + 1}`;
-    const chapter = { id: `chapter-${index}`, title, from: 0, to: 0 };
-    chapter.from = blocks.length;
-    collectSection(section, chapter, 0);
-    chapter.to = blocks.length;
-    if (chapter.to > chapter.from) chapters.push(chapter);
-  });
-  if (!blocks.length) throw new Error("The FB2 body has no readable prose blocks.");
-
+function finalizeBook(title, blocks, markers, language = null) {
+  if (!blocks.length) throw new Error("The selected book has no readable prose blocks.");
   let offset = 0;
   const decorations = [];
   for (const block of blocks) {
@@ -293,13 +274,161 @@ function parseFb2(source, fallbackTitle) {
     offset = block.to + 1;
   }
   const text = blocks.map((block) => block.text).join("\n");
-  for (const chapter of chapters) {
-    const first = blocks[chapter.from];
-    const last = blocks[chapter.to - 1];
-    chapter.from = first.from;
-    chapter.to = last.to;
+  const uniqueMarkers = new Map();
+  for (const marker of markers) {
+    if (!marker.title || marker.blockIndex >= blocks.length) continue;
+    const previous = uniqueMarkers.get(marker.blockIndex);
+    if (!previous || (!semanticChapterKey(previous.title) && semanticChapterKey(marker.title))) uniqueMarkers.set(marker.blockIndex, marker);
   }
-  return { title: bookTitle, text, decorations, chapters };
+  const ordered = [...uniqueMarkers.values()].sort((a, b) => a.blockIndex - b.blockIndex);
+  if (!ordered.length || ordered[0].blockIndex > 0) ordered.unshift({ title: title || "Beginning", blockIndex: 0 });
+  const chapters = ordered.map((marker, index) => ({
+    id: `chapter-${index}`,
+    title: marker.title,
+    syncKey: semanticChapterKey(marker.title),
+    from: blocks[marker.blockIndex].from,
+    to: index + 1 < ordered.length ? blocks[ordered[index + 1].blockIndex].from : text.length,
+  })).filter((chapter) => chapter.to > chapter.from);
+  return { title, language, text, decorations, chapters };
+}
+
+function parseFb2(source, fallbackTitle) {
+  const xml = new DOMParser().parseFromString(source, "application/xml");
+  if (xml.querySelector("parsererror")) throw new Error("The selected file is not valid FB2 XML.");
+  const bodies = [...xml.getElementsByTagNameNS("*", "body")];
+  const body = bodies.find((candidate) => !candidate.getAttribute("name"));
+  if (!body) throw new Error("The FB2 file has no main text body.");
+
+  const bookTitle = textOf(xml.querySelector("description title-info book-title")) || fallbackTitle;
+  const blocks = [];
+  const markers = [];
+
+  const collectSection = (section, depth) => {
+    const title = directChild(section, "title");
+    const chapterTitle = textOf(title);
+    if (chapterTitle) markers.push({ title: chapterTitle, blockIndex: blocks.length });
+    if (title) addBlock(blocks, inlineRuns(title), depth === 0 ? "title" : "heading");
+    for (const child of section.children) {
+      const tag = nameOf(child);
+      if (tag === "title") continue;
+      if (tag === "section") collectSection(child, depth + 1);
+      else if (tag === "p" || tag === "subtitle" || tag === "text-author") addBlock(blocks, inlineRuns(child), tag === "text-author" ? "epigraph" : "paragraph");
+      else if (tag === "poem" || tag === "epigraph" || tag === "cite") {
+        for (const paragraph of child.querySelectorAll(":scope p")) addBlock(blocks, inlineRuns(paragraph), tag === "epigraph" ? "epigraph" : "paragraph");
+      }
+    }
+  };
+
+  const topSections = directChildren(body, "section");
+  const sections = topSections.length ? topSections : [body];
+  sections.forEach((section) => collectSection(section, 0));
+  return finalizeBook(bookTitle, blocks, markers, textOf(elementsNamed(xml, "lang")[0]) || null);
+}
+
+function parseXml(source, label) {
+  // Older EPUB generators often emit HTML's named nbsp entity in otherwise XML XHTML.
+  const xml = new DOMParser().parseFromString(source.replaceAll("&nbsp;", "&#160;"), "application/xml");
+  if (xml.querySelector("parsererror")) throw new Error(`${label} is not valid XML.`);
+  return xml;
+}
+
+function zipPath(base, href) {
+  return decodeURIComponent(new URL(href, `https://book.invalid/${base ? `${base}/` : ""}`).pathname.slice(1));
+}
+
+const xmlEncodingAliases = new Map([
+  ["utf8", "utf-8"],
+  ["us-ascii", "windows-1252"],
+  ["iso-8859-1", "windows-1252"],
+  ["latin1", "windows-1252"],
+  ["cp1251", "windows-1251"],
+  ["cp1252", "windows-1252"],
+]);
+
+function decodeXmlBytes(bytes) {
+  // XML declarations are ASCII-compatible, so Windows-1252 safely reads this
+  // small prefix without assuming that the document body is UTF-8.
+  const header = new TextDecoder("windows-1252").decode(bytes.subarray(0, 512));
+  const declared = header.match(/<\?xml\b[^>]*\bencoding\s*=\s*["']([^"']+)["']/i)?.[1]?.trim().toLowerCase();
+  const encoding = xmlEncodingAliases.get(declared) ?? declared;
+  const candidates = [...new Set([encoding, "utf-8", "windows-1252"].filter(Boolean))];
+  for (const candidate of candidates) {
+    try {
+      return new TextDecoder(candidate, { fatal: true }).decode(bytes);
+    } catch {
+      // Try the next standards-compatible fallback below.
+    }
+  }
+  return new TextDecoder("windows-1252").decode(bytes);
+}
+
+function zipText(files, path) {
+  const value = files[path];
+  if (!value) throw new Error(`The book archive is missing ${path}.`);
+  return decodeXmlBytes(value);
+}
+
+function parseEpub(files, fallbackTitle) {
+  if (files["META-INF/encryption.xml"]) throw new Error("Encrypted/DRM EPUB files are not supported.");
+  const container = parseXml(zipText(files, "META-INF/container.xml"), "The EPUB container");
+  const rootfile = elementsNamed(container, "rootfile").find((node) => node.getAttribute("full-path"));
+  if (!rootfile) throw new Error("The EPUB container has no package document.");
+  const opfPath = rootfile.getAttribute("full-path");
+  const opfBase = opfPath.slice(0, opfPath.lastIndexOf("/"));
+  const opf = parseXml(zipText(files, opfPath), "The EPUB package document");
+  const metadataTitle = textOf(elementsNamed(opf, "title")[0]);
+  const manifest = new Map(elementsNamed(opf, "item").filter((item) => nameOf(item.parentElement) === "manifest").map((item) => [item.getAttribute("id"), {
+    path: zipPath(opfBase, item.getAttribute("href")), mediaType: item.getAttribute("media-type") ?? "",
+  }]));
+  const spine = elementsNamed(opf, "itemref").filter((item) => nameOf(item.parentElement) === "spine").map((item) => manifest.get(item.getAttribute("idref"))).filter(Boolean);
+  if (!spine.length) throw new Error("The EPUB has no readable spine.");
+  const ncx = [...manifest.values()].find((item) => item.mediaType === "application/x-dtbncx+xml" || item.path.endsWith(".ncx"));
+  const targets = new Map();
+  if (ncx) {
+    const ncxBase = ncx.path.slice(0, ncx.path.lastIndexOf("/"));
+    const navigation = parseXml(zipText(files, ncx.path), "The EPUB table of contents");
+    for (const point of elementsNamed(navigation, "navPoint")) {
+      const label = textOf(elementsNamed(point, "text")[0]);
+      const source = elementsNamed(point, "content")[0]?.getAttribute("src");
+      if (!label || !source) continue;
+      const [href, fragment = ""] = source.split("#", 2);
+      targets.set(`${zipPath(ncxBase, href)}#${fragment}`, label);
+    }
+  }
+  const blocks = [];
+  const markers = [];
+  const seenTargets = new Set();
+  const mark = (key, title) => {
+    if (title && !seenTargets.has(key)) {
+      seenTargets.add(key);
+      markers.push({ title, blockIndex: blocks.length });
+    }
+  };
+  for (const item of spine) {
+    if (!/(xhtml|html)/.test(item.mediaType) && !/\.x?html?$/i.test(item.path)) continue;
+    const document = parseXml(zipText(files, item.path), `The EPUB document ${item.path}`);
+    mark(`${item.path}#`, targets.get(`${item.path}#`));
+    const content = elementsNamed(document, "body")[0] ?? document.documentElement;
+    for (const element of elementsNamed(content, "*").filter((node) => /^(h[1-6]|p|blockquote|li)$/.test(nameOf(node)))) {
+      if (element.id) mark(`${item.path}#${element.id}`, targets.get(`${item.path}#${element.id}`));
+      const tag = nameOf(element);
+      const heading = /^h[1-6]$/.test(tag);
+      const value = textOf(element);
+      if (heading && value && !element.id) markers.push({ title: value, blockIndex: blocks.length });
+      addBlock(blocks, inlineRuns(element), heading ? "heading" : tag === "blockquote" ? "epigraph" : "paragraph");
+    }
+  }
+  return finalizeBook(metadataTitle || fallbackTitle, blocks, markers, textOf(elementsNamed(opf, "language")[0]) || null);
+}
+
+function parseBookBytes(bytes, fallbackTitle) {
+  const isZip = bytes[0] === 0x50 && bytes[1] === 0x4b;
+  if (!isZip) return parseFb2(decodeXmlBytes(bytes), fallbackTitle);
+  const files = unzipSync(bytes);
+  if (files["META-INF/container.xml"] || new TextDecoder().decode(files.mimetype ?? new Uint8Array()).trim() === "application/epub+zip") return parseEpub(files, fallbackTitle);
+  const fb2Path = Object.keys(files).find((path) => path.toLocaleLowerCase().endsWith(".fb2"));
+  if (fb2Path) return parseFb2(decodeXmlBytes(files[fb2Path]), fallbackTitle);
+  throw new Error("This ZIP contains neither an EPUB nor an FB2 file.");
 }
 
 function decorationSet(model) {
@@ -404,17 +533,35 @@ function scheduleSelectionAction(id) {
   pane.selectionTimer = setTimeout(() => showSelectionAction(id), 180);
 }
 
-function mockAnswer(text) {
-  const compact = normalizeText(text);
-  const wordCount = compact ? compact.split(" ").length : 0;
-  return `Mock explanation: “${compact}” has been saved as a ${wordCount === 1 ? "word" : `${wordCount}-word selection`}. A future Codex responder will replace this placeholder while preserving the same local history and cached answer.`;
+async function codexExplain(text, language) {
+  if (!bridgeToken) throw new Error("Codex explanations need Mirror Margin to be started with nix run.");
+  const response = await fetch("/api/explain", {
+    method: "POST",
+    headers: { "Content-Type": "application/json", "X-Mirror-Margin-Token": bridgeToken },
+    body: JSON.stringify({ text, language: language ?? "" }),
+  });
+  const payload = await response.json().catch(() => ({}));
+  if (!response.ok || !payload.answer) throw new Error(payload.error ?? "Codex did not return an explanation.");
+  return payload.answer;
+}
+
+function plainExplanation(value) {
+  // Responses are stored locally, so clean up both legacy Markdown answers and
+  // new plain-text ones without ever interpreting model output as HTML.
+  return value
+    .replace(/\*\*([^*]+)\*\*/g, "$1")
+    .replace(/__([^_]+)__/g, "$1")
+    .replace(/`([^`]+)`/g, "$1")
+    .replace(/\*([^*]+)\*/g, "$1")
+    .replace(/_([^_]+)_/g, "$1");
 }
 
 function showLookupCard(id, record) {
   const card = $("#lookup-card");
   activeLookup = record;
+  $("#lookup-kind").textContent = record.answerKind === "codex" ? "Codex · luna · low effort" : record.answerKind === "error" ? "Codex request failed" : "Asking Codex…";
   $("#lookup-text").textContent = record.text;
-  $("#lookup-answer").textContent = record.answer;
+  $("#lookup-answer").textContent = plainExplanation(record.answer);
   $("#lookup-count").textContent = `Looked up ${record.count} ${record.count === 1 ? "time" : "times"} · stored on this device`;
   card.hidden = false;
 }
@@ -431,8 +578,8 @@ function escapeHtml(value) {
 function openLookupInNewTab() {
   if (!activeLookup) return;
   const title = escapeHtml(activeLookup.text);
-  const answer = escapeHtml(activeLookup.answer);
-  const contents = `<!doctype html><meta charset="utf-8"><title>${title} — Mirror Margin</title><style>body{max-width:52rem;margin:4rem auto;padding:0 1.5rem;background:#f1ede4;color:#29261f;font:18px/1.6 Georgia,serif}small{font:14px system-ui;color:#71695d}h1{line-height:1.25}p{white-space:pre-wrap}</style><small>Mirror Margin · mock Codex response · looked up ${activeLookup.count} ${activeLookup.count === 1 ? "time" : "times"}</small><h1>${title}</h1><p>${answer}</p>`;
+  const answer = escapeHtml(plainExplanation(activeLookup.answer));
+  const contents = `<!doctype html><meta charset="utf-8"><title>${title} — Mirror Margin</title><style>body{max-width:52rem;margin:4rem auto;padding:0 1.5rem;background:#f1ede4;color:#29261f;font:18px/1.6 Georgia,serif}small{font:14px system-ui;color:#71695d}h1{line-height:1.25}p{white-space:pre-wrap}</style><small>Mirror Margin · Codex · luna · low effort · looked up ${activeLookup.count} ${activeLookup.count === 1 ? "time" : "times"}</small><h1>${title}</h1><p>${answer}</p>`;
   const url = URL.createObjectURL(new Blob([contents], { type: "text/html" }));
   window.open(url, "_blank", "noopener");
   setTimeout(() => URL.revokeObjectURL(url), 60_000);
@@ -449,20 +596,38 @@ async function requestExplanation(id, range, trigger) {
     key,
     normalized: key,
     text: existing?.text ?? text,
-    answer: existing?.answer ?? mockAnswer(text),
+    answer: existing?.answer ?? "Asking Codex…",
+    answerKind: existing?.answerKind ?? "pending",
     count: (existing?.count ?? 0) + 1,
     firstViewedAt: existing?.firstViewedAt ?? now,
     lastViewedAt: now,
   };
-  lookups.set(key, record);
-  refreshLookupDecorations();
-  showLookupCard(id, record);
   trace("lookup-requested", { pane: id, trigger, key, count: record.count, length: text.length });
+  if (existing?.answerKind === "codex") {
+    lookups.set(key, record);
+    refreshLookupDecorations();
+    showLookupCard(id, record);
+    try {
+      await storeLookup(record);
+    } catch (error) {
+      trace("lookup-store-failed", { message: error.message, key });
+    }
+    return;
+  }
+  showLookupCard(id, record);
   try {
+    record.answer = await codexExplain(text, panes[id].model.language);
+    record.answerKind = "codex";
+    lookups.set(key, record);
+    refreshLookupDecorations();
+    showLookupCard(id, record);
     await storeLookup(record);
   } catch (error) {
     trace("lookup-store-failed", { message: error.message, key });
-    console.warn("Could not save lookup history", error);
+    record.answer = error.message;
+    record.answerKind = "error";
+    showLookupCard(id, record);
+    console.warn("Could not request or save explanation", error);
   }
 }
 
@@ -641,14 +806,25 @@ function rebuildAutomaticPoints() {
   if (!panes.left.model || !panes.right.model) return;
   const left = panes.left.model, right = panes.right.model;
   automaticPoints = [{ left: 0, right: 0 }];
-  for (let index = 0; index < Math.min(left.chapters.length, right.chapters.length); index += 1) {
-    automaticPoints.push({ left: left.chapters[index].from, right: right.chapters[index].from });
-    automaticPoints.push({ left: left.chapters[index].to, right: right.chapters[index].to });
+  const rightByKey = new Map(right.chapters.filter((chapter) => chapter.syncKey).map((chapter) => [chapter.syncKey, chapter]));
+  let matches = 0;
+  for (const chapter of left.chapters) {
+    const counterpart = chapter.syncKey && rightByKey.get(chapter.syncKey);
+    if (!counterpart) continue;
+    matches += 1;
+    automaticPoints.push({ left: chapter.from, right: counterpart.from });
+    automaticPoints.push({ left: chapter.to, right: counterpart.to });
+  }
+  if (!matches) {
+    for (let index = 0; index < Math.min(left.chapters.length, right.chapters.length); index += 1) {
+      automaticPoints.push({ left: left.chapters[index].from, right: right.chapters[index].from });
+      automaticPoints.push({ left: left.chapters[index].to, right: right.chapters[index].to });
+    }
   }
   automaticPoints.push({ left: left.text.length, right: right.text.length });
   manualPoints = [];
   updateAlignmentStatus();
-  trace("automatic-points-rebuilt", { automaticPointCount: automaticPoints.length });
+  trace("automatic-points-rebuilt", { automaticPointCount: automaticPoints.length, semanticChapterMatches: matches });
 }
 
 function mapPosition(from, position) {
@@ -677,7 +853,6 @@ function placeAnchor(id, requestedAnchor, reason, done = () => {}) {
   pane.anchorDy = dy;
   pane.suppressScrollUntil = Math.max(pane.suppressScrollUntil, performance.now() + 400);
   pane.suppressionReason = reason;
-  view.dispatch({ effects: EditorView.scrollIntoView(position, { y: "start", yMargin: 0 }) });
   updatePanePosition(id, position);
   let completed = false;
   const finish = () => {
@@ -690,6 +865,16 @@ function placeAnchor(id, requestedAnchor, reason, done = () => {}) {
     trace("anchor-place-timeout", { pane: id, position, dy, reason });
     finish();
   }, 1200);
+  const reveal = (attempt, details = {}) => {
+    trace("anchor-place-reveal", { pane: id, position, dy, reason, attempt, ...details });
+    // Dispatch outside CodeMirror's measure write phase, then give its
+    // virtualized viewport a frame to materialize before measuring again.
+    requestAnimationFrame(() => {
+      if (pane.view !== view) return finish();
+      view.dispatch({ effects: EditorView.scrollIntoView(position, { y: "start", yMargin: 0 }) });
+      setTimeout(() => place(attempt + 1), 48);
+    });
+  };
   const place = (attempt) => {
     trace("anchor-place-intent", { pane: id, requestedAnchor, position, dy, reason, attempt, before: paneSnapshot(id) });
     requestAnimationFrame(() => view.requestMeasure({
@@ -706,11 +891,23 @@ function placeAnchor(id, requestedAnchor, reason, done = () => {}) {
         }
         if (!measurement) {
           trace("anchor-place-not-rendered", { pane: id, position, dy, reason, attempt });
-          if (attempt < 2) place(attempt + 1);
+          // The common, in-viewport path must never use scrollIntoView: it
+          // snaps the target line to the top before our sub-line correction,
+          // producing a visible up/down pulse during continuous scrolling.
+          // Reveal only a genuinely unrendered target, then measure again.
+          if (attempt < 2) reveal(attempt, { cause: "not-rendered" });
           else finish();
           return;
         }
         const correction = measurement.characterTop - measurement.viewportTop - dy;
+        // coordsAtPos may return an estimated coordinate for a position beyond
+        // the materialized viewport. Only direct-adjust a nearby line; reveal
+        // first when the correction shows that this is a virtual projection.
+        if (Math.abs(correction) > 80 && attempt < 2) {
+          trace("anchor-place-nonlocal", { pane: id, position, dy, reason, attempt, correction });
+          reveal(attempt, { cause: "nonlocal", correction });
+          return;
+        }
         if (Math.abs(correction) > 0.25) view.scrollDOM.scrollTop += correction;
         trace("anchor-place-corrected", { pane: id, position, dy, reason, attempt, correction });
         requestAnimationFrame(() => view.requestMeasure({
@@ -835,15 +1032,19 @@ function updateAlignmentStatus() {
 }
 
 function openBookSource(id, source, name) {
-  trace("book-open-started", { pane: id, name, sourceLength: source.length });
-  const model = parseFb2(source, name.replace(/\.fb2$/i, ""));
-  makeView(id, model, { name, source });
+  const record = typeof source === "string"
+    ? { name, bytes: new TextEncoder().encode(source) }
+    : { name: source.name, bytes: source.bytes instanceof Uint8Array ? source.bytes : new Uint8Array(source.bytes) };
+  trace("book-open-started", { pane: id, name: record.name, sourceLength: record.bytes.byteLength });
+  const title = record.name.replace(/\.(fb2|epub)(\.zip)?$/i, "");
+  const model = parseBookBytes(record.bytes, title);
+  makeView(id, model, record);
   traceBoth("book-opened", { pane: id, name, documentLength: model.text.length, chapterCount: model.chapters.length });
 }
 
 async function openBook(id, file) {
   try {
-    openBookSource(id, await file.text(), file.name);
+    openBookSource(id, { name: file.name, bytes: new Uint8Array(await file.arrayBuffer()) }, file.name);
     if (panes.left.model && panes.right.model) rebuildAutomaticPoints();
     scheduleSave();
   } catch (error) {
@@ -861,7 +1062,8 @@ async function restoreSession() {
     }
     for (const id of paneIds) {
       const book = session.books[id];
-      if (book?.source && book?.name) openBookSource(id, book.source, book.name);
+      if (book?.bytes && book?.name) openBookSource(id, book, book.name);
+      else if (book?.source && book?.name) openBookSource(id, book.source, book.name);
     }
     if (panes.left.model && panes.right.model) rebuildAutomaticPoints();
     manualPoints = Array.isArray(session.manualPoints)

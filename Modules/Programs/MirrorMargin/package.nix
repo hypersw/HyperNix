@@ -15,7 +15,7 @@ let
     pname = "mirror-margin-static";
     version = "0.1.0";
     src = source;
-    npmDepsHash = "sha256-/E5vRul07OWA7bxS/M+OVmcgrCVZ2oGMsvmujiO2Iro=";
+    npmDepsHash = "sha256-BkD3BYMkhuFVHwAC6pcnsERYS+KPK0u6IoKBZ7JEI5M=";
     npmBuildScript = "build";
     installPhase = ''
       runHook preInstall
@@ -24,34 +24,39 @@ let
       runHook postInstall
     '';
   };
-  siteVersion = builtins.substring 11 32 (toString staticSite);
+  portable = pkgs.runCommand "mirror-margin-portable" { } ''
+    mkdir -p "$out/site" "$out/skills/dutch-word-explainer"
+    cp -r ${staticSite}/. "$out/site/"
+    cp ${./scripts/bridge.mjs} "$out/bridge.mjs"
+    cp ${./skills/dutch-word-explainer/SKILL.md} "$out/skills/dutch-word-explainer/SKILL.md"
+    cat > "$out/README.txt" <<'EOF'
+Mirror Margin portable distribution
+
+Requirements: Node.js and Codex CLI, logged in for the current user.
+
+Run from this directory:
+  node bridge.mjs --site site --port 8000
+
+The launcher prints a loopback URL and opens it where the platform supports it.
+Set NO_BROWSER=1 to print the URL only. The bridge uses the local user's Codex
+login and sends only explicitly selected text.
+EOF
+  '';
+  portableZip = pkgs.runCommand "mirror-margin-portable.zip" { nativeBuildInputs = [ pkgs.zip ]; } ''
+    mkdir distribution
+    cp -r ${portable}/. distribution/
+    (cd distribution && zip -qr "$out" .)
+  '';
 in
 pkgs.writeShellApplication {
   name = "mirror-margin";
-  runtimeInputs = [ pkgs.coreutils pkgs.python3 pkgs.xdg-utils ];
+  runtimeInputs = [ pkgs.codex pkgs.nodejs pkgs.xdg-utils ];
   text = ''
     port="''${PORT:-8000}"
     case "$port" in
       *[!0-9]*) echo "PORT must be a number" >&2; exit 2 ;;
     esac
-    run_id="$(date +%s%N)"
-    url="http://127.0.0.1:$port/?v=${siteVersion}&run=$run_id"
-    python3 -c '
-import functools
-import http.server
-import sys
-
-class Handler(http.server.SimpleHTTPRequestHandler):
-    def end_headers(self):
-        self.send_header("Cache-Control", "no-store")
-        super().end_headers()
-
-server = http.server.ThreadingHTTPServer(
-    ("127.0.0.1", int(sys.argv[1])),
-    functools.partial(Handler, directory=sys.argv[2]),
-)
-server.serve_forever()
-' "$port" ${staticSite} &
+    SITE_DIR=${staticSite} DUTCH_SKILL_PATH=${./skills/dutch-word-explainer/SKILL.md} node ${./scripts/bridge.mjs} --port "$port" &
     server_pid=$!
     trap 'kill "$server_pid" 2>/dev/null || true' EXIT INT TERM
     sleep 0.2
@@ -60,12 +65,9 @@ server.serve_forever()
       wait "$server_pid"
       exit 1
     fi
-    echo "Mirror Margin is running at $url"
-    if [ "''${NO_BROWSER:-0}" != 1 ]; then
-      xdg-open "$url" >/dev/null 2>&1 || echo "Could not open a browser automatically; open $url yourself." >&2
-    fi
     wait "$server_pid"
   '';
+  passthru = { inherit staticSite portable portableZip; };
   meta = {
     description = "Local parallel-text reader with logical-position synchronization";
     mainProgram = "mirror-margin";
