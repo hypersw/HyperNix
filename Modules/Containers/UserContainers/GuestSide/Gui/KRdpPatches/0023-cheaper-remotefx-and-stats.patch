@@ -15,22 +15,22 @@ Log a summary every ten seconds while frames are sent: frame rate, damaged share
 of the frames, bandwidth and size, so load that does not match the screen shows
 up as such.
 diff --git a/src/VideoStream.cpp b/src/VideoStream.cpp
-index b663478..e366904 100644
+index 7a26ddd..34ee101 100644
 --- a/src/VideoStream.cpp
 +++ b/src/VideoStream.cpp
-@@ -61,6 +61,8 @@ constexpr clk::steady_clock::duration AckStallTimeout = clk::milliseconds(1000);
- // MS-RDPEGFX: a FrameAcknowledge with this queue depth means the client stops
- // acknowledging frames until further notice.
- constexpr uint32_t SuspendFrameAcknowledgement = 0xFFFFFFFF;
+@@ -58,6 +58,8 @@ constexpr qsizetype LowQueueCount = 1; // Level of frames in the pending-send qu
+ // before it is assumed lost and cleared, so the stream recovers instead of
+ // stalling for good.
+ constexpr clk::steady_clock::duration AckStallTimeout = clk::milliseconds(1000);
 +// How often a summary of what was sent is logged, while anything is sent at all.
 +constexpr clk::steady_clock::duration StatsInterval = clk::seconds(10);
  
  constexpr uint32_t ProgressiveCodecContextId = 1;
  
-@@ -182,6 +184,12 @@ public:
+@@ -178,6 +180,12 @@ public:
+     // Last time the in-flight window made progress: a frame acknowledged,
+     // the window emptied, or the GFX channel reset. Guarded by pendingFramesMutex.
      clk::steady_clock::time_point lastAckProgress = clk::steady_clock::now();
-     // Set while the client has suspended frame acknowledgements; guarded likewise.
-     bool acksSuspended = false;
 +    // Periodic send statistics, touched only by the frame-submission thread.
 +    clk::steady_clock::time_point statsSince = clk::steady_clock::now();
 +    uint64_t statsFrames = 0;
@@ -40,7 +40,7 @@ index b663478..e366904 100644
  
      std::atomic_int requestedFrameRate = 60;
      std::atomic<qsizetype> maxInFlight{MaximumInFlightFrames}; // recomputed from RTT on rttChanged
-@@ -986,6 +994,33 @@ void VideoStream::sendFrame(const VideoFrame &frame)
+@@ -978,6 +986,33 @@ void VideoStream::sendFrame(const VideoFrame &frame)
          sendFrameProgressive(frame);
      }
  
@@ -74,7 +74,7 @@ index b663478..e366904 100644
      QMetaObject::invokeMethod(this, &VideoStream::updateBackpressure, Qt::QueuedConnection);
  }
  
-@@ -1078,7 +1113,29 @@ void VideoStream::sendFrameProgressive(const VideoFrame &frame)
+@@ -1072,7 +1107,29 @@ void VideoStream::sendFrameProgressive(const VideoFrame &frame)
          return;
      }
  
@@ -105,7 +105,7 @@ index b663478..e366904 100644
      const QRect frameRect(QPoint(0, 0), image.size());
      auto invalidRegion = toRegion16(frame.damage, frameRect);
      if (!invalidRegion) {
-@@ -1092,7 +1149,7 @@ void VideoStream::sendFrameProgressive(const VideoFrame &frame)
+@@ -1086,7 +1143,7 @@ void VideoStream::sendFrameProgressive(const VideoFrame &frame)
      const int compressionStatus = progressive_compress(d->progressive.get(),
                                                         image.constBits(),
                                                         image.sizeInBytes(),
@@ -114,7 +114,7 @@ index b663478..e366904 100644
                                                         image.width(),
                                                         image.height(),
                                                         image.bytesPerLine(),
-@@ -1105,6 +1162,7 @@ void VideoStream::sendFrameProgressive(const VideoFrame &frame)
+@@ -1099,6 +1156,7 @@ void VideoStream::sendFrameProgressive(const VideoFrame &frame)
                          << "status" << compressionStatus << "rects" << rectCount << "size" << frame.size;
          return;
      }
@@ -123,7 +123,7 @@ index b663478..e366904 100644
      auto frameId = d->frameId++;
  
 diff --git a/src/VideoStreamSurface.cpp b/src/VideoStreamSurface.cpp
-index e1cc369..fe44921 100644
+index a1a59ea..dada563 100644
 --- a/src/VideoStreamSurface.cpp
 +++ b/src/VideoStreamSurface.cpp
 @@ -5,6 +5,7 @@

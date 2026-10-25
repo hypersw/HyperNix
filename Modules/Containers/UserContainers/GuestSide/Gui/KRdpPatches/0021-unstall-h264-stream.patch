@@ -9,17 +9,17 @@ with its cursor over a black screen. Observed on an mstsc connection right after
 its GFX channel reset, with the encoder paused for 13 seconds until the user
 gave up.
 
-Honour a FrameAcknowledge whose queue depth suspends acknowledgements, as
-MS-RDPEGFX allows. Clear frames in flight if the window stays full with no
-acknowledgement for a second. And on a GFX channel reset, drop the frames
-already encoded for the old surface, not only the ones in flight, and let the
-encoder run again.
+6.8.1 honours a FrameAcknowledge whose queue depth suspends acknowledgements;
+this logs when that changes. On top, clear frames in flight if the window stays
+full with no acknowledgement for a second. And on a GFX channel reset, drop the
+frames already encoded for the old surface, not only the ones in flight, and
+let the encoder run again.
 
 diff --git a/src/VideoStream.cpp b/src/VideoStream.cpp
-index 94ce754..0a8b10d 100644
+index 1048af0..7a26ddd 100644
 --- a/src/VideoStream.cpp
 +++ b/src/VideoStream.cpp
-@@ -53,6 +53,13 @@ constexpr double MaximumValidRttMs = 60000.0; // ignore garbage RTT samples
+@@ -54,6 +54,10 @@ constexpr double MaximumValidRttMs = 60000.0; // ignore garbage RTT samples
  
  constexpr qsizetype HighQueueCount = 1; // Level of frames in the pending-send queue that pauses frames pre-encoder; past this point a newer frame is worth more than a queued one
  constexpr qsizetype LowQueueCount = 1; // Level of frames in the pending-send queue that resumes the encoder
@@ -27,33 +27,30 @@ index 94ce754..0a8b10d 100644
 +// before it is assumed lost and cleared, so the stream recovers instead of
 +// stalling for good.
 +constexpr clk::steady_clock::duration AckStallTimeout = clk::milliseconds(1000);
-+// MS-RDPEGFX: a FrameAcknowledge with this queue depth means the client stops
-+// acknowledging frames until further notice.
-+constexpr uint32_t SuspendFrameAcknowledgement = 0xFFFFFFFF;
  
  constexpr uint32_t ProgressiveCodecContextId = 1;
  
-@@ -169,6 +176,11 @@ public:
-     QQueue<VideoFrame> frameQueue;
+@@ -171,6 +175,9 @@ public:
      QSet<uint32_t> pendingFrames;
+     bool frameAcknowledgementSuspended = false;
      std::mutex pendingFramesMutex;
 +    // Last time the in-flight window made progress: a frame acknowledged,
 +    // the window emptied, or the GFX channel reset. Guarded by pendingFramesMutex.
 +    clk::steady_clock::time_point lastAckProgress = clk::steady_clock::now();
-+    // Set while the client has suspended frame acknowledgements; guarded likewise.
-+    bool acksSuspended = false;
  
      std::atomic_int requestedFrameRate = 60;
      std::atomic<qsizetype> maxInFlight{MaximumInFlightFrames}; // recomputed from RTT on rttChanged
-@@ -523,8 +535,19 @@ uint32_t VideoStream::onCapsAdvertise(const RDPGFX_CAPS_ADVERTISE_PDU *capsAdver
+@@ -537,9 +544,20 @@ uint32_t VideoStream::onCapsAdvertise(const RDPGFX_CAPS_ADVERTISE_PDU *capsAdver
          d->capsConfirmed = false;
          d->surface->pendingReset = true;
          destroySurface();
 -        std::lock_guard lock(d->pendingFramesMutex);
 -        d->pendingFrames.clear();
+-        d->frameAcknowledgementSuspended = false;
 +        {
 +            std::lock_guard lock(d->pendingFramesMutex);
 +            d->pendingFrames.clear();
++            d->frameAcknowledgementSuspended = false;
 +            d->lastAckProgress = clk::steady_clock::now();
 +        }
 +        // Frames encoded for the old surface would hold the queue - and with it
@@ -67,36 +64,27 @@ index 94ce754..0a8b10d 100644
      }
  
      auto capsSets = capsAdvertise->capsSets;
-@@ -619,6 +642,23 @@ uint32_t VideoStream::onFrameAcknowledge(const RDPGFX_FRAME_ACKNOWLEDGE_PDU *fra
+@@ -634,8 +652,13 @@ uint32_t VideoStream::onFrameAcknowledge(const RDPGFX_FRAME_ACKNOWLEDGE_PDU *fra
      auto id = frameAcknowledge->frameId;
  
      std::lock_guard lock(d->pendingFramesMutex);
 +    d->lastAckProgress = clk::steady_clock::now();
-+
-+    // A client may stop acknowledging frames, and it says so. Waiting for those
-+    // acknowledgements regardless fills the in-flight window and stops the
-+    // stream for good, so stop counting frames in flight until it resumes.
-+    if (frameAcknowledge->queueDepth == SuspendFrameAcknowledgement) {
-+        if (!d->acksSuspended) {
-+            qCInfo(KRDP) << "Client suspended frame acknowledgements";
-+        }
-+        d->acksSuspended = true;
-+        d->pendingFrames.clear();
-+        return CHANNEL_RC_OK;
-+    }
-+    if (d->acksSuspended) {
-+        qCInfo(KRDP) << "Client resumed frame acknowledgements";
-+        d->acksSuspended = false;
-+    }
  
-     auto itr = d->pendingFrames.constFind(id);
-     if (itr == d->pendingFrames.cend()) {
-@@ -889,7 +929,24 @@ void VideoStream::updateAdaptiveQuality()
+-    d->frameAcknowledgementSuspended = frameAcknowledge->queueDepth == SUSPEND_FRAME_ACKNOWLEDGEMENT;
++    const bool suspended = frameAcknowledge->queueDepth == SUSPEND_FRAME_ACKNOWLEDGEMENT;
++    if (suspended != d->frameAcknowledgementSuspended) {
++        qCInfo(KRDP) << (suspended ? "Client suspended frame acknowledgements" : "Client resumed frame acknowledgements");
++    }
++    d->frameAcknowledgementSuspended = suspended;
+     if (d->frameAcknowledgementSuspended) {
+         d->pendingFrames.clear();
+         return CHANNEL_RC_OK;
+@@ -910,7 +933,24 @@ void VideoStream::updateAdaptiveQuality()
  bool VideoStream::hasInFlightCapacity() const
  {
      std::lock_guard lock(d->pendingFramesMutex);
 -    return d->pendingFrames.size() < d->maxInFlight.load();
-+    if (d->acksSuspended || d->pendingFrames.isEmpty()) {
++    if (d->frameAcknowledgementSuspended || d->pendingFrames.isEmpty()) {
 +        d->lastAckProgress = clk::steady_clock::now();
 +        return true;
 +    }
