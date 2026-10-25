@@ -117,6 +117,10 @@
           # NixOS module installs. Run directly via:
           #   nix run github:hypersw/HyperNix#Modules-System-Btm-Fork
           Modules-System-Btm-Fork = import ./Modules/System/Btm/package.nix { inherit pkgs; };
+          # Builds a JetBrains IDE from a Linux tarball given by path, no nix-ld, and starts it:
+          #   nix run github:hypersw/HyperNix#Modules-Programs-JetBrainsTarballIde -- ~/Downloads/ide.tar.gz
+          # See Modules/Programs/JetBrainsTarballIde/README.md.
+          Modules-Programs-JetBrainsTarballIde = import ./Modules/Programs/JetBrainsTarballIde/run.nix { inherit pkgs nixpkgs; };
           # `zfs-tpm-key` — gen-key / seal / test TPM-sealed ZFS keys.
           # Paired with the `hypersw.services.zfs-tpm-unlock` module:
           # `seal --name foo` produces blobs that `keys.foo` unseals.
@@ -151,6 +155,16 @@
       # all host-local sockets and persistent vTPM/PKCS#11 state.
       lib."Machines-MicroVM-VmSshFront" = args:
         import ./Machines/MicroVM/VmSshFront/nixos.nix ({ inherit nixpkgs microvm; } // args);
+      # The builder behind Modules-Programs-JetBrainsTarballIde: `{ pkgs, src, ... }` to a JetBrains IDE package.
+      lib."Modules-Programs-JetBrainsTarballIde" = import ./Modules/Programs/JetBrainsTarballIde/package.nix;
+
+      # A drop-in flake for a folder holding one JetBrains IDE tarball:
+      #   nix flake init -t github:hypersw/HyperNix#Modules-Programs-JetBrainsTarballIde && nix run path:.
+      templates."Modules-Programs-JetBrainsTarballIde" = {
+        path = ./Modules/Programs/JetBrainsTarballIde/Template;
+        description = "A JetBrains IDE built from the single *.tar.gz next to flake.nix";
+      };
+
       # ── NixOS Modules ──
       # Single entry point: `default` imports the
       # `Modules/default.nix` module-list which transitively loads
