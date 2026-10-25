@@ -1,4 +1,4 @@
-import { EditorState, RangeSetBuilder } from "@codemirror/state";
+import { Compartment, EditorState, RangeSetBuilder } from "@codemirror/state";
 import { Decoration, EditorView } from "@codemirror/view";
 
 const $ = (selector) => document.querySelector(selector);
@@ -6,6 +6,7 @@ const paneIds = ["left", "right"];
 const intermediateSyncInterval = 48;
 const panes = Object.fromEntries(paneIds.map((id) => [id, {
   id, view: null, model: null, source: null, anchor: 0, anchorDy: 0, measureRequest: 0, syncTimer: null, intermediateTimer: null, resizeObserver: null,
+  decorations: new Compartment(), selectionTimer: null,
   suppressScrollUntil: 0, suppressionReason: null,
 }]));
 let automaticPoints = [];
@@ -71,13 +72,52 @@ function downloadTrace() {
 
 const databaseName = "mirror-margin";
 const databaseStore = "session";
+const lookupStore = "lookups";
+const lookupEventStore = "lookup-events";
+const lookups = new Map();
+let activeSelection = null;
+let activeLookup = null;
+let lookupDrag = null;
 
 function openDatabase() {
   return new Promise((resolve, reject) => {
-    const request = indexedDB.open(databaseName, 1);
-    request.onupgradeneeded = () => request.result.createObjectStore(databaseStore);
+    const request = indexedDB.open(databaseName, 2);
+    request.onupgradeneeded = () => {
+      const database = request.result;
+      if (!database.objectStoreNames.contains(databaseStore)) database.createObjectStore(databaseStore);
+      if (!database.objectStoreNames.contains(lookupStore)) database.createObjectStore(lookupStore, { keyPath: "key" });
+      if (!database.objectStoreNames.contains(lookupEventStore)) database.createObjectStore(lookupEventStore, { keyPath: "id" });
+    };
     request.onsuccess = () => resolve(request.result);
     request.onerror = () => reject(request.error);
+  });
+}
+
+function requestResult(request) {
+  return new Promise((resolve, reject) => {
+    request.onsuccess = () => resolve(request.result);
+    request.onerror = () => reject(request.error);
+  });
+}
+
+async function loadLookups() {
+  const database = await openDatabase();
+  const records = await requestResult(database.transaction(lookupStore).objectStore(lookupStore).getAll());
+  for (const record of records) lookups.set(record.key, record);
+  refreshLookupDecorations();
+}
+
+async function storeLookup(record) {
+  const database = await openDatabase();
+  const transaction = database.transaction([lookupStore, lookupEventStore], "readwrite");
+  transaction.objectStore(lookupStore).put(record);
+  transaction.objectStore(lookupEventStore).put({
+    id: crypto.randomUUID(), key: record.key, occurredAt: record.lastViewedAt, answer: record.answer,
+  });
+  await new Promise((resolve, reject) => {
+    transaction.oncomplete = resolve;
+    transaction.onerror = () => reject(transaction.error);
+    transaction.onabort = () => reject(transaction.error);
   });
 }
 
@@ -268,6 +308,164 @@ function decorationSet(model) {
   return builder.finish();
 }
 
+function lookupKey(text) {
+  return normalizeText(text).toLocaleLowerCase();
+}
+
+function isWord(text) {
+  return /^\p{L}[\p{L}\p{M}'’-]*$/u.test(text);
+}
+
+function escapedPattern(text) {
+  return text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&").replace(/\s+/g, "\\s+");
+}
+
+function lookupDecorations(model) {
+  const decorations = [];
+  for (const record of lookups.values()) {
+    if (!record.normalized) continue;
+    const count = Math.min(record.count, 5);
+    const className = `${isWord(record.normalized) ? "mm-looked-up-word" : "mm-looked-up-phrase"} mm-lookup-count-${count}`;
+    const decoration = Decoration.mark({
+      class: className,
+      attributes: { title: `Looked up ${record.count} ${record.count === 1 ? "time" : "times"}`, style: `--mm-lookup-count:${count}` },
+    });
+    const pattern = isWord(record.normalized)
+      ? new RegExp(`\\p{L}[\\p{L}\\p{M}'’-]*`, "gu")
+      : new RegExp(escapedPattern(record.normalized), "giu");
+    for (const match of model.text.matchAll(pattern)) {
+      if (lookupKey(match[0]) === record.key) decorations.push({ from: match.index, to: match.index + match[0].length, decoration });
+    }
+  }
+  return decorations;
+}
+
+function combinedDecorationSet(model) {
+  const builder = new RangeSetBuilder();
+  const decorations = [...model.decorations, ...lookupDecorations(model)]
+    .sort((a, b) => a.from - b.from || a.to - b.to);
+  for (const item of decorations) builder.add(item.from, item.to, item.decoration);
+  return builder.finish();
+}
+
+function refreshLookupDecorations() {
+  for (const id of paneIds) {
+    const pane = panes[id];
+    if (pane.view && pane.model) pane.view.dispatch({ effects: pane.decorations.reconfigure(EditorView.decorations.of(combinedDecorationSet(pane.model))) });
+  }
+}
+
+function selectedRange(id) {
+  const view = panes[id].view;
+  if (!view) return null;
+  const selection = view.state.selection.main;
+  if (selection.empty) return null;
+  return { from: selection.from, to: selection.to, text: view.state.doc.sliceString(selection.from, selection.to) };
+}
+
+function wordRangeAt(view, position) {
+  return view.state.wordAt(Math.max(0, Math.min(view.state.doc.length, position)));
+}
+
+function sentenceRangeAt(view, position) {
+  const text = view.state.doc.toString();
+  let from = Math.max(0, Math.min(text.length, position));
+  let to = from;
+  while (from > 0 && !/[.!?…]/.test(text[from - 1])) from -= 1;
+  while (from < text.length && /\s/.test(text[from])) from += 1;
+  while (to < text.length && !/[.!?…]/.test(text[to])) to += 1;
+  if (to < text.length) to += 1;
+  while (to < text.length && /[”’"')\]]/.test(text[to])) to += 1;
+  return { from, to };
+}
+
+function hideSelectionAction() {
+  activeSelection = null;
+  $("#selection-action").hidden = true;
+}
+
+function showSelectionAction(id) {
+  const range = selectedRange(id);
+  if (!range || !range.text.trim()) return hideSelectionAction();
+  const view = panes[id].view;
+  const rect = view.coordsAtPos(range.to);
+  if (!rect) return hideSelectionAction();
+  activeSelection = { pane: id, ...range };
+  const action = $("#selection-action");
+  action.hidden = false;
+  const width = action.offsetWidth || 70;
+  action.style.left = `${Math.max(8, Math.min(window.innerWidth - width - 8, rect.right + 8))}px`;
+  action.style.top = `${Math.max(8, rect.top - action.offsetHeight - 8)}px`;
+}
+
+function scheduleSelectionAction(id) {
+  const pane = panes[id];
+  clearTimeout(pane.selectionTimer);
+  pane.selectionTimer = setTimeout(() => showSelectionAction(id), 180);
+}
+
+function mockAnswer(text) {
+  const compact = normalizeText(text);
+  const wordCount = compact ? compact.split(" ").length : 0;
+  return `Mock explanation: “${compact}” has been saved as a ${wordCount === 1 ? "word" : `${wordCount}-word selection`}. A future Codex responder will replace this placeholder while preserving the same local history and cached answer.`;
+}
+
+function showLookupCard(id, record) {
+  const card = $("#lookup-card");
+  activeLookup = record;
+  $("#lookup-text").textContent = record.text;
+  $("#lookup-answer").textContent = record.answer;
+  $("#lookup-count").textContent = `Looked up ${record.count} ${record.count === 1 ? "time" : "times"} · stored on this device`;
+  card.hidden = false;
+}
+
+function closeLookupCard() {
+  $("#lookup-card").hidden = true;
+  activeLookup = null;
+}
+
+function escapeHtml(value) {
+  return value.replace(/[&<>"']/g, (character) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[character]);
+}
+
+function openLookupInNewTab() {
+  if (!activeLookup) return;
+  const title = escapeHtml(activeLookup.text);
+  const answer = escapeHtml(activeLookup.answer);
+  const contents = `<!doctype html><meta charset="utf-8"><title>${title} — Mirror Margin</title><style>body{max-width:52rem;margin:4rem auto;padding:0 1.5rem;background:#f1ede4;color:#29261f;font:18px/1.6 Georgia,serif}small{font:14px system-ui;color:#71695d}h1{line-height:1.25}p{white-space:pre-wrap}</style><small>Mirror Margin · mock Codex response · looked up ${activeLookup.count} ${activeLookup.count === 1 ? "time" : "times"}</small><h1>${title}</h1><p>${answer}</p>`;
+  const url = URL.createObjectURL(new Blob([contents], { type: "text/html" }));
+  window.open(url, "_blank", "noopener");
+  setTimeout(() => URL.revokeObjectURL(url), 60_000);
+}
+
+async function requestExplanation(id, range, trigger) {
+  const text = normalizeText(range.text);
+  if (!text) return;
+  hideSelectionAction();
+  const key = lookupKey(text);
+  const now = new Date().toISOString();
+  const existing = lookups.get(key);
+  const record = {
+    key,
+    normalized: key,
+    text: existing?.text ?? text,
+    answer: existing?.answer ?? mockAnswer(text),
+    count: (existing?.count ?? 0) + 1,
+    firstViewedAt: existing?.firstViewedAt ?? now,
+    lastViewedAt: now,
+  };
+  lookups.set(key, record);
+  refreshLookupDecorations();
+  showLookupCard(id, record);
+  trace("lookup-requested", { pane: id, trigger, key, count: record.count, length: text.length });
+  try {
+    await storeLookup(record);
+  } catch (error) {
+    trace("lookup-store-failed", { message: error.message, key });
+    console.warn("Could not save lookup history", error);
+  }
+}
+
 function makeView(id, model, source) {
   const pane = panes[id];
   trace("view-replaced", { pane: id, previous: paneSnapshot(id), nextDocumentLength: model.text.length });
@@ -285,13 +483,54 @@ function makeView(id, model, source) {
       EditorState.readOnly.of(true),
       EditorView.editable.of(false),
       EditorView.lineWrapping,
-      EditorView.decorations.of(decorationSet(model)),
+      pane.decorations.of(EditorView.decorations.of(combinedDecorationSet(model))),
+      EditorView.updateListener.of((update) => {
+        if (update.selectionSet) scheduleSelectionAction(id);
+      }),
       EditorView.contentAttributes.of({ "aria-label": `${id === "left" ? "Sample" : "Reference"} text` }),
       theme,
     ],
   });
   pane.view = new EditorView({ state, parent: host });
+  pane.view.scrollDOM.addEventListener("mousedown", (event) => {
+    if (event.button !== 0) return;
+    if (!event.ctrlKey && event.detail === 3) {
+      const position = pane.view.posAtCoords({ x: event.clientX, y: event.clientY });
+      if (position === null) return;
+      const range = sentenceRangeAt(pane.view, position);
+      event.preventDefault();
+      event.stopPropagation();
+      pane.view.dispatch({ selection: { anchor: range.from, head: range.to } });
+      return;
+    }
+    if (!event.ctrlKey) return;
+    const existing = selectedRange(id);
+    const position = pane.view.posAtCoords({ x: event.clientX, y: event.clientY });
+    const word = position === null ? null : wordRangeAt(pane.view, position);
+    const range = existing ?? (word && { from: word.from, to: word.to, text: pane.view.state.doc.sliceString(word.from, word.to) });
+    if (!range) return;
+    event.preventDefault();
+    event.stopPropagation();
+    if (!existing) pane.view.dispatch({ selection: { anchor: range.from, head: range.to } });
+    requestExplanation(id, range, existing ? "ctrl-selection" : "ctrl-word");
+  }, { capture: true });
+  pane.view.scrollDOM.addEventListener("pointerdown", (event) => {
+    if (event.pointerType !== "touch") return;
+    const previous = pane.lastTap;
+    const closeEnough = previous && event.timeStamp - previous.time < 450
+      && Math.hypot(event.clientX - previous.x, event.clientY - previous.y) < 28;
+    const count = closeEnough ? previous.count + 1 : 1;
+    pane.lastTap = { time: event.timeStamp, x: event.clientX, y: event.clientY, count };
+    if (count !== 3) return;
+    pane.lastTap = null;
+    const position = pane.view.posAtCoords({ x: event.clientX, y: event.clientY });
+    if (position === null) return;
+    const range = sentenceRangeAt(pane.view, position);
+    event.preventDefault();
+    pane.view.dispatch({ selection: { anchor: range.from, head: range.to } });
+  }, { passive: false, capture: true });
   pane.view.scrollDOM.addEventListener("scroll", () => {
+    hideSelectionAction();
     trace("scroll-event", { pane: id, state: paneSnapshot(id) });
     if (performance.now() < pane.suppressScrollUntil) {
       trace("scroll-event-suppressed", {
@@ -656,6 +895,39 @@ async function restoreSession() {
 $("#left-file").addEventListener("change", (event) => event.target.files[0] && openBook("left", event.target.files[0]));
 $("#right-file").addEventListener("change", (event) => event.target.files[0] && openBook("right", event.target.files[0]));
 $("#download-trace").addEventListener("click", downloadTrace);
+$("#explain-selection").addEventListener("pointerdown", (event) => event.preventDefault());
+$("#explain-selection").addEventListener("click", () => {
+  if (activeSelection) requestExplanation(activeSelection.pane, activeSelection, "selection-control");
+});
+$("#close-lookup").addEventListener("click", closeLookupCard);
+$("#open-lookup-tab").addEventListener("click", openLookupInNewTab);
+$("#lookup-drag-handle").addEventListener("pointerdown", (event) => {
+  if (event.button !== 0 || event.target.closest("button")) return;
+  const card = $("#lookup-card");
+  const rect = card.getBoundingClientRect();
+  card.style.left = `${rect.left}px`;
+  card.style.top = `${rect.top}px`;
+  card.style.transform = "none";
+  lookupDrag = { pointerId: event.pointerId, offsetX: event.clientX - rect.left, offsetY: event.clientY - rect.top };
+  event.currentTarget.setPointerCapture(event.pointerId);
+  event.preventDefault();
+});
+$("#lookup-drag-handle").addEventListener("pointermove", (event) => {
+  if (!lookupDrag || lookupDrag.pointerId !== event.pointerId) return;
+  const card = $("#lookup-card");
+  const rect = card.getBoundingClientRect();
+  const left = Math.max(0, Math.min(window.innerWidth - Math.min(rect.width, 96), event.clientX - lookupDrag.offsetX));
+  const top = Math.max(0, Math.min(window.innerHeight - Math.min(rect.height, 48), event.clientY - lookupDrag.offsetY));
+  card.style.left = `${left}px`;
+  card.style.top = `${top}px`;
+});
+$("#lookup-drag-handle").addEventListener("pointerup", (event) => {
+  if (lookupDrag?.pointerId === event.pointerId) lookupDrag = null;
+});
+$("#lookup-drag-handle").addEventListener("pointercancel", () => { lookupDrag = null; });
+window.addEventListener("keydown", (event) => {
+  if (event.key === "Escape" && !$("#lookup-card").hidden) closeLookupCard();
+});
 $("#add-alignment").addEventListener("click", () => {
   if (syncInProgress) return;
   const operation = beginSync("manual-point", "manual-alignment");
@@ -689,3 +961,7 @@ for (const id of paneIds) {
 }
 
 restoreSession();
+loadLookups().catch((error) => {
+  trace("lookup-load-failed", { message: error.message });
+  console.warn("Could not load lookup history", error);
+});

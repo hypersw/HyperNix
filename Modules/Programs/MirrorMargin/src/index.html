@@ -31,6 +31,22 @@
         <div id="right-reader" class="reader-host"></div>
       </section>
     </main>
+    <div id="selection-action" class="selection-action" hidden>
+      <button id="explain-selection" type="button">Explain</button>
+    </div>
+    <aside id="lookup-card" class="lookup-card" hidden aria-live="polite">
+      <div id="lookup-drag-handle" class="lookup-titlebar" title="Drag to move this explanation">
+        <span>Explanation</span>
+        <div class="lookup-card-actions">
+          <button id="open-lookup-tab" type="button">Open in new tab</button>
+          <button id="close-lookup" type="button">Close</button>
+        </div>
+      </div>
+      <p id="lookup-kind" class="lookup-kind">Mock Codex response</p>
+      <h2 id="lookup-text"></h2>
+      <p id="lookup-answer"></p>
+      <p id="lookup-count" class="lookup-count"></p>
+    </aside>
     <script type="module" src="app.js"></script>
   </body>
 </html>

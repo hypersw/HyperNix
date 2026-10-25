@@ -31,10 +31,17 @@ choose another port, for example `PORT=8011 nix run .#Modules-Programs-MirrorMar
   **Add alignment point** adds a user pair at the two current anchors.  Mapping
   between pairs is linear in character offsets, so the two translations need
   not have matching paragraphs.
-- Supports paragraph text plus simple FB2 bold, emphasis, and links.  Images,
-  notes, `.fb2.zip`, and Codex explanations are intentionally not in this first
-  slice.
+- Supports paragraph text plus simple FB2 bold, emphasis, and links. Images,
+  notes, and `.fb2.zip` are intentionally outside this slice.
+- Keeps a book-independent local lookup ledger in IndexedDB. Double-click/tap
+  selects a word; triple-click/tap selects a sentence; any settled selection
+  gets an **Explain** control. On a desktop, `Ctrl`-click queries the current
+  selection, or the clicked word when there is no selection.
+- The current responses are clearly labelled local mock responses. Lookup data
+  is stored as normalized text plus append-only local events, so a later sync
+  provider can merge it without tying history to a particular book. Looked-up
+  words receive a subtle dotted underline; multi-word selections use a fading
+  edge highlight.
 
-The forthcoming lookup feature should use a deliberately separate local bridge:
-the static reader must never be able to send book text to a model without an
-explicit user action.
+No book text is sent anywhere: a future Codex bridge must preserve the explicit
+selection/`Ctrl`-click action boundary.
