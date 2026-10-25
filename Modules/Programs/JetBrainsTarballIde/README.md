@@ -4,13 +4,18 @@ Turns a JetBrains IDE Linux tarball (`*.tar.gz`) into a proper Nix package that 
 
 ## Use
 
-By path:
+By path, with a folder, a glob or one file:
 
 ```sh
+nix run github:hypersw/HyperNix#Modules-Programs-JetBrainsTarballIde -- ~/Apps/Draft
+nix run github:hypersw/HyperNix#Modules-Programs-JetBrainsTarballIde -- ~/Apps/Draft/*.tar.gz
 nix run github:hypersw/HyperNix#Modules-Programs-JetBrainsTarballIde -- ~/Downloads/draft-271.1325.tar.gz
 ```
 
-The build stays rooted under `~/.cache/jetbrains-tarball-ide/<tarball name>` until you delete that link.
+Of several tarballs, the one with the highest version in its name wins (`sort -V`), so one command line serves every new download dropped into the folder.
+Arguments after the tarballs go to the IDE.
+The build stays rooted under `~/.cache/jetbrains-tarball-ide/<folder name>`, or `<tarball name>` for a single file, until you delete that link.
+A newer build from the same folder takes over that root.
 
 Drop-in, in a folder holding exactly one tarball:
 
