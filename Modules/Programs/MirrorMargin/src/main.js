@@ -165,12 +165,13 @@ function applyReaderFontSize(value, { persist = true } = {}) {
   readerFontSize = Math.max(minimumReaderFontSize, Math.min(maximumReaderFontSize, Math.round(value)));
   document.documentElement.style.setProperty("--reader-font-size", `${readerFontSize}px`);
   $("#font-size").textContent = `${readerFontSize} px`;
-  const anchors = Object.fromEntries(paneIds.map((id) => [id, { position: panes[id].anchor, dy: panes[id].anchorDy }]));
-  for (const id of paneIds) panes[id].view?.requestMeasure();
+  const activePaneIds = paneIds.filter((id) => panes[id].view);
+  const anchors = Object.fromEntries(activePaneIds.map((id) => [id, { position: panes[id].anchor, dy: panes[id].anchorDy }]));
+  for (const id of activePaneIds) panes[id].view.requestMeasure();
   // Font-size reflow is exactly the operation logical anchors are intended to
   // survive. Wait for the stylesheet change to take effect, then re-place each.
-  requestAnimationFrame(() => requestAnimationFrame(() => {
-    for (const id of paneIds) if (panes[id].view) placeAnchor(id, anchors[id], "font-size-change");
+  if (activePaneIds.length) requestAnimationFrame(() => requestAnimationFrame(() => {
+    for (const id of activePaneIds) if (panes[id].view) placeAnchor(id, anchors[id], "font-size-change");
   }));
   traceBoth("reader-font-size-changed", { readerFontSize, anchors });
   if (persist) scheduleSave();
@@ -777,7 +778,10 @@ function sampleViewportAnchor(view) {
     const position = view.posAtCoords({ x, y: viewport.top + offset });
     if (position === null) continue;
     const character = view.coordsAtPos(position);
-    if (character) return { position, dy: character.top - viewport.top, probeOffset: offset };
+    if (character) return {
+      position, dy: character.top - viewport.top, probeOffset: offset,
+      materialized: position >= view.viewport.from && position <= view.viewport.to,
+    };
   }
   return null;
 }
@@ -834,11 +838,16 @@ function observeScrollAnchor(id) {
   // pre-correction logical anchor instead of accepting the wrong viewport.
   const heightChanged = previousScroll && Math.abs(currentScroll.height - previousScroll.height) > Math.max(10_000, previousScroll.height * 0.08);
   const documentJumped = Math.abs(sample.position - retainedAnchor.position) > Math.max(3_000, pane.model.text.length * 0.02);
-  if (heightChanged && documentJumped && now >= pane.suppressScrollUntil && !pane.recoveryPending) {
+  // A position outside `view.viewport` is a virtual projection, not the
+  // character actually under the pointer at the top of the scroller. It must
+  // never become a source anchor: that is how an offset glitch gets amplified
+  // into a repeated cross-pane synchronization loop.
+  const projectedHitTest = !sample.materialized;
+  if ((projectedHitTest || (heightChanged && documentJumped)) && now >= pane.suppressScrollUntil && !pane.recoveryPending) {
     pane.recoveryPending = true;
     trace("viewport-discontinuity", {
       pane: id, retainedAnchor, observedAnchor: { position: sample.position, dy: sample.dy },
-      previousScroll, currentScroll,
+      projectedHitTest, previousScroll, currentScroll, viewport: { ...view.viewport },
     });
     requestAnimationFrame(() => {
       pane.recoveryPending = false;
@@ -850,6 +859,7 @@ function observeScrollAnchor(id) {
     });
     return;
   }
+  if (!sample.materialized) return;
   pane.anchor = sample.position;
   pane.anchorDy = sample.dy;
   updatePanePosition(id);
@@ -876,7 +886,7 @@ function measureAnchor(id, reason, callback) {
   // query, so prefer it as the source anchor and retain requestMeasure only as
   // a fallback for the rare frame where browser layout is not ready yet.
   const immediate = sampleViewportAnchor(view);
-  if (immediate) {
+  if (immediate?.materialized) {
     const previous = { position: pane.anchor, dy: pane.anchorDy };
     pane.anchor = immediate.position;
     pane.anchorDy = immediate.dy;
@@ -886,7 +896,8 @@ function measureAnchor(id, reason, callback) {
   }
   view.requestMeasure({
     read(measuredView) {
-      return sampleViewportAnchor(measuredView);
+      const sample = sampleViewportAnchor(measuredView);
+      return sample?.materialized ? sample : null;
     },
     write(sample) {
       if (pane.view !== view || pane.measureRequest !== request) {
