@@ -32,10 +32,13 @@ launcher.
 That machine needs Node.js plus its own logged-in Codex CLI; the distribution
 contains no executable, Nix store reference, or credential.
 
-Press `Ctrl+Q` (or `Ctrl+Shift+Q`) in the reader and confirm to stop its local
-launcher cleanly. `Ctrl+C` also asks the launcher to stop cleanly; when it is started
-from a Windows batch file, `cmd.exe` may additionally show its normal
-“Terminate batch job?” prompt.
+`Ctrl+C` or `Ctrl+Q` in the launcher console asks it to stop cleanly. The
+launcher enables raw console input for these keys, avoiding `cmd.exe`'s normal
+batch-job termination prompt.
+
+The launcher prints diagnostics to its console and appends them to
+`%TEMP%\mirror-margin-bridge.log` on Windows. These diagnostics record Codex
+startup and exit details, but not selected book text or the local bridge token.
 
 ## Prototype behavior
 

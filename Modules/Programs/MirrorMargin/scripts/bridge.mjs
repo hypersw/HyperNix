@@ -15,15 +15,25 @@ if (args.has("site")) throw new Error("--site is not supported: this launcher al
 const siteDirectory = resolve(process.env.SITE_DIR ?? join(scriptDirectory, "site"));
 const port = Number(args.get("port") ?? process.env.PORT ?? 8000);
 const token = process.env.BRIDGE_TOKEN ?? randomBytes(24).toString("hex");
-const codex = process.env.CODEX_BIN ?? (process.platform === "win32" ? "codex.cmd" : "codex");
+// The standalone Windows distribution installs an executable. An npm shim can
+// still be selected explicitly with CODEX_BIN=codex.cmd when needed.
+const codex = process.env.CODEX_BIN ?? (process.platform === "win32" ? "codex.exe" : "codex");
+const codexUsesShell = process.platform === "win32" && /\.(cmd|bat)$/i.test(codex);
 const dutchSkillPath = process.env.DUTCH_SKILL_PATH ?? join(scriptDirectory, "skills", "dutch-word-explainer", "SKILL.md");
 const maxSelectionChars = 4000;
 const codexModel = "gpt-6-luna";
+const logPath = process.env.BRIDGE_LOG ?? join(tmpdir(), "mirror-margin-bridge.log");
 let running = false;
 let activeChild = null;
 let shuttingDown = false;
 
 const mimeTypes = { ".css": "text/css", ".html": "text/html", ".js": "text/javascript", ".json": "application/json", ".svg": "image/svg+xml" };
+
+function bridgeLog(event, details = {}) {
+  const line = `[Mirror Margin ${new Date().toISOString()}] ${event} ${JSON.stringify(details)}`;
+  console.log(line);
+  fs.appendFile(logPath, `${line}\n`).catch(() => {});
+}
 
 function sendJson(response, status, payload) {
   const body = Buffer.from(JSON.stringify(payload));
@@ -61,13 +71,14 @@ async function runCodex(text, language) {
   try {
     const prompt = await tutorPrompt(text, language);
     const result = await new Promise((resolve, reject) => {
-      const child = spawn(codex, command, { cwd: workdir, stdio: ["pipe", "ignore", "pipe"] });
+      bridgeLog("codex-spawn", { executable: codex, arguments: [...command.slice(0, -2), "<temporary-output>", "-"], shell: codexUsesShell, language, selectionLength: text.length });
+      const child = spawn(codex, command, { cwd: workdir, stdio: ["pipe", "ignore", "pipe"], shell: codexUsesShell });
       activeChild = child;
       let stderr = "";
       const timer = setTimeout(() => { child.kill(); reject(new Error("Codex did not finish within two minutes.")); }, 120_000);
       child.stderr.on("data", (chunk) => { stderr = `${stderr}${chunk}`.slice(-2000); });
-      child.on("error", reject);
-      child.on("close", (code) => { activeChild = null; clearTimeout(timer); code === 0 ? resolve(stderr) : reject(new Error(stderr || "Codex did not complete the explanation.")); });
+      child.on("error", (error) => { activeChild = null; clearTimeout(timer); bridgeLog("codex-spawn-error", { name: error.name, message: error.message, code: error.code, errno: error.errno, syscall: error.syscall }); reject(error); });
+      child.on("close", (code, signal) => { activeChild = null; clearTimeout(timer); bridgeLog("codex-exit", { code, signal, stderr }); code === 0 ? resolve(stderr) : reject(new Error(stderr || "Codex did not complete the explanation.")); });
       child.stdin.end(prompt);
     });
     const answer = (await fs.readFile(output, "utf8")).trim();
@@ -80,12 +91,6 @@ async function runCodex(text, language) {
 
 const server = createServer(async (request, response) => {
   const url = new URL(request.url, "http://127.0.0.1");
-  if (request.method === "POST" && url.pathname === "/api/shutdown") {
-    if (!sameToken(request.headers["x-mirror-margin-token"])) return sendJson(response, 403, { error: "Invalid local bridge token." });
-    sendJson(response, 200, { shuttingDown: true });
-    response.once("finish", () => shutdown("browser shortcut"));
-    return;
-  }
   if (request.method === "POST" && url.pathname === "/api/explain") {
     if (!sameToken(request.headers["x-mirror-margin-token"])) return sendJson(response, 403, { error: "Invalid local bridge token." });
     let body = "";
@@ -98,10 +103,11 @@ const server = createServer(async (request, response) => {
         if (typeof language !== "string" || language.length > 32) throw new Error("Invalid language tag.");
         if (running) return sendJson(response, 409, { error: "Another explanation is still running." });
         running = true;
+        bridgeLog("explanation-requested", { language, selectionLength: text.length });
         const answer = await runCodex(text, language);
         sendJson(response, 200, { answer, model: codexModel, reasoningEffort: "low" });
       } catch (error) {
-        console.error("Mirror Margin Codex request failed:", error.message);
+        bridgeLog("explanation-failed", { name: error.name, message: error.message, code: error.code });
         sendJson(response, 502, { error: error.message });
       } finally {
         running = false;
@@ -146,9 +152,22 @@ function shutdown(reason) {
 
 process.on("SIGINT", () => shutdown("Ctrl+C"));
 process.on("SIGTERM", () => shutdown("SIGTERM"));
+// In a Windows console, raw stdin lets the launcher receive Ctrl+Q (0x11)
+// directly instead of leaving it to cmd.exe or a browser. Raw mode also turns
+// Ctrl+C into byte 0x03, so handle both control keys explicitly.
+if (process.stdin.isTTY && process.stdin.setRawMode) {
+  process.stdin.setRawMode(true);
+  process.stdin.resume();
+  process.stdin.on("data", (chunk) => {
+    if (chunk.includes(0x11)) shutdown("Ctrl+Q");
+    if (chunk.includes(0x03)) shutdown("Ctrl+C");
+  });
+  bridgeLog("console-shortcuts-enabled", { shortcuts: ["Ctrl+C", "Ctrl+Q"] });
+}
 
 server.listen(port, "127.0.0.1", () => {
   const url = `http://127.0.0.1:${port}/?bridge=${token}`;
+  bridgeLog("started", { platform: process.platform, port, siteDirectory, codex, codexUsesShell, model: codexModel, logPath });
   console.log(`Mirror Margin is running at ${url}`);
   if (process.env.NO_BROWSER !== "1") {
     const opener = process.platform === "win32" ? ["cmd", ["/c", "start", "", url]] : process.platform === "darwin" ? ["open", [url]] : ["xdg-open", [url]];

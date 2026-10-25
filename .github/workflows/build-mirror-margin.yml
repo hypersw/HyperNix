@@ -16,9 +16,9 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
-      - uses: cachix/install-nix-action@v30
+      - uses: cachix/install-nix-action@v31
         with:
           extra_nix_config: |
             experimental-features = nix-command flakes
@@ -28,7 +28,7 @@ jobs:
           ZIP_PATH=$(nix build .#Modules-Programs-MirrorMargin.portableZip --no-link --print-out-paths)
           cp "$ZIP_PATH" mirror-margin-portable.zip
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: mirror-margin-portable
           path: mirror-margin-portable.zip

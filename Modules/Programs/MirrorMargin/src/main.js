@@ -84,6 +84,7 @@ const lookups = new Map();
 const bridgeToken = new URLSearchParams(window.location.search).get("bridge");
 let activeSelection = null;
 let activeLookup = null;
+let activeLookupPane = null;
 let lookupDrag = null;
 
 function openDatabase() {
@@ -583,16 +584,23 @@ function renderExplanation(value) {
 function showLookupCard(id, record) {
   const card = $("#lookup-card");
   activeLookup = record;
-  $("#lookup-kind").textContent = record.answerKind === "codex" ? "Codex · luna · low effort" : record.answerKind === "error" ? "Codex request failed" : "Asking Codex…";
+  activeLookupPane = id;
+  $("#lookup-kind").textContent = record.answerKind === "codex"
+    ? `Codex · luna · low effort · ${record.displaySource === "cache" ? "cached replay" : "live reply"}`
+    : record.answerKind === "error" ? `Codex request failed · ${record.displaySource === "cache" ? "cached failure" : "live request"}` : "Asking Codex live…";
   $("#lookup-text").textContent = record.text;
   $("#lookup-answer").innerHTML = renderExplanation(record.answer);
-  $("#lookup-count").textContent = `Looked up ${record.count} ${record.count === 1 ? "time" : "times"} · stored on this device`;
+  $("#retry-lookup").disabled = record.answerKind === "pending";
+  $("#lookup-count").textContent = record.answerKind === "error"
+    ? `Last request failed · retry will replace this saved result`
+    : `Looked up ${record.count} ${record.count === 1 ? "time" : "times"} · stored on this device`;
   card.hidden = false;
 }
 
 function closeLookupCard() {
   $("#lookup-card").hidden = true;
   activeLookup = null;
+  activeLookupPane = null;
 }
 
 function escapeHtml(value) {
@@ -609,7 +617,7 @@ function openLookupInNewTab() {
   setTimeout(() => URL.revokeObjectURL(url), 60_000);
 }
 
-async function requestExplanation(id, range, trigger) {
+async function requestExplanation(id, range, trigger, force = false) {
   const text = normalizeText(range.text);
   if (!text) return;
   hideSelectionAction();
@@ -622,12 +630,14 @@ async function requestExplanation(id, range, trigger) {
     text: existing?.text ?? text,
     answer: existing?.answer ?? "Asking Codex…",
     answerKind: existing?.answerKind ?? "pending",
+    language: existing?.language ?? panes[id].model?.language ?? "",
+    displaySource: existing && !force ? "cache" : "live",
     count: (existing?.count ?? 0) + 1,
     firstViewedAt: existing?.firstViewedAt ?? now,
     lastViewedAt: now,
   };
   trace("lookup-requested", { pane: id, trigger, key, count: record.count, length: text.length });
-  if (existing?.answerKind === "codex") {
+  if (existing?.answerKind === "codex" && !force) {
     lookups.set(key, record);
     refreshLookupDecorations();
     showLookupCard(id, record);
@@ -638,19 +648,33 @@ async function requestExplanation(id, range, trigger) {
     }
     return;
   }
+  if (force) {
+    record.answer = "Asking Codex…";
+    record.answerKind = "pending";
+    record.displaySource = "live";
+  }
   showLookupCard(id, record);
   try {
-    record.answer = await codexExplain(text, panes[id].model.language);
+    record.answer = await codexExplain(text, record.language);
     record.answerKind = "codex";
+    record.displaySource = "live";
     lookups.set(key, record);
     refreshLookupDecorations();
     showLookupCard(id, record);
     await storeLookup(record);
   } catch (error) {
-    trace("lookup-store-failed", { message: error.message, key });
+    trace("lookup-request-failed", { message: error.message, key });
     record.answer = error.message;
     record.answerKind = "error";
+    record.displaySource = "live";
+    lookups.set(key, record);
+    refreshLookupDecorations();
     showLookupCard(id, record);
+    try {
+      await storeLookup(record);
+    } catch (storeError) {
+      trace("lookup-store-failed", { message: storeError.message, key });
+    }
     console.warn("Could not request or save explanation", error);
   }
 }
@@ -1249,6 +1273,9 @@ $("#explain-selection").addEventListener("click", () => {
 });
 $("#close-lookup").addEventListener("click", closeLookupCard);
 $("#open-lookup-tab").addEventListener("click", openLookupInNewTab);
+$("#retry-lookup").addEventListener("click", () => {
+  if (activeLookup && activeLookupPane) requestExplanation(activeLookupPane, { text: activeLookup.text }, "popup-retry", true);
+});
 $("#lookup-drag-handle").addEventListener("pointerdown", (event) => {
   if (event.button !== 0 || event.target.closest("button")) return;
   const card = $("#lookup-card");
@@ -1275,13 +1302,6 @@ $("#lookup-drag-handle").addEventListener("pointerup", (event) => {
 $("#lookup-drag-handle").addEventListener("pointercancel", () => { lookupDrag = null; });
 window.addEventListener("keydown", (event) => {
   if (event.key === "Escape" && !$("#lookup-card").hidden) closeLookupCard();
-  if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "q") {
-    event.preventDefault();
-    if (!bridgeToken || !window.confirm("Stop the local Mirror Margin server?")) return;
-    fetch("/api/shutdown", { method: "POST", headers: { "X-Mirror-Margin-Token": bridgeToken } })
-      .catch(() => {})
-      .finally(() => { document.title = "Mirror Margin — stopped"; });
-  }
 });
 $("#add-alignment").addEventListener("click", () => {
   if (syncInProgress) return;
