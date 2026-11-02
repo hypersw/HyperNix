@@ -5,13 +5,16 @@ With KRDP_PERSISTENT_OUTPUT naming an output, every connection streams that
 existing output instead of creating a virtual monitor of its own. Its mode and
 scale are set to the client's on connect, and again whenever the client sends a
 Display Control layout, through the output-lifecycle helper's "prepare" action.
-Disconnecting changes nothing, so a reconnect with the same geometry causes no
-relayout, and a new connection never waits for the previous one to tear down.
+After each layout the stream is asked for the new size too: KWin 6.8 does not
+resize a stream from a virtual output when the output's mode changes, so the
+client would keep getting frames of the old size. Disconnecting changes
+nothing, so a reconnect with the same geometry causes no relayout, and a new
+connection never waits for the previous one to tear down.
 
 Display Control now accepts multi-monitor layouts, following the client's
 primary monitor, and carries the client's scale with the size.
 diff --git a/server/SessionController.cpp b/server/SessionController.cpp
-index 3471c3f..bb90692 100644
+index 3471c3f..31a7ac1 100644
 --- a/server/SessionController.cpp
 +++ b/server/SessionController.cpp
 @@ -15,6 +15,12 @@
@@ -46,7 +49,7 @@ index 3471c3f..bb90692 100644
  class SessionWrapper : public QObject
  {
      Q_OBJECT
-@@ -61,6 +79,123 @@ public:
+@@ -61,6 +79,131 @@ public:
          connect(connection, &QObject::destroyed, this, &SessionWrapper::onConnectionDestroyed);
      }
  
@@ -60,9 +63,9 @@ index 3471c3f..bb90692 100644
 +    {
 +        m_persistentOutput = outputName;
 +
-+        // Upstream turns a layout request into a size request on the PipeWire
-+        // stream. That only works for a virtual monitor KRdp created; here the
-+        // output itself has to change mode, or the stream would merely scale.
++        // Upstream turns every layout request straight into a size request on the
++        // PipeWire stream. Here the size request waits for applyLayout instead,
++        // so that it is debounced and follows the output's scale change.
 +        disconnect(connection->displayControl(), &KRdp::DisplayControl::requestedScreenSizeChanged, connection->videoStream(), &KRdp::VideoStream::setRequestedSize);
 +
 +        // Dragging the client window edge sends a burst of layouts. Apply only
@@ -112,7 +115,7 @@ index 3471c3f..bb90692 100644
 +                                       QString::number(layout.size.width()),
 +                                       QString::number(layout.size.height()),
 +                                       QString::number(layout.scale, 'g', 4)};
-+        auto finish = [this, process, arguments, then](bool ok) {
++        auto finish = [this, process, arguments, layout, then](bool ok) {
 +            const QByteArray output = process->readAll().trimmed();
 +            if (ok) {
 +                qInfo().noquote() << "KRDP-LAYOUT: applied" << arguments.join(QLatin1Char(' ')) << (output.isEmpty() ? QString() : QString::fromUtf8(output));
@@ -121,6 +124,14 @@ index 3471c3f..bb90692 100644
 +            }
 +            m_layoutHelper = nullptr;
 +            process->deleteLater();
++            // KWin 6.8 lets the consumer pick the size of a stream from a resizable
++            // output, which a virtual one is, and never resizes the stream when the
++            // output's mode changes. Without this request the stream keeps the size
++            // it was negotiated at, and the client gets frames of the old size on its
++            // new monitor. If the helper failed, KWin resizes the output to match.
++            if (connection) {
++                connection->videoStream()->setRequestedSize(layout.size);
++            }
 +            if (then) {
 +                then();
 +            }
@@ -170,7 +181,7 @@ index 3471c3f..bb90692 100644
      // KRdp names the monitor it asks KWin for; the lifecycle helper needs that
      // name to find the output again, so route every set through here.
      void setVirtualMonitor(const KRdp::VirtualMonitor &virtualMonitor)
-@@ -140,6 +275,10 @@ public:
+@@ -140,6 +283,10 @@ public:
      KStatusNotifierItem *m_sni;
      bool m_sessionStarted = false;
      QString m_virtualMonitorName;
@@ -181,7 +192,7 @@ index 3471c3f..bb90692 100644
  };
  
  SessionController::SessionController(KRdp::Server *server, SessionType sessionType)
-@@ -265,6 +404,10 @@ void SessionController::onNewConnection(KRdp::RdpConnection *newConnection)
+@@ -265,6 +412,10 @@ void SessionController::onNewConnection(KRdp::RdpConnection *newConnection)
          // waits out itself; gating session creation on it a second time here
          // only added dead time, and that dead time is what produced the
          // black screen - not the momentary two-output overlap itself.
@@ -192,7 +203,7 @@ index 3471c3f..bb90692 100644
          for (const auto &incumbent : m_wrappers) {
              if (incumbent->connection && incumbent->connection != newConnection) {
                  qInfo() << "KRDP-SEAT: closing incumbent session" << incumbent->connection << "for" << newConnection;
-@@ -273,6 +416,9 @@ void SessionController::onNewConnection(KRdp::RdpConnection *newConnection)
+@@ -273,6 +424,9 @@ void SessionController::onNewConnection(KRdp::RdpConnection *newConnection)
          }
  
          auto wrapper = std::make_unique<SessionWrapper>(newConnection, makeSession(), m_sni);
@@ -202,7 +213,7 @@ index 3471c3f..bb90692 100644
          // 6.8 never looks at the client's own desktop: an explicit
          // --virtual-monitor wins, and otherwise a fixed 1024x768 is used. By
          // the time a connection reaches Activated its capabilities have been
-@@ -298,7 +444,10 @@ void SessionController::onNewConnection(KRdp::RdpConnection *newConnection)
+@@ -298,7 +452,10 @@ void SessionController::onNewConnection(KRdp::RdpConnection *newConnection)
              return monitor;
          };
  
@@ -214,7 +225,7 @@ index 3471c3f..bb90692 100644
              wrapper->setVirtualMonitor(clientVirtualMonitor(*m_virtualMonitor));
          } else if (m_monitorIndex) {
              wrapper->session->setActiveStream(*m_monitorIndex);
-@@ -343,7 +492,15 @@ void SessionController::onNewConnection(KRdp::RdpConnection *newConnection)
+@@ -343,7 +500,15 @@ void SessionController::onNewConnection(KRdp::RdpConnection *newConnection)
              newConnection->close(KRdp::RdpConnection::CloseReason::None);
          });
  

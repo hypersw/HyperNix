@@ -72,9 +72,12 @@ KRdp, developed on the 6.8 line:
   instead of creating a virtual monitor. Its mode and scale follow the client
   through the lifecycle helper's `prepare` action, on connect and on each
   Display Control layout, debounced while a window edge is dragged. Display
-  Control also stops rejecting multi-monitor layouts. This supersedes the
-  virtual-monitor half of `0016` and makes `0017`'s handover race moot; both
-  stay applied because their remaining parts still serve this path.
+  Control also stops rejecting multi-monitor layouts. After each layout the
+  stream is asked for the new size as well: KWin 6.8 lets the consumer size a
+  stream from a virtual output and never resizes it on a mode change, so
+  without that a move to another monitor kept frames of the old size. This
+  supersedes the virtual-monitor half of `0016` and makes `0017`'s handover
+  race moot; both stay applied because their remaining parts still serve this path.
 - `0022-auto-reconnect-cookie.patch` — sends the auto-reconnect cookie (Save
   Session Info, extended logon info) once per connection. Without it mstsc never
   retries a dropped connection, whatever its own setting says. Only network
