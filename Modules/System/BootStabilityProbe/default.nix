@@ -102,9 +102,7 @@ in
     # Make journal-sync aggressive — default is async and a reset may catch
     # us between writes. SyncIntervalSec=1s bounds the worst-case loss
     # window to ~1 s in addition to the explicit syncs in the script.
-    services.journald.extraConfig = lib.mkBefore ''
-      SyncIntervalSec=1s
-    '';
+    services.journald.settings.Journal.SyncIntervalSec = "1s";
 
     systemd.services.peripheral-bringup = {
       description = "Staged peripheral bring-up for boot-stability diagnosis";
