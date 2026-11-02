@@ -14,8 +14,7 @@ nix run github:hypersw/HyperNix#Modules-Programs-JetBrainsTarballIde -- ~/Downlo
 
 Of several tarballs, the one with the highest version in its name wins (`sort -V`), so one command line serves every new download dropped into the folder.
 Arguments after the tarballs go to the IDE.
-The build stays rooted under `~/.cache/jetbrains-tarball-ide/<folder name>`, or `<tarball name>` for a single file, until you delete that link.
-A newer build from the same folder takes over that root.
+No GC root is kept: a garbage collection spares a running IDE, and otherwise the next start rebuilds in about 20 s.
 
 Drop-in, in a folder holding tarballs of one product:
 
@@ -27,7 +26,7 @@ chmod +x run.sh   # nix flake init drops the executable bit
 
 `run.sh` builds the flake of its own folder from any working directory, so `~/Apps/Draft/run.sh` is one fixed command line.
 The build shows in the terminal; the IDE then starts detached in a session of its own (`setsid`), with no controlling terminal.
-Its launcher output goes to `~/.local/state/jetbrains-tarball-ide/<folder name>.log`, and the build stays rooted under `~/.cache/jetbrains-tarball-ide/<folder name>`.
+Its launcher output goes to `~/.local/state/jetbrains-tarball-ide/<folder name>.log`; as with the runner, no GC root is kept.
 For an attached run, use `nix run path:.` instead.
 The `path:` it uses keeps Nix from treating the folder as part of a parent git repo, which would hide the untracked tarball.
 For a new build, drop the new tarball in: the highest version wins, by `builtins.compareVersions` on the file names.

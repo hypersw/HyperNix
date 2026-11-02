@@ -6,11 +6,9 @@ here=$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")
 name=$(basename "$here")
 
 # The build stays in the terminal, so its progress and errors are seen.
-# The out-link lives outside the folder: inside, it would change the flake's source and so force a rebuild on every run.
-# It keeps the build from a garbage collection, and a newer build takes over the same link.
-roots="${XDG_CACHE_HOME:-$HOME/.cache}/jetbrains-tarball-ide"
-mkdir -p "$roots"
-out=$(nix build "path:$here" --print-out-paths --out-link "$roots/$name")
+# No GC root: a garbage collection spares the running IDE anyway, and otherwise only costs one rebuild.
+# A result link inside the folder would be worse still: it changes the flake's source and so forces a rebuild on every run.
+out=$(nix build "path:$here" --print-out-paths --no-link)
 
 # The one launcher in bin/, beside the remote-dev-server wrapper.
 for exe in "$out"/bin/*; do
