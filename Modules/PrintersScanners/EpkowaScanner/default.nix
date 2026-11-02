@@ -129,13 +129,23 @@ let
   # autoreconfHook regenerates configure/Makefile.in after our patch
   # touches configure.ac and Makefile.am.
 
-  iscanWithIpcProxy = (pkgs.epkowa.overrideAttrs (old: {
+  #
+  # Without GTK 2, which nixpkgs now refuses to evaluate: epkowa builds with
+  # --disable-frontend, so only iscan's configure.ac still probes for it, and
+  # unconditionally. Preset GTK_CFLAGS/GTK_LIBS make PKG_CHECK_MODULES skip the
+  # probe; only frontend/Makefile.am, which is not built, uses them.
+
+  iscanWithIpcProxy = ((pkgs.epkowa.override { gtk2 = null; }).overrideAttrs (old: {
     patches = (old.patches or []) ++ [ ../EpkowaStubX64/iscan-ipc-proxy.patch ];
     nativeBuildInputs = (old.nativeBuildInputs or []) ++ [ pkgs.autoreconfHook ];
     configureFlags = (old.configureFlags or []) ++ [
       "--enable-ipc-proxy"
       "--with-ipc-stub=${stubWrapper}/bin/epkowa-stub-x64"
     ];
+    env = (old.env or { }) // {
+      GTK_CFLAGS = "-DHYPERSW_NO_GTK";
+      GTK_LIBS = "-lm";
+    };
   })).overrideAttrs (final: {
     # Upstream epkowa bakes the proprietary x86_64 plugin paths into
     # var/lib/iscan/interpreter at build time — each line maps a USB
