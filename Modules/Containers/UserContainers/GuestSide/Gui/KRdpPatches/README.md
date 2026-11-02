@@ -6,7 +6,11 @@ nixpkgs still shipped 6.7.5, behind a `Gui.KRdpBeta` switch; since nixpkgs
 moved to the 6.8.0 release it is the only set, and the 6.7.5 patches are gone.
 Their history explains some of the numbering:
 
-- `0001-pointer-coordinate-fix.patch` — KRdp.
+- `0001-pointer-coordinate-fix.patch` — KRdp. Since 6.8.2 the Plasma session
+  injects input through libei, and this patch now names the streamed output as
+  the EIS mapping, so pointer positions land right on a scaled output or one off
+  the origin. It also moves the pointer to a click's position first. The pointer
+  parts of `0016` and `0020`, written for KWin's fake-input, folded into it.
 - `0009-h264-max-level-5.2.patch` — KPipeWire.
 
 The rest of the 6.7.5 set was dropped, because 6.8 does the same thing or better:
@@ -41,8 +45,8 @@ KRdp, developed on the 6.8 line:
 - `0016-client-layout-lifecycle-pointer.patch` — restores the three things 6.8
   dropped: a virtual monitor sized and scaled from the client's negotiated
   desktop, the output-lifecycle hook that disables the bootstrap stub output
-  and moves the panel, and the pointer origin offset for an output that is not
-  at the virtual-desktop origin. Under test: an earlier build of it crashed as
+  and moves the panel. Its pointer origin offset moved into `0001` with the
+  libei port. Under test: an earlier build of it crashed as
   a client finalized, with the stack unrecoverable because KCrash faulted
   inside its own handler. `KDE_DEBUG=1` on the service works around that, so
   the next crash produces a readable core.
@@ -68,8 +72,7 @@ KRdp, developed on the 6.8 line:
   instead of creating a virtual monitor. Its mode and scale follow the client
   through the lifecycle helper's `prepare` action, on connect and on each
   Display Control layout, debounced while a window edge is dragged. Display
-  Control also stops rejecting multi-monitor layouts, and the pointer maps
-  through the screen the session actually streams. This supersedes the
+  Control also stops rejecting multi-monitor layouts. This supersedes the
   virtual-monitor half of `0016` and makes `0017`'s handover race moot; both
   stay applied because their remaining parts still serve this path.
 - `0022-auto-reconnect-cookie.patch` — sends the auto-reconnect cookie (Save

@@ -9,10 +9,9 @@ Disconnecting changes nothing, so a reconnect with the same geometry causes no
 relayout, and a new connection never waits for the previous one to tear down.
 
 Display Control now accepts multi-monitor layouts, following the client's
-primary monitor, and carries the client's scale with the size. The pointer is
-mapped through the screen the session actually streams.
+primary monitor, and carries the client's scale with the size.
 diff --git a/server/SessionController.cpp b/server/SessionController.cpp
-index 3471c3f..de9a6bc 100644
+index 3471c3f..bb90692 100644
 --- a/server/SessionController.cpp
 +++ b/server/SessionController.cpp
 @@ -15,6 +15,12 @@
@@ -47,7 +46,7 @@ index 3471c3f..de9a6bc 100644
  class SessionWrapper : public QObject
  {
      Q_OBJECT
-@@ -61,6 +77,123 @@ public:
+@@ -61,6 +79,123 @@ public:
          connect(connection, &QObject::destroyed, this, &SessionWrapper::onConnectionDestroyed);
      }
  
@@ -171,7 +170,7 @@ index 3471c3f..de9a6bc 100644
      // KRdp names the monitor it asks KWin for; the lifecycle helper needs that
      // name to find the output again, so route every set through here.
      void setVirtualMonitor(const KRdp::VirtualMonitor &virtualMonitor)
-@@ -140,6 +273,10 @@ public:
+@@ -140,6 +275,10 @@ public:
      KStatusNotifierItem *m_sni;
      bool m_sessionStarted = false;
      QString m_virtualMonitorName;
@@ -182,7 +181,7 @@ index 3471c3f..de9a6bc 100644
  };
  
  SessionController::SessionController(KRdp::Server *server, SessionType sessionType)
-@@ -265,6 +402,10 @@ void SessionController::onNewConnection(KRdp::RdpConnection *newConnection)
+@@ -265,6 +404,10 @@ void SessionController::onNewConnection(KRdp::RdpConnection *newConnection)
          // waits out itself; gating session creation on it a second time here
          // only added dead time, and that dead time is what produced the
          // black screen - not the momentary two-output overlap itself.
@@ -193,7 +192,7 @@ index 3471c3f..de9a6bc 100644
          for (const auto &incumbent : m_wrappers) {
              if (incumbent->connection && incumbent->connection != newConnection) {
                  qInfo() << "KRDP-SEAT: closing incumbent session" << incumbent->connection << "for" << newConnection;
-@@ -273,6 +414,9 @@ void SessionController::onNewConnection(KRdp::RdpConnection *newConnection)
+@@ -273,6 +416,9 @@ void SessionController::onNewConnection(KRdp::RdpConnection *newConnection)
          }
  
          auto wrapper = std::make_unique<SessionWrapper>(newConnection, makeSession(), m_sni);
@@ -203,7 +202,7 @@ index 3471c3f..de9a6bc 100644
          // 6.8 never looks at the client's own desktop: an explicit
          // --virtual-monitor wins, and otherwise a fixed 1024x768 is used. By
          // the time a connection reaches Activated its capabilities have been
-@@ -298,7 +442,10 @@ void SessionController::onNewConnection(KRdp::RdpConnection *newConnection)
+@@ -298,7 +444,10 @@ void SessionController::onNewConnection(KRdp::RdpConnection *newConnection)
              return monitor;
          };
  
@@ -215,7 +214,7 @@ index 3471c3f..de9a6bc 100644
              wrapper->setVirtualMonitor(clientVirtualMonitor(*m_virtualMonitor));
          } else if (m_monitorIndex) {
              wrapper->session->setActiveStream(*m_monitorIndex);
-@@ -343,7 +490,15 @@ void SessionController::onNewConnection(KRdp::RdpConnection *newConnection)
+@@ -343,7 +492,15 @@ void SessionController::onNewConnection(KRdp::RdpConnection *newConnection)
              newConnection->close(KRdp::RdpConnection::CloseReason::None);
          });
  
@@ -288,73 +287,3 @@ index 7957263..6e5762e 100644
  
  private:
      RdpConnection *m_session = nullptr;
-diff --git a/src/PlasmaScreencastV1Session.cpp b/src/PlasmaScreencastV1Session.cpp
-index b35d079..c77767d 100644
---- a/src/PlasmaScreencastV1Session.cpp
-+++ b/src/PlasmaScreencastV1Session.cpp
-@@ -20,6 +20,7 @@
- #include "qwayland-wayland.h"
- #include "screencasting_p.h"
- #include <QScreen>
-+#include <QPointer>
- 
- namespace KRdp
- {
-@@ -28,8 +29,21 @@ namespace KRdp
- // RDP reports coordinates relative to this connection's own output. With more
- // than one output present the RDP monitor is rarely at the origin, so without
- // the offset every click lands on the wrong output.
--static QPointF fakeInputPosition(const QPointF &rdpPosition, const std::optional<VirtualMonitor> &monitor)
-+static QPointF fakeInputPosition(const QPointF &rdpPosition, const std::optional<VirtualMonitor> &monitor, QScreen *streamedScreen, const QSize &streamSize)
- {
-+    // When the session streams an existing output it knows exactly which
-+    // screen that is, so map through it rather than looking one up by name.
-+    // RDP coordinates are pixels of the stream, which is the output's current
-+    // mode; the screen's geometry is logical, so the ratio of the two is the
-+    // output's effective scale, fractional ones included.
-+    if (streamedScreen) {
-+        const QRect geometry = streamedScreen->geometry();
-+        const qreal scale = (streamSize.width() > 0 && geometry.width() > 0)
-+            ? qreal(streamSize.width()) / geometry.width()
-+            : streamedScreen->devicePixelRatio();
-+        return QPointF(geometry.topLeft()) + rdpPosition / scale;
-+    }
-+
-     const qreal scale = monitor ? monitor->dpr : 1.0;
-     const QPointF localPosition = rdpPosition / scale;
-     if (!monitor) {
-@@ -179,6 +193,8 @@ public:
-     Screencasting m_screencasting;
-     std::unique_ptr<ScreencastingStream> request;
-     std::unique_ptr<FakeInput> remoteInterface;
-+    /// The output this session captures, when it captures an existing one.
-+    QPointer<QScreen> streamedScreen;
- };
- 
- PlasmaScreencastV1Session::PlasmaScreencastV1Session()
-@@ -204,6 +220,7 @@ void PlasmaScreencastV1Session::start()
-             return;
-         }
-         auto screen = qApp->screens().at(*streamIndex);
-+        d->streamedScreen = screen;
-         d->request.reset(d->m_screencasting.createOutputStream(screen, Screencasting::Metadata));
-     } else {
-         d->request.reset(d->m_screencasting.createWorkspaceStream(Screencasting::Metadata));
-@@ -247,7 +264,7 @@ void PlasmaScreencastV1Session::sendEvent(const std::shared_ptr<QEvent> &event)
-         // fake-input button request does not. Keep KWin's pointer in sync before
-         // delivering the button; otherwise a click can be applied at (0,0).
-         const auto position = me->position();
--        const auto logicalPosition = fakeInputPosition(position, virtualMonitor());
-+        const auto logicalPosition = fakeInputPosition(position, virtualMonitor(), d->streamedScreen, size());
-         d->remoteInterface->pointer_motion_absolute(wl_fixed_from_double(logicalPosition.x()),
-                                                     wl_fixed_from_double(logicalPosition.y()));
-         uint state = me->type() == QEvent::MouseButtonPress ? 1 : 0;
-@@ -259,7 +276,7 @@ void PlasmaScreencastV1Session::sendEvent(const std::shared_ptr<QEvent> &event)
-         auto position = me->position();
-         // RDP reports physical pixels; KWin fake-input expects logical output
-         // coordinates. Do not use the encoder's PipeWire stream size here.
--        auto logicalPosition = fakeInputPosition(position, virtualMonitor());
-+        auto logicalPosition = fakeInputPosition(position, virtualMonitor(), d->streamedScreen, size());
-         d->remoteInterface->pointer_motion_absolute(wl_fixed_from_double(logicalPosition.x()), wl_fixed_from_double(logicalPosition.y()));
-         break;
-     }

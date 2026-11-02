@@ -1,30 +1,74 @@
+From: KRdp displayless experiment <noreply@example.invalid>
+Subject: [PATCH] Map RDP pointer positions through the streamed output's EIS region
+
+KRdp's Plasma session hands RDP pointer positions to libei unmapped. RDP
+positions are pixels of the stream, while KWin's EIS pointer regions are the
+outputs' logical geometry, so on any output that is scaled or not at the
+origin of the virtual desktop every click lands in the wrong place. KWin
+tags each region with its output's name; pass the streamed output's name as
+the mapping, and EiConnection maps stream pixels into that region. Also move
+the pointer to a button event's position first, since an EIS button event
+carries none.
+
+diff --git a/src/PlasmaScreencastV1Session.cpp b/src/PlasmaScreencastV1Session.cpp
+index 109f194..912667b 100644
 --- a/src/PlasmaScreencastV1Session.cpp
 +++ b/src/PlasmaScreencastV1Session.cpp
-@@ -215,6 +215,15 @@ void PlasmaScreencastV1Session::sendEvent(const std::shared_ptr<QEvent> &event)
-             qCWarning(KRDP) << "Unsupported mouse button" << me->button();
+@@ -13,6 +13,7 @@
+ #include <QDBusPendingReply>
+ #include <QDBusUnixFileDescriptor>
+ #include <QGuiApplication>
++#include <QMouseEvent>
+ 
+ using namespace Qt::StringLiterals;
+ 
+@@ -28,6 +29,9 @@ public:
+     std::unique_ptr<ScreencastingStream> request;
+     std::unique_ptr<EiConnection> eiConnection;
+     int eisCookie = 0;
++    /// Name of the output this session streams, which KWin also gives the matching EIS pointer region.
++    /// Empty for a workspace stream, which has no single output.
++    QString mappingId;
+ };
+ 
+ PlasmaScreencastV1Session::PlasmaScreencastV1Session()
+@@ -72,6 +76,8 @@ PlasmaScreencastV1Session::~PlasmaScreencastV1Session()
+ void PlasmaScreencastV1Session::start()
+ {
+     if (auto vm = virtualMonitor()) {
++        // KRdp asks KWin for "<name>"; KWin names the output "Virtual-<name>".
++        d->mappingId = QStringLiteral("Virtual-") + vm->name;
+         d->request.reset(d->m_screencasting.createVirtualMonitorStream(vm->name, vm->size, vm->dpr, Screencasting::Metadata));
+     } else if (const auto streamIndex = activeStream()) {
+         if (*streamIndex >= qApp->screens().size()) {
+@@ -79,6 +85,7 @@ void PlasmaScreencastV1Session::start()
              return;
          }
-+        // An RDP button packet carries an absolute pointer position, but KWin's
-+        // fake-input button request does not. Keep KWin's pointer in sync before
-+        // delivering the button; otherwise a click can be applied at (0,0).
-+        const auto position = me->position();
-+        const auto monitor = virtualMonitor();
-+        const auto scale = monitor ? monitor->dpr : 1.0;
-+        const auto logicalPosition = position / scale;
-+        d->remoteInterface->pointer_motion_absolute(wl_fixed_from_double(logicalPosition.x()),
-+                                                    wl_fixed_from_double(logicalPosition.y()));
-         uint state = me->type() == QEvent::MouseButtonPress ? 1 : 0;
-         d->remoteInterface->button(button, state);
-         break;
-@@ -222,6 +231,10 @@ void PlasmaScreencastV1Session::sendEvent(const std::shared_ptr<QEvent> &event)
-     case QEvent::MouseMove: {
-         auto me = std::static_pointer_cast<QMouseEvent>(event);
-         auto position = me->position();
--        auto logicalPosition = QPointF{(position.x() / size().width()) * logicalSize().width(), (position.y() / size().height()) * logicalSize().height()};
-+        // RDP reports physical pixels; KWin fake-input expects logical output
-+        // coordinates. Do not use the encoder's PipeWire stream size here.
-+        const auto monitor = virtualMonitor();
-+        const auto scale = monitor ? monitor->dpr : 1.0;
-+        auto logicalPosition = position / scale;
-         d->remoteInterface->pointer_motion_absolute(wl_fixed_from_double(logicalPosition.x()), wl_fixed_from_double(logicalPosition.y()));
-         break;
+         auto screen = qApp->screens().at(*streamIndex);
++        d->mappingId = screen->name();
+         d->request.reset(d->m_screencasting.createOutputStream(screen, Screencasting::Metadata));
+     } else {
+         d->request.reset(d->m_screencasting.createWorkspaceStream(Screencasting::Metadata));
+@@ -99,8 +106,20 @@ void PlasmaScreencastV1Session::start()
+ 
+ void PlasmaScreencastV1Session::sendEvent(const std::shared_ptr<QEvent> &event)
+ {
+-    if (isStarted() && d->eiConnection) {
+-        d->eiConnection->sendEvent(event, size(), {});
++    if (!isStarted() || !d->eiConnection) {
++        return;
+     }
++    // RDP positions are pixels of the stream. KWin's EIS pointer regions are logical output
++    // geometry, so with no mapping a position lands wrong on any output that is scaled or not
++    // at the origin. Naming the output lets EiConnection map stream pixels into its region.
++    if (event->type() == QEvent::MouseButtonPress || event->type() == QEvent::MouseButtonRelease) {
++        // An RDP button packet carries a position, an EIS button event does not, and
++        // the pointer may not have been moved there yet: a click could land wherever
++        // it last was. Move it first.
++        auto me = std::static_pointer_cast<QMouseEvent>(event);
++        auto move = std::make_shared<QMouseEvent>(QEvent::MouseMove, me->position(), me->globalPosition(), Qt::NoButton, me->buttons(), me->modifiers());
++        d->eiConnection->sendEvent(move, size(), d->mappingId);
++    }
++    d->eiConnection->sendEvent(event, size(), d->mappingId);
+ }
+ }
