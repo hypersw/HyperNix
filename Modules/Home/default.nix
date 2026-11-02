@@ -13,6 +13,7 @@
 #
 # Activation is via option-setting:
 #   programs.askpass-safe.enable = true;
+#   services.git-fetch-all.enable = true;
 #   programs.nix-ld-libraries = { enable = true; libraries = [ ... ]; };
 #   programs.wsl1-exec.enable = true;
 #
@@ -25,6 +26,7 @@
 {
   imports = [
     ../Git/AskpassSafe/home.nix
+    ../Git/FetchAll/home.nix
     ../Programs/NixLdLibraries/home.nix
     ../Programs/Wsl1Exec/home.nix
   ];
