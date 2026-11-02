@@ -17,7 +17,7 @@ Arguments after the tarballs go to the IDE.
 The build stays rooted under `~/.cache/jetbrains-tarball-ide/<folder name>`, or `<tarball name>` for a single file, until you delete that link.
 A newer build from the same folder takes over that root.
 
-Drop-in, in a folder holding exactly one tarball:
+Drop-in, in a folder holding tarballs of one product:
 
 ```sh
 nix flake init -t github:hypersw/HyperNix#Modules-Programs-JetBrainsTarballIde
@@ -27,7 +27,8 @@ chmod +x run.sh   # nix flake init drops the executable bit
 
 `run.sh` runs the flake of its own folder from any working directory, so `~/Apps/Draft/run.sh` is one fixed command line.
 The `path:` it uses keeps Nix from treating the folder as part of a parent git repo, which would hide the untracked tarball.
-For a new build, replace the tarball: the folder must hold exactly one.
+For a new build, drop the new tarball in: the highest version wins, by `builtins.compareVersions` on the file names.
+Nix copies the whole folder into the store on every change, so delete old tarballs once they are no longer needed.
 
 From another flake: `hypernix.lib."Modules-Programs-JetBrainsTarballIde" { inherit pkgs; src = ./ide.tar.gz; }`, with `allowUnfree` on `pkgs`.
 

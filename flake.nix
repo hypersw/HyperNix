@@ -166,7 +166,7 @@
       #   nix flake init -t github:hypersw/HyperNix#Modules-Programs-JetBrainsTarballIde && nix run path:.
       templates."Modules-Programs-JetBrainsTarballIde" = {
         path = ./Modules/Programs/JetBrainsTarballIde/Template;
-        description = "A JetBrains IDE built from the single *.tar.gz next to flake.nix";
+        description = "A JetBrains IDE built from the newest *.tar.gz next to flake.nix";
       };
 
       # ── NixOS Modules ──
