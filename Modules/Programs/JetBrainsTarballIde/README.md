@@ -25,7 +25,10 @@ chmod +x run.sh   # nix flake init drops the executable bit
 ./run.sh   # or: nix run path:.
 ```
 
-`run.sh` runs the flake of its own folder from any working directory, so `~/Apps/Draft/run.sh` is one fixed command line.
+`run.sh` builds the flake of its own folder from any working directory, so `~/Apps/Draft/run.sh` is one fixed command line.
+The build shows in the terminal; the IDE then starts detached in a session of its own (`setsid`), with no controlling terminal.
+Its launcher output goes to `~/.local/state/jetbrains-tarball-ide/<folder name>.log`, and the build stays rooted under `~/.cache/jetbrains-tarball-ide/<folder name>`.
+For an attached run, use `nix run path:.` instead.
 The `path:` it uses keeps Nix from treating the folder as part of a parent git repo, which would hide the untracked tarball.
 For a new build, drop the new tarball in: the highest version wins, by `builtins.compareVersions` on the file names.
 Nix copies the whole folder into the store on every change, so delete old tarballs once they are no longer needed.
