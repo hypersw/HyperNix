@@ -152,6 +152,8 @@
             self.nixosConfigurations.GhostHome-sdImage.config.system.build.sdImage or null;
           Machines-PhysicalServers-GhostHome-provisioning-sdImage =
             self.nixosConfigurations.GhostHome-provisioning-sdImage.config.system.build.sdImage or null;
+        } // nixpkgs.lib.optionalAttrs (system == "x86_64-linux") {
+          Modules-Images-UbuntuLive = import ./Modules/Images/UbuntuLive { inherit pkgs; };
         });
 
       # Build another isolated SshFront instance by passing a different name,
@@ -161,6 +163,8 @@
         import ./Machines/MicroVM/VmSshFront/nixos.nix ({ inherit nixpkgs microvm; } // args);
       # The builder behind Modules-Programs-JetBrainsTarballIde: `{ pkgs, src, ... }` to a JetBrains IDE package.
       lib."Modules-Programs-JetBrainsTarballIde" = import ./Modules/Programs/JetBrainsTarballIde/package.nix;
+      # Configure the Ubuntu live VM builder from a consumer flake.
+      lib."Modules-Images-UbuntuLive" = import ./Modules/Images/UbuntuLive;
 
       # A drop-in flake for a folder holding one JetBrains IDE tarball:
       #   nix flake init -t github:hypersw/HyperNix#Modules-Programs-JetBrainsTarballIde && nix run path:.

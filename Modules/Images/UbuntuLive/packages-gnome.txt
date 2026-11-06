@@ -1,0 +1,8 @@
+ubuntu-session
+gnome-shell
+mutter-common-bin
+gnome-control-center
+gnome-terminal
+nautilus
+gdm3
+firefox/mozilla

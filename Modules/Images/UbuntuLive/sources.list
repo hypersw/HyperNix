@@ -1,0 +1,3 @@
+deb http://archive.ubuntu.com/ubuntu stonking main universe restricted multiverse
+deb http://archive.ubuntu.com/ubuntu stonking-updates main universe restricted multiverse
+deb http://security.ubuntu.com/ubuntu stonking-security main universe restricted multiverse

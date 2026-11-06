@@ -1,0 +1,14 @@
+linux-image-virtual
+casper
+initramfs-tools
+systemd-sysv
+dbus
+sudo
+ca-certificates
+curl
+network-manager
+xwayland
+far2l-wx
+gvfs-backends
+openssh-client
+qemu-guest-agent

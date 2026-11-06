@@ -1,0 +1,4 @@
+#!/bin/sh
+# The target's first systemd boot creates its volatile files and directories.
+# 26.10's tmpfiles refuses to run here without a /proc mount.
+exit 0
