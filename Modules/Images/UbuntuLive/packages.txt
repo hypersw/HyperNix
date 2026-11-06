@@ -6,7 +6,6 @@ dbus
 sudo
 ca-certificates
 curl
-network-manager
 xwayland
 far2l-wx
 gvfs-backends

@@ -12,6 +12,8 @@ apt-get install -y --no-install-recommends mmdebstrap ubuntu-keyring ca-certific
   squashfs-tools grub-pc-bin grub-efi-amd64-bin xorriso mtools curl gpg python3
 
 packages="$(paste -sd, /source/packages.txt),$(paste -sd, /source/packages-gnome.txt)"
+network_mode="$(python3 -c 'import json; print(json.load(open("/config.json"))["network"]["mode"])')"
+if [[ "$network_mode" == networkmanager ]]; then packages+=",network-manager"; fi
 extra_packages="$(python3 -c 'import json; print(",".join(json.load(open("/config.json"))["packages"]))')"
 if [[ -n "$extra_packages" ]]; then packages+=",$extra_packages"; fi
 cp /source/sources.list /tmp/image-sources.list
@@ -46,9 +48,33 @@ done
 install -d /rootfs/etc/xdg/autostart /rootfs/var/crash /rootfs/etc/systemd/user
 # Shadow the distribution's same-named snippet, which otherwise excludes
 # Ethernet. Do not retain mmdebstrap's copy of the build host's resolver.
-install -D -m 644 /source/network-manager.conf /rootfs/etc/NetworkManager/conf.d/10-globally-managed-devices.conf
 rm -f /rootfs/etc/resolv.conf
-printf '%s\n' '# Managed by NetworkManager' > /rootfs/etc/resolv.conf
+if [[ "$network_mode" == networkmanager ]]; then
+  install -D -m 644 /source/network-manager.conf /rootfs/etc/NetworkManager/conf.d/10-globally-managed-devices.conf
+  printf '%s\n' '# Managed by NetworkManager' > /rootfs/etc/resolv.conf
+elif [[ "$network_mode" == static ]]; then
+  for unwanted in network-manager systemd-resolved; do
+    if chroot /rootfs dpkg-query -W -f='${db:Status-Status}' "$unwanted" 2>/dev/null | grep -qx installed; then
+      echo "Static networking requires $unwanted to be absent" >&2; exit 1
+    fi
+  done
+  test -x /rootfs/usr/lib/systemd/systemd-networkd || { echo 'systemd-networkd is missing' >&2; exit 1; }
+  python3 <<'PY'
+import ipaddress, json, pathlib, re
+n = json.loads(pathlib.Path('/config.json').read_text())['network']
+assert re.fullmatch(r'[a-zA-Z0-9_.-]{1,15}', n['interface'])
+address = ipaddress.IPv4Interface(n['address'])
+gateway = ipaddress.IPv4Address(n['gateway']) if n.get('gateway') else None
+path = pathlib.Path('/rootfs/etc/systemd/network/10-static.network')
+path.parent.mkdir(parents=True, exist_ok=True)
+path.write_text(f"[Match]\nName={n['interface']}\n\n[Network]\nDHCP=no\nIPv6AcceptRA=no\nLinkLocalAddressing=no\nAddress={address}\n" + (f"Gateway={gateway}\n" if gateway else ''))
+PY
+  printf '%s\n' '# No DNS resolver configured' > /rootfs/etc/resolv.conf
+  install -d /rootfs/etc/systemd/system/multi-user.target.wants
+  ln -sf /usr/lib/systemd/system/systemd-networkd.service /rootfs/etc/systemd/system/multi-user.target.wants/systemd-networkd.service
+else
+  echo "Invalid network mode: $network_mode" >&2; exit 1
+fi
 if true; then
   install -D -m 644 /source/gdm.conf /rootfs/etc/gdm3/custom.conf
   python3 <<'PY'

@@ -60,6 +60,26 @@ the mode and 200% scaling in a single-display Hyper-V GNOME session after login;
 the mode must be supported. It falls back to the current display configuration
 when unavailable. `scale` defaults to 1. The VM can ignore the mode request.
 
+`network` defaults to `{ mode = "networkmanager"; }`, using DHCP as usual. To
+use a named Ethernet interface with a static IPv4 address instead, configure:
+
+```nix
+network = {
+  mode = "static";
+  interface = "eth0";
+  address = "192.0.2.10/24";
+  gateway = "192.0.2.1"; # optional for proxies on the same subnet
+};
+```
+
+Use the actual guest interface name, IP prefix and gateway. In static mode
+`systemd-networkd` configures that interface; DHCP, IPv6 autoconfiguration,
+NetworkManager and a DNS resolver are not configured. The build fails if a
+requested package pulls in NetworkManager. SOCKS must be configured separately
+in Firefox, with remote DNS enabled and a proxy address reachable over this
+network. This is not a firewall: applications can still make direct connections
+or perform their own DNS lookups. A gateway is needed if the proxy is off-link.
+
 `firefoxPolicies` is recursively merged into the default Firefox enterprise
 policies. These disable Firefox telemetry, studies and automatic crash
 submission, and skip its initial terms notice. Mozilla says that the
