@@ -44,6 +44,11 @@ for reporting_package in apport apport-gtk whoopsie ubuntu-report ubuntu-insight
 done
 
 install -d /rootfs/etc/xdg/autostart /rootfs/var/crash /rootfs/etc/systemd/user
+# Shadow the distribution's same-named snippet, which otherwise excludes
+# Ethernet. Do not retain mmdebstrap's copy of the build host's resolver.
+install -D -m 644 /source/network-manager.conf /rootfs/etc/NetworkManager/conf.d/10-globally-managed-devices.conf
+rm -f /rootfs/etc/resolv.conf
+printf '%s\n' '# Managed by NetworkManager' > /rootfs/etc/resolv.conf
 if true; then
   install -D -m 644 /source/gdm.conf /rootfs/etc/gdm3/custom.conf
   python3 <<'PY'
