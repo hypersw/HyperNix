@@ -135,7 +135,16 @@ let
   # unconditionally. Preset GTK_CFLAGS/GTK_LIBS make PKG_CHECK_MODULES skip the
   # probe; only frontend/Makefile.am, which is not built, uses them.
 
-  iscanWithIpcProxy = ((pkgs.epkowa.override { gtk2 = null; }).overrideAttrs (old: {
+  # nixpkgs removed the now-unusable GTK 2 input from epkowa.  Keep the
+  # override only for older pins that still expose it, so the module works
+  # across the transition.
+  epkowaWithoutGtk2 =
+    if pkgs.epkowa.override.__functionArgs ? gtk2 then
+      pkgs.epkowa.override { gtk2 = null; }
+    else
+      pkgs.epkowa;
+
+  iscanWithIpcProxy = (epkowaWithoutGtk2.overrideAttrs (old: {
     patches = (old.patches or []) ++ [ ../EpkowaStubX64/iscan-ipc-proxy.patch ];
     nativeBuildInputs = (old.nativeBuildInputs or []) ++ [ pkgs.autoreconfHook ];
     configureFlags = (old.configureFlags or []) ++ [
