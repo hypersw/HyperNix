@@ -439,6 +439,15 @@ let
       mv "$TRYBOOT_CFG_TMP" "$TRYBOOT_CFG"
       sync
 
+      # The candidate is a plain `nixos-rebuild build` result, not a
+      # /nix/var/nix/profiles/system generation.  Its FAT-side copy contains
+      # `init=$SYSTEM_PATH/init`, so it must have a host-visible GC root until
+      # it is promoted or nvmd's regular stage retires nixos/tryboot/.
+      # RaspberryPiNonProvisioningBase synchronises/removes this root during
+      # normal retention cleanup as a second line of defence.
+      mkdir -p /nix/var/nix/gcroots
+      ln -sfn "$SYSTEM_PATH" /nix/var/nix/gcroots/hypersw-rpi-tryboot
+
       cat <<BANNER
 
       ================================================================

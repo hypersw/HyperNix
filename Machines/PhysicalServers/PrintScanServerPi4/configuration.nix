@@ -52,7 +52,7 @@
   # back to `lib.mkForce "uboot"` (or remove the override
   # entirely to inherit nvmd's default).
   boot.loader.raspberry-pi.bootloader = lib.mkForce "kernel";
-  boot.loader.raspberry-pi.configurationLimit = 3;
+  # RaspberryPiNonProvisioningBase owns the shared live-Pi limit of three.
 
   # (Second workaround for nvmd's linux-kernel.target read reverted
   # in lockstep with the GhostHome sibling — see that config for the

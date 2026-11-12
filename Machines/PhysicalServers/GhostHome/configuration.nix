@@ -62,7 +62,8 @@
   # mount the FAT partition on another box, copy a previous gen's
   # files over the FAT root to recover from a bad upgrade).
   boot.loader.raspberry-pi.bootloader = "kernel";
-  boot.loader.raspberry-pi.configurationLimit = 3;
+  # RaspberryPiNonProvisioningBase owns the shared live-Pi limit of three:
+  # firmware generations and system-profile retention stay in lockstep.
 
   # (Second workaround for nvmd's linux-kernel.target read at
   # loader/raspberrypi/default.nix:535 was reverted — attempts via
