@@ -452,6 +452,12 @@
           ];
         };
 
+        # ── VdsRuOne — small BIOS/virtio x86_64 VPS at VDSina ───────
+        VdsRuOne = nixpkgs.lib.nixosSystem {
+          system = "x86_64-linux";
+          modules = [ ./Machines/PhysicalServers/VdsRuOne/configuration.nix ];
+        };
+
         # ── GhostHome — Pi 5 home-automation server. Inherits the
         # print/scan stack as a guest workload until a dedicated
         # home-automation role takes its place as the headline.
