@@ -128,13 +128,13 @@
           # Run directly via:
           #   nix run github:hypersw/HyperNix#Modules-System-ZfsTpmUnlock-KeyTool -- --help
           Modules-System-ZfsTpmUnlock-KeyTool = import ./Modules/System/ZfsTpmUnlock/package.nix { inherit pkgs; };
-          # Remmina patched for Looking-Glass / mstsc-style focus-driven
           # Mirror Margin — local, side-by-side FB2 reading prototype. Its
           # launcher serves static assets only on 127.0.0.1 and opens a browser.
           Modules-Programs-MirrorMargin = import ./Modules/Programs/MirrorMargin/package.nix { inherit pkgs; };
           # Minimal, pinned WSL 1 exec-rescue preload. The Home Manager module
           # provisions this under ~/.local/lib; export it for manual use too.
           Modules-Programs-Wsl1Exec = wsl1Exec;
+          # Remmina patched for Looking-Glass / mstsc-style focus-driven
           # keyboard capture (transient grab toggle, type-to-regrab,
           # Ctrl+Alt+Home release chord, floating-toolbar cue). Same
           # derivation the hypersw.programs.remminaAutograb module installs.
