@@ -167,7 +167,7 @@ let
     echo "== step 1: flake update (production inputs only)"
     nix --extra-experimental-features 'nix-command flakes' flake update \
       --flake "path:$SANDBOX" \
-      ${lib.concatStringsSep " " productionInputs}
+      ${lib.concatStringsSep " " cfg.productionInputs}
 
     # ── Step 2: dry build the candidate configuration ─────────
     # --no-link so we don't pollute /nix/store links with a
@@ -184,7 +184,7 @@ let
     # is untouched.
     echo "== step 3: splice production nodes into $LIVE/flake.lock"
     jq --slurpfile new "$SANDBOX/flake.lock" --arg mode sandbox-promote \
-      --argjson inputs '${builtins.toJSON productionInputs}' -f ${lockGraphFilter} \
+      --argjson inputs '${builtins.toJSON cfg.productionInputs}' -f ${lockGraphFilter} \
       "$LIVE/flake.lock" > "$LIVE/flake.lock.tx-new"
     mv -f "$LIVE/flake.lock.tx-new" "$LIVE/flake.lock"
 
@@ -238,6 +238,24 @@ in
         traffic to github + cache.nixos.org.
       '';
     };
+
+    productionInputs = lib.mkOption {
+      type = lib.types.listOf lib.types.str;
+      default = productionInputs;
+      description = ''
+        Root flake inputs updated and atomically promoted by one
+        transaction. Small x86 hosts can omit the Pi-specific input.
+      '';
+    };
+
+    onFailureUnit = lib.mkOption {
+      type = lib.types.nullOr lib.types.str;
+      default = "nixos-upgrade-failure-notify.service";
+      description = ''
+        Optional unit started on upgrade failure. Set to null on hosts that
+        intentionally do not install Telegram alerts.
+      '';
+    };
   };
 
   config = lib.mkIf cfg.enable {
@@ -253,7 +271,7 @@ in
       wants = [ "network-online.target" ];
 
       unitConfig = {
-        OnFailure = "nixos-upgrade-failure-notify.service";
+        OnFailure = lib.optionalString (cfg.onFailureUnit != null) cfg.onFailureUnit;
         StartLimitIntervalSec = "1h";
         StartLimitBurst = 3;
       };

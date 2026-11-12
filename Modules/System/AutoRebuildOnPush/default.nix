@@ -16,6 +16,9 @@ let
   # path unit loops forever.
   runtimeDir = "/run/auto-rebuild";
   triggerDir = "${runtimeDir}/triggers";
+  # Shared with autoUpgradeTransactional: both services change the local
+  # flake lock and therefore must never update/rebuild concurrently.
+  updateLock = "/run/nixos-upgrade-transactional.lock";
 
   checkerScript = pkgs.writeShellScript "auto-rebuild-github-check" ''
     set -euo pipefail
@@ -135,6 +138,11 @@ let
 
   switchScript = pkgs.writeShellScript "auto-rebuild-switch" ''
     set -euo pipefail
+    exec 9>"${updateLock}"
+    if ! ${pkgs.util-linux}/bin/flock -w 300 9; then
+      echo "could not acquire ${updateLock} within 5 minutes" >&2
+      exit 1
+    fi
     # Update the lock for the watched input, then activate. Both steps run
     # as root (NixOS activation requires it), but the service takes no
     # parameters — its entire behavior is determined by the flake.nix at
@@ -195,6 +203,18 @@ in
         nixos-rebuild, such as managed containers where "boot" means
         "build a guest system and ask the host to use that path next
         time the container starts".
+      '';
+    };
+
+    onFailure = lib.mkOption {
+      type = lib.types.listOf lib.types.str;
+      default = [
+        "auto-rebuild-checker-failure-notify.service"
+        "auto-rebuild-switch-failure-notify.service"
+      ];
+      description = ''
+        Units to start when the checker or switcher fails. Hosts without the
+        optional Telegram alerts module can set this to an empty list.
       '';
     };
   };
@@ -316,7 +336,8 @@ in
       # failures — parse errors, malformed flake.lock, unsupported
       # upstream type — are bugs worth alerting on. Service defined in
       # Modules/Monitoring/TelegramAlerts/default.nix.
-      unitConfig.OnFailure = "auto-rebuild-checker-failure-notify.service";
+      unitConfig.OnFailure = lib.optionalString (cfg.onFailure != [])
+        (lib.head cfg.onFailure);
       path = [ pkgs.git ];
     };
 
@@ -375,7 +396,8 @@ in
       # quickly" journal line every tick. Refused starts don't fire
       # OnFailure= so we don't flood the alert queue either.
       unitConfig = {
-        OnFailure = "auto-rebuild-switch-failure-notify.service";
+        OnFailure = lib.optionalString (cfg.onFailure != [])
+          (lib.last cfg.onFailure);
         StartLimitIntervalSec = "5min";
         StartLimitBurst = 3;
       };
