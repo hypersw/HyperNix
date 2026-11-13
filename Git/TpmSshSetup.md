@@ -321,6 +321,29 @@ tpm2_ptool addkey --label=<service> --userpin="" --algorithm=ecc256 --key-label=
 
 An empty `--userpin` sets the token's `empty-user-pin` itself, so ssh never asks; tokens with PINs keep asking.
 
+An existing token goes the same way with `changepin`, which also sets `empty-user-pin` when the new PIN is empty:
+
+```bash
+read -rsp 'Current user PIN: ' old; echo
+tpm2_ptool changepin --label=<service> --user=user --old="$old" --new=''
+unset old
+tpm2_ptool config --label=<service>   # shows empty-user-pin: true
+```
+
+## Keeping the store in git
+
+Every `tpm2_ptool` change rewrites the one SQLite file, so a git repository in the store directory is a cheap undo history.
+tpm2-pkcs11 opens only `tpm2_pkcs11.sqlite3` there, so the repository does not disturb it.
+
+```bash
+cd "$TPM2_PKCS11_STORE"
+git init -b main . && git config core.fsmonitor false
+printf '%s\n' '*-journal' '*-wal' '*-shm' > .gitignore
+git add . && git commit -m "Store as of $(date -I)"
+```
+
+Commit after each change. The history does not survive a TPM clear in any useful way: the files stay on disk, but a clear replaces the owner hierarchy's seed, so no old blob loads on that TPM again.
+
 ## Rekeying (new machine or container)
 
 Each machine/container creates its own key. To add a new machine:
