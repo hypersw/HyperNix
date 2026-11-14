@@ -86,7 +86,13 @@ let
       serviceConfig = {
         Type = "notify";
         LoadCredentialEncrypted = "${cfg.passwordCredentialName}:${credentialFile}";
-        ExecStartPre = "${pkgs.coreutils}/bin/mkdir -p ${lib.escapeShellArg mountPoint} ${lib.escapeShellArg cacheDirectory}";
+        # Do not ever mount a remote from a plaintext rclone.conf.  This also
+        # verifies that this service can decrypt the TPM-bound credential and
+        # use it to decrypt the configuration before it accesses an OAuth token.
+        ExecStartPre = [
+          "${pkgs.coreutils}/bin/mkdir -p ${lib.escapeShellArg mountPoint} ${lib.escapeShellArg cacheDirectory}"
+          "${pkgs.rclone}/bin/rclone --config=${lib.escapeShellArg cfg.configFile} --password-command=${lib.escapeShellArg passwordCommand} config encryption check"
+        ];
         ExecStart = "${pkgs.rclone}/bin/rclone --config=${lib.escapeShellArg cfg.configFile} --password-command=${lib.escapeShellArg passwordCommand} --cache-dir=${lib.escapeShellArg cacheDirectory} mount ${lib.escapeShellArg "${mount.remote}:"} ${lib.escapeShellArg mountPoint} --vfs-cache-mode=${mount.vfsCacheMode}${lib.optionalString (mountArgs != "") " ${mountArgs}"}";
         ExecStop = "-/run/wrappers/bin/fusermount -u ${mountPoint}";
         Restart = "on-failure";
