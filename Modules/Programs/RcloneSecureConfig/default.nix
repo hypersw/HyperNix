@@ -100,6 +100,12 @@ let
         config "$@"
   '';
 
+  mkSetupCommand = name: _: pkgs.writeShellScriptBin "rclone-secure-config-${name}" ''
+    exec ${setupCommand}/bin/rclone-secure-config ${lib.escapeShellArg name} "$@"
+  '';
+
+  setupCommands = lib.mapAttrs mkSetupCommand cfg.mounts;
+
   mkMountService = name: mount:
     let
       mountPoint = mount.mountPoint;
@@ -172,7 +178,13 @@ in
     setupCommand = mkOption {
       type = types.path;
       readOnly = true;
-      description = "Interactive rclone configuration command that selects one mount's configuration and receives its password through a transient systemd service.";
+      description = "Internal dispatcher for the generated per-mount rclone configuration commands.";
+    };
+
+    setupCommands = mkOption {
+      type = types.attrsOf types.path;
+      readOnly = true;
+      description = "Generated interactive rclone configuration commands, one per mount. Each receives its password through a transient systemd service.";
     };
 
     mounts = mkOption {
@@ -222,7 +234,7 @@ in
   };
 
   config = mkIf cfg.enable {
-    environment.systemPackages = [ pkgs.rclone setupCommand ];
+    environment.systemPackages = [ pkgs.rclone ] ++ lib.attrValues setupCommands;
 
     # Supplies the setuid fusermount/fusermount3 wrappers rclone mount needs.
     # A container still needs IsFuse on its host-side declaration to expose
@@ -251,6 +263,7 @@ in
 
     hypersw.programs.rcloneSecureConfig.passwordCommand = passwordCommand;
     hypersw.programs.rcloneSecureConfig.setupCommand = setupCommand;
+    hypersw.programs.rcloneSecureConfig.setupCommands = setupCommands;
 
     assertions = [
       {
