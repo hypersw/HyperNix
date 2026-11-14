@@ -59,6 +59,10 @@ let
       ${pkgs.coreutils}/bin/mv -f "$tmp" "$credential_file"
       trap - EXIT
     fi
+
+    # Directly provisioned credential ciphertext may have inherited a broader
+    # mode. Keep it private even though the containing directory is private.
+    ${pkgs.coreutils}/bin/chmod 0600 "$credential_file"
   '';
 
   mkSetupCase = name: mount: ''
