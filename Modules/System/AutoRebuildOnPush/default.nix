@@ -126,7 +126,8 @@ let
     echo "upstream changed $CURRENT_REV -> $LATEST_REV — queueing a switch"
     # mktemp a unique name per trigger. If the switcher is mid-run when
     # we fire, successive queue-drops create distinct files; the switcher
-    # sweeps the dir in ExecStartPre so no trigger is ever "stuck".
+    # sweeps the dir once it holds the update lock, so no trigger is ever
+    # "stuck".
     ${pkgs.coreutils}/bin/mktemp -p ${triggerDir} trigger.XXXXXX > /dev/null
   '';
 
@@ -138,11 +139,20 @@ let
 
   switchScript = pkgs.writeShellScript "auto-rebuild-switch" ''
     set -euo pipefail
+    # A busy lock is not a failure: the other lane is running. Exit 75 and
+    # let systemd re-run this unit after RestartSec (see serviceConfig).
+    # A stuck holder is killed by its own TimeoutStartSec, and the kernel
+    # frees the flock with it, so no lane waits on another forever.
     exec 9>"${updateLock}"
-    if ! ${pkgs.util-linux}/bin/flock -w 300 9; then
-      echo "could not acquire ${updateLock} within 5 minutes" >&2
-      exit 1
+    if ! ${pkgs.util-linux}/bin/flock -n 9; then
+      echo "${updateLock} is held by the other update lane; deferring"
+      exit 75
     fi
+    # Sweep the triggers only under the lock, so a deferred run keeps them.
+    # From here on a failed switch leaves the dir empty and the path unit
+    # does not loop; the checker fires again when it next sees the rev
+    # difference.
+    ${pkgs.findutils}/bin/find ${triggerDir} -maxdepth 1 -name 'trigger.*' -delete
     # Update the lock for the watched input, then activate. Both steps run
     # as root (NixOS activation requires it), but the service takes no
     # parameters — its entire behavior is determined by the flake.nix at
@@ -189,6 +199,15 @@ in
         override activationCommand to route boot/test/switch through
         their container-specific lifecycle wrapper while reusing this
         module's checker and trigger machinery.
+      '';
+    };
+
+    timeout = lib.mkOption {
+      type = lib.types.str;
+      default = "6h";
+      description = ''
+        TimeoutStartSec of the switcher: the longest one update-and-activate
+        run may take before systemd kills it and frees the shared update lock.
       '';
     };
 
@@ -377,16 +396,24 @@ in
         Type = "oneshot";
         WorkingDirectory = "/var/empty";
 
-        # Sweep triggers BEFORE attempting the switch. If the switch
-        # fails at any point, the dir is already empty — the path unit
-        # won't re-fire in a loop. Next attempt is whenever the checker
-        # next sees a rev difference (minutes later, via its timer).
-        ExecStartPre = "${pkgs.findutils}/bin/find ${triggerDir} -maxdepth 1 -name 'trigger.*' -delete";
+        # The script sweeps the triggers itself, after it takes the lock.
         ExecStart = switchScript;
 
         # Restart=no is the oneshot default; keep it. A failed switch
         # should freeze visibly in `systemctl --failed` and alert via
-        # OnFailure below, not thrash.
+        # OnFailure, not thrash.
+        # Exit 75 (lock busy) alone re-runs the unit. RestartMode=direct
+        # keeps it activating across the wait, which skips OnFailure and
+        # OnSuccess (checked on systemd 262: without it every deferral
+        # fires OnFailure). The pending triggers do not start extra runs
+        # meanwhile. Ten minutes stays clear of StartLimitBurst below.
+        RestartForceExitStatus = 75;
+        RestartMode = "direct";
+        RestartSec = "10min";
+        # A oneshot has no start timeout by default. This one bounds a
+        # stuck build or activation, so a stuck run cannot hold the lane
+        # lock forever; a Pi kernel built from source takes about 3 h.
+        TimeoutStartSec = cfg.timeout;
       };
       # Defense-in-depth against runaway path-activation loops. If some
       # future bug makes a trigger file reappear on its own, cap the

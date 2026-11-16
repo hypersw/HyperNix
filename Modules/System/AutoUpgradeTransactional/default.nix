@@ -143,14 +143,14 @@ let
     LOCK=${lockFile}
 
     # ── Mutex ─────────────────────────────────────────────────
-    # 5-minute wait for auto-rebuild-switch to finish its own flake
-    # write. Longer than a typical rebuild; short enough that a
-    # legitimately-stuck peer surfaces via our own OnFailure alert
-    # rather than blocking forever.
+    # Shared with auto-rebuild-switch. A busy lock is not a failure:
+    # exit 75 and systemd re-runs this unit after RestartSec (see
+    # serviceConfig). The holder is bounded by its own TimeoutStartSec,
+    # and the kernel frees the flock when it is killed.
     exec 200>"$LOCK"
-    if ! flock -w 300 200; then
-      echo "could not acquire $LOCK within 5 minutes — likely a stuck peer"
-      exit 1
+    if ! flock -n 200; then
+      echo "$LOCK is held by the other update lane; deferring"
+      exit 75
     fi
 
     # ── Sandbox seed ──────────────────────────────────────────
@@ -239,6 +239,15 @@ in
       '';
     };
 
+    timeout = lib.mkOption {
+      type = lib.types.str;
+      default = "8h";
+      description = ''
+        TimeoutStartSec of the transaction: the longest one run may take
+        before systemd kills it and frees the shared update lock.
+      '';
+    };
+
     productionInputs = lib.mkOption {
       type = lib.types.listOf lib.types.str;
       default = productionInputs;
@@ -272,8 +281,10 @@ in
 
       unitConfig = {
         OnFailure = lib.optionalString (cfg.onFailureUnit != null) cfg.onFailureUnit;
+        # Deferral restarts count as starts: at one per 10 min, six fit in
+        # the hour, and a few manual starts on top.
         StartLimitIntervalSec = "1h";
-        StartLimitBurst = 3;
+        StartLimitBurst = 10;
       };
 
       environment = {
@@ -302,6 +313,16 @@ in
         # Verified by inspecting `systemctl cat nixos-upgrade.service`
         # on the device before this line was added.
         ExecStartPre = lib.mkForce [];
+        # Exit 75 (lock busy) alone re-runs the unit. RestartMode=direct
+        # keeps it activating across the wait, which skips OnFailure and
+        # OnSuccess (checked on systemd 262: without it every deferral
+        # fires OnFailure).
+        RestartForceExitStatus = 75;
+        RestartMode = "direct";
+        RestartSec = "10min";
+        # A oneshot has no start timeout by default. This bounds a stuck
+        # transaction, so it cannot hold the shared lock forever.
+        TimeoutStartSec = cfg.timeout;
         # RuntimeDirectory would auto-clean between runs; we use an
         # explicit path in /run so the shell can rm -rf defensively.
       };
