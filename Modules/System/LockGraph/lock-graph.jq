@@ -21,14 +21,20 @@ def assert_candidates_unchanged($live; $new; $names):
     then error("production update changed candidate closure") else . end;
 # $candidates lists the root inputs that the production update must leave
 # alone; empty for a lock without candidate inputs.
+# The live lock may lack root inputs: the shim's baked first-boot lock has
+# only nixpkgs, nixos-hardware and upstream. A candidate it lacks has
+# nothing to protect yet; a production input it lacks is adopted under the
+# sandbox's node id.
 def sandbox_promote($new; $names; $candidates):
   . as $live
-  | assert_candidates_unchanged($live; $new; $candidates)
+  | assert_candidates_unchanged($live; $new; [ $candidates[] | select($live.nodes.root.inputs[.] != null) ])
   | root_ids($new; $names) as $roots
   | closure($new.nodes; $roots) as $ids
   | reduce ($ids | keys[]) as $id (. ; .nodes[$id] = $new.nodes[$id])
   | reduce $names[] as $name
-      (. ; root_id($live; $name) as $to | root_id($new; $name) as $from | .nodes[$to] = $new.nodes[$from]);
+      (. ; root_id($new; $name) as $from
+        | if $live.nodes.root.inputs[$name] == null then .nodes.root.inputs[$name] = $from
+          else root_id($live; $name) as $to | .nodes[$to] = $new.nodes[$from] end);
 def rewrite_node($node; $node_map; $follow_map):
   $node | if .inputs? == null then . else .inputs |= with_entries(
     if (.value | type) == "string" then .value = ($node_map[.value] // .value)
