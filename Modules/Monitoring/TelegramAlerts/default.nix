@@ -1173,17 +1173,27 @@ Last failing boot ended with:
     # NixOS upgrade failure → alert
     # The transactional replacement deliberately disables the stock
     # `system.autoUpgrade` option, but it retains the same service name.
-    # It has a specialized failure notifier of its own; add only the missing
-    # success handler there.
+    # Its failure notifier quotes a longer journal tail.
+    # This module attaches every update-lane notifier itself, so the update
+    # modules name no alert unit and a host without alerts sets nothing.
     systemd.services.nixos-upgrade = lib.mkMerge [
       (lib.mkIf config.system.autoUpgrade.enable {
         unitConfig.OnFailure = "upgrade-failure-notify.service";
         unitConfig.OnSuccess = "upgrade-success-notify.service";
       })
       (lib.mkIf config.hypersw.system.autoUpgradeTransactional.enable {
+        unitConfig.OnFailure = "nixos-upgrade-failure-notify.service";
         unitConfig.OnSuccess = "upgrade-success-notify.service";
       })
     ];
+    systemd.services.auto-rebuild-github-checker =
+      lib.mkIf config.hypersw.services.auto-rebuild-on-push.enable {
+        unitConfig.OnFailure = "auto-rebuild-checker-failure-notify.service";
+      };
+    systemd.services.auto-rebuild-switch =
+      lib.mkIf config.hypersw.services.auto-rebuild-on-push.enable {
+        unitConfig.OnFailure = "auto-rebuild-switch-failure-notify.service";
+      };
 
     systemd.services.upgrade-success-notify = {
       description = "Notify Telegram that upgrade service completed";
@@ -1212,7 +1222,7 @@ Last failing boot ended with:
     };
 
     # Our custom auto-rebuild path (not NixOS autoUpgrade). Wired via
-    # OnFailure= in Modules/System/AutoRebuildOnPush/default.nix. The
+    # OnFailure= next to nixos-upgrade's notifiers above. The
     # switcher is the privileged component — its failure means a broken
     # deployment or build error and wants a real alert. The checker's
     # transient network issues soft-exit without firing its notifier;

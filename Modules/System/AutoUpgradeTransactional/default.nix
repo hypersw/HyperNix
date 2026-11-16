@@ -206,11 +206,9 @@ let
     echo "== upgrade complete"
   '';
 
-  # The failure-notify service body (nixos-upgrade-failure-notify.service)
-  # is defined in Modules/Monitoring/TelegramAlerts/default.nix alongside
-  # the other *-failure-notify services, because that's where the
-  # `sendAlert` helper is in scope. This module only references its
-  # unit name via OnFailure=.
+  # This module names no alert unit. Modules/Monitoring/TelegramAlerts
+  # attaches its own OnFailure/OnSuccess notifiers to nixos-upgrade when
+  # it is enabled, so a host without alerts needs no option here.
 in
 {
   options.hypersw.system.autoUpgradeTransactional = {
@@ -256,15 +254,6 @@ in
         transaction. Small x86 hosts can omit the Pi-specific input.
       '';
     };
-
-    onFailureUnit = lib.mkOption {
-      type = lib.types.nullOr lib.types.str;
-      default = "nixos-upgrade-failure-notify.service";
-      description = ''
-        Optional unit started on upgrade failure. Set to null on hosts that
-        intentionally do not install Telegram alerts.
-      '';
-    };
   };
 
   config = lib.mkIf cfg.enable {
@@ -280,7 +269,6 @@ in
       wants = [ "network-online.target" ];
 
       unitConfig = {
-        OnFailure = lib.optionalString (cfg.onFailureUnit != null) cfg.onFailureUnit;
         # Deferral restarts count as starts: at one per 10 min, six fit in
         # the hour, and a few manual starts on top.
         StartLimitIntervalSec = "1h";

@@ -224,18 +224,6 @@ in
         time the container starts".
       '';
     };
-
-    onFailure = lib.mkOption {
-      type = lib.types.listOf lib.types.str;
-      default = [
-        "auto-rebuild-checker-failure-notify.service"
-        "auto-rebuild-switch-failure-notify.service"
-      ];
-      description = ''
-        Units to start when the checker or switcher fails. Hosts without the
-        optional Telegram alerts module can set this to an empty list.
-      '';
-    };
   };
 
   config = lib.mkIf cfg.enable {
@@ -351,12 +339,11 @@ in
         # AF_INET/INET6 for HTTPS to github; AF_UNIX for nix daemon RPC.
         RestrictAddressFamilies = [ "AF_INET" "AF_INET6" "AF_UNIX" ];
       };
-      # Transient network failures soft-exit 0 (don't fire this). Hard
-      # failures — parse errors, malformed flake.lock, unsupported
-      # upstream type — are bugs worth alerting on. Service defined in
-      # Modules/Monitoring/TelegramAlerts/default.nix.
-      unitConfig.OnFailure = lib.optionalString (cfg.onFailure != [])
-        (lib.head cfg.onFailure);
+      # Transient network failures soft-exit 0, so they never count as a
+      # failure. Hard failures — parse errors, malformed flake.lock,
+      # unsupported upstream type — are bugs worth alerting on;
+      # Modules/Monitoring/TelegramAlerts attaches its notifier to this
+      # unit when alerts are enabled.
       path = [ pkgs.git ];
     };
 
@@ -422,9 +409,9 @@ in
       # runs, no CPU/SD burn, just a "Start request repeated too
       # quickly" journal line every tick. Refused starts don't fire
       # OnFailure= so we don't flood the alert queue either.
+      # Modules/Monitoring/TelegramAlerts attaches its failure notifier here
+      # when alerts are enabled.
       unitConfig = {
-        OnFailure = lib.optionalString (cfg.onFailure != [])
-          (lib.last cfg.onFailure);
         StartLimitIntervalSec = "5min";
         StartLimitBurst = 3;
       };

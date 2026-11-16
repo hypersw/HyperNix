@@ -90,14 +90,10 @@
     mv -f "$tmp" /etc/nixos/flake.nix
   '';
 
-  hypersw.services.auto-rebuild-on-push = {
-    enable = true;
-    onFailure = [];
-  };
+  hypersw.services.auto-rebuild-on-push.enable = true;
   hypersw.system.autoUpgradeTransactional = {
     enable = true;
     productionInputs = [ "nixpkgs" "nixos-hardware" "upstream" ];
-    onFailureUnit = null;
   };
 
   system.stateVersion = "26.05";
