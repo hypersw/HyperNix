@@ -331,6 +331,16 @@ in
       # ── auto-rebuild-on-push ──────────────────────────────────────
       hypersw.services.auto-rebuild-on-push.enable = cfg.autoRebuildOnPush.enable;
 
+      # The shim below renders a candidate quartet next to production;
+      # the transactional upgrade must leave those inputs alone.
+      hypersw.system.autoUpgradeTransactional.candidateInputs =
+        lib.mkIf cfg.localFlake.enable (lib.mkDefault [
+          "nixpkgs-candidate"
+          "nixos-hardware-candidate"
+          "nixos-raspberrypi-candidate"
+          "upstream-candidate"
+        ]);
+
       # ── telegram-alerts ───────────────────────────────────────────
       hypersw.services.telegram-alerts = lib.mkIf cfg.alerts.enable {
         enable = true;

@@ -19,9 +19,11 @@ def assert_candidates_unchanged($live; $new; $names):
   | closure($live.nodes; $roots) as $ids
   | if ([ $ids | keys[] | select($live.nodes[.] != $new.nodes[.]) ] | length) != 0
     then error("production update changed candidate closure") else . end;
-def sandbox_promote($new; $names):
+# $candidates lists the root inputs that the production update must leave
+# alone; empty for a lock without candidate inputs.
+def sandbox_promote($new; $names; $candidates):
   . as $live
-  | assert_candidates_unchanged($live; $new; ($names | map(. + "-candidate")))
+  | assert_candidates_unchanged($live; $new; $candidates)
   | root_ids($new; $names) as $roots
   | closure($new.nodes; $roots) as $ids
   | reduce ($ids | keys[]) as $id (. ; .nodes[$id] = $new.nodes[$id])
@@ -43,6 +45,7 @@ def candidate_promote($names):
   | reduce ($ids | keys[]) as $source
       ($live; $node_map[$source] as $destination | .nodes[$destination] = rewrite_node($live.nodes[$source]; $node_map; $follow_map))
   | reduce $p_roots[] as $id (. ; .nodes[$id].original = $originals[$id]);
-if $mode == "sandbox-promote" then $new[0] as $new | sandbox_promote($new; $inputs)
+# `--argjson candidates` is optional: candidate-promote callers never pass it.
+if $mode == "sandbox-promote" then $new[0] as $new | sandbox_promote($new; $inputs; ($ARGS.named.candidates // []))
 elif $mode == "candidate-promote" then candidate_promote($inputs)
 else error("unknown mode") end

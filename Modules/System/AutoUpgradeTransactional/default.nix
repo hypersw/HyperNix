@@ -185,7 +185,9 @@ let
     # is untouched.
     echo "== step 3: splice production nodes into $LIVE/flake.lock"
     jq --slurpfile new "$SANDBOX/flake.lock" --arg mode sandbox-promote \
-      --argjson inputs '${builtins.toJSON cfg.productionInputs}' -f ${lockGraphFilter} \
+      --argjson inputs '${builtins.toJSON cfg.productionInputs}' \
+      --argjson candidates '${builtins.toJSON cfg.candidateInputs}' \
+      -f ${lockGraphFilter} \
       "$LIVE/flake.lock" > "$LIVE/flake.lock.tx-new"
     mv -f "$LIVE/flake.lock.tx-new" "$LIVE/flake.lock"
 
@@ -270,6 +272,19 @@ in
       description = ''
         Root flake inputs updated and atomically promoted by one
         transaction. Small x86 hosts can omit the Pi-specific input.
+      '';
+    };
+
+    candidateInputs = lib.mkOption {
+      type = lib.types.listOf lib.types.str;
+      default = [ ];
+      example = [ "nixpkgs-candidate" "upstream-candidate" ];
+      description = ''
+        Root flake inputs of an operator-managed candidate set. The
+        transaction never updates them, and it refuses to promote when
+        the production update changed their lock closure. Empty for a
+        local flake without candidates; the local-flake shim sets it
+        for the shape it renders.
       '';
     };
   };
