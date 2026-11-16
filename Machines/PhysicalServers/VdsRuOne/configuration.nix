@@ -66,35 +66,16 @@
   # /etc/nixos/flake.nix is module-owned; flake.lock remains operational
   # state, changed by the update services.  No candidate quartet or Pi input:
   # those would consume source-store space without benefiting this VPS.
-  system.activationScripts.vdsRuOneLocalFlake.text = ''
-    install -d -m 0755 /etc/nixos
-    tmp=$(mktemp /etc/nixos/.flake.nix.XXXXXX)
-    cat > "$tmp" <<'EOF'
-    {
-      description = "VdsRuOne local update shim";
-      inputs = {
-        nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
-        nixos-hardware.url = "github:NixOS/nixos-hardware";
-        upstream = {
-          url = "github:hypersw/HyperNix";
-          inputs.nixpkgs.follows = "nixpkgs";
-          inputs.nixos-hardware.follows = "nixos-hardware";
-        };
-      };
-      outputs = { upstream, ... }: {
-        nixosConfigurations.default = upstream.nixosConfigurations.VdsRuOne;
-      };
-    }
-    EOF
-    chmod 0644 "$tmp"
-    mv -f "$tmp" /etc/nixos/flake.nix
-  '';
+  # The update lanes take their input lists from the shim.
+  hypersw.system.localFlakeShim = {
+    enable = true;
+    configurationName = "VdsRuOne";
+    raspberryPiInput = false;
+    candidates = false;
+  };
 
   hypersw.services.auto-rebuild-on-push.enable = true;
-  hypersw.system.autoUpgradeTransactional = {
-    enable = true;
-    productionInputs = [ "nixpkgs" "nixos-hardware" "upstream" ];
-  };
+  hypersw.system.autoUpgradeTransactional.enable = true;
 
   system.stateVersion = "26.05";
 }

@@ -259,10 +259,10 @@ in
           full transitive flake-locking from GitHub anonymously,
           which trips the secondary rate limit before any tick
           can win and persist a lock to disk. See the long
-          comment on
-          <literal>system.activationScripts.localFlake</literal>
-          (in this same file) for why the shim has the
-          multi-input shape rather than a single-input one.
+          header comment of
+          <literal>Modules/System/LocalFlakeShim</literal>
+          for why the shim has the multi-input shape
+          rather than a single-input one.
         '';
       };
     };
@@ -330,16 +330,6 @@ in
 
       # ── auto-rebuild-on-push ──────────────────────────────────────
       hypersw.services.auto-rebuild-on-push.enable = cfg.autoRebuildOnPush.enable;
-
-      # The shim below renders a candidate quartet next to production;
-      # the transactional upgrade must leave those inputs alone.
-      hypersw.system.autoUpgradeTransactional.candidateInputs =
-        lib.mkIf cfg.localFlake.enable (lib.mkDefault [
-          "nixpkgs-candidate"
-          "nixos-hardware-candidate"
-          "nixos-raspberrypi-candidate"
-          "upstream-candidate"
-        ]);
 
       # ── telegram-alerts ───────────────────────────────────────────
       hypersw.services.telegram-alerts = lib.mkIf cfg.alerts.enable {
@@ -431,250 +421,13 @@ in
       ];
 
       # ── local-flake bootstrap ─────────────────────────────────────
-      # ## What this writes
-      #
-      # A pair of files at /etc/nixos/, iff neither exists yet:
-      #
-      #   - flake.nix  — a MULTI-input shim with three direct
-      #     inputs (nixpkgs, nixos-hardware, upstream) and follows
-      #     directives wiring upstream's nixpkgs / nixos-hardware
-      #     to the shim's top-level ones. See "Why multi-input"
-      #     below.
-      #
-      #   - flake.lock — pre-baked by a jq transform of upstream's
-      #     own flake.lock (in-store via pin.sourcePath). Avoids
-      #     the first-boot chicken-and-egg where the auto-rebuild
-      #     checker would have to do anonymous full-graph flake-
-      #     locking from GitHub on its first tick — and trip the
-      #     secondary rate limit before any tick can win and
-      #     persist a lock to disk.
-      #
-      # If the pin is null (dirty tree, build without self.rev),
-      # only flake.nix is written; the first checker tick will
-      # generate the lock the slow way.
-      #
-      # ## Why multi-input (the load-bearing design point)
-      #
-      # The shim's top-level nixpkgs / nixos-hardware are
-      # MOVABLE HANDLES, separable from whatever upstream pinned
-      # in its own lock. Two distinct refresh modes ride on top:
-      #
-      #   - Routine "update from github" (the auto-rebuild-on-push
-      #     loop, ~every 5 min) runs:
-      #       nix flake update upstream --flake /etc/nixos
-      #     This refreshes only the `upstream` input. Because of
-      #     the follows directives, upstream's view of nixpkgs is
-      #     pinned to the shim's top-level nixpkgs — which DIDN'T
-      #     change. No kernel rebuild, no nixpkgs-rooted derivation
-      #     hash churn. Fast incremental switches on every push.
-      #
-      #   - Periodic system upgrade (daily / weekly / monthly per
-      #     machine role, the system.autoUpgrade timer in this
-      #     same profile) runs:
-      #       nix flake update --flake /etc/nixos
-      #     With no input name, this advances EVERY input —
-      #     including the shim's top-level nixpkgs, which moves
-      #     to the current head of nixos-unstable. The follows
-      #     directives then carry that new nixpkgs into upstream's
-      #     evaluation. Result: fresh kernel + security patches +
-      #     glibc / openssl / etc. updates, even if upstream's own
-      #     flake.lock has been stale for months.
-      #
-      # The single-input variant (shim has only `upstream`) is
-      # simpler but eliminates this asymmetry — the box's nixpkgs
-      # is then frozen to whatever upstream pins, and security
-      # upgrades require a HyperNix commit. We want the box to be
-      # able to grab the freshest kernel autonomously.
-      #
-      # ## The jq lock transform
-      #
-      # `nix flake metadata` on the multi-input shim would compute
-      # an 11-node lock (root + nixpkgs + nixos-hardware +
-      # upstream + each transitive flake of upstream). The same
-      # data is already in upstream's own flake.lock — we just
-      # need to restructure it for the shim's perspective:
-      #
-      #   1. Walk every non-root node, prepend "upstream" to
-      #      array-typed (follows) input entries. Targets that
-      #      were root-relative in upstream's lock are now
-      #      reachable via upstream from the shim root.
-      #
-      #   2. Build an "upstream" node from upstream's old root
-      #      data + the pin's locked/original. Override its
-      #      nixpkgs / nixos-hardware entries to follows-pointers
-      #      to the shim root (matching the
-      #      `upstream.inputs.X.follows = "X"` directives in the
-      #      shim's flake.nix below).
-      #
-      #   3. Replace "root" with the shim's 3-input form.
-      #
-      # Build-time runCommand keeps the jq invocation off the
-      # boot critical path — it runs once per system generation,
-      # not on every activation.
-      system.activationScripts.localFlake = lib.mkIf cfg.localFlake.enable (
-        let
-          pin = cfg.localFlake.upstreamPin;
-          # Parse upstreamUrl ("github:owner/repo") for the
-          # baked lock's `original` block on the upstream node.
-          urlNoScheme = lib.removePrefix "github:" cfg.localFlake.upstreamUrl;
-          urlParts = lib.splitString "/" urlNoScheme;
-          upstreamOwner = lib.head urlParts;
-          upstreamRepo  = lib.elemAt urlParts 1;
-
-          # jq transform — see the long header comment above for
-          # the three-step derivation. The output is a single
-          # store-path .lock file the activation script cp's into
-          # place; the runCommand wrapper runs it once per system
-          # generation rather than on every boot.
-          jqProgram = ''
-            .nodes |= with_entries(
-              if .key == "root" then .
-              else .value |= (
-                if .inputs == null then .
-                else .inputs |= with_entries(
-                  .value |= (if type == "array" then ["upstream"] + . else . end)
-                )
-                end
-              )
-              end
-            ) |
-            .nodes.upstream = (.nodes.root + {
-              locked: {
-                type: "github",
-                owner: $upstream_owner,
-                repo: $upstream_repo,
-                rev: $upstream_rev,
-                narHash: $upstream_narHash,
-                lastModified: ($upstream_lastModified | tonumber)
-              },
-              original: {
-                type: "github",
-                owner: $upstream_owner,
-                repo: $upstream_repo
-              }
-            } | .inputs.nixpkgs = ["nixpkgs"]
-              | .inputs["nixos-hardware"] = ["nixos-hardware"]) |
-            .nodes.root = {
-              inputs: {
-                nixpkgs: "nixpkgs",
-                "nixos-hardware": "nixos-hardware",
-                upstream: "upstream"
-              }
-            }
-          '';
-
-          bakedLock =
-            if pin == null then null
-            # buildPackages.* runs on the build platform, not the
-            # target. Lets x86 dev hosts pre-verify the transform
-            # without cross-building for aarch64; the Pi itself
-            # runs everything native so this is a no-op there.
-            else pkgs.buildPackages.runCommand "shim-flake.lock" {} ''
-              ${pkgs.buildPackages.jq}/bin/jq \
-                --arg upstream_rev          "${pin.rev}" \
-                --arg upstream_narHash      "${pin.narHash}" \
-                --arg upstream_lastModified "${toString pin.lastModified}" \
-                --arg upstream_owner        "${upstreamOwner}" \
-                --arg upstream_repo         "${upstreamRepo}" \
-                '${jqProgram}' \
-                ${pin.sourcePath}/flake.lock > $out
-            '';
-        in ''
-          mkdir -p /etc/nixos
-
-          # /etc/nixos/flake.nix is module-owned (the template below).
-          # Rewrite on every activation, atomically via temp+rename so
-          # a power-loss mid-write can't corrupt the file. Operator
-          # edits go through this template in
-          # Modules/Profiles/AnyMachineBase/default.nix, not through
-          # the rendered file.
-          FLAKE_TMP=$(mktemp /etc/nixos/.flake.nix.XXXXXX)
-          cat > "$FLAKE_TMP" << 'FLAKE'
-          {
-            description = '''
-          Multi-input shim with parallel main and candidate quartets. Each quartet is `{nixpkgs, nixos-hardware, nixos-raspberrypi, upstream}`. The main quartet drives `nixosConfigurations.default` (production); the candidate quartet drives `nixosConfigurations.candidate` (the try-boot staging slot — see Modules/System/BootOnceRaspberryPi/). Every input uses a moving branch-ref URL (nixos-unstable for nixpkgs, the upstream-repo HEAD for HyperNix, the upstream branches for nixos-hardware and nixos-raspberrypi). Each input's `original` block descriptor is identical across the two quartets, but each input locks to a separate rev. Result: main and candidate hold independent revisions of the same branches at the same time.
-
-          nixos-raspberrypi is locally-managed alongside nixpkgs and nixos-hardware (not delegated to whatever HyperNix's flake.lock pinned) so monthly upgrades advance it in lockstep with the rest of userland — that's where the Pi-vendor kernel + its security patches arrive from.
-
-          This file is regenerated by the activation script on every nixos-rebuild switch — content is module-owned. Operator edits go through the template in Modules/Profiles/AnyMachineBase/default.nix, not through this file. /etc/nixos/flake.lock is operator state (mutated by `nix flake update`, `nixos-rebuild-promote-candidate`, etc.) and is left alone.
-
-          Lock-update commands (each touches only the named inputs; others are left as they were):
-
-          sudo nix flake update --flake /etc/nixos upstream
-              Bumps the production HyperNix snapshot. Wired into the ~5-minute auto-rebuild-on-push timer.
-
-          sudo nix flake update --flake /etc/nixos
-              Advances every input (both trios + upstream) to current branch HEAD. Wired as the preStart of nixos-upgrade.service (monthly or per-cadence timer). The candidate trio auto-rolls forward along with the production trio at the monthly tick — promote or discard within the cadence window if you want a probe to outlive that.
-
-          sudo nix flake update --flake /etc/nixos nixpkgs-candidate nixos-hardware-candidate nixos-raspberrypi-candidate upstream-candidate
-              Starts a fresh major-upgrade probe at current branch HEADs without touching production.
-
-          Try-boot the candidate (Pi 5 EEPROM one-shot; failure auto-reverts on the next power cycle):
-
-          sudo nixos-rebuild-boot-once --flake /etc/nixos#candidate
-          sudo reboot-tryboot
-
-          Promote a successful candidate without any rebuild — full local cache reuse, branch-ref descriptors on the main trio preserved so subsequent monthly upgrades advance normally:
-
-          sudo nixos-rebuild-promote-candidate
-
-          Promotes the tested candidate lock graph through the root input handles, then offers a 1-4 apply prompt (nothing / switch / boot / boot + reboot). See Modules/System/BootOnceRaspberryPi/.
-            ''';
-
-            inputs = {
-              nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
-              nixos-hardware.url = "github:NixOS/nixos-hardware";
-              # FORKED to hypersw/nixos-raspberrypi (develop branch).
-              # Fork carries a single-line patch to the raspberrypi
-              # boot-loader module that hardcodes kernelFile="Image"
-              # instead of reading fragile nvmd/nixpkgs attribute
-              # paths. See HyperNix's flake.nix for the full story
-              # and the unpin path (fork can be dropped once nvmd
-              # accepts an equivalent upstream fix).
-              nixos-raspberrypi.url = "github:hypersw/nixos-raspberrypi/develop";
-              upstream = {
-                url = "${cfg.localFlake.upstreamUrl}";
-                inputs.nixpkgs.follows = "nixpkgs";
-                inputs.nixos-hardware.follows = "nixos-hardware";
-                inputs.nixos-raspberrypi.follows = "nixos-raspberrypi";
-              };
-
-              nixpkgs-candidate.url = "github:NixOS/nixpkgs/nixos-unstable";
-              nixos-hardware-candidate.url = "github:NixOS/nixos-hardware";
-              # Keep the candidate on the same maintained loader fork as
-              # production. Upstream currently evaluates its kernel filename
-              # through a vendor-kernel passthru (`kernel.target`) that is
-              # absent with current nixpkgs; the fork fixes this as `Image`.
-              nixos-raspberrypi-candidate.url = "github:hypersw/nixos-raspberrypi/develop";
-              upstream-candidate = {
-                url = "${cfg.localFlake.upstreamUrl}";
-                inputs.nixpkgs.follows = "nixpkgs-candidate";
-                inputs.nixos-hardware.follows = "nixos-hardware-candidate";
-                inputs.nixos-raspberrypi.follows = "nixos-raspberrypi-candidate";
-              };
-            };
-
-            outputs = { upstream, upstream-candidate, ... }: {
-              nixosConfigurations.default =
-                upstream.nixosConfigurations.${cfg.localFlake.configurationName};
-              nixosConfigurations.candidate =
-                upstream-candidate.nixosConfigurations.${cfg.localFlake.configurationName};
-            };
-          }
-          FLAKE
-          chmod 0644 "$FLAKE_TMP"
-          mv -f "$FLAKE_TMP" /etc/nixos/flake.nix
-
-          # /etc/nixos/flake.lock is operator state — mutated by
-          # `nix flake update`, `promote-candidate`, etc. Bake on
-          # first boot when the upstream pin is known; never overwrite
-          # afterwards.
-        '' + lib.optionalString (pin != null) ''
-          if [ ! -f /etc/nixos/flake.lock ]; then
-            install -m 0644 ${bakedLock} /etc/nixos/flake.lock
-          fi
-        ''
-      );
+      # The shim and its baked lock live in Modules/System/LocalFlakeShim;
+      # this profile keeps its `localFlake` options and renders the full
+      # Pi-capable shape with the candidate quartet.
+      hypersw.system.localFlakeShim = lib.mkIf cfg.localFlake.enable {
+        enable = true;
+        inherit (cfg.localFlake) configurationName upstreamUrl upstreamPin;
+      };
     })
 
     # ── Non-container only (need own kernel + own rootfs) ────────────
