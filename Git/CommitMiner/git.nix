@@ -21,7 +21,16 @@ base.overrideAttrs (old: {
   version = "${old.version}-mine";
   __intentionallyOverridingVersion = true;
 
-  patches = (old.patches or [ ]) ++ [ ./git-mine.patch ];
+  patches = (old.patches or [ ]) ++ [
+    ./git-mine.patch
+    # Upstream reads `fsmonitor.socketDir` only for a gitdir on a network
+    # filesystem, so a local repo always gets `.git/fsmonitor--daemon.ipc`.
+    # Nix `path:` copies, `builtins.getFlake` on a plain path and other tree
+    # copiers die on that socket. With this patch an explicit socketDir is
+    # used for local repos too; unset, nothing changes. The directory must
+    # exist: git checks its filesystem and does not create it.
+    ./git-fsmonitor-socketdir.patch
+  ];
 
   doInstallCheck = runGitTests && (old.doInstallCheck or false);
 })

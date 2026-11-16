@@ -1,0 +1,65 @@
+--- a/compat/fsmonitor/fsm-ipc-unix.c
++++ b/compat/fsmonitor/fsm-ipc-unix.c
+@@ -28,8 +28,16 @@
+ 		return ipc_path;
+ 
+ 
+-	/* By default the socket file is created in the .git directory */
+-	if (fsmonitor__is_fs_remote(r->gitdir) < 1) {
++	repo_config_get_string(r, "fsmonitor.socketdir", &sock_dir);
++
++	/*
++	 * By default the socket file is created in the .git directory.
++	 * An explicit socketDir moves it out of .git for a local gitdir
++	 * too, so that tools copying the tree never meet a socket there.
++	 */
++	if (!r->worktree ||
++	    (!(sock_dir && *sock_dir) && fsmonitor__is_fs_remote(r->gitdir) < 1)) {
++		free(sock_dir);
+ 		ipc_path = fsmonitor_ipc__get_default_path();
+ 		return ipc_path;
+ 	}
+@@ -38,8 +46,6 @@
+ 	git_SHA1_Update(&sha1ctx, r->worktree, strlen(r->worktree));
+ 	git_SHA1_Final(hash, &sha1ctx);
+ 
+-	repo_config_get_string(r, "fsmonitor.socketdir", &sock_dir);
+-
+ 	/* Create the socket file in either socketDir or $HOME */
+ 	if (sock_dir && *sock_dir) {
+ 		strbuf_addf(&ipc_file, "%s/.git-fsmonitor-%s",
+--- a/Documentation/config/fsmonitor--daemon.adoc
++++ b/Documentation/config/fsmonitor--daemon.adoc
+@@ -6,6 +6,8 @@
+ fsmonitor.socketDir::
+     This Mac OS and Linux-specific option, if set, specifies the directory in
+     which to create the Unix domain socket used for communication
+-    between the fsmonitor daemon and various Git commands. The directory must
+-    reside on a native filesystem.  Only respected when `core.fsmonitor`
++    between the fsmonitor daemon and various Git commands, for local and
++    network-mounted repositories alike; the socket is then named
++    `.git-fsmonitor-<hash of the worktree path>`. The directory must exist
++    and reside on a native filesystem.  Only respected when `core.fsmonitor`
+     is set to `true`.
+--- a/Documentation/git-fsmonitor--daemon.adoc
++++ b/Documentation/git-fsmonitor--daemon.adoc
+@@ -83,12 +83,13 @@
+ may or may not have the needed support; the fsmonitor daemon is not guaranteed
+ to work with these filesystems and such use is considered experimental.
+ 
+-By default, the socket is created in the `.git` directory.  However, if the
+-`.git` directory is on a network-mounted filesystem, it will instead be
+-created at `$HOME/.git-fsmonitor-*` unless `$HOME` itself is on a
+-network-mounted filesystem, in which case you must set the configuration
+-variable `fsmonitor.socketDir` to the path of a directory on a native
+-filesystem in which to create the socket file.
++By default, the socket is created in the `.git` directory.  If the
++configuration variable `fsmonitor.socketDir` is set, the socket is created
++in that directory instead, whatever filesystem `.git` is on.  Otherwise, if
++the `.git` directory is on a network-mounted filesystem, it will instead be
++created at `$HOME/.git-fsmonitor-*`, and if `$HOME` itself is on a
++network-mounted filesystem you must set `fsmonitor.socketDir` to the path
++of a directory on a native filesystem in which to create the socket file.
+ 
+ If none of the above directories (`.git`, `$HOME`, or `fsmonitor.socketDir`)
+ is on a native filesystem the fsmonitor daemon will report an

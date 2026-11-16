@@ -18,6 +18,7 @@ first mined commit
 | Path | What |
 |---|---|
 | `git-mine.patch` | Patch to git's `commit.c`. It covers `commit_tree_extended()`, which every commit-creating command goes through: commit, commit-tree, merge, am, and rebase/cherry-pick/revert. It adds the `nonce` header and runs the miner. |
+| `git-fsmonitor-socketdir.patch` | Unrelated to mining, carried in the same build: an explicit `fsmonitor.socketDir` also applies to a local gitdir, so the fsmonitor socket leaves `.git` (upstream honours it only for a network-mounted one). |
 | `git.nix` | The patched git: a separate derivation, **not** an overlay over `pkgs.git`, which would rebuild half of nixpkgs. |
 | `Miner/` | `git-mine-commit`, a Rust miner. The CPU backend uses all SHA-NI threads. The GPU backend runs wgpu/Vulkan compute (SHA-1 only), and the two race on disjoint counter ranges. |
 | `package.nix` | The two joined on one `bin/`. |
