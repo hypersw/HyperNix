@@ -126,7 +126,8 @@ let
 
   sandboxDir = "/run/nixos-upgrade-transactional-sandbox";
   lockFile = "/run/nixos-upgrade-transactional.lock";
-  liveDir = "/etc/nixos";
+  liveDir = cfg.flakeDir;
+  configName = cfg.configName;
 
   lockGraphFilter = ../LockGraph/lock-graph.jq;
 
@@ -175,7 +176,7 @@ let
     # are ready for Step 4's reuse.
     echo "== step 2: nix build (dry, --no-link)"
     nix --extra-experimental-features 'nix-command flakes' build \
-      "path:$SANDBOX#nixosConfigurations.default.config.system.build.toplevel" \
+      "path:$SANDBOX#nixosConfigurations.${configName}.config.system.build.toplevel" \
       --no-link
 
     # ── Step 3: splice sandbox's production nodes → live lock ─
@@ -190,12 +191,12 @@ let
 
     # ── Step 4: switch to the freshly-promoted revs ───────────
     # Same store paths as Step 2 → cache hit → no rebuild.
-    echo "== step 4: nixos-rebuild switch --flake $LIVE#default"
-    nixos-rebuild switch --flake "$LIVE#default"
+    echo "== step 4: nixos-rebuild switch --flake $LIVE#${configName}"
+    nixos-rebuild switch --flake "$LIVE#${configName}"
 
     # FUTURE-ROBUSTNESS (documented, not implemented):
     #   Between Step 3 and Step 4, add:
-    #     nixos-rebuild-boot-once --flake "$LIVE#default"
+    #     nixos-rebuild-boot-once --flake "$LIVE#${configName}"
     #     reboot-tryboot
     #   which uses the Pi 5 EEPROM one-shot slot to guarantee an
     #   unbootable config auto-reverts on next power cycle. This
@@ -235,6 +236,23 @@ in
         RandomizedDelaySec= for the timer. Spreads fleet-wide
         traffic to github + cache.nixos.org.
       '';
+    };
+
+    flakeDir = lib.mkOption {
+      type = lib.types.str;
+      default = "/etc/nixos";
+      description = ''
+        Live local flake whose lock the transaction promotes and which
+        it switches to. Same meaning as auto-rebuild-on-push.flakeDir;
+        both lanes must point at the same flake, since they share one
+        lock on it.
+      '';
+    };
+
+    configName = lib.mkOption {
+      type = lib.types.str;
+      default = "default";
+      description = "NixOS configuration name to build and switch to (the #name in --flake).";
     };
 
     timeout = lib.mkOption {
