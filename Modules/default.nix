@@ -48,6 +48,7 @@
     ./System/BootOnceRaspberryPi
     ./System/BootStabilityProbe
     ./System/Btm
+    ./System/GenerationRetention
     ./System/LocalFlakeShim
     ./System/ZfsTpmUnlock
     ./Containers/UserContainers

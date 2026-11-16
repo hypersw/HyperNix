@@ -57,11 +57,14 @@
     gc = {
       automatic = true;
       dates = "weekly";
-      options = "--delete-older-than 7d";
       persistent = true;
     };
     optimise.automatic = true;
   };
+
+  # GRUB's configurationLimit (2) is also the system-profile count; nix-gc
+  # then runs without a time-based option.
+  hypersw.system.generationRetention.enable = true;
 
   # /etc/nixos/flake.nix is module-owned; flake.lock remains operational
   # state, changed by the update services.  No candidate quartet or Pi input:
