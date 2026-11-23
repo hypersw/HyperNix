@@ -682,6 +682,9 @@ in
         # Unattended recovery: a dead kernel reboots on its own instead of waiting for a hand on the power button
         "kernel.panic" = 30;            # Reboot 30 s after a panic instead of staying dead
         "kernel.hardlockup_panic" = 1;  # A CPU stuck with interrupts off panics instead of only logging it; inert where no detector exists
+
+        # Alt+SysRq keys at a keyboard plugged in for diagnosis, for recovery by hand when nothing else responds
+        "kernel.sysrq" = 252;  # Sync, remount read-only, kill, reboot, task and memory dumps; no log level or real-time nice keys
       };
 
       # Keep the hardware watchdog armed while the system runs, not only during a reboot.
