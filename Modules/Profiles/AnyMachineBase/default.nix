@@ -676,7 +676,13 @@ in
         device = "/var/swapfile";
         size = 2048;
       }];
-      boot.kernel.sysctl."vm.swappiness" = 1;
+      boot.kernel.sysctl = {
+        "vm.swappiness" = 1;
+
+        # Unattended recovery: a dead kernel reboots on its own instead of waiting for a hand on the power button
+        "kernel.panic" = 30;            # Reboot 30 s after a panic instead of staying dead
+        "kernel.hardlockup_panic" = 1;  # A CPU stuck with interrupts off panics instead of only logging it; inert where no detector exists
+      };
 
       # /tmp on tmpfs — works on any non-pathological RAM budget;
       # small enough tmp jobs use real fs only when explicitly
