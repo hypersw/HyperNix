@@ -37,6 +37,12 @@ let
     weekly  = "Tue *-*-* 04:00";
     monthly = "*-*-01 02:00";
   }.${cfg.autoUpgrade.cadence};
+
+  # The Raspberry Pi kernel's bcm2835_wdt programs the hardware timeout modulo 16 s until raspberrypi/linux e69f138 (2026-06-11), so a 3 min watchdog resets the board after 4 s.
+  # rpi-6.18.y carries the fix from 6.18.36 on; any other Pi kernel counts as unfixed until it is added here.
+  kernel = config.boot.kernelPackages.kernel;
+  isPiKernel = lib.hasPrefix "linux_rpi" (kernel.pname or "");
+  hasPiWatchdogFix = (lib.versions.majorMinor kernel.modDirVersion == "6.18") && (lib.versionAtLeast kernel.modDirVersion "6.18.36");
 in
 {
   # No `imports` here — `Modules/default.nix` (the module-list)
@@ -689,8 +695,13 @@ in
 
       # Keep the hardware watchdog armed while the system runs, not only during a reboot.
       # If systemd or the kernel stalls for 3 min, the board resets itself; a machine without a watchdog device only logs that it has none.
-      # A Pi's watchdog counts to 15 s at most, so the kernel keeps feeding it on systemd's behalf.
-      systemd.settings.Manager.RuntimeWatchdogSec = "3min";
+      systemd.settings.Manager.RuntimeWatchdogSec = lib.mkIf (!isPiKernel) "3min";
+
+      # A Pi arms it from the kernel command line instead, and only on a kernel with the bcm2835_wdt fix (see hasPiWatchdogFix).
+      # The command line takes effect only when the board boots this generation's kernel, so a live switch never arms the watchdog on an older running kernel.
+      # Leave an unknown Pi kernel unarmed: a wrong arm there resets the board seconds into every boot, with no console to recover it.
+      # The option also sets the reboot and kexec watchdogs to 3 min; a Pi does not kexec.
+      boot.kernelParams = lib.mkIf (isPiKernel && hasPiWatchdogFix) [ "systemd.watchdog_sec=3min" ];
 
       # Cap crash dumps at 2 GiB instead of 32 GiB.
       # Reading, compressing and writing the dump of a big process is a stall of its own, worst on an SD card, and such a dump rarely helps a diagnosis.
