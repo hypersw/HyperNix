@@ -692,6 +692,14 @@ in
       # A Pi's watchdog counts to 15 s at most, so the kernel keeps feeding it on systemd's behalf.
       systemd.settings.Manager.RuntimeWatchdogSec = "3min";
 
+      # Cap crash dumps at 2 GiB instead of 32 GiB.
+      # Reading, compressing and writing the dump of a big process is a stall of its own, worst on an SD card, and such a dump rarely helps a diagnosis.
+      # At the cap systemd-coredump stops reading and keeps the dump truncated, so the crashed process releases its memory at once.
+      systemd.coredump.settings.Coredump = {
+        ProcessSizeMax = "2G";   # The largest dump that gets analyzed for a stack trace
+        ExternalSizeMax = "2G";  # The largest dump that gets stored; reading stops at the larger of the two
+      };
+
       # /tmp on tmpfs — works on any non-pathological RAM budget;
       # small enough tmp jobs use real fs only when explicitly
       # directed.
