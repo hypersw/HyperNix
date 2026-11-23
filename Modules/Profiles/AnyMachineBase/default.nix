@@ -684,6 +684,11 @@ in
         "kernel.hardlockup_panic" = 1;  # A CPU stuck with interrupts off panics instead of only logging it; inert where no detector exists
       };
 
+      # Keep the hardware watchdog armed while the system runs, not only during a reboot.
+      # If systemd or the kernel stalls for 3 min, the board resets itself; a machine without a watchdog device only logs that it has none.
+      # A Pi's watchdog counts to 15 s at most, so the kernel keeps feeding it on systemd's behalf.
+      systemd.settings.Manager.RuntimeWatchdogSec = "3min";
+
       # /tmp on tmpfs — works on any non-pathological RAM budget;
       # small enough tmp jobs use real fs only when explicitly
       # directed.
