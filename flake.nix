@@ -161,6 +161,10 @@
       # all host-local sockets and persistent vTPM/PKCS#11 state.
       lib."Machines-MicroVM-VmSshFront" = args:
         import ./Machines/MicroVM/VmSshFront/nixos.nix ({ inherit nixpkgs microvm; } // args);
+      # A Cloudflare One (WARP) proxy microVM; it has no default instance,
+      # since the team name and the guest subnet are the consumer's.
+      lib."Machines-MicroVM-VmWarpProxy" = args:
+        import ./Machines/MicroVM/VmWarpProxy/nixos.nix ({ inherit nixpkgs microvm; } // args);
       # The builder behind Modules-Programs-JetBrainsTarballIde: `{ pkgs, src, ... }` to a JetBrains IDE package.
       lib."Modules-Programs-JetBrainsTarballIde" = import ./Modules/Programs/JetBrainsTarballIde/package.nix;
       # Configure the Ubuntu live VM builder from a consumer flake.
