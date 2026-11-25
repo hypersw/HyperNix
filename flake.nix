@@ -197,7 +197,12 @@
       # the module-list, consumers import the bundle and activate by
       # setting options. See that file for the discussion.
       homeModules = {
-        default = import ./Modules/Home;
+        default = {
+          imports = [ ./Modules/Home ];
+          # VmWarpProxy's units need its builder, which needs this flake's
+          # nixpkgs and microvm; a path import of Modules/Home passes it itself.
+          services.warp-proxy.builder = nixpkgs.lib.mkDefault self.lib."Machines-MicroVM-VmWarpProxy";
+        };
       };
 
       # home-manager renamed this output `hmModules` -> `homeModules`.

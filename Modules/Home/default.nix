@@ -29,5 +29,8 @@
     ../Git/FetchAll/home.nix
     ../Programs/NixLdLibraries/home.nix
     ../Programs/Wsl1Exec/home.nix
+    # Beside its machine builder rather than under Modules/, because it only
+    # declares units for that builder's VMs.
+    ../../Machines/MicroVM/VmWarpProxy/home.nix
   ];
 }
