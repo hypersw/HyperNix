@@ -14,6 +14,7 @@
 , Mem
 , Vcpu
 , VmMacAddress
+, IsHardwareBackedRegistration
 }:
 { config, lib, pkgs, ... }:
 let
@@ -25,6 +26,31 @@ let
   # warp-svc runs as root, loads no NSS module and resolves on its own, so it
   # still reaches the SLIRP resolver and the WARP API before enrollment.
   ProxyUsers = [ "microsocks" "warp" "nscd" ] ++ lib.optional HasHttpProxy "tinyproxy";
+  # The MDM file which turns on hardware-backed registration, in the layout of
+  # Cloudflare's "Hardware-backed registration" page: the setting sits in
+  # organization_configs, so it holds for every configuration of the team.
+  Team = lib.escapeXML TeamName;
+  MdmFile = pkgs.writeText "warp-mdm.xml" ''
+    <dict>
+      <key>organization_configs</key>
+      <dict>
+        <key>${Team}</key>
+        <dict>
+          <key>hardware_backed_registration</key>
+          <true/>
+        </dict>
+      </dict>
+      <key>configs</key>
+      <array>
+        <dict>
+          <key>organization</key>
+          <string>${Team}</string>
+          <key>display_name</key>
+          <string>${Team}</string>
+        </dict>
+      </array>
+    </dict>
+  '';
 in
 {
   nixpkgs.config.allowUnfreePredicate = pkg: builtins.elem (lib.getName pkg) [ "cloudflare-warp" ];
@@ -138,6 +164,16 @@ in
   # Enrollment is interactive, once per state directory: `control enroll`.
   # warp-svc remembers the connected state across reboots.
   services.cloudflare-warp.enable = true;
+
+  # Hardware-backed registration is an MDM setting in the client's own state
+  # directory. warp-svc reads it at start, so the file is written right before;
+  # turned off, only a file this module wrote is removed. Switching either way
+  # invalidates the current registration (Cloudflare's rule), so enroll again.
+  systemd.services.cloudflare-warp.path = [ pkgs.diffutils ];
+  systemd.services.cloudflare-warp.preStart =
+    if IsHardwareBackedRegistration
+    then "install -m 0644 ${MdmFile} /var/lib/cloudflare-warp/mdm.xml"
+    else "if cmp -s ${MdmFile} /var/lib/cloudflare-warp/mdm.xml; then rm -f /var/lib/cloudflare-warp/mdm.xml; fi";
 
   # Unauthenticated, but reachable only through the hostfwd on the host's
   # 127.0.0.1; any local user of the host can use it.

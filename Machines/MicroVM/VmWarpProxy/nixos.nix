@@ -58,12 +58,16 @@
 , Mem ? 1024
 , Vcpu ? 2
 , VmMacAddress ? "02:00:00:00:00:01"
+  # Binds the WARP registration to a non-exportable key in the guest's TPM
+  # (Cloudflare's MDM setting hardware_backed_registration, client 2026.6+).
+  # Changing it invalidates the registration: enroll again afterwards.
+, IsHardwareBackedRegistration ? false
 , ExtraModules ? [ ]
 }:
 nixpkgs.lib.nixosSystem {
   modules = [
     { nixpkgs.hostPlatform.system = "x86_64-linux"; }
     microvm.nixosModules.microvm
-    (import ./configuration.nix { inherit VmName VmHostname TeamName GuestSubnet SocksHostPort SshHostPort HttpHostPort SshAuthorizedKeys SshIdentityFile StateDir IsTcgOnly Mem Vcpu VmMacAddress; })
+    (import ./configuration.nix { inherit VmName VmHostname TeamName GuestSubnet SocksHostPort SshHostPort HttpHostPort SshAuthorizedKeys SshIdentityFile StateDir IsTcgOnly Mem Vcpu VmMacAddress IsHardwareBackedRegistration; })
   ] ++ ExtraModules;
 }
