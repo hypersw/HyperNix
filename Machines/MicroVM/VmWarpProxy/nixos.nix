@@ -62,12 +62,18 @@
   # (Cloudflare's MDM setting hardware_backed_registration, client 2026.6+).
   # Changing it invalidates the registration: enroll again afterwards.
 , IsHardwareBackedRegistration ? false
+  # Encrypts the swtpm state with a key that systemd-creds seals with the
+  # host's TPM, scoped to the user; it needs a host TPM and systemd 256+.
+  # The state on disk is then useless on another machine, but a process of
+  # the same user here can still have it decrypted. Turning it on needs an
+  # empty swtpm/ directory, so the TPM contents start fresh.
+, IsTpmStateSealed ? false
 , ExtraModules ? [ ]
 }:
 nixpkgs.lib.nixosSystem {
   modules = [
     { nixpkgs.hostPlatform.system = "x86_64-linux"; }
     microvm.nixosModules.microvm
-    (import ./configuration.nix { inherit VmName VmHostname TeamName GuestSubnet SocksHostPort SshHostPort HttpHostPort SshAuthorizedKeys SshIdentityFile StateDir IsTcgOnly Mem Vcpu VmMacAddress IsHardwareBackedRegistration; })
+    (import ./configuration.nix { inherit VmName VmHostname TeamName GuestSubnet SocksHostPort SshHostPort HttpHostPort SshAuthorizedKeys SshIdentityFile StateDir IsTcgOnly Mem Vcpu VmMacAddress IsHardwareBackedRegistration IsTpmStateSealed; })
   ] ++ ExtraModules;
 }

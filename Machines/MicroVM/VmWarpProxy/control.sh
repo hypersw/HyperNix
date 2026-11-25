@@ -17,6 +17,7 @@ State=@stateDir@
 Identity=@sshIdentityFile@
 SshPort=@sshPort@
 SocksPort=@socksPort@
+IsTpmStateSealed=@isTpmStateSealed@
 
 # A leading "~/" means $HOME; nothing else in a path is interpreted.
 ExpandHome()
@@ -121,6 +122,31 @@ WaitReady()
   return 1
 }
 
+# IsTpmStateSealed: fills CredArgs (Start's local) with the sealed swtpm key.
+# The key is 32 random bytes, sealed once by systemd-creds with the host's TPM
+# and the user's scope, and stored next to the state it unlocks. systemd
+# decrypts it into the unit's private credential directory at start.
+# Sealed and unsealed TPM state never mix: either direction needs an empty swtpm/.
+SealArgs()
+{
+  local Cred="$State/swtpm-key.cred"
+  if [ -z "$IsTpmStateSealed" ]; then
+    if [ -e "$Cred" ]; then
+      echo "$Cred exists, but sealing is off: the TPM state in $State/swtpm is encrypted. Turn sealing on again, or remove both to start with an empty TPM." >&2
+      return 1
+    fi
+    return 0
+  fi
+  if [ ! -e "$Cred" ]; then
+    if [ -e "$State/swtpm/tpm2-00.permall" ]; then
+      echo "$State/swtpm holds an unsealed TPM state; remove it to start sealed (its contents, keys included, are lost)." >&2
+      return 1
+    fi
+    (umask 077 && head -c 32 /dev/urandom | systemd-creds --user encrypt --with-key=host+tpm2 --name=swtpm-key - "$Cred")
+  fi
+  CredArgs=(--property="LoadCredentialEncrypted=swtpm-key:$Cred")
+}
+
 Start()
 {
   Lock
@@ -140,12 +166,15 @@ Start()
     install -d "$(dirname "$Profile")"
     nix-env --profile "$Profile" --set "$Runner" >/dev/null
     nix-env --profile "$Profile" --delete-generations old >/dev/null 2>&1 || true
+    local CredArgs=()
+    if ! SealArgs; then return 1; fi
     systemctl --user reset-failed "$Unit" 2>/dev/null || true
     systemd-run --user --unit="$Unit" --description="$Unit WARP proxy microVM (SOCKS5 on 127.0.0.1:$SocksPort)" \
       --working-directory="$State" \
       --property=KillMode=mixed \
       --property=TimeoutStopSec=60 \
       --property=ExecStop="$Runner/bin/microvm-shutdown" \
+      "${CredArgs[@]}" \
       "$Runner/bin/microvm-run"
   fi
   WaitReady

@@ -15,6 +15,7 @@
 , Vcpu
 , VmMacAddress
 , IsHardwareBackedRegistration
+, IsTpmStateSealed
 }:
 { config, lib, pkgs, ... }:
 let
@@ -119,12 +120,20 @@ in
       state_dir=./swtpm
       install -d -m 0700 "$state_dir"
       rm -f "$state_dir/swtpm.sock" "$state_dir/swtpm.pid"
+      # With IsTpmStateSealed the control program hands systemd a credential
+      # sealed by the host's TPM, which arrives here decrypted in the unit's
+      # private credential directory; swtpm then encrypts its state with it.
+      key_args=()
+      if [ -n "''${CREDENTIALS_DIRECTORY:-}" ] && [ -e "$CREDENTIALS_DIRECTORY/swtpm-key" ]; then
+        key_args=(--key "file=$CREDENTIALS_DIRECTORY/swtpm-key,format=binary,mode=aes-256-cbc")
+      fi
       ${HostPkgs.swtpm}/bin/swtpm socket \
         --tpm2 \
         --tpmstate "dir=$state_dir,mode=0600,lock" \
         --ctrl "type=unixio,path=$state_dir/swtpm.sock,mode=0600,terminate" \
         --pid "file=$state_dir/swtpm.pid" \
         --log "file=$state_dir/swtpm.log,level=1" \
+        "''${key_args[@]}" \
         --daemon
     '';
 
@@ -286,6 +295,7 @@ in
         "@sshIdentityFile@"
         "@sshPort@"
         "@socksPort@"
+        "@isTpmStateSealed@"
       ]
       (map lib.escapeShellArg [
         VmName
@@ -295,6 +305,7 @@ in
         SshIdentityFile
         (toString SshHostPort)
         (toString SocksHostPort)
+        (if IsTpmStateSealed then "1" else "")
       ])
       (builtins.readFile ./control.sh);
   };
