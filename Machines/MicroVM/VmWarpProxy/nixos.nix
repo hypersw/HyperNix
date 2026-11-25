@@ -68,12 +68,16 @@
   # the same user here can still have it decrypted. Turning it on needs an
   # empty swtpm/ directory, so the TPM contents start fresh.
 , IsTpmStateSealed ? false
+  # A home-manager or NixOS module declares the instance's user unit (see
+  # home.nix); the control program then starts and stops that unit instead of
+  # a transient one.
+, IsUnitDeclared ? false
 , ExtraModules ? [ ]
 }:
 nixpkgs.lib.nixosSystem {
   modules = [
     { nixpkgs.hostPlatform.system = "x86_64-linux"; }
     microvm.nixosModules.microvm
-    (import ./configuration.nix { inherit VmName VmHostname TeamName GuestSubnet SocksHostPort SshHostPort HttpHostPort SshAuthorizedKeys SshIdentityFile StateDir IsTcgOnly Mem Vcpu VmMacAddress IsHardwareBackedRegistration IsTpmStateSealed; })
+    (import ./configuration.nix { inherit VmName VmHostname TeamName GuestSubnet SocksHostPort SshHostPort HttpHostPort SshAuthorizedKeys SshIdentityFile StateDir IsTcgOnly Mem Vcpu VmMacAddress IsHardwareBackedRegistration IsTpmStateSealed IsUnitDeclared; })
   ] ++ ExtraModules;
 }

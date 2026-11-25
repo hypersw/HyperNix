@@ -16,6 +16,7 @@
 , VmMacAddress
 , IsHardwareBackedRegistration
 , IsTpmStateSealed
+, IsUnitDeclared
 }:
 { config, lib, pkgs, ... }:
 let
@@ -296,6 +297,7 @@ in
         "@sshPort@"
         "@socksPort@"
         "@isTpmStateSealed@"
+        "@isUnitDeclared@"
       ]
       (map lib.escapeShellArg [
         VmName
@@ -306,6 +308,7 @@ in
         (toString SshHostPort)
         (toString SocksHostPort)
         (if IsTpmStateSealed then "1" else "")
+        (if IsUnitDeclared then "1" else "")
       ])
       (builtins.readFile ./control.sh);
   };

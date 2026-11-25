@@ -1,9 +1,10 @@
 # Control program for one VmWarpProxy instance; configuration.nix fills in the
 # @…@ placeholders, and writeShellApplication adds the shebang and
-# `set -euo pipefail`. The VM runs as a transient systemd --user unit, so it
-# outlives the shell that started it.
+# `set -euo pipefail`. The VM runs as a systemd --user unit: a transient one
+# started here, or, with IsUnitDeclared, one a home-manager or NixOS module
+# declares (home.nix next to this file), which start and stop then drive.
 #
-#   <name> start | stop | restart | status | log [n] | ssh [cmd…] | enroll [link]
+#   <name> start | stop | restart | status | log [n] | ssh [cmd…] | enroll [link] | prepare
 #
 # start exits 0 once WARP is connected, 3 when the VM is up but not enrolled
 # yet, and 1 on any failure. enroll starts a registration, prints the sign-in
@@ -18,6 +19,7 @@ Identity=@sshIdentityFile@
 SshPort=@sshPort@
 SocksPort=@socksPort@
 IsTpmStateSealed=@isTpmStateSealed@
+IsUnitDeclared=@isUnitDeclared@
 
 # A leading "~/" means $HOME; nothing else in a path is interpreted.
 ExpandHome()
@@ -122,14 +124,22 @@ WaitReady()
   return 1
 }
 
-# IsTpmStateSealed: fills CredArgs (Start's local) with the sealed swtpm key.
-# The key is 32 random bytes, sealed once by systemd-creds with the host's TPM
-# and the user's scope, and stored next to the state it unlocks. systemd
-# decrypts it into the unit's private credential directory at start.
-# Sealed and unsealed TPM state never mix: either direction needs an empty swtpm/.
-SealArgs()
+# Readies the state directory for a start, in both modes: a transient start
+# calls it, and a declared unit runs `<name> prepare` from a oneshot unit
+# ordered before it, because systemd loads credentials when a unit starts, so
+# the sealed key must already exist. It takes no lock: the declared path runs
+# it while start holds the lock, and at autostart without any control call.
+#
+# IsTpmStateSealed: the swtpm key is 32 random bytes, sealed once by
+# systemd-creds with the host's TPM and the user's scope, and stored next to
+# the state it unlocks; systemd decrypts it into the unit's private credential
+# directory at start. Sealed and unsealed TPM state never mix: either
+# direction needs an empty swtpm/.
+Prepare()
 {
   local Cred="$State/swtpm-key.cred"
+  install -d -m 0700 "$State"
+  rm -f "$State/VmControl.$Unit.socket"
   if [ -z "$IsTpmStateSealed" ]; then
     if [ -e "$Cred" ]; then
       echo "$Cred exists, but sealing is off: the TPM state in $State/swtpm is encrypted. Turn sealing on again, or remove both to start with an empty TPM." >&2
@@ -144,7 +154,6 @@ SealArgs()
     fi
     (umask 077 && head -c 32 /dev/urandom | systemd-creds --user encrypt --with-key=host+tpm2 --name=swtpm-key - "$Cred")
   fi
-  CredArgs=(--property="LoadCredentialEncrypted=swtpm-key:$Cred")
 }
 
 Start()
@@ -156,9 +165,16 @@ Start()
     echo "$Unit is still stopping after 90 s" >&2
     return 1
   fi
-  if IsGone; then
-    install -d -m 0700 "$State"
-    rm -f "$State/VmControl.$Unit.socket"
+  if IsGone && [ -n "$IsUnitDeclared" ]; then
+    # The declared unit pulls in its prepare unit; its store paths are rooted
+    # by the generation which declares it, so no profile root here.
+    systemctl --user reset-failed "$Unit" "$Unit-prepare" 2>/dev/null || true
+    if ! systemctl --user start "$Unit"; then
+      echo "$Unit did not start; see: journalctl --user -u $Unit-prepare -u $Unit" >&2
+      return 1
+    fi
+  elif IsGone; then
+    if ! Prepare; then return 1; fi
     # A GC root for the runner: a running QEMU keeps only its own binary alive, not the
     # runner, and without it a garbage collection deletes the microvm-shutdown which ExecStop runs.
     # A profile, not `nix-store --add-root`: inside a container the indirect root's path does
@@ -167,7 +183,7 @@ Start()
     nix-env --profile "$Profile" --set "$Runner" >/dev/null
     nix-env --profile "$Profile" --delete-generations old >/dev/null 2>&1 || true
     local CredArgs=()
-    if ! SealArgs; then return 1; fi
+    if [ -n "$IsTpmStateSealed" ]; then CredArgs=(--property="LoadCredentialEncrypted=swtpm-key:$State/swtpm-key.cred"); fi
     systemctl --user reset-failed "$Unit" 2>/dev/null || true
     systemd-run --user --unit="$Unit" --description="$Unit WARP proxy microVM (SOCKS5 on 127.0.0.1:$SocksPort)" \
       --working-directory="$State" \
@@ -231,5 +247,6 @@ case "${1:-status}" in
   log)     journalctl --user -u "$Unit" --no-pager -n "${2:-60}" ;;
   ssh)     shift; SshInteractive "$@" ;;
   enroll)  Enroll "${2:-}" ;;
-  *)       echo "usage: $Unit start | stop | restart | status | log [n] | ssh [cmd…] | enroll [link]" >&2; exit 2 ;;
+  prepare) Prepare ;;
+  *)       echo "usage: $Unit start | stop | restart | status | log [n] | ssh [cmd…] | enroll [link] | prepare" >&2; exit 2 ;;
 esac
