@@ -17,6 +17,7 @@ State="@stateDir@"
 Identity="@sshIdentityFile@"
 SshPort="@sshPort@"
 SocksPort="@socksPort@"
+Profile="${XDG_STATE_HOME:-$HOME/.local/state}/nix/profiles/$Unit-runner"
 
 # The guest's host key lives on its tmpfs root and changes every boot, so it is
 # not checked; see the trust note in nixos.nix.
@@ -58,9 +59,9 @@ WaitGone()
 }
 
 # Serialises start, stop, restart and enroll per instance, so two callers cannot
-# unlink each other's QMP socket under a running VM.
-# Keyed by the unit name, not the state directory, since controllers of two
-# builds with different StateDir values still share one unit.
+# unlink each other's QMP socket or repoint the runner's GC root under a running
+# VM. Keyed by the unit name, not the state directory, since controllers of two
+# builds with different StateDir values still share one unit and one profile.
 # Taken once per invocation: restart holds it across its stop and its start.
 Locked=0
 Lock()
@@ -121,6 +122,13 @@ Start()
   if IsGone; then
     install -d -m 0700 "$State"
     rm -f "$State/VmControl.$Unit.socket"
+    # A GC root for the runner: a running QEMU keeps only its own binary alive, not the
+    # runner, and without it a garbage collection deletes the microvm-shutdown which ExecStop runs.
+    # A profile, not `nix-store --add-root`: inside a container the indirect root's path does
+    # not resolve on the host, whose GC drops it as stale, while profile HEADs can be synced.
+    install -d "$(dirname "$Profile")"
+    nix-env --profile "$Profile" --set "$Runner" >/dev/null
+    nix-env --profile "$Profile" --delete-generations old >/dev/null 2>&1 || true
     systemctl --user reset-failed "$Unit" 2>/dev/null || true
     systemd-run --user --unit="$Unit" --description="$Unit WARP proxy microVM (SOCKS5 on 127.0.0.1:$SocksPort)" \
       --working-directory="$State" \

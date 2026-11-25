@@ -233,6 +233,7 @@ in
   # The host-side control program, with this VM's runner and parameters baked in.
   system.build.control = HostPkgs.writeShellApplication {
     name = VmName;
+    # nix-env is deliberately not here: the caller's one matches the system's nix daemon.
     runtimeInputs = [ HostPkgs.openssh HostPkgs.systemd HostPkgs.coreutils HostPkgs.gnugrep HostPkgs.util-linux ];
     text = builtins.replaceStrings
       [

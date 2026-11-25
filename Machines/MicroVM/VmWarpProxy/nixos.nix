@@ -23,6 +23,9 @@
 #   blocks io_uring stops the runner before the guest boots.
 # - Run the runner under a supervisor (the control program uses systemd): if
 #   it fails between starting swtpm and QEMU, swtpm is left behind.
+# - The control program roots the runner with the nix profile
+#   <VmName>-runner. In a container which shares the host's nix daemon the
+#   host GC cannot see a container-private profile unless the host roots it.
 { nixpkgs
 , microvm
   # Names the systemd user unit, the QMP socket and the default state
