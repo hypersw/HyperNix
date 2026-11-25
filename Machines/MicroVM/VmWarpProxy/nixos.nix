@@ -44,13 +44,15 @@
   # take HTTP_PROXY/HTTPS_PROXY. null leaves the HTTP proxy out.
 , HttpHostPort ? null
 , SshAuthorizedKeys
-  # Private half of a key in SshAuthorizedKeys, for the control program. A
-  # shell string, expanded at run time, so "$HOME/…" works. Never a Nix path
-  # such as ./key: that would copy the private key into the store.
+  # Private half of a key in SshAuthorizedKeys, for the control program: a
+  # path string, taken literally except that a leading "~/" means $HOME at
+  # run time. Never a Nix path such as ./key: that would copy the private key
+  # into the store.
 , SshIdentityFile
-  # Holds warp-state.img and swtpm/; losing it means a new enrollment. A shell
-  # string, expanded at run time.
-, StateDir ? "\${XDG_STATE_HOME:-$HOME/.local/state}/${VmName}"
+  # Holds warp-state.img and swtpm/; losing it means a new enrollment. A path
+  # string like SshIdentityFile; null means $XDG_STATE_HOME/<VmName>, or
+  # ~/.local/state/<VmName> without XDG_STATE_HOME.
+, StateDir ? null
   # No /dev/kvm (e.g. inside a container): run under TCG emulation.
 , IsTcgOnly ? false
 , Mem ? 1024

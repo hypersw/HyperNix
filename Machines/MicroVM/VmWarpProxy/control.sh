@@ -9,14 +9,25 @@
 # yet, and 1 on any failure. enroll starts a registration, prints the sign-in
 # URL, then reads the com.cloudflare.warp:// link from stdin (an argument works
 # too, but stays visible in the process list).
-Unit="@unit@"
-Runner="@runner@"
-Team="@team@"
-# Shell strings from the instance's parameters, expanded here at run time.
-State="@stateDir@"
-Identity="@sshIdentityFile@"
-SshPort="@sshPort@"
-SocksPort="@socksPort@"
+# The instance's parameters, single-quoted by configuration.nix, so literal.
+Unit=@unit@
+Runner=@runner@
+Team=@team@
+State=@stateDir@
+Identity=@sshIdentityFile@
+SshPort=@sshPort@
+SocksPort=@socksPort@
+
+# A leading "~/" means $HOME; nothing else in a path is interpreted.
+ExpandHome()
+{
+  case "$1" in
+    "~/"*) printf '%s\n' "$HOME/${1#"~/"}" ;;
+    *) printf '%s\n' "$1" ;;
+  esac
+}
+if [ -z "$State" ]; then State="${XDG_STATE_HOME:-$HOME/.local/state}/$Unit"; else State=$(ExpandHome "$State"); fi
+Identity=$(ExpandHome "$Identity")
 Profile="${XDG_STATE_HOME:-$HOME/.local/state}/nix/profiles/$Unit-runner"
 
 # The guest's host key lives on its tmpfs root and changes every boot, so it is
@@ -162,7 +173,7 @@ Enroll()
   # Starts the enrollment session and prints its sign-in URL. Its stdin is
   # closed, so it cannot swallow a link piped into this program.
   # shellcheck disable=SC2029
-  SshDeadline=60 Ssh "sudo warp-cli --accept-tos registration new '$Team'" </dev/null
+  SshDeadline=60 Ssh "sudo warp-cli --accept-tos registration new $(printf '%q' "$Team")" </dev/null
   # The token inside the link lives 60 s from the sign-in, so paste it at once.
   # Every wait is bounded, since it holds the lifecycle lock.
   if [ -n "${1:-}" ]; then
@@ -177,7 +188,6 @@ Enroll()
   if [ -z "$Link" ]; then echo "no com.cloudflare.warp:// link in the input" >&2; exit 1; fi
   # The link goes over SSH's stdin, so it shows up in neither the host's process
   # list nor the guest's sudo log. $Link expands in the guest's shell.
-  # shellcheck disable=SC2016
   printf '%s\n' "$Link" | SshDeadline=60 Ssh 'sudo sh -c '\''read -r Link && exec warp-cli --accept-tos registration token "$Link"'\'''
   SshDeadline=30 Ssh 'sudo warp-cli --accept-tos connect' </dev/null
   WaitReady

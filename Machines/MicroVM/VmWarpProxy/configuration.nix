@@ -235,6 +235,12 @@ in
     name = VmName;
     # nix-env is deliberately not here: the caller's one matches the system's nix daemon.
     runtimeInputs = [ HostPkgs.openssh HostPkgs.systemd HostPkgs.coreutils HostPkgs.gnugrep HostPkgs.util-linux ];
+    # SC2088 ("tilde does not expand in quotes") and SC2016 ("expressions don't
+    # expand in single quotes"): literal values are the point. ExpandHome in
+    # control.sh gives a leading "~/" its meaning, and a consumer's "$" stays a "$".
+    excludeShellChecks = [ "SC2088" "SC2016" ];
+    # Every value goes in single-quoted by escapeShellArg, so the shell sees it
+    # literally; control.sh itself gives a leading "~/" its meaning.
     text = builtins.replaceStrings
       [
         "@unit@"
@@ -245,15 +251,15 @@ in
         "@sshPort@"
         "@socksPort@"
       ]
-      [
+      (map lib.escapeShellArg [
         VmName
         "${config.microvm.declaredRunner}"
         TeamName
-        StateDir
+        (if StateDir == null then "" else StateDir)
         SshIdentityFile
         (toString SshHostPort)
         (toString SocksHostPort)
-      ]
+      ])
       (builtins.readFile ./control.sh);
   };
 }
