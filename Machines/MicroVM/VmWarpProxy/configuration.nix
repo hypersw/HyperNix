@@ -22,6 +22,11 @@
 { config, lib, pkgs, ... }:
 let
   HasHttpProxy = HttpHostPort != null;
+  # SLIRP presents a forwarded connection from the host's loopback as coming
+  # from its gateway, but one from any other address with that address.
+  # Off loopback, the guest therefore sees and answers the real clients.
+  IsProxyExposed = !(lib.hasPrefix "127." ProxyListenAddress);
+  ProxyPorts = [ 1080 ] ++ lib.optional HasHttpProxy 3128;
   HostPkgs = config.microvm.vmHostPackages;
   # Accounts whose outbound traffic must go through the tunnel: the two proxies;
   # the login user, whose sshd session opens the ssh -W / -J connections; and
@@ -202,11 +207,13 @@ in
     settings = {
       Listen = "0.0.0.0";
       Port = 3128;
-      # Every forwarded connection arrives from the SLIRP gateway.
-      Allow = "${GuestSubnet}.2";
       DisableViaHeader = true;
       # The default level logs every plain-HTTP request line, query strings included.
       LogLevel = "Warning";
+    } // lib.optionalAttrs (!IsProxyExposed) {
+      # Every forwarded connection then arrives from the SLIRP gateway.
+      # Exposed, tinyproxy takes any client, as microsocks does: without an Allow line it allows all.
+      Allow = "${GuestSubnet}.2";
     };
   };
 
@@ -235,9 +242,10 @@ in
     # Only the SLIRP side, where the host's forwards arrive. The
     # CloudflareWARP interface carries an organisation IP that other WARP
     # devices may reach, and an unauthenticated proxy there would be open to them.
-    interfaces.eth0.allowedTCPPorts = [ 22 1080 ] ++ lib.optional HasHttpProxy 3128;
+    interfaces.eth0.allowedTCPPorts = [ 22 ] ++ ProxyPorts;
     # Egress guard: the proxies and SSH jumps may use eth0 only to answer the
-    # host's forwarded connections, which all come from the SLIRP gateway.
+    # host's forwarded connections. Those come from the SLIRP gateway, except
+    # that clients of exposed proxy ports keep their own address (IsProxyExposed).
     # Anything else they send there, including the SLIRP resolver, is refused,
     # so their traffic leaves only through the tunnel: nothing goes out directly
     # before enrollment or while WARP is down. Destinations the organisation
@@ -257,7 +265,15 @@ in
         || iptables -w -A warp-proxy-egress -j REJECT
       iptables -w -C warp-proxy-egress -d ${GuestSubnet}.2 -m conntrack --ctstate ESTABLISHED,RELATED -j RETURN 2>/dev/null \
         || iptables -w -I warp-proxy-egress 1 -d ${GuestSubnet}.2 -m conntrack --ctstate ESTABLISHED,RELATED -j RETURN
-    '' + lib.concatMapStrings (User: ''
+    '' + lib.optionalString IsProxyExposed (
+      # The answers on connections which a client opened to a proxy port, to any address.
+      # REPLY is the direction opposite to the client's, so the proxies still open nothing on eth0.
+      # A client in a range the organisation tunnels gets its answers sent into the tunnel instead,
+      # just as GuestSubnet must lie outside those ranges.
+      let Rule = "-p tcp -m multiport --sports ${lib.concatMapStringsSep "," toString ProxyPorts} -m conntrack --ctdir REPLY --ctstate ESTABLISHED,RELATED -j RETURN"; in ''
+      iptables -w -C warp-proxy-egress ${Rule} 2>/dev/null \
+        || iptables -w -I warp-proxy-egress 1 ${Rule}
+    '') + lib.concatMapStrings (User: ''
       iptables -w -C OUTPUT -o eth0 -m owner --uid-owner ${User} -j warp-proxy-egress 2>/dev/null \
         || iptables -w -A OUTPUT -o eth0 -m owner --uid-owner ${User} -j warp-proxy-egress
     '') ProxyUsers;
