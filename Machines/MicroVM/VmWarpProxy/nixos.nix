@@ -1,11 +1,13 @@
 # Called from the root flake: hypernix.lib."Machines-MicroVM-VmWarpProxy" { VmName = …; TeamName = …; … }
 #
-# A microVM that joins a Cloudflare One (WARP) Zero Trust organisation and
-# publishes the tunnel as SOCKS5 (and optionally an HTTP proxy) on the host's
-# 127.0.0.1, plus SSH for enrollment and jumps. It touches no host networking
-# and needs no root: QEMU user-mode networking with hostfwd, and under
-# IsTcgOnly not even /dev/kvm. Several instances can run side by side, one per
-# organisation, as long as VmName and the host ports differ.
+# A microVM that joins a Cloudflare One (WARP) Zero Trust organisation.
+# It publishes the tunnel as SOCKS5 (and optionally an HTTP proxy)
+# on the host's 127.0.0.1 or ProxyListenAddress,
+# plus SSH on 127.0.0.1 for enrollment and jumps.
+# It touches no host networking and needs no root:
+# QEMU user-mode networking with hostfwd, and under IsTcgOnly not even /dev/kvm.
+# Several instances can run side by side, one per organisation,
+# as long as VmName and the host ports differ.
 #
 # The result is a nixosSystem. Consumers take two outputs from it:
 #   config.microvm.declaredRunner   the VM runner
@@ -16,6 +18,8 @@
 # - It trusts every local user of the host. The proxies take no credentials,
 #   and the control program accepts any SSH host key on SshHostPort, because
 #   the guest's key changes every boot. Do not use it on a shared host.
+#   With a ProxyListenAddress other than 127.0.0.1, it trusts every machine
+#   which can reach that address as well.
 # - The proxies send nothing outside the tunnel (see the egress guard in
 #   configuration.nix), so a host the organisation excludes from the tunnel
 #   cannot be reached through them.
@@ -43,6 +47,11 @@
   # Host port for an HTTP proxy with CONNECT (tinyproxy), for clients which only
   # take HTTP_PROXY/HTTPS_PROXY. null leaves the HTTP proxy out.
 , HttpHostPort ? null
+  # Host IPv4 address the SOCKS5 and HTTP proxy ports listen on; "0.0.0.0" for
+  # every interface, so that other machines can use the proxies. The proxies
+  # are unauthenticated, so anything that reaches this address can use them.
+  # SSH always stays on 127.0.0.1.
+, ProxyListenAddress ? "127.0.0.1"
 , SshAuthorizedKeys
   # Private half of a key in SshAuthorizedKeys, for the control program: a
   # path string, taken literally except that a leading "~/" means $HOME at
@@ -78,6 +87,6 @@ nixpkgs.lib.nixosSystem {
   modules = [
     { nixpkgs.hostPlatform.system = "x86_64-linux"; }
     microvm.nixosModules.microvm
-    (import ./configuration.nix { inherit VmName VmHostname TeamName GuestSubnet SocksHostPort SshHostPort HttpHostPort SshAuthorizedKeys SshIdentityFile StateDir IsTcgOnly Mem Vcpu VmMacAddress IsHardwareBackedRegistration IsTpmStateSealed IsUnitDeclared; })
+    (import ./configuration.nix { inherit VmName VmHostname TeamName GuestSubnet SocksHostPort SshHostPort HttpHostPort ProxyListenAddress SshAuthorizedKeys SshIdentityFile StateDir IsTcgOnly Mem Vcpu VmMacAddress IsHardwareBackedRegistration IsTpmStateSealed IsUnitDeclared; })
   ] ++ ExtraModules;
 }

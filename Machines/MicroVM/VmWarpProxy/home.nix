@@ -33,6 +33,7 @@ let
         SocksHostPort = Inst.socksPort;
         SshHostPort = Inst.sshPort;
         HttpHostPort = Inst.httpPort;
+        ProxyListenAddress = Inst.proxyListenAddress;
         SshAuthorizedKeys = Inst.sshAuthorizedKeys;
         SshIdentityFile = Inst.sshIdentityFile;
         StateDir = Inst.stateDir;
@@ -57,9 +58,10 @@ let
     options = {
       teamName = mkOption { type = types.str; description = "Cloudflare One team name, as in `warp-cli registration new <team>`."; };
       guestSubnet = mkOption { type = types.str; description = "First three octets of the guest's /24, outside every range the organisation routes into the tunnel."; };
-      socksPort = mkOption { type = types.port; description = "Host port on 127.0.0.1 for SOCKS5."; };
+      socksPort = mkOption { type = types.port; description = "Host port for SOCKS5, on proxyListenAddress."; };
       sshPort = mkOption { type = types.port; description = "Host port on 127.0.0.1 for the guest's SSH."; };
-      httpPort = mkOption { type = types.nullOr types.port; default = null; description = "Host port on 127.0.0.1 for an HTTP CONNECT proxy; null leaves it out."; };
+      httpPort = mkOption { type = types.nullOr types.port; default = null; description = "Host port for an HTTP CONNECT proxy, on proxyListenAddress; null leaves it out."; };
+      proxyListenAddress = mkOption { type = types.str; default = "127.0.0.1"; description = "Host IPv4 address of the SOCKS5 and HTTP proxy ports; \"0.0.0.0\" serves other machines too. The proxies are unauthenticated: anything that reaches this address can use them. SSH stays on 127.0.0.1."; };
       sshAuthorizedKeys = mkOption { type = types.listOf types.str; description = "Public keys of the guest's login user."; };
       sshIdentityFile = mkOption { type = types.str; description = "Private half of one of those keys, as a path string; a leading \"~/\" means $HOME. Never a Nix path, which would copy the key into the store."; };
       stateDir = mkOption { type = types.nullOr types.str; default = null; description = "State directory (WARP disk image, vTPM, sealed key); a leading \"~/\" means $HOME; null means $XDG_STATE_HOME/warp-proxy-<name>."; };
@@ -115,7 +117,7 @@ in
         };
         ${B.VmName} = {
           Unit = {
-            Description = "${B.VmName}: WARP proxy microVM (SOCKS5 on 127.0.0.1:${toString Inst.socksPort})";
+            Description = "${B.VmName}: WARP proxy microVM (SOCKS5 on ${Inst.proxyListenAddress}:${toString Inst.socksPort})";
             Requires = [ "${B.VmName}-prepare.service" ];
             After = [ "${B.VmName}-prepare.service" ];
           };

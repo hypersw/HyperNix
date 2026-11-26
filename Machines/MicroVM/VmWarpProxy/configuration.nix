@@ -1,5 +1,5 @@
 # VmWarpProxy guest: Cloudflare WARP plus local proxies, reachable only via the
-# host's 127.0.0.1 forwards. Parameters are documented in nixos.nix.
+# host's forwards. Parameters are documented in nixos.nix.
 { VmName
 , VmHostname
 , TeamName
@@ -7,6 +7,7 @@
 , SocksHostPort
 , SshHostPort
 , HttpHostPort
+, ProxyListenAddress
 , SshAuthorizedKeys
 , SshIdentityFile
 , StateDir
@@ -94,10 +95,10 @@ in
         "net=${GuestSubnet}.0/24"                                # see GuestSubnet in nixos.nix
         "host=${GuestSubnet}.2"                                  # SLIRP gateway, the source address of every forwarded connection
         "dns=${GuestSubnet}.3"                                   # used only until warp-svc takes over resolv.conf
-        "hostfwd=tcp:127.0.0.1:${toString SocksHostPort}-:1080"  # SOCKS5
-        "hostfwd=tcp:127.0.0.1:${toString SshHostPort}-:22"      # enrollment shell, ssh -W / -J
+        "hostfwd=tcp:${ProxyListenAddress}:${toString SocksHostPort}-:1080"  # SOCKS5
+        "hostfwd=tcp:127.0.0.1:${toString SshHostPort}-:22"                  # enrollment shell, ssh -W / -J; loopback only
       ] ++ lib.optionals HasHttpProxy [
-        "hostfwd=tcp:127.0.0.1:${toString HttpHostPort}-:3128"   # HTTP proxy with CONNECT
+        "hostfwd=tcp:${ProxyListenAddress}:${toString HttpHostPort}-:3128"   # HTTP proxy with CONNECT
       ]))
       "-device"
       # "-device" suffix: -M microvm without shares or graphics has no PCI bus.
@@ -186,7 +187,7 @@ in
     else "if cmp -s ${MdmFile} /var/lib/cloudflare-warp/mdm.xml; then rm -f /var/lib/cloudflare-warp/mdm.xml; fi";
 
   # Unauthenticated, but reachable only through the hostfwd on the host's
-  # 127.0.0.1; any local user of the host can use it.
+  # ProxyListenAddress; anything that reaches that address can use it.
   services.microsocks = {
     enable = true;
     ip = "0.0.0.0";
@@ -231,7 +232,7 @@ in
 
   networking.firewall = {
     enable = true;
-    # Only the SLIRP side, where the host's 127.0.0.1 forwards arrive. The
+    # Only the SLIRP side, where the host's forwards arrive. The
     # CloudflareWARP interface carries an organisation IP that other WARP
     # devices may reach, and an unauthenticated proxy there would be open to them.
     interfaces.eth0.allowedTCPPorts = [ 22 1080 ] ++ lib.optional HasHttpProxy 3128;
